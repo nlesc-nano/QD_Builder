@@ -1,0 +1,14 @@
+name: nc-builder
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - numpy
+  - scipy>=1.11
+  - pyyaml
+  - pymatgen>=2023.7
+  - pip
+  - pip:
+      # editable install of THIS repo (requires you've cloned it first)
+      - -e .
+

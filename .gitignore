@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.log
+*.sqlite3
+*.db
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+*.conda
+*.ipynb_checkpoints
+*.DS_Store
+
+# Build
+build/
+dist/
+*.egg
+*.whl
+src/*.egg-info/
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
