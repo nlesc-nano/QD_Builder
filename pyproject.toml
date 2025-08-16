@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanocrystal-builder"
+version = "0.1.0"
+description = "Wulff-construction nanocrystal builder with coordination-aware surface passivation"
+readme = "README.md"
+authors = [
+  { name = "Ivan Infante" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "scipy>=1.11",
+  "pyyaml",
+  "pymatgen>=2023.7"
+]
+
+[project.scripts]
+nc-builder = "builder.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+include-package-data = true
+
