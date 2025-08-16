@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 
 from .constants import EPS
 from .nc_types import Facet, Plane
+from .facets import halfspaces
 
 def unit_normal(lattice_or_struct, hkl: Tuple[int,int,int]) -> NDArray[np.float64]:
     """
@@ -18,10 +19,6 @@ def unit_normal(lattice_or_struct, hkl: Tuple[int,int,int]) -> NDArray[np.float6
     v = lattice.reciprocal_lattice.get_cartesian_coords(hkl)
     n = v / np.linalg.norm(v)
     return n
-
-def halfspaces(s, facets: List[Facet], R: float) -> List[Plane]:
-    lam = R / min(f.gamma for f in facets)
-    return [(unit_normal(s, (f.h, f.k, f.l)), lam * f.gamma) for f in facets]
 
 def inside(pts: NDArray[np.float64], planes: List[Plane]) -> NDArray[bool]:
     if len(planes) == 0:
@@ -35,8 +32,8 @@ def rep_ranges(lattice, maxd: float):
     n = lambda v: int(math.ceil((maxd + EPS) / np.linalg.norm(v))) + 1
     return (range(-n(a), n(a) + 1), range(-n(b), n(b) + 1), range(-n(c), n(c) + 1))
 
-def build_nanocrystal(struct, facets: List[Facet], R: float):
-    planes = halfspaces(struct, facets, R)
+def build_nanocrystal(struct, facets, R: float, aspect=(1.0, 1.0, 1.0)):
+    planes = halfspaces(struct, facets, R, aspect=aspect)
     maxd = max(d for _, d in planes)
     rx, ry, rz = rep_ranges(struct.lattice, maxd)
 

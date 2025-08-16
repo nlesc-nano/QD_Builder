@@ -57,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--proper-rotations-only", action="store_true", default=True,
                    help="Use only proper rotations (det=+1) when expanding seed facets; "
                         "prevents folding +hkl into -h-k-l via inversion (default: on).")
+
+    # Shape / anisotropy
+    shape = p.add_argument_group("shape")
+    shape.add_argument(
+        "--aspect", type=float, nargs=3, metavar=("AX", "AY", "AZ"),
+        default=None,
+        help="Anisotropy multipliers along lattice a,b,c axes (default 1 1 1). "
+             "Examples: platelet 1 1 0.3; rod 0.7 0.7 2.0"
+    )
+    
     return p
 
 # -------------------- YAML --------------------
@@ -118,6 +128,44 @@ def _parse_hkl(val) -> tuple[int, int, int]:
 
     raise TypeError(f"Unsupported hkl type: {type(val).__name__}")
 
+def _parse_aspect(val) -> Tuple[float, float, float]:
+    """
+    Parse aspect multipliers along lattice a,b,c axes.
+    Accepts:
+      - list/tuple: [ax, ay, az]
+      - mapping: {a:..., b:..., c:...} or {x:..., y:..., z:...}
+      - string: "ax ay az" or "ax,ay,az"
+    """
+    if val is None:
+        return (1.0, 1.0, 1.0)
+
+    # list/tuple
+    if isinstance(val, (list, tuple)) and len(val) == 3:
+        ax, ay, az = (float(val[0]), float(val[1]), float(val[2]))
+        return (ax, ay, az)
+
+    # mapping
+    if isinstance(val, dict):
+        # accept a/b/c or x/y/z
+        keys = {k.lower(): float(v) for k, v in val.items()}
+        def get3(a, b, c):
+            return (keys[a], keys[b], keys[c])
+        if all(k in keys for k in ("a", "b", "c")):
+            return get3("a", "b", "c")
+        if all(k in keys for k in ("x", "y", "z")):
+            return get3("x", "y", "z")
+        raise ValueError(f"shape.aspect mapping must have a/b/c or x/y/z: {val!r}")
+
+    # string: "ax ay az" or "ax,ay,az"
+    if isinstance(val, str):
+        toks = re.split(r"[,\s]+", val.strip())
+        toks = [t for t in toks if t]
+        if len(toks) == 3:
+            ax, ay, az = (float(toks[0]), float(toks[1]), float(toks[2]))
+            return (ax, ay, az)
+        raise ValueError(f"Cannot parse shape.aspect string: {val!r}")
+
+    raise TypeError(f"Unsupported shape.aspect type: {type(val).__name__}")
 
 @dataclass(frozen=True)
 class Config:
@@ -128,20 +176,29 @@ class Config:
     charges: Dict[str, int]
 
 def parse_yaml_config(path: str):
-    cfg = yaml.safe_load(open(path))
+    """
+    Returns:
+      seeds: List[Facet]
+      ligand: str
+      surf_tol: float
+      charges: Dict[str,int]
+      pair_opposites: bool
+      aspect: Tuple[float,float,float]
+      proper_rotations_only: bool
+    """
+    with open(path, "r") as fh:
+        cfg = yaml.safe_load(fh)
 
-    if 'facets' not in cfg:
+    if "facets" not in cfg:
         raise KeyError("YAML: need 'facets'")
-    if 'passivation' not in cfg or 'ligand' not in cfg['passivation']:
+    if "passivation" not in cfg or "ligand" not in cfg["passivation"]:
         raise KeyError("YAML: need passivation.ligand")
-    if 'charges' not in cfg:
+    if "charges" not in cfg:
         raise KeyError("YAML: need 'charges'")
 
-    # facet entries: allow
-    #  - list:  - {hkl: "111", gamma: 1.0}  - {hkl:"-1-1-1", gamma:0.8}
-    #  - map:   facets: {"111": 1.0, "-1-1-1": 0.8}
-    raw_facets = cfg['facets']
-    items = []
+    # ---- facets: list or mapping
+    raw_facets = cfg["facets"]
+    items: List[Dict[str, float]] = []
     if isinstance(raw_facets, dict):
         for k, v in raw_facets.items():
             items.append({"hkl": str(k), "gamma": float(v)})
@@ -150,22 +207,18 @@ def parse_yaml_config(path: str):
     else:
         raise TypeError("YAML facets must be a list or a mapping of hkl->gamma")
 
-    # parse into a dict to allow overriding same signed hkl
-    gamma_by_hkl: dict[tuple[int,int,int], float] = {}
+    # parse signed HKL → gamma
+    gamma_by_hkl: Dict[tuple[int, int, int], float] = {}
     for f in items:
-        h, k, l = _parse_hkl(f['hkl'])   # your existing helper supports "-1-1-1"
-        gamma_by_hkl[(h, k, l)] = float(f['gamma'])
+        h, k, l = _parse_hkl(f["hkl"])
+        gamma_by_hkl[(h, k, l)] = float(f["gamma"])
 
-    pair_opposites = bool(cfg.get('facet_options', {}).get('pair_opposites', True))
-    # CLI override takes precedence if present
-    try:
-        # when called from main, args are attached to cfg via Namespace-like object; skip if not
-        from argparse import Namespace
-        if isinstance(cfg.get('_args'), Namespace):
-            if hasattr(cfg['_args'], 'pair_opposites'):
-                pair_opposites = cfg['_args'].pair_opposites
-    except Exception:
-        pass
+    # options (with defaults)
+    facet_opts = cfg.get("facet_options", {}) or {}
+    pair_opposites: bool = bool(facet_opts.get("pair_opposites", True))
+
+    sym_opts = cfg.get("symmetry", {}) or {}
+    proper_rotations_only: bool = bool(sym_opts.get("proper_rotations_only", True))
 
     # auto-pair: add missing antipodes with same gamma
     if pair_opposites:
@@ -176,14 +229,20 @@ def parse_yaml_config(path: str):
                 to_add[opp] = g
         gamma_by_hkl.update(to_add)
 
+    # materialize seeds (keep signed HKL as-is)
     seeds = [Facet(h=h, k=k, l=l, gamma=g) for (h, k, l), g in sorted(gamma_by_hkl.items())]
 
-    ligand = cfg['passivation']['ligand']
-    surf_tol = float(cfg['passivation'].get('surf_tol', 1.0))
-    charges = {k: int(v) for k, v in cfg['charges'].items()}
+    # passivation + charges
+    ligand = cfg["passivation"]["ligand"]
+    surf_tol = float(cfg["passivation"].get("surf_tol", 1.0))
+    charges = {k: int(v) for k, v in cfg["charges"].items()}
     if ligand not in charges:
         raise KeyError(f"YAML: missing charge for {ligand}")
 
-    return seeds, ligand, surf_tol, charges, pair_opposites
+    # shape / anisotropy
+    aspect = (1.0, 1.0, 1.0)
+    if "shape" in cfg and isinstance(cfg["shape"], dict):
+        aspect = _parse_aspect(cfg["shape"].get("aspect"))
 
+    return seeds, ligand, surf_tol, charges, pair_opposites, aspect, proper_rotations_only
 

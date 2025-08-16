@@ -42,20 +42,25 @@ def main(argv: List[str] | None = None) -> int:
     # -----------------------------
     if args.verbose:
         print("\n[2] Parsing YAML config...")
-    seeds, ligand, surf_tol, charges, pair_opposites = parse_yaml_config(args.yaml)
+    seeds, ligand, surf_tol, charges, pair_opposites, yaml_aspect, yaml_proper = parse_yaml_config(args.yaml)
+    # Decide effective aspect/proper flags (CLI > YAML)
+    aspect = args.aspect if args.aspect is not None else yaml_aspect
+    proper_only = (args.proper_rotations_only
+                   if getattr(args, "proper_rotations_only", None) is not None
+                   else yaml_proper)
     if args.verbose:
         print(f"    - Facet seeds: {[ (f.h, f.k, f.l) for f in seeds ]}")
         print(f"    - Ligand: {ligand}, surf_tol={surf_tol:.3f} Å")
         print(f"    - Charges: {charges}")
         print(f"    - Pair opposites: {bool(pair_opposites)}")
-        print(f"    - Proper rotations only: {bool(args.proper_rotations_only)}")
+        print(f"    - Proper rotations only (effective): {bool(proper_only)}")
 
     # -----------------------------
     # [3] Expand symmetry → Wulff facets
     # -----------------------------
     if args.verbose:
         print("\n[3] Expanding symmetry & building Wulff facets...")
-    wulff_facets: List[Facet] = expand_facets(struct, seeds, proper_only=args.proper_rotations_only)
+    wulff_facets: List[Facet] = expand_facets(struct, seeds, proper_only=proper_only)
     if args.verbose:
         print(f"    - Expanded to {len(wulff_facets)} oriented facets")
 
@@ -64,11 +69,15 @@ def main(argv: List[str] | None = None) -> int:
     # -----------------------------
     if args.verbose:
         print("\n[4] Building nanocrystal from Wulff facets...")
-    syms, pts, _planes_geo = build_nanocrystal(struct, wulff_facets, args.radius)
+    syms, pts, _planes_geo = build_nanocrystal(struct, wulff_facets, args.radius, aspect=aspect)
     syms, pts = dedupe_points(syms, pts, tol=1e-3)
     if args.verbose:
         print(f"    - Cut particle: {len(syms)} atoms")
 
+    if args.verbose:
+        ax, ay, az = aspect
+        print(f"    - Aspect multipliers (a,b,c): {ax:.3f}, {ay:.3f}, {az:.3f}")
+    
     # Optional: prune monocoordinated sites
     if args.prune_mono:
         if args.verbose:
