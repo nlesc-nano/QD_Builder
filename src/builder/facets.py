@@ -9,8 +9,16 @@ except ImportError:
     raise SystemExit("pip install pymatgen[matproj]")
 
 from .nc_types import Facet, Plane
-from .geometry import unit_normal
 from .constants import EPS
+
+def unit_normal(lattice_or_struct, hkl: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Unit normal for Miller indices (h,k,l) in Cartesian using the reciprocal lattice:
+        n ∝ h*b1 + k*b2 + l*b3
+    """
+    lattice = lattice_or_struct.lattice if hasattr(lattice_or_struct, "lattice") else lattice_or_struct
+    v = lattice.reciprocal_lattice.get_cartesian_coords(hkl)
+    return v / np.linalg.norm(v)
 
 def expand_facets(s: Structure, seeds: list[Facet], proper_only: bool = True) -> list[Facet]:
     ops = SpacegroupAnalyzer(s, symprec=1e-3).get_symmetry_operations(cartesian=True)
@@ -91,7 +99,22 @@ def detect_facets_from_nc(
 
     return facets, planes
 
-def halfspaces(s, facets: List[Facet], R: float) -> List[Plane]:
-    from .geometry import halfspaces as _hs
-    return _hs(s, facets, R)
+
+def halfspaces(s, facets, R: float, aspect=(1.0, 1.0, 1.0)) -> list[Plane]:
+    """
+    Build Wulff half-spaces with optional anisotropy.
+    Distance for facet normal n is: d = λ * γ * h_E(n),
+    where h_E(n) = sqrt((ax*n_x)^2 + (ay*n_y)^2 + (az*n_z)^2)
+    """
+    ax, ay, az = aspect
+    # keep λ scaling compatible with previous behavior
+    lam = R / min(f.gamma for f in facets)
+    planes: list[Plane] = []
+    for f in facets:
+        n = unit_normal(s, (f.h, f.k, f.l))  # unit vector in Cartesian
+        he = math.sqrt((ax * n[0])**2 + (ay * n[1])**2 + (az * n[2])**2)
+        d = lam * f.gamma * he
+        planes.append((n, d))
+    return planes
+
 
