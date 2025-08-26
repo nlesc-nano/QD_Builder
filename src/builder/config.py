@@ -119,6 +119,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print cation–anion nearest-neighbor distance stats for core/interface/shell (pre/post shrink)."
     )
     
+    # Facet scan (pre-run diagnostic)
+    scan = p.add_argument_group("facet scan")
+    scan.add_argument("--scan-facets", action="store_true",
+                      help="Scan symmetry-distinct facets and classify polar vs non-polar using user charges.")
+    scan.add_argument("--scan-max-index", type=int, default=2,
+                      help="Max |h|,|k|,|l| for facet scan (default: 2).")
+    scan.add_argument("--scan-slab-size", type=float, default=18.0,
+                      help="Min slab thickness in Å for scan (default: 18).")
+    scan.add_argument("--scan-vacuum-size", type=float, default=20.0,
+                      help="Min vacuum thickness in Å for scan (default: 20).")
+    scan.add_argument("--scan-shifts", type=int, default=8,
+                      help="Number of evenly-spaced terminations to sample with unsymmetrized slabs (default: 8).")
+     
  
     return p
 
