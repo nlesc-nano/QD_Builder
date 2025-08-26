@@ -12,7 +12,7 @@ except ImportError:
 
 from .config import build_parser, parse_yaml_config
 from .nc_types import Config, Facet
-from .facets import expand_facets, detect_facets_from_nc, halfspaces
+from .facets import expand_facets, detect_facets_from_nc, halfspaces, scan_facets_from_cif
 from .geometry import build_nanocrystal, dedupe_points, build_core_shell_by_labeling
 from .io_utils import write_xyz, write_manifest, center_coords
 from .passivation import collect_anion_candidates, charge_balance
@@ -26,6 +26,27 @@ def main(argv: List[str] | None = None) -> int:
 
     cfg: Config = parse_yaml_config(args.yaml)
 
+    # ----- Optional facet scan (universal; runs before build) -----
+    if args.scan_facets:
+        if cfg.mode == "stack":
+            for m in cfg.materials:
+                rows = scan_facets_from_cif(m.cif if cfg.mode=="stack" else args.cif, cfg.charges, max_index=args.scan_max_index, min_slab_size=args.scan_slab_size, min_vacuum_size=args.scan_vacuum_size, n_shifts=args.scan_shifts)
+
+                print(f"\n[facet-scan] {m.name} ({m.cif}) — |h|,|k|,|l| ≤ {args.scan_max_index}")
+                for r in rows:
+                    pol = "polar" if r["polar_any"] else "non-polar"
+                    pc = r["polar_count"]; nt = r["n_terms_checked"]
+                    print(f"  hkl={r['hkl']!s:>10}  fam={r['family']:<6}  {pol:9}  ({pc}/{nt} terminations polar)")
+        else:
+            rows = scan_facets_from_cif(m.cif if cfg.mode=="stack" else args.cif, cfg.charges, max_index=args.scan_max_index, min_slab_size=args.scan_slab_size, min_vacuum_size=args.scan_vacuum_size, n_shifts=args.scan_shifts)
+
+            print(f"\n[facet-scan] single-mode ({args.cif}) — |h|,|k|,|l| ≤ {args.scan_max_index}")
+            for r in rows:
+                pol = "polar" if r["polar_any"] else "non-polar"
+                pc = r["polar_count"]; nt = r["n_terms_checked"]
+                print(f"  hkl={r['hkl']!s:>10}  fam={r['family']:<6}  {pol:9}  ({pc}/{nt} terminations polar)")
+        # continue with the normal run afterwards
+    
     if cfg.mode == "stack":
         # Multi-material: YAML drives CIFs & radii; CLI --cif/--radius ignored
         if args.verbose:

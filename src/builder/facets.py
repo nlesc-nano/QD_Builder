@@ -5,6 +5,8 @@ from typing import Dict, List, Tuple
 
 try:
     from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+    from pymatgen.core import Structure
+    from pymatgen.core.surface import SlabGenerator, get_symmetrically_distinct_miller_indices
 except ImportError:
     raise SystemExit("pip install pymatgen[matproj]")
 
@@ -117,4 +119,93 @@ def halfspaces(s, facets, R: float, aspect=(1.0, 1.0, 1.0)) -> list[Plane]:
         planes.append((n, d))
     return planes
 
+def _ensure_oxi_states(struct: Structure, charges: Dict[str, int]) -> Structure:
+    s = struct.copy()
+    species = {sp.symbol for sp in s.types_of_specie}
+    missing = sorted(species - set(charges))
+    if missing:
+        raise ValueError(
+            f"Facet scan requires explicit charges for all species. Missing: {missing}"
+        )
+    s.add_oxidation_state_by_site([int(charges[site.specie.symbol]) for site in s.sites])
+    return s
 
+def _is_polar_safe(slab) -> bool:
+    try:
+        return bool(slab.is_polar())
+    except Exception:
+        # fallback: simple dipole along slab normal (z)
+        import numpy as np
+        z = slab.cart_coords[:, 2]
+        q = np.array([getattr(site.specie, "oxi_state", 0) for site in slab.sites], float)
+        mu = float((q * z).sum())
+        return abs(mu) > 1e-3
+
+def scan_facets_from_cif(
+    cif_path: str,
+    charges: Dict[str, int],
+    *,
+    max_index: int = 2,
+    min_slab_size: float = 18.0,
+    min_vacuum_size: float = 20.0,
+    n_shifts: int = 8,
+) -> List[dict]:
+    """
+    Return per symmetry-distinct (hkl):
+      {
+        "hkl": (h,k,l),
+        "family": "{hkl}",
+        "polar_any": bool,             # any termination polar?
+        "polar_count": int,            # how many terminations polar
+        "n_terms_checked": int         # total terminations inspected
+      }
+    Uses user 'charges' only; raises if missing.
+    Scans both symmetrized slabs and a grid of unsymmetrized shifts.
+    """
+    base = _ensure_oxi_states(Structure.from_file(cif_path), charges)
+    hkls = get_symmetrically_distinct_miller_indices(base, max_index=max_index)
+
+    out: List[dict] = []
+    for hkl in sorted(hkls, key=lambda t: (abs(t[0])+abs(t[1])+abs(t[2]), t)):
+        gen = SlabGenerator(
+            base, hkl,
+            min_slab_size=min_slab_size,
+            min_vacuum_size=min_vacuum_size,
+            center_slab=True, in_unit_planes=True, reorient_lattice=True
+        )
+
+        polar_flags: List[bool] = []
+
+        # 1) Symmetrized terminations (fast, typical)
+        try:
+            slabs_sym = gen.get_slabs(symmetrize=True)
+        except Exception:
+            slabs_sym = []
+        for slab in slabs_sym:
+            # ensure oxi states on slab sites (pymatgen usually propagates, but be safe)
+            slab.add_oxidation_state_by_site([int(charges[site.specie.symbol]) for site in slab.sites])
+            polar_flags.append(_is_polar_safe(slab))
+
+        # 2) Unsymmetrized shift grid (captures alternative terminations)
+        if n_shifts > 0:
+            for i in range(n_shifts):
+                shift = (i + 0.5) / n_shifts  # sample midpoints to avoid duplicates
+                try:
+                    slab = gen.get_slab(shift=shift)
+                    slab.add_oxidation_state_by_site([int(charges[site.specie.symbol]) for site in slab.sites])
+                    polar_flags.append(_is_polar_safe(slab))
+                except Exception:
+                    # some shifts can be invalid; skip silently
+                    continue
+
+        n_terms = len(polar_flags)
+        polar_count = int(sum(polar_flags))
+        fam = "{" + "".join(str(abs(x)) for x in hkl) + "}"
+        out.append({
+            "hkl": tuple(hkl),
+            "family": fam,
+            "polar_any": bool(polar_count > 0),
+            "polar_count": polar_count,
+            "n_terms_checked": n_terms,
+        })
+    return out
