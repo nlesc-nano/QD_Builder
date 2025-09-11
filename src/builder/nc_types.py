@@ -60,5 +60,7 @@ class Config:
     passivation: PassivationSpec
     charges: Dict[str,int]
     materials: List[MaterialSpec]
+    twins: Optional[List[Dict[str, Any]]] = None
+
 
 
