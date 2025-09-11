@@ -212,7 +212,16 @@ def _parse_aspect(val) -> Tuple[float, float, float]:
     raise TypeError(f"Unsupported shape.aspect type: {type(val).__name__}")
 
 # -------------------- YAML → Config --------------------
-# -------------------- YAML → Config --------------------
+def _normalize_twins(raw):
+    """
+    Accept twins: [ {...}, {...} ]  or twins: {...}  or missing/None.
+    Return list[dict] or None.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [dict(x) for x in raw]
+    return [dict(raw)]
 
 def parse_yaml_config(path: str) -> Config:
     with open(path, "r") as fh:
@@ -234,6 +243,9 @@ def parse_yaml_config(path: str) -> Config:
     # ---- Global options ----
     proper_only = bool(cfg.get("symmetry", {}).get("proper_rotations_only", True))
     pair_opposites = bool(cfg.get("facet_options", {}).get("pair_opposites", True))
+
+    # ---- twins (top-level) ----
+    twins = _normalize_twins(cfg.get("twins"))
 
     # ---- Helper: parse facets list/mapping → List[Facet] ----
     def _parse_facets(raw) -> List[Facet]:
@@ -326,6 +338,7 @@ def parse_yaml_config(path: str) -> Config:
             seeds=[], aspect=(1.0, 1.0, 1.0),
             proper_only=proper_only, pair_opposites=pair_opposites,
             passivation=passiv_spec, charges=charges, materials=mats,
+            twins=twins,
         )
 
     # ---- SINGLE MODE (legacy) ----
@@ -345,5 +358,6 @@ def parse_yaml_config(path: str) -> Config:
         seeds=seeds, aspect=aspect,
         proper_only=proper_only, pair_opposites=pair_opposites,
         passivation=passiv_spec, charges=charges, materials=[],
+        twins=twins,   # <-- NEW
     )
 
