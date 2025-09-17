@@ -8,6 +8,51 @@ from scipy.spatial import cKDTree
 from .constants import COV_RAD
 from .nc_types import Plane, Facet
 
+def coord_numbers_bipartite(symbols, pts, charges):
+    """CN counting only opposite-charge neighbors per site."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    N = len(symbols)
+    pts = np.asarray(pts, float)
+    tree = cKDTree(pts)
+    cn = np.zeros(N, dtype=int)
+    for i in range(N):
+        s_i = symbols[i]
+        q_i = charges.get(s_i, 0)
+        if q_i == 0:
+            # fallback to generic (rare, neutral species)
+            nbrs = tree.query_ball_point(pts[i], r=2.4)  # modest radius; we still gate below
+            for j in nbrs:
+                if j == i: continue
+                if np.linalg.norm(pts[j] - pts[i]) <= _pair_cut(symbols[i], symbols[j]):
+                    cn[i] += 1
+            continue
+        # only opposite-charge neighbors
+        nbrs = tree.query_ball_point(pts[i], r=3.5)  # generous prefilter
+        count = 0
+        for j in nbrs:
+            if j == i: continue
+            if charges.get(symbols[j], 0) * q_i >= 0:
+                continue
+            if np.linalg.norm(pts[j] - pts[i]) <= _pair_cut(symbols[i], symbols[j]):
+                count += 1
+        cn[i] = count
+    return cn
+
+def bulk_cn_opposite_by_interior(symbols, pts, planes, surf_tol, charges):
+    """Mode CN per element counting only opposite-charge partners, using interior atoms."""
+    cn = coord_numbers_bipartite(symbols, pts, charges)
+    interior = ~_atoms_in_any_shell(pts, planes, surf_tol)
+    bulk = {}
+    arr_sym = np.array(symbols, dtype=object)
+    for el in set(symbols):
+        vals = cn[(arr_sym == el) & interior]
+        if vals.size == 0:
+            vals = cn[(arr_sym == el)]
+        bulk[el] = int(np.bincount(vals).argmax()) if vals.size else 0
+    return bulk
+
+
 def _cov_radius(sym: str) -> float:
     try:
         from pymatgen.core.periodic_table import Element

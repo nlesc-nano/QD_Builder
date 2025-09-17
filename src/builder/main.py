@@ -72,6 +72,21 @@ def main(argv: List[str] | None = None) -> int:
     random.seed(args.seed)
 
     cfg: Config = parse_yaml_config(args.yaml)
+    # --- Passivation ligand selection (backward compatible) ---
+    pass_cfg = getattr(cfg, "passivation", None)
+    if pass_cfg:
+        # legacy: 'ligand' means anion ligand
+        anion_lig = getattr(pass_cfg, "anion_ligand", getattr(pass_cfg, "ligand", None))
+        cation_lig = getattr(pass_cfg, "cation_ligand", None) or "Rb"
+    else:
+        anion_lig, cation_lig = None, None
+
+    # Ensure ligand charges are present (do it in-place so downstream uses cfg.charges)
+    if anion_lig and (anion_lig not in cfg.charges):
+        cfg.charges[anion_lig] = -1.0
+    if cation_lig and (cation_lig not in cfg.charges):
+        cfg.charges[cation_lig] = +1.0
+
 
     # ----- Optional facet scan (universal; runs before build) -----
     if args.scan_facets:
@@ -229,7 +244,7 @@ def main(argv: List[str] | None = None) -> int:
         if args.verbose:
             print("\n[8] Gathering outer-layer anion candidates (composite)...")
         outer_cands, subl_cands = collect_anion_candidates(
-            syms, pts, planes, cfg.charges, cfg.passivation.ligand, cfg.passivation.surf_tol, verbose=args.verbose
+            syms, pts, planes, cfg.charges, anion_lig, cfg.passivation.surf_tol, verbose=args.verbose
         )
 
         if args.verbose:
@@ -237,11 +252,12 @@ def main(argv: List[str] | None = None) -> int:
         syms, pts = charge_balance(
             syms, pts,
             outer_cands, subl_cands,
-            cfg.charges, cfg.passivation.ligand,
+            cfg.charges, anion_lig,
             verbose=args.verbose,
             planes=planes, facets=facets, surf_tol=cfg.passivation.surf_tol,
             rng=random,
             prefer_remove_parity=(args.parity == "remove"),
+            cation_ligand=cation_lig,          # NEW
         )
 
         # 7) Final write
@@ -272,7 +288,7 @@ def main(argv: List[str] | None = None) -> int:
     if args.verbose:
         print("\n[2] Using YAML config (single material)...")
         print(f"    - Facet seeds: {[ (f.h, f.k, f.l) for f in cfg.seeds ]}")
-        print(f"    - Ligand: {cfg.passivation.ligand}, surf_tol={cfg.passivation.surf_tol:.3f} Å")
+        print(f"    - Ligands: anion={anion_lig}, cation={cation_lig}, surf_tol={cfg.passivation.surf_tol:.3f} Å")
         print(f"    - Charges: {cfg.charges}")
         print(f"    - Pair opposites: {bool(cfg.pair_opposites)}")
         po_cli = getattr(args, "proper_rotations_only", None)
@@ -505,7 +521,7 @@ def main(argv: List[str] | None = None) -> int:
     if args.verbose:
         print("\n[8] Gathering outer-layer anion candidates...")
     outer_cands, subl_cands = collect_anion_candidates(
-        syms, pts, planes, cfg.charges, cfg.passivation.ligand, cfg.passivation.surf_tol, verbose=args.verbose
+        syms, pts, planes, cfg.charges, anion_lig, cfg.passivation.surf_tol, verbose=args.verbose
     )
 
     if args.verbose:
@@ -513,12 +529,14 @@ def main(argv: List[str] | None = None) -> int:
     syms, pts = charge_balance(
         syms, pts,
         outer_cands, subl_cands,
-        cfg.charges, cfg.passivation.ligand,
+        cfg.charges, anion_lig,
         verbose=args.verbose,
         planes=planes, facets=facets, surf_tol=cfg.passivation.surf_tol,
         rng=random,
         prefer_remove_parity=(args.parity == "remove"),
+        cation_ligand=cation_lig,          # NEW
     )
+    
 
     if args.verbose:
         print(f"\n[11] Writing final XYZ to {args.out}")

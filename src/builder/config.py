@@ -228,12 +228,38 @@ def parse_yaml_config(path: str) -> Config:
         cfg = yaml.safe_load(fh) or {}
 
     # ---- Global passivation + charges ----
-    passiv = cfg.get("passivation", {}) or {}
-    if "ligand" not in passiv:
-        raise KeyError("YAML: need passivation.ligand (global)")
+    pass_cfg = cfg.get("passivation") or {}
+    lig_old = pass_cfg.get("ligand")           # legacy key
+    lig_new = pass_cfg.get("anion_ligand")     # new key
+    cat_new = pass_cfg.get("cation_ligand")    # optional new key
+    surf_tol = float(pass_cfg.get("surf_tol", 1.0))
+
+    # Back-compat shim: accept either 'ligand' or 'anion_ligand'
+    if not lig_old:
+        if lig_new:
+            pass_cfg["ligand"] = lig_new
+            cfg["passivation"] = pass_cfg
+            lig_old = lig_new
+        else:
+            raise KeyError("YAML: need passivation.ligand or passivation.anion_ligand")
+
+    # Charges are required
+    if "charges" not in cfg:
+        raise KeyError("YAML: need 'charges' (global)")
+    # keep them numeric but allow +2/-1 in YAML
+    charges: Dict[str, int] = {str(k): int(v) for k, v in cfg["charges"].items()}
+
+    # Ensure ligand charges exist (harmless if already provided)
+    if lig_old not in charges:
+        charges[lig_old] = -1
+    if cat_new and (cat_new not in charges):
+        charges[cat_new] = +1
+
+    # Build the passivation spec (see nc_types.PassivationSpec update below)
     passiv_spec = PassivationSpec(
-        ligand=str(passiv["ligand"]),
-        surf_tol=float(passiv.get("surf_tol", 1.0)),
+        ligand=str(lig_old),                # anion ligand (legacy field)
+        surf_tol=surf_tol,
+        cation_ligand=str(cat_new) if cat_new else None,
     )
 
     if "charges" not in cfg:
