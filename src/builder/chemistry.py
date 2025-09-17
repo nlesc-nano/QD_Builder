@@ -7,7 +7,8 @@ from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
 from .nc_types import Plane, Facet
-from .analysis import coord_numbers, bulk_cn_by_interior, _pair_cut
+from .analysis import coord_numbers, bulk_cn_by_interior
+from .analysis import _pair_cut as pc 
 
 def facet_surface_charge(symbols, pts, planes, charges, surf_tol):
     surf_Q = {}
@@ -30,8 +31,9 @@ def find_dangling_cations(
     Return sorted list of (idx, facet_normal, depth) for under-coordinated cations
     that belong to exactly one facet shell and (optionally) to allowed facets.
     """
-    cn = coord_numbers(symbols, pts)
-    bulk_cn = bulk_cn_by_interior(symbols, pts, planes, surf_tol)
+    from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
+    cn = coord_numbers_bipartite(symbols, pts, charges)
+    bulk_cn = bulk_cn_opposite_by_interior(symbols, pts, planes, surf_tol, charges)
     cations = {el for el, q in charges.items() if q > 0}
 
     hits = {i: [] for i in range(len(symbols))}
@@ -63,6 +65,10 @@ def find_dangling_cations(
     candidates.sort(key=lambda t: (t[0], -t[1]), reverse=True)
     return [(i, n, depth) for (deficit, depth, i, n) in candidates]
 
+
+# Plane is (n, d) with half-space n·x >= d
+Plane = Tuple[NDArray[np.float64], float]
+
 def place_ligand(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -70,32 +76,78 @@ def place_ligand(
     normal: NDArray[np.float64],
     ligand: str,
     planes: List[Plane],
-) -> tuple[list[str], NDArray[np.float64]]:
+) -> Tuple[List[str], NDArray[np.float64]]:
     """
-    Add ligand along +normal at bond cutoff distance from cation, ensure:
-      (a) it’s outside the half-space (n·x > d + δ)
-      (b) no clashes to existing atoms closer than 0.8 * pair_cut
+    Place ligand near cation idx_cat, along 'normal', just beyond the *matched* facet.
+    - Enforce n_face·p >= d_face + eps for one plane (not all).
+    - Avoid clashes; try small lateral fan and 5% bond stretch if needed.
     """
-    normal = normal / (np.linalg.norm(normal) + 1e-12)
-    cat_sym = symbols[idx_cat]
-    from .analysis import _pair_cut as pc
-    bond_len = pc(cat_sym, ligand)
+    eps = 0.05
+    n_vec = np.asarray(normal, float)
+    n_vec /= (np.linalg.norm(n_vec) + 1e-12)
 
-    new = pts[idx_cat] + bond_len * normal
-    # (a) outside hull
-    n0, d0 = max(planes, key=lambda pl: np.dot(new, pl[0]) - pl[1])
-    if (new @ n0) <= (d0 + 0.05):  # let it protrude a bit
-        new = new + 0.3 * bond_len * normal
+    origin = pts[idx_cat]
+    bond_len = pc(symbols[idx_cat], ligand)
 
-    # (b) clash check
+    # --- pick the facet whose normal best aligns with 'normal' ---
+    if not planes:
+        n0, d0 = n_vec, float(np.dot(n_vec, origin))
+    else:
+        best = None; best_cos = -1.0
+        for (n, d) in planes:
+            n = np.asarray(n, float)
+            ln = np.linalg.norm(n) + 1e-12
+            nu, du = n / ln, float(d) / ln      # normalize (n,d)
+            cos = float(np.dot(nu, n_vec))
+            if cos > best_cos:
+                best_cos, best = cos, (nu, du)
+        n0, d0 = best
+
+    def ensure_outside_face(p: NDArray[np.float64]) -> NDArray[np.float64]:
+        slack = float(np.dot(n0, p) - d0)
+        if slack < eps:
+            p = p + (eps - slack) * n0
+        return p
+
     tree = cKDTree(pts)
-    idxs = tree.query_ball_point(new, r=2.5)  # generous
-    for j in idxs:
-        if np.linalg.norm(pts[j] - new) < 0.8 * pc(symbols[j], ligand):
-            return symbols, pts  # skip placement
+    r_query = 1.5 * max(pc(s, ligand) for s in set(symbols)) if symbols else 2.5
 
-    symbols = list(symbols)
-    symbols.append(ligand)
-    pts = np.vstack([pts, new])
-    return symbols, pts
+    def clashes(p: NDArray[np.float64]) -> bool:
+        for j in tree.query_ball_point(p, r_query):
+            if j == idx_cat:
+                if np.linalg.norm(pts[j] - p) < 0.9 * bond_len:
+                    return True
+                continue
+            if np.linalg.norm(pts[j] - p) < 0.8 * pc(symbols[j], ligand):
+                return True
+        return False
+
+    # candidate 0: straight along 'normal'
+    cand = ensure_outside_face(origin + bond_len * n_vec)
+    if clashes(cand):
+        # try a small lateral fan
+        u = np.cross(n_vec, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(u) < 1e-6:
+            u = np.cross(n_vec, np.array([0.0, 1.0, 0.0]))
+        u /= (np.linalg.norm(u) + 1e-12)
+
+        for ang_deg in (15, -15, 25, -25):
+            ang = np.deg2rad(ang_deg)
+            n_try = (np.cos(ang) * n_vec + np.sin(ang) * u)
+            n_try /= (np.linalg.norm(n_try) + 1e-12)
+            p_try = ensure_outside_face(origin + bond_len * n_try)
+            if not clashes(p_try):
+                cand = p_try
+                break
+        else:
+            # last resort: slightly longer bond
+            p_try = ensure_outside_face(origin + 1.05 * bond_len * n_vec)
+            if clashes(p_try):
+                return symbols, pts
+            cand = p_try
+
+    new_symbols = list(symbols)
+    new_symbols.append(ligand)
+    new_pts = np.vstack([pts, cand])
+    return new_symbols, new_pts
 
