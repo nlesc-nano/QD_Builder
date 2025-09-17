@@ -210,13 +210,13 @@ def main(argv: List[str] | None = None) -> int:
         facet_atom_report(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
 
         # --- Unconditional pre-treatment of dicoordinated sites ---
-        syms = _swap_all_dicoord_sites(
-            syms, pts,
-            charges=cfg.charges,
-            anion_target=cfg.passivation.ligand,
-            cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
-            verbose=args.verbose,
-        )
+#        syms = _swap_all_dicoord_sites(
+#            syms, pts,
+#            charges=cfg.charges,
+#            anion_target=cfg.passivation.ligand,
+#            cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
+#            verbose=args.verbose,
+#        )
 
         # 5) Write snapshot before passivation if requested
         prefix = os.path.splitext(os.path.basename(args.out))[0]
@@ -488,14 +488,13 @@ def main(argv: List[str] | None = None) -> int:
     facet_atom_report(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
 
     # --- Unconditional pre-treatment of dicoordinated sites ---
-    syms = _swap_all_dicoord_sites(
-        syms, pts,
-        charges=cfg.charges,
-        anion_target=cfg.passivation.ligand,
-        cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
-        verbose=args.verbose,
-    )
-
+#    syms = _swap_all_dicoord_sites(
+#        syms, pts,
+#        charges=cfg.charges,
+#        anion_target=cfg.passivation.ligand,
+#        cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
+#        verbose=args.verbose,
+#    )
 
     prefix = os.path.splitext(os.path.basename(args.out))[0]
     if args.write_all:
