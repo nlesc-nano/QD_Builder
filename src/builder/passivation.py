@@ -3,10 +3,12 @@ from __future__ import annotations
 import random
 from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
+import numpy.linalg as LA
 from numpy.typing import NDArray
 
 from .nc_types import Plane, Facet
 from .analysis import coord_numbers, bulk_cn_by_interior
+from .analysis import _pair_cut as pc
 from .chemistry import facet_surface_charge, place_ligand
 
 __all__ = ["collect_anion_candidates", "charge_balance"]
@@ -14,8 +16,53 @@ __all__ = ["collect_anion_candidates", "charge_balance"]
 # --------------------------------------
 # Internal helpers
 # --------------------------------------
+
+def _build_facet_frames(planes: List[Plane]):
+    """Return list of tuples (n̂, d̂, u, v, x0) with normalized plane normals."""
+    frames = []
+    for (n, d) in planes:
+        n = np.asarray(n, float); ln = LA.norm(n) + 1e-12
+        n = n / ln; d = float(d) / ln
+        a = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(a, n)) > 0.9: a = np.array([0.0, 1.0, 0.0])
+        u = np.cross(n, a); u /= (LA.norm(u) + 1e-12)
+        v = np.cross(n, u); v /= (LA.norm(v) + 1e-12)
+        x0 = d * n
+        frames.append((n, d, u, v, x0))
+    return frames
+
+def _unit_planes_from_frames(frames: List[tuple]) -> List[Tuple[np.ndarray, float]]:
+    """Return (n̂, d̂) list from frames."""
+    return [(n, d) for (n, d, *_rest) in frames]
+
+def _plane_uv(frames, fid: int, x: NDArray[np.float64]) -> Tuple[float, float]:
+    """Project 3D point x to facet fid's (u,v) coordinates."""
+    n, d, u, v, x0 = frames[fid]
+    xproj = x - (np.dot(x, n) - d) * n  # orthogonal projection
+    return float(np.dot(xproj - x0, u)), float(np.dot(xproj - x0, v))
+
+def _incident_facets(idx: int, pts: NDArray[np.float64], frames: List[tuple], surf_tol: float) -> List[int]:
+    out = []
+    xi = pts[idx]
+    for fid, (n, d, *_rest) in enumerate(frames):
+        depth = d - float(np.dot(xi, n))  # positive if inside
+        if depth < surf_tol:
+            out.append(fid)
+    return out
+
+def _record_uv_allfacets(idx: int,
+                         pts: NDArray[np.float64],
+                         frames: List[tuple],
+                         surf_tol: float,
+                         uv_taken: Dict[int, List[Tuple[float, float]]],
+                         edit_count_facet: Dict[int, int]) -> None:
+    for fid in _incident_facets(idx, pts, frames, surf_tol):
+        uv = _plane_uv(frames, fid, pts[idx])
+        uv_taken.setdefault(fid, []).append(uv)
+        edit_count_facet[fid] = edit_count_facet.get(fid, 0) + 1
+
 def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
-    """List of facet-IDs each atom belongs to (within surf_tol)."""
+    """List facet-IDs each atom belongs to (within surf_tol)."""
     mem = [[] for _ in range(len(pts))]
     for fid, (n, d) in enumerate(planes):
         shell = np.where((d - pts @ n) < surf_tol)[0]
@@ -23,39 +70,240 @@ def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: 
             mem[i].append(fid)
     return mem
 
-def _role_and_rank(m: int) -> Tuple[str, int]:
-    """
-    Map membership count to role + rank:
-      unique (m=1) -> rank 0 (highest priority for swaps)
-      edge   (m=2) -> rank 1
-      vertex (m>=3)-> rank 2
-    """
-    if m == 1:  return "unique", 0
-    if m == 2:  return "edge",   1
-    return "vertex",             2
+# ---------- Geometry-driven role classification ----------
 
-def _build_facet_frames(planes):
-    frames = []
-    for (n, d) in planes:
-        n = np.asarray(n, float); ln = np.linalg.norm(n) + 1e-12
-        n = n / ln; d = float(d) / ln
-        a = np.array([1.0, 0.0, 0.0]); 
-        if abs(np.dot(a, n)) > 0.9: a = np.array([0.0, 1.0, 0.0])
-        u = np.cross(n, a); u /= (np.linalg.norm(u) + 1e-12)
-        v = np.cross(n, u); v /= (np.linalg.norm(v) + 1e-12)
-        x0 = d * n
-        frames.append((n, d, u, v, x0))
-    return frames
+def _intersections_geometry(frames: List[tuple]):
+    """
+    From unit planes (frames), build:
+      - edges_by_facet[fid] -> list of lines (p0, u) on facet fid (u unit)
+      - verts_by_facet[fid] -> list of vertex points on facet fid
+    """
+    planes = _unit_planes_from_frames(frames)
+    N = len(planes)
+    edges_by_facet: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {k: [] for k in range(N)}
+    verts_by_facet: Dict[int, List[np.ndarray]] = {k: [] for k in range(N)}
 
-def _plane_uv(frames, fid: int, x: NDArray[np.float64]) -> Tuple[float, float]:
-    """Project 3D point x to facet fid's (u,v) coordinates."""
-    n, d, u, v, x0 = frames[fid]
-    xproj = x - (np.dot(x, n) - d) * n      # orthogonal projection onto plane
-    return float(np.dot(xproj - x0, u)), float(np.dot(xproj - x0, v))
+    def _line_ij(i: int, j: int):
+        ni, di = planes[i]; nj, dj = planes[j]
+        u = np.cross(ni, nj)
+        lu = LA.norm(u)
+        if lu < 1e-9:
+            return None
+        u /= lu
+        A = np.vstack([ni, nj])       # 2x3
+        b = np.array([di, dj], float) # 2
+        p0 = A.T @ LA.pinv(A @ A.T) @ b
+        return p0, u
+
+    for i in range(N):
+        for j in range(i+1, N):
+            out = _line_ij(i, j)
+            if out is None: 
+                continue
+            p0, u = out
+            edges_by_facet[i].append((p0, u))
+            edges_by_facet[j].append((p0, u))
+
+    # vertices (triple intersections)
+    for i in range(N):
+        ni, di = planes[i]
+        for j in range(i+1, N):
+            nj, dj = planes[j]
+            for k in range(j+1, N):
+                nk, dk = planes[k]
+                M = np.vstack([ni, nj, nk])  # 3x3
+                if abs(LA.det(M)) < 1e-9:
+                    continue
+                x = LA.solve(M, np.array([di, dj, dk], float))
+                verts_by_facet[i].append(x)
+                verts_by_facet[j].append(x)
+                verts_by_facet[k].append(x)
+
+    return edges_by_facet, verts_by_facet
+
+def _point_line_distance(p: np.ndarray, p0: np.ndarray, u: np.ndarray) -> float:
+    v = p - p0
+    return LA.norm(v - (v @ u) * u)
+
+def _role_by_geometry(i: int, fid: int,
+                      pts: NDArray[np.float64],
+                      frames: List[tuple],
+                      edges_by_facet: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
+                      verts_by_facet: Dict[int, List[np.ndarray]],
+                      edge_tol: float,
+                      vertex_tol: float) -> Tuple[str, int]:
+    """
+    Decide 'vertex'/'edge'/'unique' for atom i on facet fid by geometric proximity.
+      - vertex if within vertex_tol of any vertex point of fid
+      - else edge if within edge_tol of any (fid, *) edge line
+      - else unique
+    Returns (role_name, role_rank) with ranks: unique=0, edge=1, vertex=2.
+    """
+    x = pts[i]
+    vlist = verts_by_facet.get(fid, [])
+    if vlist:
+        dv = min(float(LA.norm(x - v)) for v in vlist)
+        if dv < vertex_tol:
+            return "vertex", 2
+    elist = edges_by_facet.get(fid, [])
+    if elist:
+        de = min(_point_line_distance(x, p0, u) for (p0, u) in elist)
+        if de < edge_tol:
+            return "edge", 1
+    return "unique", 0
+
+# ---------- Placement fallback along facet normal ----------
+
+def _fallback_place_on_facet(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    idx_cat: int,
+    fid: int,
+    ligand: str,
+    frames: List[tuple],
+    charges: Dict[str, int],
+    *,
+    eps_out: float = 0.05,
+) -> Tuple[List[str], NDArray[np.float64], Optional[int]]:
+    """
+    Place ligand along facet normal of fid (using unit planes for outside constraint).
+    Short line/tilt search; extra spacing vs anions. Returns (symbols2, pts2, new_index or None).
+    """
+    import math
+    n_unit, d_unit, *_ = frames[fid]
+    origin = pts[idx_cat]
+    cat_sym = symbols[idx_cat]
+    bond0 = pc(cat_sym, ligand)
+
+    def _ensure_outside(p: NDArray[np.float64]) -> NDArray[np.float64]:
+        slack = float(np.dot(n_unit, p) - d_unit)
+        if slack < eps_out:
+            p = p + (eps_out - slack) * n_unit
+        return p
+
+    def _ok(p: NDArray[np.float64]) -> bool:
+        for j, sj in enumerate(symbols):
+            if j == idx_cat:
+                if np.linalg.norm(pts[j] - p) < 0.90 * bond0:
+                    return False
+                continue
+            minsep = 0.80 * pc(sj, ligand)
+            if charges.get(sj, 0) < 0:
+                minsep = max(minsep, 0.90 * pc(sj, ligand))
+            if np.linalg.norm(pts[j] - p) < minsep:
+                return False
+        return True
+
+    a = np.array([1.0, 0.0, 0.0], float)
+    if abs(np.dot(a, n_unit)) > 0.9:
+        a = np.array([0.0, 1.0, 0.0], float)
+    u = np.cross(n_unit, a); u /= (LA.norm(u) + 1e-12)
+
+    scales = (1.00, 1.05, 1.10, 1.15, 1.20)
+    tilts  = (0.0, math.radians(8.0), -math.radians(8.0), math.radians(15.0), -math.radians(15.0))
+
+    for sc in scales:
+        for ang in tilts:
+            dirv = n_unit if ang == 0.0 else (math.cos(ang) * n_unit + math.sin(ang) * u)
+            dirv /= (LA.norm(dirv) + 1e-12)
+            p = origin + sc * bond0 * dirv
+            p = _ensure_outside(p)
+            if _ok(p):
+                new_symbols = list(symbols); new_symbols.append(ligand)
+                new_pts = np.vstack([pts, p])
+                return new_symbols, new_pts, len(new_symbols) - 1
+
+    return symbols, pts, None
 
 # --------------------------------------
 # Candidate collection (no mutation)
 # --------------------------------------
+
+def prepass_surface_cleanup(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    charges: Dict[str, int],
+    anion_ligand: str,
+    surf_tol: float,
+    *,
+    verbose: bool = False,
+) -> Tuple[List[str], NDArray[np.float64], Dict[int, List[Tuple[float, float]]], Dict[int, int]]:
+    """
+    Always run before charge balancing:
+      • swap all surface anions with CN<=2 to the anion ligand (e.g., Se2- -> Cl-)
+      • remove all surface cations with CN==1 (spacing-aware)
+    Returns (symbols, pts, uv_taken, edit_count_facet) to seed spacing state.
+    """
+    from .analysis import coord_numbers_bipartite
+
+    frames = _build_facet_frames(planes)
+    uv_taken: Dict[int, List[Tuple[float, float]]] = {}
+    edit_count_facet: Dict[int, int] = {}
+
+    def _facet_members() -> List[List[int]]:
+        return _facet_memberships(pts, planes, surf_tol)
+
+    def _is_surface(i: int, mem: List[List[int]]) -> bool:
+        return len(mem[i]) > 0
+
+    mem = _facet_members()
+    cn  = coord_numbers_bipartite(symbols, pts, charges)
+    changed = True
+    while changed:
+        changed = False
+        # A. swap anions CN<=2
+        for i, s in enumerate(symbols):
+            if not _is_surface(i, mem):
+                continue
+            if charges.get(s, 0) >= 0:
+                continue
+            if s == anion_ligand:
+                continue
+            if cn[i] <= 2:
+                if verbose:
+                    print(f"prepass: swap anion {s}#{i} (CN={int(cn[i])}) → {anion_ligand}")
+                symbols[i] = anion_ligand
+                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                changed = True
+        if changed:
+            mem = _facet_members()
+            cn  = coord_numbers_bipartite(symbols, pts, charges)
+
+        # B. remove all cation CN==1 (spacing-aware)
+        while True:
+            mem = _facet_members()
+            cn  = coord_numbers_bipartite(symbols, pts, charges)
+            cands = []
+            for i, s in enumerate(symbols):
+                if charges.get(s, 0) <= 0: continue
+                if not _is_surface(i, mem): continue
+                if int(round(cn[i])) != 1: continue
+                best = None
+                for fid, (n, d, *_rest) in enumerate(frames):
+                    depth = d - float(np.dot(pts[i], n))
+                    if depth < surf_tol:
+                        if best is None or depth < best[0]:
+                            best = (depth, fid)
+                if best is None: continue
+                depth, fid = best
+                uv = _plane_uv(frames, fid, pts[i])
+                from math import hypot
+                taken = uv_taken.get(fid, [])
+                dmin = float("inf") if not taken else min(hypot(uv[0]-x, uv[1]-y) for (x,y) in taken)
+                cands.append((dmin, -depth, -i, i, s, fid))
+            if not cands: break
+            cands.sort(reverse=True)
+            _, _, _, i, s, _fid = cands[0]
+            if verbose:
+                print(f"prepass: remove cation {s}#{i} (CN=1)")
+            _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+            symbols.pop(i)
+            pts = np.delete(pts, i, axis=0)
+            changed = True
+
+    return symbols, pts, uv_taken, edit_count_facet
+
 def collect_anion_candidates(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -67,11 +315,7 @@ def collect_anion_candidates(
 ) -> Tuple[List[dict], List[dict]]:
     """
     Build lists of ANION candidates. Does NOT mutate 'symbols'.
-    Returns (outer_candidates, sublayer_candidates), where each candidate is:
-      dict(idx, elem, cn, bulk_cn, deficit, depth, role, role_rank, fid)
-
-    Intended ranking (applied later during swaps):
-      (-deficit, role_rank, depth)  # larger deficit first (e.g., 1/4 before 2/4 before 3/4), then unique>edge>vertex, then shallower
+    Returns (outer_candidates, sublayer_candidates): dict(idx, elem, cn, bulk_cn, deficit, depth, role, role_rank, fid)
     """
     pts = np.asarray(pts, float)
     from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
@@ -97,7 +341,10 @@ def collect_anion_candidates(
             if deficit <= 0:
                 continue
             depth = d - float(np.dot(pts[i], n))
-            role, role_rank = _role_and_rank(len(memberships[i]))
+            # fallback role (collector is used only when Q<0 swaps): membership-based is fine here
+            m = len(memberships[i])
+            role = "unique" if m == 1 else ("edge" if m == 2 else "vertex")
+            role_rank = 0 if m == 1 else (1 if m == 2 else 2)
             rec = {
                 "idx": i, "elem": s, "cn": int(cn[i]), "bulk_cn": int(bulk_cn[s]),
                 "deficit": int(deficit), "depth": depth,
@@ -119,8 +366,9 @@ def collect_anion_candidates(
     return outer, subl
 
 # --------------------------------------
-# Cation-site collection for additions
+# Cation-site collection for additions (geometry-aware)
 # --------------------------------------
+
 def _collect_cation_sites(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -129,73 +377,110 @@ def _collect_cation_sites(
     surf_tol: float,
     *,
     outer_only: bool = True,
-    allow_shared: bool = True,         # allow edge/vertex
+    allow_shared: bool = True,         # ignored if geometry classifier used; we still gate by role_rank==0
     include_sublayer: bool = False,
     allowed_facets: Optional[Set[int]] = None,
+    # geometry classifiers (optional; pass from charge_balance if available)
+    frames: Optional[List[tuple]] = None,
+    edges_by_facet: Optional[Dict[int, List[Tuple[np.ndarray, np.ndarray]]]] = None,
+    verts_by_facet: Optional[Dict[int, List[np.ndarray]]] = None,
+    edge_tol: Optional[float] = None,
+    vertex_tol: Optional[float] = None,
 ) -> List[Tuple[int, NDArray[np.float64], float, int, int, int]]:
     """
-    Return candidate cation sites to attach one ligand:
-      (idx, normal, depth, deficit, role_rank, fid)
+    One candidate per cation atom:
+      (idx, n_out, depth_min, deficit, role_rank, fid_star)
 
-    - outer_only: restrict to outer layer (depth < 0.35*surf_tol)
-    - allow_shared: include edge/vertex (shared) atoms
-    - include_sublayer: allow sublayer cations (depth < 1.2*surf_tol)
-    - allowed_facets: optional whitelist of facet ids
-
-    Results are later ranked by: higher deficit first, shallower depth first,
-    unique>edge>vertex, then idx.
+    - deficit uses bipartite CNs: bulk_cn_opposite_by_interior(...) - coord_numbers_bipartite(...)
+    - n_out is weighted average of incident facet normals
+    - role_rank uses geometry if frames/edges/verts given, else membership count
     """
-    pts = np.asarray(pts, float)
-    cn = coord_numbers(symbols, pts)
-    bulk = bulk_cn_by_interior(symbols, pts, planes, surf_tol)
+    from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
+
+    ptsA = np.asarray(pts, float)
+    N = len(symbols)
     cations = {el for el, q in charges.items() if q > 0}
 
-    # memberships
-    memberships = [[] for _ in range(len(symbols))]
-    for fid, (n, d) in enumerate(planes):
-        shell = np.where((d - pts @ n) < surf_tol)[0]
+    # normalized facet normals + d (unit planes)
+    n_unit, d_unit = [], []
+    for (n, d) in planes:
+        n = np.asarray(n, float)
+        ln = LA.norm(n) + 1e-12
+        n_unit.append(n / ln)
+        d_unit.append(float(d) / ln)
+    n_unit = np.stack(n_unit, axis=0) if planes else np.zeros((0, 3))
+    d_unit = np.array(d_unit, float) if planes else np.zeros((0,))
+
+    # incident facets + depths
+    mem = [[] for _ in range(N)]
+    depths = [[] for _ in range(N)]
+    for fid, (nu, du) in enumerate(zip(n_unit, d_unit)):
+        if allowed_facets is not None and fid not in allowed_facets:
+            continue
+        t = du - ptsA @ nu
+        shell = np.where(t < surf_tol)[0]
         for i in shell:
-            memberships[i].append(fid)
+            mem[i].append(fid)
+            depths[i].append(float(t[i]))
+
+    # bipartite CNs and bulk targets
+    cn_bi   = coord_numbers_bipartite(symbols, ptsA, charges)
+    bulk_cn = bulk_cn_opposite_by_interior(symbols, ptsA, planes, surf_tol, charges)
 
     outer_thr = 0.35 * surf_tol
     subl_thr  = 1.20 * surf_tol
 
     out: List[Tuple[int, NDArray[np.float64], float, int, int, int]] = []
-    for fid, (n, d) in enumerate(planes):
-        if allowed_facets is not None and fid not in allowed_facets:
-            continue
-        n_unit = n / (np.linalg.norm(n) + 1e-12)
-        shell = np.where((d - pts @ n_unit) < surf_tol)[0]
-        for i in shell:
-            s = symbols[i]
-            if s not in cations:
-                continue
-            depth = d - float(np.dot(pts[i], n_unit))
-            if outer_only and not (depth < outer_thr):
-                continue
-            if not include_sublayer and depth >= outer_thr:
-                continue
-            if include_sublayer and not (depth < subl_thr):
-                continue
+    use_geom = (frames is not None and edges_by_facet is not None and
+                verts_by_facet is not None and edge_tol is not None and vertex_tol is not None)
 
-            m = len(memberships[i])
+    for i, s in enumerate(symbols):
+        if s not in cations: continue
+        if not mem[i]: continue
+
+        # shallowest facet
+        dlist = depths[i]
+        depth_min = min(dlist)
+        fid_star  = mem[i][int(np.argmin(dlist))]
+
+        # outer/sublayer gating
+        if outer_only:
+            if not (depth_min < outer_thr): continue
+        else:
+            if include_sublayer:
+                if not (depth_min < subl_thr): continue
+            else:
+                if depth_min >= outer_thr: continue
+
+        # deficit (bipartite)
+        tgt = int(bulk_cn.get(s, int(round(cn_bi[i]))))
+        dft = int(max(0, tgt - int(round(cn_bi[i]))))
+        if dft <= 0: continue
+
+        # role by geometry if available, else by membership count
+        if use_geom:
+            _role, role_rank = _role_by_geometry(i, fid_star, ptsA, frames,
+                                                 edges_by_facet, verts_by_facet,
+                                                 edge_tol, vertex_tol)
+        else:
+            m = len(mem[i])
             role_rank = 0 if m == 1 else (1 if m == 2 else 2)
-            if not allow_shared and role_rank != 0:
-                continue
 
-            deficit = max(0, bulk[s] - cn[i])
-            if deficit <= 0:
-                continue
+        if not allow_shared and role_rank != 0:
+            continue
 
-            out.append((i, n_unit, depth, int(deficit), role_rank, fid))
+        # averaged outward normal (weights: shallower facets more)
+        vec = np.zeros(3, float)
+        for fid, dep in zip(mem[i], dlist):
+            w = 1.0 / (dep + 1e-6)
+            vec += w * n_unit[fid]
+        ln = LA.norm(vec)
+        n_out = n_unit[fid_star] if ln < 1e-8 else (vec / ln)
 
-    # keep only shallowest record per atom (dedupe potential multiple shell hits)
-    best: Dict[int, Tuple[int, NDArray[np.float64], float, int, int, int]] = {}
-    for rec in out:
-        i = rec[0]
-        if i not in best or rec[2] < best[i][2]:
-            best[i] = rec
-    return list(best.values())
+        out.append((i, n_out, depth_min, dft, role_rank, fid_star))
+
+    out.sort(key=lambda t: (-t[3], t[2], t[4], t[0]))  # deficit desc, shallower, role, idx
+    return out
 
 def _collect_cation_remove_candidates(
     symbols: List[str],
@@ -204,60 +489,151 @@ def _collect_cation_remove_candidates(
     charges: Dict[str, int],
     surf_tol: float,
     allowed_facets: Optional[Set[int]] = None,
+    *,
+    frames: Optional[List[tuple]] = None,
+    edges_by_facet: Optional[Dict[int, List[Tuple[np.ndarray, np.ndarray]]]] = None,
+    verts_by_facet: Optional[Dict[int, List[np.ndarray]]] = None,
+    edge_tol: Optional[float] = None,
+    vertex_tol: Optional[float] = None,
 ) -> List[Tuple[int, str, int, float, int, int]]:
     """
     Return surface cation-removal candidates:
       (idx, elem, q_cation, depth, role_rank, fid)
-
-    Ranking preference (applied later):
-      q_cation asc  → remove lowest-charged species first (e.g., Cu+ before In3+)
-      role vertex>edge>unique  → role_rank desc (2,1,0)
-      depth asc (shallower first)
+    Ranking preference (coarse): (q asc, role_rank desc, depth asc, idx)
     """
-    pts = np.asarray(pts, float)
+    ptsA = np.asarray(pts, float)
     cations = {el for el, q in charges.items() if q > 0}
+    use_geom = (frames is not None and edges_by_facet is not None and
+                verts_by_facet is not None and edge_tol is not None and vertex_tol is not None)
 
-    # memberships per atom
     memberships = [[] for _ in range(len(symbols))]
     for fid, (n, d) in enumerate(planes):
         if allowed_facets is not None and fid not in allowed_facets:
             continue
-        shell = np.where((d - pts @ n) < surf_tol)[0]
+        shell = np.where((d - ptsA @ n) < surf_tol)[0]
         for i in shell:
             memberships[i].append(fid)
 
-    # candidates, keeping the SHALLOWEST facet hit per atom
     best: Dict[int, Tuple[int, str, int, float, int, int]] = {}
     for fid, (n, d) in enumerate(planes):
         if allowed_facets is not None and fid not in allowed_facets:
             continue
-        n_unit = n / (np.linalg.norm(n) + 1e-12)
-        shell = np.where((d - pts @ n_unit) < surf_tol)[0]
+        n_unit = n / (LA.norm(n) + 1e-12)
+        shell = np.where((d - ptsA @ n_unit) < surf_tol)[0]
         for i in shell:
             s = symbols[i]
             if s not in cations:
                 continue
-            depth = float(d - np.dot(pts[i], n_unit))
-            role_rank = 0 if len(memberships[i]) == 1 else (1 if len(memberships[i]) == 2 else 2)
+            depth = float(d - np.dot(ptsA[i], n_unit))
+            if use_geom:
+                _role, role_rank = _role_by_geometry(i, fid, ptsA, frames,
+                                                     edges_by_facet, verts_by_facet,
+                                                     edge_tol, vertex_tol)
+            else:
+                m = len(memberships[i])
+                role_rank = 0 if m == 1 else (1 if m == 2 else 2)
             q = int(charges.get(s, 0))
             rec = (i, s, q, depth, role_rank, fid)
             if i not in best or depth < best[i][3]:
                 best[i] = rec
 
     out = list(best.values())
-    # primary coarse ranking (we’ll still do facet seeding + FPS when picking)
-    out.sort(key=lambda r: (r[2], -r[4], r[3], r[0]))  # (q asc, role_rank desc, depth asc, idx)
+    out.sort(key=lambda r: (r[2], -r[4], r[3], r[0]))
+    return out
+
+def _unique_center_candidates(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    charges: Dict[str, int],
+    surf_tol: float,
+    *,
+    frames: List[tuple],
+    edges_by_facet: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
+    verts_by_facet: Dict[int, List[np.ndarray]],
+    edge_tol: float,
+    vertex_tol: float,
+    outer_thr_scale: float = 0.35,   # outer = depth < 0.35*surf_tol
+) -> List[Tuple[float,int,int,float,int]]:
+    """
+    Return list of center-biased UNIQUE outer candidates with deficit==1:
+      items: (center_score, idx, fid, depth_min, deficit)
+    center_score = distance to nearest edge line on that facet (bigger = more central).
+    """
+    from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
+
+    ptsA = np.asarray(pts, float)
+    cations = {el for el, q in charges.items() if q > 0}
+    n_unit, d_unit = [], []
+    for (n, d) in planes:
+        n = np.asarray(n, float); ln = np.linalg.norm(n) + 1e-12
+        n_unit.append(n / ln); d_unit.append(float(d) / ln)
+    n_unit = np.stack(n_unit, axis=0) if planes else np.zeros((0,3))
+    d_unit = np.array(d_unit, float) if planes else np.zeros((0,))
+
+    # surface membership + shallowest facet per atom
+    mem = [[] for _ in range(len(symbols))]
+    depths = [[] for _ in range(len(symbols))]
+    for fid, (nu, du) in enumerate(zip(n_unit, d_unit)):
+        t = du - ptsA @ nu
+        shell = np.where(t < surf_tol)[0]
+        for i in shell:
+            mem[i].append(fid); depths[i].append(float(t[i]))
+
+    cn_bi   = coord_numbers_bipartite(symbols, ptsA, charges)
+    from .analysis import bulk_cn_opposite_by_interior
+    bulk_cn = bulk_cn_opposite_by_interior(symbols, ptsA, planes, surf_tol, charges)
+
+    outer_thr = outer_thr_scale * surf_tol
+    out = []
+    for i, s in enumerate(symbols):
+        if s not in cations: continue
+        if not mem[i]:      continue
+        dlist = depths[i]
+        depth_min = min(dlist)
+        fid_star  = mem[i][int(np.argmin(dlist))]
+        if depth_min >= outer_thr:   # outer only
+            continue
+
+        # deficit == 1 (using bipartite/bulk target)
+        tgt = int(bulk_cn.get(s, int(round(cn_bi[i]))))
+        dft = int(max(0, tgt - int(round(cn_bi[i]))))
+        if dft != 1:
+            continue
+
+        # role by geometry: require UNIQUE on this facet
+        role_name, role_rank = _role_by_geometry(i, fid_star, ptsA, frames,
+                                                 edges_by_facet, verts_by_facet,
+                                                 edge_tol, vertex_tol)
+        if role_rank != 0:
+            continue
+
+        # center score = distance to nearest edge line on this facet
+        elist = edges_by_facet.get(fid_star, [])
+        if elist:
+            de = min(_point_line_distance(ptsA[i], p0, u) for (p0,u) in elist)
+        else:
+            # no explicit edges: use distance to plane origin (proxy)
+            n, d, *_ = frames[fid_star]
+            x0 = d * n
+            de = float(np.linalg.norm(ptsA[i] - x0))
+
+        out.append((de, i, fid_star, depth_min, dft))
+
+    # prefer more central (de desc), then shallower, then idx
+    out.sort(key=lambda t: (-t[0], t[3], t[1]))
     return out
 
 
 # --------------------------------------
 # Charge balance (stepwise, facet-aware swaps & removals)
 # --------------------------------------
+
 def charge_balance(
     symbols: List[str],
     pts: NDArray[np.float64],
-    outer_candidates: List[dict],
-    sublayer_candidates: List[dict],   # reserved for future use
+    _outer_candidates: List[dict],
+    _sublayer_candidates: List[dict],
     charges: Dict[str, int],
     ligand: str,
     verbose: bool,
@@ -267,424 +643,373 @@ def charge_balance(
     rng: random.Random,
     *,
     prefer_remove_parity: bool = False,
-    cation_ligand: str | None = None,  # <-- NEW (kw-only, backward compatible)
+    cation_ligand: str | None = None,
 ):
-    """
-    Stepwise neutrality:
+    from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
 
-    1) While Q < 0: Se→Cl on OUTER anions using facet-aware FPS **within categories**:
-         Categories prioritized by deficit (larger first: 1/4 → 2/4 → 3/4), then role (unique → edge → vertex).
-         For each (deficit, role):
-           A) Seed: take one per facet (shallower first).
-           B) Space: choose candidate that maximizes min in-plane distance to existing swaps on that facet (FPS).
-
-       Parity policy (odd Q after +2 steps per swap):
-         - prefer_remove_parity=False (default): allow overshoot to Q=+1; later add one ligand (−1) if needed.
-         - prefer_remove_parity=True: stop at Q=-1 and resolve by removing one ligand (+1).
-
-    2) If still Q < 0 after swaps: REMOVE some Cl to raise Q (facet-aware & spaced).
-         CN 3/4 first, then 2/4; within CN: vertex > edge > unique; deeper first.
-         Seed one removal per facet before spacing.
-
-    3) If Q > 0: add Cl near under-coordinated cations (outer first; relax as needed).
-
-    Returns updated (symbols, pts).
-    """
     def total_Q() -> int:
         return int(sum(charges.get(s, 0) for s in symbols))
 
+    # frames (unit planes & UV bases)
+    frames = _build_facet_frames(planes)
+    planes_unit = _unit_planes_from_frames(frames)
+    com = np.mean(pts, axis=0)
+
+    # ---- Adaptive tolerances from lattice (opp. NN distances on surface) ----
+    charges_arr = np.array([charges.get(s, 0) for s in symbols], int)
+    surf_mask = np.zeros(len(symbols), dtype=bool)
+    for (n, d, *_rest) in frames:
+        surf_mask |= (d - pts @ n) < surf_tol
+    opp_nn = []
+    for i in np.where(surf_mask)[0]:
+        qi = charges_arr[i]
+        if qi == 0:
+            continue
+        diffs = pts - pts[i]
+        mask = (charges_arr * qi) < 0
+        if not np.any(mask):
+            continue
+        dists = np.linalg.norm(diffs[mask], axis=1)
+        if dists.size:
+            opp_nn.append(float(np.min(dists)))
+    b_nn = float(np.median(opp_nn)) if opp_nn else 2.5
+    edge_tol   = min(0.50 * b_nn, 0.30 * surf_tol)
+    vertex_tol = min(0.35 * b_nn, 0.20 * surf_tol)
+
+    edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+
+    # Ensure the ligand is negative for charge accounting
+    if ligand not in charges or int(charges.get(ligand, 0)) >= 0:
+        if verbose:
+            print(f"[warning] ligand '{ligand}' missing or non-negative in charges map; forcing −1 for balancing.")
+        charges = dict(charges)  # avoid mutating caller’s dict
+        charges[ligand] = -1
+
+    # --- Step 0: pre-pass surface cleanup (always) ---
+    symbols, pts, uv_taken, edit_count_facet = prepass_surface_cleanup(
+        symbols, pts, planes, charges, ligand, surf_tol, verbose=verbose
+    )
+
+    from collections import defaultdict
+    add_count_facet = defaultdict(int)   # counts only anion additions per facet
+
+    # helpers that use current uv_taken/edit_count_facet
+    from math import hypot
+    def _min_uv_dist(fid: int, uv: Tuple[float, float]) -> float:
+        lst = uv_taken.get(fid, [])
+        if not lst:
+            return float("inf")
+        x, y = uv
+        return min(hypot(x - u, y - v) for (u, v) in lst)
+
+    def _fix_undercoord_anions_once() -> bool:
+        """One pass: swap any surface anion with CN<=2 to ligand. Records UVs."""
+        changed = False
+        cn = coord_numbers_bipartite(symbols, pts, charges)
+        for i, s in enumerate(symbols):
+            if charges.get(s, 0) >= 0:
+                continue
+            incident = _incident_facets(i, pts, frames, surf_tol)
+            if not incident:
+                continue
+            if s != ligand and int(round(cn[i])) <= 2:
+                if verbose:
+                    print(f"stabilize: swap anion {s}#{i} (CN={int(cn[i])}) → {ligand}")
+                symbols[i] = ligand
+                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                changed = True
+        return changed
+
+    # --- keep Q in sync whenever stabilization mutates symbols ---
+    def _stabilize_and_update_Q() -> bool:
+        changed = _fix_undercoord_anions_once()
+        if changed:
+            # recompute global Q after any number of swaps in the pass
+            nonlocal Q
+            Q = total_Q()
+        return changed
+
+    def _add_one_anion(allowed_facets: Optional[Set[int]] = None) -> bool:
+        """Add ONE anion on a unique, outer, deficit=1 cation; min-max round-robin across facets."""
+        nonlocal symbols, pts, Q
+
+        # candidates (center-biased unique, deficit=1)
+        cand = _unique_center_candidates(
+            symbols, pts, planes, charges, surf_tol,
+            frames=frames,
+            edges_by_facet=edges_by_facet, verts_by_facet=verts_by_facet,
+            edge_tol=edge_tol, vertex_tol=vertex_tol,
+        )
+        if not cand:
+            return False
+
+        # group by facet and filter by allowed_facets (if provided)
+        by_facet: Dict[int, List[Tuple[float,int,int,float,int]]] = {}
+        for rec in cand:
+            de, idx, fid, depth, dft = rec
+            if allowed_facets is not None and fid not in allowed_facets:
+                continue
+            by_facet.setdefault(fid, []).append(rec)
+        if not by_facet:
+            return False
+
+        # min-max round-robin: pick facets with the fewest additions so far
+        minc = min(add_count_facet[fid] for fid in by_facet.keys())
+        f_pool = [fid for fid in sorted(by_facet.keys()) if add_count_facet[fid] == minc]
+
+        # pick the facet whose top candidate is most central
+        best = None; best_key = None
+        for fid in f_pool:
+            recs = by_facet[fid]
+            recs.sort(key=lambda t: (-t[0], t[3], t[1]))  # center desc, shallow, idx
+            top = recs[0]
+            center_score = top[0]
+            facet_edits  = edit_count_facet.get(fid, 0)
+            key = (center_score, -facet_edits, -fid)
+            if best_key is None or key > best_key:
+                best_key, best = key, top
+
+        if best is None:
+            return False
+
+        center_score, idx, fid, depth, dft = best
+
+        # Place along COM→cation radial, flipped outward wrt chosen facet
+        radial = pts[idx] - com
+        nr = np.linalg.norm(radial) + 1e-12
+        radial /= nr
+        n_f, d_f, *_ = frames[fid]
+        if np.dot(radial, n_f) < 0.0:
+            radial = -radial
+
+        sym2, pts2, j_new = place_ligand(
+            symbols, pts, idx, radial, ligand, planes_unit, charges=charges
+        )
+        if j_new is None:
+            # try facet-normal fallback on the same site/facet
+            sym2, pts2, j_new = _fallback_place_on_facet(
+                symbols, pts, idx, fid, ligand, frames, charges
+            )
+            if j_new is None:
+                return False
+
+        # commit + log with fresh totals
+        symbols, pts = sym2, pts2
+        _record_uv_allfacets(j_new, pts, frames, surf_tol, uv_taken, edit_count_facet)
+        add_count_facet[fid] += 1
+
+        before = total_Q()
+        Q = total_Q()
+        if verbose:
+            print(f"add {ligand} near {symbols[idx]}#{idx} "
+                  f"(def=1, unique, center_score={center_score:.2f}, depth={depth:.2f} Å, facet {fid})  | "
+                  f"Q:{before:+d}→{Q:+d}")
+
+        _stabilize_and_update_Q()
+        return True
+
+    # after pre-pass, recompute Q
     Q = total_Q()
     if verbose:
-        print(f"# Q before = {Q:+d}")
+        print(f"# Q before (after prepass) = {Q:+d}")
 
-    frames = _build_facet_frames(planes)
+    def _fresh_anion_candidates():
+        return collect_anion_candidates(
+            symbols, pts, planes, charges, ligand, surf_tol, verbose=False
+        )
 
-    # --- 1) Facet-aware Se->Cl swaps with FPS within categories ---
-    deficits = sorted({r["deficit"] for r in outer_candidates}, reverse=True) if outer_candidates else []
+    # --- 1) If Q < 0: do Se->Cl swaps (facet-aware spacing) ---
+    if Q < 0:
+        outer_candidates, _ = _fresh_anion_candidates()
+        deficits = sorted({r["deficit"] for r in outer_candidates}, reverse=True) if outer_candidates else []
+        swap_uv: Dict[Tuple[int, int, int], List[Tuple[float, float]]] = {}
 
-    swapped_log: List[dict] = []   # {idx, cn, bulk_cn, role, role_rank, depth, fid}
-    # UV positions of swapped Cl per (deficit, role_rank, facet)
-    swap_uv: Dict[Tuple[int, int, int], List[Tuple[float, float]]] = {}
+        def _available_in_category(deficit: int, role_rank: int):
+            return [r for r in outer_candidates
+                    if r["deficit"] == deficit and r["role_rank"] == role_rank
+                    and 0 <= r["idx"] < len(symbols) and symbols[r["idx"]] != ligand]
 
-    def _available_in_category(deficit: int, role_rank: int):
-        return [r for r in outer_candidates
-                if r["deficit"] == deficit and r["role_rank"] == role_rank
-                and 0 <= r["idx"] < len(symbols) and symbols[r["idx"]] != ligand]
+        def _seeded_facets_in_category(deficit: int, role_rank: int) -> set[int]:
+            return {fid for (d, rr, fid), uv in swap_uv.items() if d == deficit and rr == role_rank and uv}
 
-    def _seeded_facets_in_category(deficit: int, role_rank: int) -> set[int]:
-        return {fid for (d, rr, fid), uv in swap_uv.items() if d == deficit and rr == role_rank and uv}
+        def _min_uv_for_swap(r: dict) -> float:
+            key = (r["deficit"], r["role_rank"], r["fid"])
+            uv_list = swap_uv.get(key, [])
+            if not uv_list:
+                return 0.0
+            ux, vy = _plane_uv(frames, r["fid"], pts[r["idx"]])
+            return float(min(np.hypot(ux - x, vy - y) for (x, y) in uv_list))
 
-    def _min_uv_dist_for_swap(r: dict) -> float:
-        key = (r["deficit"], r["role_rank"], r["fid"])
-        uv_list = swap_uv.get(key, [])
-        if not uv_list:
-            return 0.0
-        ux, vy = _plane_uv(frames, r["fid"], pts[r["idx"]])
-        return float(min(np.hypot(ux - x, vy - y) for (x, y) in uv_list))
-
-    # Loop categories
-    stop_swaps = False
-    for deficit in deficits:
-        if stop_swaps: break
-        for role_rank in (0, 1, 2):  # unique -> edge -> vertex
-            if stop_swaps: break
-            while Q < 0:
-                # Parity preference: if we prefer resolving by removal, stop at -1.
-                if prefer_remove_parity and Q == -1:
-                    if verbose:
-                        print("(parity) stopping swaps at Q=-1 to resolve by removing one ligand.")
-                    stop_swaps = True
+        stop_swaps = False
+        for deficit in deficits:
+            if stop_swaps:
+                break
+            for role_rank in (0, 1, 2):  # unique → edge → vertex
+                if stop_swaps:
                     break
+                while Q < 0:
+                    if prefer_remove_parity and Q == -1:
+                        if verbose:
+                            print("(parity) stopping swaps at Q=-1 to resolve by removing one ligand.")
+                        stop_swaps = True
+                        break
+                    cand = _available_in_category(deficit, role_rank)
+                    if not cand:
+                        break
+                    seeded = _seeded_facets_in_category(deficit, role_rank)
+                    unseeded = {r["fid"] for r in cand if r["fid"] not in seeded}
+                    if unseeded:
+                        fid_pick = min(unseeded)
+                        c_facet = [r for r in cand if r["fid"] == fid_pick]
+                        c_facet.sort(key=lambda r: (r["depth"], r["idx"]))
+                        picked = c_facet[0]
+                    else:
+                        scored = []
+                        for k, r in enumerate(cand):
+                            dmin = _min_uv_for_swap(r)
+                            scored.append((dmin, -float(r["depth"]), -int(r["idx"]), k))
+                        scored.sort(reverse=True)
+                        picked = cand[scored[0][3]]
 
-                cand = _available_in_category(deficit, role_rank)
+                    i = picked["idx"]
+                    before = total_Q()
+                    old = symbols[i]
+                    symbols[i] = ligand
+                    Q = total_Q()
+
+                    key = (picked["deficit"], picked["role_rank"], picked["fid"])
+                    uv = _plane_uv(frames, picked["fid"], pts[i])
+                    swap_uv.setdefault(key, []).append(uv)
+
+                    if verbose:
+                        role = ["unique","edge","vertex"][picked["role_rank"]]
+                        print(f"swap {old}#{i} (CN {picked['cn']}/{picked['bulk_cn']}, {role}, depth={picked['depth']:.2f} Å) "
+                              f"→ {ligand}  | Q:{before:+d}→{Q:+d}")
+
+                    _stabilize_and_update_Q()
+
+                    if Q >= 0:
+                        stop_swaps = True
+                        break
+
+    # --- 2) If Q > 0: CN=2 cations → L+ (if provided) ---
+    if Q > 0 and cation_ligand:
+        qL = int(charges.get(cation_ligand, 0))
+        if qL > 0:
+            while Q > 0:
+                cn = coord_numbers_bipartite(symbols, pts, charges)
+                mem = _facet_memberships(pts, planes, surf_tol)
+                cand = []
+                for i, s in enumerate(symbols):
+                    q = int(charges.get(s, 0))
+                    if q <= 0:
+                        continue
+                    if len(mem[i]) == 0:
+                        continue
+                    if int(round(cn[i])) != 2:
+                        continue
+                    delta = q - qL
+                    if delta <= 0 or delta > Q:
+                        continue
+                    best = None
+                    for fid, (n, d, *_rest) in enumerate(frames):
+                        depth = d - float(np.dot(pts[i], n))
+                        if depth < surf_tol:
+                            if best is None or depth < best[0]:
+                                best = (depth, fid)
+                    if best is None:
+                        continue
+                    depth, fid = best
+                    m = len(mem[i]); role_rank = 0 if m == 1 else (1 if m == 2 else 2)
+                    uv = _plane_uv(frames, fid, pts[i])
+                    dmin = _min_uv_dist(fid, uv)
+                    fcount = edit_count_facet.get(fid, 0)
+                    score = (delta, dmin, role_rank, -depth, -fcount, -i)
+                    cand.append((score, i, s, q, delta, depth, role_rank, fid))
                 if not cand:
                     break
-
-                # Stage A: seed one per facet if possible
-                seeded_facets = _seeded_facets_in_category(deficit, role_rank)
-                unseeded = {r["fid"] for r in cand if r["fid"] not in seeded_facets}
-                if unseeded:
-                    fid_pick = min(unseeded)  # deterministic facet selection
-                    c_facet = [r for r in cand if r["fid"] == fid_pick]
-                    c_facet.sort(key=lambda r: (r["depth"], r["idx"]))  # shallower first
-                    picked = c_facet[0]
-                else:
-                    # Stage B: spacing (maximize min UV distance to existing swaps on same facet)
-                    scored: List[Tuple[float, float, int, int]] = []
-                    # tuple: (dmin, -depth, idx, idx_in_cand)
-                    for k, r in enumerate(cand):
-                        dmin = _min_uv_dist_for_swap(r)
-                        scored.append((dmin, -float(r["depth"]), int(r["idx"]), k))
-                    scored.sort(key=lambda t: (t[0], t[1], -t[2]), reverse=True)
-                    picked = cand[scored[0][3]]
-
-                # Apply swap
-                i = picked["idx"]
-                before = Q
-                old = symbols[i]
-                symbols[i] = ligand
+                cand.sort(reverse=True)
+                _, i, s, q, delta, depth, role_rank, fid = cand[0]
+                before = total_Q()
+                symbols[i] = cation_ligand
+                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
                 Q = total_Q()
-                swapped_log.append({
-                    "idx": i,
-                    "cn": int(picked["cn"]),
-                    "bulk_cn": int(picked["bulk_cn"]),
-                    "role": ["unique", "edge", "vertex"][role_rank],
-                    "role_rank": role_rank,
-                    "depth": float(picked["depth"]),
-                    "fid": int(picked["fid"]),
-                })
-                # record UV for FPS
-                key = (deficit, role_rank, picked["fid"])
-                uv = _plane_uv(frames, picked["fid"], pts[i])
-                swap_uv.setdefault(key, []).append(uv)
-
                 if verbose:
-                    print(f"swap {old}#{i} (CN {picked['cn']}/{picked['bulk_cn']}, "
-                          f"{['unique','edge','vertex'][role_rank]}, depth={picked['depth']:.2f} Å) "
-                          f"→ {ligand}  | Q:{before:+d}→{Q:+d}")
+                    role = ["unique","edge","vertex"][role_rank]
+                    print(f"downgrade {s}#{i} (CN=2, q={q}→{qL}, Δq={delta}, {role}, depth={depth:.2f} Å, facet {fid}) "
+                          f"| Q:{before:+d}→{Q:+d}")
+                _stabilize_and_update_Q()
 
-                if Q >= 0:
-                    stop_swaps = True
-                    break
-
-    # --- 2) If still negative, facet-aware Cl removals (seed + spacing) ---
-    if Q < 0 and swapped_log:
-        vac_uv: Dict[int, List[Tuple[float, float]]] = {}
-        seeded_remove: set[int] = set()
-
-        def _reindex_after_delete(rem: int):
-            for r in swapped_log:
-                if r["idx"] > rem:
-                    r["idx"] -= 1
-
-        def _removable_now() -> List[dict]:
-            return [r for r in swapped_log if 0 <= r["idx"] < len(symbols) and symbols[r["idx"]] == ligand]
-
-        def _min_uv_dist(fid: int, uv: Tuple[float, float]) -> float:
-            pts_uv = vac_uv.get(fid, [])
-            if not pts_uv:
-                return 0.0
-            ux, vy = uv
-            return float(min(np.hypot(ux - x, vy - y) for (x, y) in pts_uv))
-
-        cn_groups = (3, 2)
-
-        while Q < 0:
-            removable = _removable_now()
-            if not removable:
-                if verbose:
-                    print("WARNING: No removable Cl left from swapped sites; still negative.")
-                break
-
-            # pick highest CN group available
-            group = None
-            for g in cn_groups:
-                if any(r["cn"] == g for r in removable):
-                    group = g
-                    break
-            cand = [r for r in removable if (group is None or r["cn"] == group)]
-            if not cand:
-                break
-
-            # Stage A: one removal per facet (prefer vertex>edge>unique; deeper first)
-            unseeded = {r["fid"] for r in cand if r["fid"] not in seeded_remove}
-            if unseeded:
-                fid_pick = min(unseeded)
-                c_facet = [r for r in cand if r["fid"] == fid_pick]
-                c_facet.sort(key=lambda r: (r["role_rank"], r["depth"], -int(r["idx"])), reverse=True)
-                picked = c_facet[0]
-            else:
-                # Stage B: spacing within facet(s) with existing removals
-                scored: List[Tuple[float, float, int, int]] = []
-                # tuple: (dmin, depth, -idx, idx_in_cand)
-                for k, r in enumerate(cand):
-                    uv = _plane_uv(frames, r["fid"], pts[r["idx"]])
-                    dmin = _min_uv_dist(r["fid"], uv)
-                    scored.append((dmin, float(r["depth"]), -int(r["idx"]), k))
-                scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-                picked = cand[scored[0][3]]
-
-            # Apply removal
-            i = picked["idx"]
-            fid = picked["fid"]
-            before = Q
-
-            # record vacancy position
-            uv = _plane_uv(frames, fid, pts[i])
-            vac_uv.setdefault(fid, []).append(uv)
-            seeded_remove.add(fid)
-
-            # remove atom i
-            symbols.pop(i)
-            pts = np.delete(pts, i, axis=0)
-            _reindex_after_delete(i)
-
-            Q = total_Q()
-            if verbose:
-                print(f"remove {ligand}#{i} (from Se, orig CN {picked['cn']}/{picked['bulk_cn']}, "
-                      f"{picked['role']}, depth={picked['depth']:.2f} Å, facet {fid})  | Q:{before:+d}→{Q:+d}")
-
-    elif Q < 0 and not swapped_log:
-        # Rare: Q<0 but no swapped Cl to remove (e.g., initial structure already negative and no anion swaps available)
-        if verbose:
-            print("NOTE: Q<0 but no swapped Cl available to remove; attempting cation additions as fallback.")
-
-    # --- 3) If positive, add ligands near dangling/under-coordinated cations ---
-    # --- 3) Prefer removing surface cations (default) with strict V→E→U gating and global spacing ---
-    if Q > 0 or (Q < 0 and not swapped_log):
-        frames = _build_facet_frames(planes)  # frames[fid] = (n_norm, d_norm, u, v, x0)
-
-        from math import hypot
-        # UV positions taken on each facet by ANY prior edit (removal/addition)
-        uv_taken: Dict[int, List[Tuple[float, float]]] = {}
-        # per-facet removal counts (for facet round-robin)
-        rem_count_facet: Dict[int, int] = {}
-
-        def _min_uv_dist(fid: int, uv: Tuple[float, float]) -> float:
-            pts_uv = uv_taken.get(fid, [])
-            if not pts_uv:
-                return float("inf")
-            x, y = uv
-            return min(hypot(x - u, y - v) for (u, v) in pts_uv)
-
-        def _incident_fids(idx: int) -> List[int]:
-            """Which facets this atom belongs to (within surf_tol), using normalized (n,d) in frames."""
-            out = []
-            for fid, (n, d, *_rest) in enumerate(frames):
-                depth = d - float(np.dot(pts[idx], n))
-                if depth < surf_tol:
-                    out.append(fid)
-            return out
-
-        def _record_uv_allfacets(idx: int) -> None:
-            """Record UV of site idx on *all* incident facets to enforce cross-manifold spacing."""
-            for fid in _incident_fids(idx):
-                uv = _plane_uv(frames, fid, pts[idx])
-                uv_taken.setdefault(fid, []).append(uv)
-                rem_count_facet[fid] = rem_count_facet.get(fid, 0) + 1
-
-        # prefer cation-rich facets for removals; if none rich, allow all
+    # --- 3) If still Q > 0: strict V→E→U removals with global RR+FPS ---
+    if Q > 0:
         surf_Q = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
         rich = {fid for fid, q in surf_Q.items() if q > 0}
         allowed = rich if rich else None
 
-        def _collect_cation_remove_candidates(
-            symbols: List[str],
-            pts: NDArray[np.float64],
-            planes: List[Plane],
-            charges: Dict[str, int],
-            surf_tol: float,
-            allowed_facets: Optional[Set[int]] = None,
-        ) -> List[Tuple[int, str, int, float, int, int]]:
-            """
-            Return surface cation-removal candidates as (idx, elem, q_cation, depth, role_rank, fid),
-            where role_rank: unique=0, edge=1, vertex=2. fid is the shallowest-hit facet for that atom.
-            """
-            pts = np.asarray(pts, float)
-            cations = {el for el, q in charges.items() if q > 0}
-
-            # memberships by half-space test
-            memberships = [[] for _ in range(len(symbols))]
-            for fid, (n, d) in enumerate(planes):
-                if allowed_facets is not None and fid not in allowed_facets:
-                    continue
-                shell = np.where((d - pts @ n) < surf_tol)[0]
-                for i in shell:
-                    memberships[i].append(fid)
-
-            best: Dict[int, Tuple[int, str, int, float, int, int]] = {}
-            for fid, (n, d) in enumerate(planes):
-                if allowed_facets is not None and fid not in allowed_facets:
-                    continue
-                n_unit = n / (np.linalg.norm(n) + 1e-12)
-                shell = np.where((d - pts @ n_unit) < surf_tol)[0]
-                for i in shell:
-                    s = symbols[i]
-                    if s not in cations:
-                        continue
-                    depth = float(d - np.dot(pts[i], n_unit))
-                    m = len(memberships[i])
-                    role_rank = 0 if m == 1 else (1 if m == 2 else 2)  # unique, edge, vertex
-                    q = int(charges.get(s, 0))
-                    rec = (i, s, q, depth, role_rank, fid)
-                    if i not in best or depth < best[i][3]:
-                        best[i] = rec
-
-            out = list(best.values())
-            # Coarse sort (used only for tie-breaking later)
-            out.sort(key=lambda r: (r[2], -r[4], r[3], r[0]))  # q asc, role vertex>edge>unique, shallow first
-            return out
-
-        def _gather_removals() -> List[Tuple[int, str, int, float, int, int]]:
-            return _collect_cation_remove_candidates(symbols, pts, planes, charges, surf_tol, allowed_facets=allowed)
-
-        def _pick_from_role(cand: List[Tuple[int, str, int, float, int, int]], need_role: int) -> Optional[Tuple[int, str, int, float, int, int]]:
-            """Pick best candidate within a fixed role: facet RR, then max spacing on that facet."""
-            cand = [r for r in cand if r[4] == need_role]  # keep only that manifold
-            if not cand:
-                return None
-            # facet RR: facets with fewest removals so far
-            fids = {r[5] for r in cand}
-            minc_f = min(rem_count_facet.get(fid, 0) for fid in fids)
-            fids_rr = [fid for fid in sorted(fids) if rem_count_facet.get(fid, 0) == minc_f]
-
-            best = None
-            best_score = None
-            for fid in fids_rr:
-                on_f = [r for r in cand if r[5] == fid]
-                for (i, s, q, depth, role_rank, _fid) in on_f:
-                    uv = _plane_uv(frames, fid, pts[i])
-                    dmin = _min_uv_dist(fid, uv)
-                    # spacing first; then prefer lower q (Cu+ before In3+), then shallower, then older idx
-                    score = (dmin, -q, -depth, -i)
-                    if best_score is None or score > best_score:
-                        best_score, best = score, (i, s, q, depth, role_rank, fid)
-            return best
-
-        # optional fine-step: add one anion (−1) if we cannot remove within current gating without overshoot
-        def _add_one_anion() -> bool:
-            nonlocal symbols, pts, Q
-            sites = _collect_cation_sites(
-                symbols, pts, planes, charges, surf_tol,
-                outer_only=True, allow_shared=False, include_sublayer=False, allowed_facets=allowed
-            )
-            if not sites:
-                sites = _collect_cation_sites(
-                    symbols, pts, planes, charges, surf_tol,
-                    outer_only=True, allow_shared=True, include_sublayer=False, allowed_facets=allowed
-                )
-            if not sites:
-                sites = _collect_cation_sites(
-                    symbols, pts, planes, charges, surf_tol,
-                    outer_only=False, allow_shared=True, include_sublayer=True, allowed_facets=allowed
-                )
-            if not sites:
-                return False
-
-            # choose site maximizing spacing wrt ALL prior edits on that facet
-            sites.sort(key=lambda t: (-t[3], t[2], t[4], t[0]))  # deficit desc, depth asc, role, idx
-            best = None; best_key = None
-            for (idx, n, depth, deficit, role_rank, fid) in sites:
-                uv = _plane_uv(frames, fid, pts[idx])
-                dmin = _min_uv_dist(fid, uv)
-                key = (rem_count_facet.get(fid, 0), -dmin, depth, -deficit, role_rank, idx)
-                if best_key is None or key < best_key:
-                    best_key, best = key, (idx, n, depth, deficit, role_rank, fid)
-
-            if best is None:
-                return False
-
-            idx, n, depth, deficit, role_rank, fid = best
-            before = Q
-            symbols, pts = place_ligand(symbols, pts, idx, n, ligand, planes)
-            Q = int(sum(charges.get(x, 0) for x in symbols))
-            # record UV for additions on all incident facets of the host site (spacing awareness)
-            _record_uv_allfacets(idx)
-
-            if verbose:
-                role = ["unique", "edge", "vertex"][role_rank]
-                print(f"add {ligand} near {symbols[idx]}#{idx} "
-                      f"(def={deficit}, {role}, depth={depth:.2f} Å, facet {fid})  | Q:{before:+d}→{Q:+d}")
-            return True
-
-        # -------- main loop with strict manifold gating (vertex → edge → unique) --------
-        ROLE_ORDER = (2, 1, 0)  # 2=vertex, 1=edge, 0=unique/center
-        while Q > 0:
-            cand_all = _gather_removals()
-            if not cand_all:
-                # nothing removable; try one -1 addition as last resort and re-loop
-                if not _add_one_anion():
-                    if verbose:
-                        print("WARNING: no removable cations available and no suitable anion-add site found.")
-                    break
-                continue
-
+        ROLE_ORDER = (2, 1, 0)  # vertex, edge, unique
+        progressed = True
+        while Q > 0 and progressed:
             progressed = False
+            cand_all = _collect_cation_remove_candidates(
+                symbols, pts, planes, charges, surf_tol, allowed_facets=allowed,
+                frames=frames, edges_by_facet=edges_by_facet, verts_by_facet=verts_by_facet,
+                edge_tol=edge_tol, vertex_tol=vertex_tol
+            )
+            if not cand_all:
+                break
             for role in ROLE_ORDER:
-                # only consider this role if there exists at least one candidate in it
-                if not any(r[4] == role for r in cand_all):
-                    continue
-                # avoid overshoot: restrict to q <= Q within the role
                 role_cand = [r for r in cand_all if r[4] == role and r[2] <= Q]
                 if not role_cand:
-                    # cannot progress within this role without overshoot; try next role
                     continue
-                # pick best within role (facet RR + farthest spacing)
-                pick = _pick_from_role(role_cand, role)
-                if pick is None:
+                fids = {r[5] for r in role_cand}
+                minc = min(edit_count_facet.get(fid, 0) for fid in fids)
+                fids_rr = [fid for fid in sorted(fids) if edit_count_facet.get(fid, 0) == minc]
+
+                best = None; best_score = None
+                for fid in fids_rr:
+                    on_f = [r for r in role_cand if r[5] == fid]
+                    for (i, s, q_site, depth, role_rank, _fid) in on_f:
+                        uv = _plane_uv(frames, fid, pts[i])
+                        dmin = _min_uv_dist(fid, uv)
+                        score = (dmin, -q_site, -depth, -i)
+                        if best_score is None or score > best_score:
+                            best_score, best = score, (i, s, q_site, depth, role_rank, fid)
+                if best is None:
                     continue
 
-                i, s, q, depth, role_rank, fid = pick
-                before = Q
-
-                # record UV on all incident facets BEFORE deletion (cross-manifold spacing)
-                _record_uv_allfacets(i)
-
-                # delete atom i
+                i, s, q_site, depth, role_rank, fid = best
+                before = total_Q()
+                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
                 symbols.pop(i)
                 pts = np.delete(pts, i, axis=0)
-
-                Q = int(sum(charges.get(x, 0) for x in symbols))
+                Q = total_Q()
                 if verbose:
                     role_name = ["unique", "edge", "vertex"][role_rank]
-                    print(f"remove {s}#{i} (q=+{q}, {role_name}, depth={depth:.2f} Å, facet {fid})  | Q:{before:+d}→{Q:+d}")
+                    print(f"remove {s}#{i} (q=+{q_site}, {role_name}, depth={depth:.2f} Å, facet {fid})  | Q:{before:+d}→{Q:+d}")
                 progressed = True
-                break  # restart from highest role (keep V→E→U gating)
-
-            if progressed:
-                continue
-
-            # Reached here: no role could progress without overshoot → try a single -1 anion add
-            if not _add_one_anion():
-                if verbose:
-                    print("WARNING: stuck by overshoot constraints and cannot add an anion; stopping.")
+                _stabilize_and_update_Q()
                 break
 
+            if not progressed:
+                # recompute facet charges and try one −1 add
+                surf_Q_now = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
+                allowed_now = {fid for fid, q in surf_Q_now.items() if q > 0} or None
+                if _add_one_anion(allowed_now):
+                    progressed = True
+
+    # --- Final parity guard (e.g., Q = +1) ---
+    if Q > 0:
+        surf_Q_end = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
+        allowed_final = {fid for fid, q in surf_Q_end.items() if q > 0} or None
+        ok = _add_one_anion(allowed_final) or _add_one_anion(None)
+        # Q already updated inside _add_one_anion
+        if verbose and not ok:
+            print("[parity] add-one-anion failed: no placeable site (likely plane/clash constraint).")
 
     if verbose:
         print(f"# Q after  = {Q:+d}")
     if Q != 0 and verbose:
-        print("WARNING: neutrality not reached. Consider enabling deeper swaps or revisiting charges.")
+        print("WARNING: neutrality not reached. Consider deeper edits or charges.")
 
     return symbols, pts
 
