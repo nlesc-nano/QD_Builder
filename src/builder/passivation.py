@@ -702,32 +702,45 @@ def charge_balance(
         x, y = uv
         return min(hypot(x - u, y - v) for (u, v) in lst)
 
-    def _fix_undercoord_anions_once() -> bool:
-        """One pass: swap any surface anion with CN<=2 to ligand. Records UVs."""
+    def _fix_undercoord_anions_once(log_each: bool = True) -> bool:
+        """
+        One pass: swap any surface anion with CN<=2 to ligand (X−).
+        Records UVs and (optionally) logs Q before/after EACH swap.
+        """
+        nonlocal Q  # keep Q in sync on every single swap
         changed = False
         cn = coord_numbers_bipartite(symbols, pts, charges)
+    
         for i, s in enumerate(symbols):
-            if charges.get(s, 0) >= 0:
+            if charges.get(s, 0) >= 0:   # skip cations
                 continue
+    
+            # is it on the surface?
             incident = _incident_facets(i, pts, frames, surf_tol)
             if not incident:
                 continue
+    
             if s != ligand and int(round(cn[i])) <= 2:
-                if verbose:
-                    print(f"stabilize: swap anion {s}#{i} (CN={int(cn[i])}) → {ligand}")
+                before = total_Q()
+                if verbose and log_each:
+                    # we log before modifying symbols, so idx is still valid
+                    pass
+                old = symbols[i]
                 symbols[i] = ligand
                 _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                Q = total_Q()  # recompute Q immediately
+    
+                if verbose and log_each:
+                    print(f"stabilize: swap anion {old}#{i} (CN={int(cn[i])}) → {ligand}  | Q:{before:+d}→{Q:+d}")
+    
                 changed = True
+    
         return changed
+    
 
     # --- keep Q in sync whenever stabilization mutates symbols ---
     def _stabilize_and_update_Q() -> bool:
-        changed = _fix_undercoord_anions_once()
-        if changed:
-            # recompute global Q after any number of swaps in the pass
-            nonlocal Q
-            Q = total_Q()
-        return changed
+        return _fix_undercoord_anions_once(log_each=True) 
 
     def _add_one_anion(allowed_facets: Optional[Set[int]] = None) -> bool:
         """Add ONE anion on a unique, outer, deficit=1 cation; min-max round-robin across facets."""
