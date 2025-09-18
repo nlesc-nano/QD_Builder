@@ -76,78 +76,136 @@ def place_ligand(
     normal: NDArray[np.float64],
     ligand: str,
     planes: List[Plane],
-) -> Tuple[List[str], NDArray[np.float64]]:
+    charges: Dict[str, int] | None = None,   # NEW (optional)
+) -> Tuple[List[str], NDArray[np.float64], int | None]:
     """
-    Place ligand near cation idx_cat, along 'normal', just beyond the *matched* facet.
-    - Enforce n_face·p >= d_face + eps for one plane (not all).
-    - Avoid clashes; try small lateral fan and 5% bond stretch if needed.
-    """
-    eps = 0.05
-    n_vec = np.asarray(normal, float)
-    n_vec /= (np.linalg.norm(n_vec) + 1e-12)
+    Place `ligand` bonded to cation at `idx_cat` along `normal`.
+    Hard guarantees:
+      • candidate lies outside all planes (n·x >= d + eps_out)
+      • nearest neighbor to ligand is the TARGET CATION at ~bond_len
+      • reject if too close to any anion or existing ligand anion (like-charge spacing)
+      • general clash check vs all atoms
 
+    Returns (new_symbols, new_pts, new_index) or (symbols, pts, None) if failed.
+    """
+    from .analysis import _pair_cut as pc
+    from scipy.spatial import cKDTree
+
+    eps_out = 0.05
+    normal = normal / (np.linalg.norm(normal) + 1e-12)
     origin = pts[idx_cat]
-    bond_len = pc(symbols[idx_cat], ligand)
-
-    # --- pick the facet whose normal best aligns with 'normal' ---
-    if not planes:
-        n0, d0 = n_vec, float(np.dot(n_vec, origin))
-    else:
-        best = None; best_cos = -1.0
-        for (n, d) in planes:
-            n = np.asarray(n, float)
-            ln = np.linalg.norm(n) + 1e-12
-            nu, du = n / ln, float(d) / ln      # normalize (n,d)
-            cos = float(np.dot(nu, n_vec))
-            if cos > best_cos:
-                best_cos, best = cos, (nu, du)
-        n0, d0 = best
-
-    def ensure_outside_face(p: NDArray[np.float64]) -> NDArray[np.float64]:
-        slack = float(np.dot(n0, p) - d0)
-        if slack < eps:
-            p = p + (eps - slack) * n0
-        return p
+    cat_sym = symbols[idx_cat]
+    bond_len = pc(cat_sym, ligand)
 
     tree = cKDTree(pts)
-    r_query = 1.5 * max(pc(s, ligand) for s in set(symbols)) if symbols else 2.5
+    uniq_syms = set(symbols)
+    r_query = max(pc(s, ligand) for s in uniq_syms) * 1.6 if uniq_syms else 3.0
 
-    def clashes(p: NDArray[np.float64]) -> bool:
-        for j in tree.query_ball_point(p, r_query):
+    # quick partitions (if charges known)
+    anion_idx: list[int] = []
+    lig_idx: list[int] = []
+    if charges is not None:
+        for j, s in enumerate(symbols):
+            if charges.get(s, 0) < 0:
+                anion_idx.append(j)
+            if s == ligand:
+                lig_idx.append(j)
+
+    def ensure_outside(p: NDArray[np.float64]) -> NDArray[np.float64]:
+        min_slack = float("inf")
+        for (n_i, d_i) in planes:
+            slack = float(np.dot(n_i, p) - d_i)
+            if slack < min_slack:
+                min_slack = slack
+        if min_slack < eps_out:
+            p = p + (eps_out - min_slack) * normal
+        return p
+
+    def ok_bond_to_target(p: NDArray[np.float64]) -> bool:
+        d_cat = np.linalg.norm(p - origin)
+        if not (0.92 * bond_len <= d_cat <= 1.08 * bond_len):
+            return False
+        # make sure the closest atom is the target cation
+        dists, idxs = tree.query(p, k=min(6, len(symbols)))
+        if np.isscalar(dists):
+            # only one neighbor
+            return int(idxs) == idx_cat
+        # find closest neighbor
+        kmin = int(idxs[0]); dmin = float(dists[0])
+        if kmin != idx_cat:
+            return False
+        # margin vs the next neighbor
+        if len(dists) > 1 and float(dists[1]) < dmin + 0.12:
+            return False
+        return True
+
+    def clear_of_anions_and_ligands(p: NDArray[np.float64]) -> bool:
+        # stronger repulsion to like-charge anions/ligands
+        if anion_idx:
+            for j in anion_idx:
+                if j == idx_cat:
+                    continue
+                if np.linalg.norm(p - pts[j]) < 1.10 * pc(symbols[j], ligand):
+                    return False
+        if lig_idx:
+            for j in lig_idx:
+                if np.linalg.norm(p - pts[j]) < 1.10 * pc(ligand, symbols[j]):
+                    return False
+        return True
+
+    def no_general_clash(p: NDArray[np.float64]) -> bool:
+        idxs = tree.query_ball_point(p, r_query)
+        for j in idxs:
             if j == idx_cat:
-                if np.linalg.norm(pts[j] - p) < 0.9 * bond_len:
-                    return True
+                # allow bonded cation at ~bond_len
+                if np.linalg.norm(pts[j] - p) < 0.90 * bond_len:
+                    return False
                 continue
-            if np.linalg.norm(pts[j] - p) < 0.8 * pc(symbols[j], ligand):
-                return True
-        return False
+            if np.linalg.norm(pts[j] - p) < 0.80 * pc(symbols[j], ligand):
+                return False
+        return True
 
-    # candidate 0: straight along 'normal'
-    cand = ensure_outside_face(origin + bond_len * n_vec)
-    if clashes(cand):
-        # try a small lateral fan
-        u = np.cross(n_vec, np.array([1.0, 0.0, 0.0]))
-        if np.linalg.norm(u) < 1e-6:
-            u = np.cross(n_vec, np.array([0.0, 1.0, 0.0]))
-        u /= (np.linalg.norm(u) + 1e-12)
+    # candidate directions: normal + lateral fan
+    # (keep small angles to favor true bonding geometry)
+    angs = [0, 12, -12, 24, -24, 36, -36, 48, -48]
+    # small bond stretch if needed
+    scales = [1.00, 1.05]
 
-        for ang_deg in (15, -15, 25, -25):
-            ang = np.deg2rad(ang_deg)
-            n_try = (np.cos(ang) * n_vec + np.sin(ang) * u)
+    # lateral axis
+    u = np.cross(normal, np.array([1.0, 0.0, 0.0], dtype=float))
+    if np.linalg.norm(u) < 1e-6:
+        u = np.cross(normal, np.array([0.0, 1.0, 0.0], dtype=float))
+    u /= (np.linalg.norm(u) + 1e-12)
+
+    best_p = None
+    best_sep = -1.0  # maximize min separation to anions/ligands
+    for s in scales:
+        for a in angs:
+            ang = np.deg2rad(a)
+            n_try = (np.cos(ang) * normal + np.sin(ang) * u)
             n_try /= (np.linalg.norm(n_try) + 1e-12)
-            p_try = ensure_outside_face(origin + bond_len * n_try)
-            if not clashes(p_try):
-                cand = p_try
-                break
-        else:
-            # last resort: slightly longer bond
-            p_try = ensure_outside_face(origin + 1.05 * bond_len * n_vec)
-            if clashes(p_try):
-                return symbols, pts
-            cand = p_try
+            p = ensure_outside(origin + s * bond_len * n_try)
+            if not ok_bond_to_target(p):
+                continue
+            if not no_general_clash(p):
+                continue
+            if not clear_of_anions_and_ligands(p):
+                continue
+            # score: min distance to (anions ∪ ligand anions)
+            sep = float("inf")
+            if anion_idx:
+                sep = min(sep, *(np.linalg.norm(p - pts[j]) for j in anion_idx if j != idx_cat))
+            if lig_idx:
+                sep = min(sep, *(np.linalg.norm(p - pts[j]) for j in lig_idx))
+            if sep > best_sep:
+                best_sep = sep
+                best_p = p
+
+    if best_p is None:
+        return symbols, pts, None
 
     new_symbols = list(symbols)
     new_symbols.append(ligand)
-    new_pts = np.vstack([pts, cand])
-    return new_symbols, new_pts
+    new_pts = np.vstack([pts, best_p])
+    return new_symbols, new_pts, len(new_symbols) - 1
 
