@@ -624,7 +624,6 @@ def _unique_center_candidates(
     out.sort(key=lambda t: (-t[0], t[3], t[1]))
     return out
 
-
 # --------------------------------------
 # Charge balance (stepwise, facet-aware swaps & removals)
 # --------------------------------------
@@ -643,7 +642,7 @@ def charge_balance(
     rng: random.Random,
     *,
     prefer_remove_parity: bool = False,
-    cation_ligand: str | None = None,
+    cation_ligand: str | None = None,  # kept for compatibility; not used in polish anymore
 ):
     from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior
 
@@ -702,49 +701,72 @@ def charge_balance(
         x, y = uv
         return min(hypot(x - u, y - v) for (u, v) in lst)
 
+    # ---- guarded stabilization: avoid creating new CN=2 cations
     def _fix_undercoord_anions_once(log_each: bool = True) -> bool:
         """
-        One pass: swap any surface anion with CN<=2 to ligand (X−).
-        Records UVs and (optionally) logs Q before/after EACH swap.
+        One pass: swap any surface anion with CN<=2 to ligand (X−),
+        BUT skip swaps that would reduce any neighbor cation below CN=3.
         """
-        nonlocal Q  # keep Q in sync on every single swap
+        nonlocal symbols, pts
         changed = False
         cn = coord_numbers_bipartite(symbols, pts, charges)
-    
+
+        # quick neighbor check using pair cutoffs
+        def _neighbors(i):
+            si = symbols[i]; xi = pts[i]
+            out = []
+            for j, sj in enumerate(symbols):
+                if j == i:
+                    continue
+                rc = pc(si, sj)
+                if rc <= 0:
+                    continue
+                if np.linalg.norm(pts[j] - xi) < rc + 1e-9:
+                    out.append(j)
+            return out
+
         for i, s in enumerate(symbols):
             if charges.get(s, 0) >= 0:   # skip cations
                 continue
-    
-            # is it on the surface?
+
+            # surface?
             incident = _incident_facets(i, pts, frames, surf_tol)
             if not incident:
                 continue
-    
+
             if s != ligand and int(round(cn[i])) <= 2:
+                # would removing this anion drop any neighbor cation below 3?
+                harmful = False
+                for j in _neighbors(i):
+                    sj = symbols[j]
+                    if charges.get(sj, 0) <= 0:
+                        continue  # only worry about cations
+                    # j currently counts i as a neighbor; removing i -> cn_j' = cn[j] - 1
+                    if int(round(cn[j])) <= 3:
+                        harmful = True
+                        break
+                if harmful:
+                    continue  # skip this anion; it would create a CN=2 cation
+
                 before = total_Q()
-                if verbose and log_each:
-                    # we log before modifying symbols, so idx is still valid
-                    pass
                 old = symbols[i]
                 symbols[i] = ligand
                 _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
-                Q = total_Q()  # recompute Q immediately
-    
+                after = total_Q()
                 if verbose and log_each:
-                    print(f"stabilize: swap anion {old}#{i} (CN={int(cn[i])}) → {ligand}  | Q:{before:+d}→{Q:+d}")
-    
+                    print(f"stabilize: swap anion {old}#{i} (CN={int(cn[i])}) → {ligand}  | Q:{before:+d}→{after:+d}")
                 changed = True
-    
+
         return changed
-    
 
     # --- keep Q in sync whenever stabilization mutates symbols ---
     def _stabilize_and_update_Q() -> bool:
-        return _fix_undercoord_anions_once(log_each=True) 
+        changed = _fix_undercoord_anions_once(log_each=True)
+        return changed
 
     def _add_one_anion(allowed_facets: Optional[Set[int]] = None) -> bool:
         """Add ONE anion on a unique, outer, deficit=1 cation; min-max round-robin across facets."""
-        nonlocal symbols, pts, Q
+        nonlocal symbols, pts
 
         # candidates (center-biased unique, deficit=1)
         cand = _unique_center_candidates(
@@ -812,156 +834,209 @@ def charge_balance(
         add_count_facet[fid] += 1
 
         before = total_Q()
-        Q = total_Q()
+        after = total_Q()
         if verbose:
             print(f"add {ligand} near {symbols[idx]}#{idx} "
                   f"(def=1, unique, center_score={center_score:.2f}, depth={depth:.2f} Å, facet {fid})  | "
-                  f"Q:{before:+d}→{Q:+d}")
+                  f"Q:{before:+d}→{after:+d}")
 
         _stabilize_and_update_Q()
         return True
 
+    # Convenience: a reusable driver for the Q<0 pipeline
     # after pre-pass, recompute Q
+    # Convenience: a reusable driver for the Q<0 pipeline (global RR + FPS; no ligand removal at Q=-1)
+    def _drive_Q_negative():
+        nonlocal symbols, pts
+        from math import hypot
+    
+        if total_Q() >= 0:
+            return
+    
+        stop_swaps = False
+        while total_Q() < 0 and not stop_swaps:
+            # Always refresh candidates to reflect current topology
+            outer_candidates, _ = collect_anion_candidates(
+                symbols, pts, planes, charges, ligand, surf_tol, verbose=False
+            )
+            if not outer_candidates:
+                break
+            deficits = sorted({r["deficit"] for r in outer_candidates}, reverse=True)
+    
+            made_progress = False
+            for deficit in deficits:
+                if stop_swaps or total_Q() >= 0:
+                    break
+                for role_rank in (0, 1, 2):  # unique → edge → vertex
+                    if stop_swaps or total_Q() >= 0:
+                        break
+    
+                    while total_Q() < 0:
+                        if prefer_remove_parity and total_Q() == -1:
+                            if verbose:
+                                print("(parity) stopping swaps at Q=-1 (no ligand removal).")
+                            stop_swaps = True
+                            break
+    
+                        # Candidates for this (deficit, role_rank)
+                        cand = [r for r in outer_candidates
+                                if r["deficit"] == deficit and r["role_rank"] == role_rank
+                                and 0 <= r["idx"] < len(symbols) and symbols[r["idx"]] != ligand]
+                        if not cand:
+                            break
+    
+                        # For each facet, keep only its best candidate by global FPS score:
+                        # score_in_facet = (dmin_vs_uv_taken, -depth, -idx)
+                        by_facet: Dict[int, Tuple[Tuple[float, float, float], dict]] = {}
+                        for r in cand:
+                            fid = r["fid"]
+                            ux, vy = _plane_uv(frames, fid, pts[r["idx"]])
+                            taken = uv_taken.get(fid, [])
+                            dmin = float("inf") if not taken else min(hypot(ux - x, vy - y) for (x, y) in taken)
+                            score_in_facet = (dmin, -float(r["depth"]), -int(r["idx"]))
+                            best = by_facet.get(fid)
+                            if best is None or score_in_facet > best[0]:
+                                by_facet[fid] = (score_in_facet, r)
+    
+                        if not by_facet:
+                            break
+    
+                        # Round-robin across facets with fewest edits so far (global RR),
+                        # tie-break by the per-facet best FPS score.
+                        min_edits = min(edit_count_facet.get(fid, 0) for fid in by_facet.keys())
+                        facet_pool = [fid for fid in by_facet.keys() if edit_count_facet.get(fid, 0) == min_edits]
+    
+                        def facet_key(fid: int):
+                            # Prefer larger dmin, then shallower (-depth), then smaller idx
+                            return by_facet[fid][0]
+    
+                        fid_pick = max(facet_pool, key=facet_key)
+                        picked = by_facet[fid_pick][1]
+    
+                        # Execute swap and RECORD in global spacing/edit trackers
+                        i = picked["idx"]
+                        before = total_Q()
+                        old = symbols[i]
+                        symbols[i] = ligand  # e.g., Se→Cl (−2→−1 increases Q by +1)
+                        after = total_Q()
+    
+                        _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+    
+                        if verbose:
+                            role = ["unique", "edge", "vertex"][picked["role_rank"]]
+                            print(
+                                f"swap {old}#{i} (CN {picked['cn']}/{picked['bulk_cn']}, {role}, depth={picked['depth']:.2f} Å) "
+                                f"→ {ligand}  | Q:{before:+d}→{after:+d}"
+                            )
+    
+                        _stabilize_and_update_Q()
+                        made_progress = True
+    
+                        if total_Q() >= 0:
+                            stop_swaps = True
+                            break  # exit while total_Q()<0
+    
+            if not made_progress:
+                # Try a single −1 addition on a facet that is still cation-rich
+                surf_Q_now = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
+                allowed_now = {fid for fid, q in surf_Q_now.items() if q > 0} or None
+                if not _add_one_anion(allowed_now):
+                    break  # cannot progress further
+    
     Q = total_Q()
     if verbose:
         print(f"# Q before (after prepass) = {Q:+d}")
 
-    def _fresh_anion_candidates():
-        return collect_anion_candidates(
-            symbols, pts, planes, charges, ligand, surf_tol, verbose=False
-        )
-
-    # --- 1) If Q < 0: do Se->Cl swaps (facet-aware spacing) ---
+    # --- A) Drive Q<0 if needed ---
     if Q < 0:
-        outer_candidates, _ = _fresh_anion_candidates()
-        deficits = sorted({r["deficit"] for r in outer_candidates}, reverse=True) if outer_candidates else []
-        swap_uv: Dict[Tuple[int, int, int], List[Tuple[float, float]]] = {}
+        _drive_Q_negative()
+        Q = total_Q()
 
-        def _available_in_category(deficit: int, role_rank: int):
-            return [r for r in outer_candidates
-                    if r["deficit"] == deficit and r["role_rank"] == role_rank
-                    and 0 <= r["idx"] < len(symbols) and symbols[r["idx"]] != ligand]
-
-        def _seeded_facets_in_category(deficit: int, role_rank: int) -> set[int]:
-            return {fid for (d, rr, fid), uv in swap_uv.items() if d == deficit and rr == role_rank and uv}
-
-        def _min_uv_for_swap(r: dict) -> float:
-            key = (r["deficit"], r["role_rank"], r["fid"])
-            uv_list = swap_uv.get(key, [])
-            if not uv_list:
-                return 0.0
-            ux, vy = _plane_uv(frames, r["fid"], pts[r["idx"]])
-            return float(min(np.hypot(ux - x, vy - y) for (x, y) in uv_list))
-
-        stop_swaps = False
-        for deficit in deficits:
-            if stop_swaps:
-                break
-            for role_rank in (0, 1, 2):  # unique → edge → vertex
-                if stop_swaps:
-                    break
-                while Q < 0:
-                    if prefer_remove_parity and Q == -1:
-                        if verbose:
-                            print("(parity) stopping swaps at Q=-1 to resolve by removing one ligand.")
-                        stop_swaps = True
-                        break
-                    cand = _available_in_category(deficit, role_rank)
-                    if not cand:
-                        break
-                    seeded = _seeded_facets_in_category(deficit, role_rank)
-                    unseeded = {r["fid"] for r in cand if r["fid"] not in seeded}
-                    if unseeded:
-                        fid_pick = min(unseeded)
-                        c_facet = [r for r in cand if r["fid"] == fid_pick]
-                        c_facet.sort(key=lambda r: (r["depth"], r["idx"]))
-                        picked = c_facet[0]
-                    else:
-                        scored = []
-                        for k, r in enumerate(cand):
-                            dmin = _min_uv_for_swap(r)
-                            scored.append((dmin, -float(r["depth"]), -int(r["idx"]), k))
-                        scored.sort(reverse=True)
-                        picked = cand[scored[0][3]]
-
-                    i = picked["idx"]
-                    before = total_Q()
-                    old = symbols[i]
-                    symbols[i] = ligand
-                    Q = total_Q()
-
-                    key = (picked["deficit"], picked["role_rank"], picked["fid"])
-                    uv = _plane_uv(frames, picked["fid"], pts[i])
-                    swap_uv.setdefault(key, []).append(uv)
-
-                    if verbose:
-                        role = ["unique","edge","vertex"][picked["role_rank"]]
-                        print(f"swap {old}#{i} (CN {picked['cn']}/{picked['bulk_cn']}, {role}, depth={picked['depth']:.2f} Å) "
-                              f"→ {ligand}  | Q:{before:+d}→{Q:+d}")
-
-                    _stabilize_and_update_Q()
-
-                    if Q >= 0:
-                        stop_swaps = True
-                        break
-
-    # --- 2) If Q > 0: CN=2 cations → L+ (if provided) ---
-    if Q > 0 and cation_ligand:
-        qL = int(charges.get(cation_ligand, 0))
-        if qL > 0:
-            while Q > 0:
-                cn = coord_numbers_bipartite(symbols, pts, charges)
-                mem = _facet_memberships(pts, planes, surf_tol)
-                cand = []
-                for i, s in enumerate(symbols):
-                    q = int(charges.get(s, 0))
-                    if q <= 0:
-                        continue
-                    if len(mem[i]) == 0:
-                        continue
-                    if int(round(cn[i])) != 2:
-                        continue
-                    delta = q - qL
-                    if delta <= 0 or delta > Q:
-                        continue
-                    best = None
-                    for fid, (n, d, *_rest) in enumerate(frames):
-                        depth = d - float(np.dot(pts[i], n))
-                        if depth < surf_tol:
-                            if best is None or depth < best[0]:
-                                best = (depth, fid)
-                    if best is None:
-                        continue
-                    depth, fid = best
-                    m = len(mem[i]); role_rank = 0 if m == 1 else (1 if m == 2 else 2)
-                    uv = _plane_uv(frames, fid, pts[i])
-                    dmin = _min_uv_dist(fid, uv)
-                    fcount = edit_count_facet.get(fid, 0)
-                    score = (delta, dmin, role_rank, -depth, -fcount, -i)
-                    cand.append((score, i, s, q, delta, depth, role_rank, fid))
-                if not cand:
-                    break
-                cand.sort(reverse=True)
-                _, i, s, q, delta, depth, role_rank, fid = cand[0]
-                before = total_Q()
-                symbols[i] = cation_ligand
-                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
-                Q = total_Q()
-                if verbose:
-                    role = ["unique","edge","vertex"][role_rank]
-                    print(f"downgrade {s}#{i} (CN=2, q={q}→{qL}, Δq={delta}, {role}, depth={depth:.2f} Å, facet {fid}) "
-                          f"| Q:{before:+d}→{Q:+d}")
-                _stabilize_and_update_Q()
-
-    # --- 3) If still Q > 0: strict V→E→U removals with global RR+FPS ---
+    # --- B) If Q > 0: prefer removing CN=2 cations, then re-stabilize anions ---
     if Q > 0:
+        progressed = True
+        while total_Q() > 0 and progressed:
+            progressed = False
+            cn = coord_numbers_bipartite(symbols, pts, charges)
+            mem = _facet_memberships(pts, planes, surf_tol)
+            cand = []
+            for i, s in enumerate(symbols):
+                q_site = int(charges.get(s, 0))
+                if q_site <= 0:
+                    continue
+                if len(mem[i]) == 0:  # not on surface
+                    continue
+                if int(round(cn[i])) != 2:
+                    continue
+                if q_site > total_Q():        # avoid overshoot; we’ll have later strict removals
+                    continue
+
+                # choose the shallowest incident facet for spacing and logging
+                best = None
+                for fid, (n, d, *_rest) in enumerate(frames):
+                    depth = d - float(np.dot(pts[i], n))
+                    if depth < surf_tol:
+                        if best is None or depth < best[0]:
+                            best = (depth, fid)
+                if best is None:
+                    continue
+                depth, fid = best
+
+                # role via geometry (preferred) else membership count
+                if 'edges_by_facet' in locals():
+                    _role_name, role_rank = _role_by_geometry(
+                        i, fid, pts, frames, edges_by_facet, verts_by_facet,
+                        edge_tol, vertex_tol
+                    )
+                else:
+                    m = len(mem[i])
+                    role_rank = 0 if m == 1 else (1 if m == 2 else 2)
+
+                # facet spacing (bigger is better)
+                uv = _plane_uv(frames, fid, pts[i])
+                dmin = _min_uv_dist(fid, uv)
+                fcount = edit_count_facet.get(fid, 0)
+
+                # score: prefer vertex(2) > edge(1) > unique(0), then spacing, shallower, fewer prior edits, smaller idx
+                score = (role_rank, dmin, -depth, -fcount, -i)
+                cand.append((score, i, s, q_site, depth, role_rank, fid))
+
+            if not cand:
+                break
+
+            cand.sort(reverse=True)
+            (_, i, s, q_site, depth, role_rank, fid) = cand[0]
+
+            before = total_Q()
+            # record UVs BEFORE deletion for cross-manifold FPS
+            _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+            # delete the CN=2 cation
+            symbols.pop(i)
+            pts = np.delete(pts, i, axis=0)
+            after = total_Q()
+            if verbose:
+                role_name = ["unique", "edge", "vertex"][role_rank]
+                print(f"remove {s}#{i} (CN=2, q=+{q_site}, {role_name}, depth={depth:.2f} Å, facet {fid})  | "
+                      f"Q:{before:+d}→{after:+d}")
+
+            # re-stabilize: repeatedly convert any surface anions with CN<=2 → ligand (guarded)
+            changed = True
+            while changed:
+                changed = _fix_undercoord_anions_once()
+
+            progressed = True
+
+        # (IMPORTANT) We do NOT do the old 'downgrade-to-L+' fallback anymore.
+
+    # --- C) If still Q > 0: strict V→E→U removals with global RR+FPS ---
+    if total_Q() > 0:
         surf_Q = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
         rich = {fid for fid, q in surf_Q.items() if q > 0}
         allowed = rich if rich else None
 
         ROLE_ORDER = (2, 1, 0)  # vertex, edge, unique
         progressed = True
-        while Q > 0 and progressed:
+        while total_Q() > 0 and progressed:
             progressed = False
             cand_all = _collect_cation_remove_candidates(
                 symbols, pts, planes, charges, surf_tol, allowed_facets=allowed,
@@ -971,7 +1046,7 @@ def charge_balance(
             if not cand_all:
                 break
             for role in ROLE_ORDER:
-                role_cand = [r for r in cand_all if r[4] == role and r[2] <= Q]
+                role_cand = [r for r in cand_all if r[4] == role and r[2] <= total_Q()]
                 if not role_cand:
                     continue
                 fids = {r[5] for r in role_cand}
@@ -995,10 +1070,10 @@ def charge_balance(
                 _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
                 symbols.pop(i)
                 pts = np.delete(pts, i, axis=0)
-                Q = total_Q()
+                after = total_Q()
                 if verbose:
                     role_name = ["unique", "edge", "vertex"][role_rank]
-                    print(f"remove {s}#{i} (q=+{q_site}, {role_name}, depth={depth:.2f} Å, facet {fid})  | Q:{before:+d}→{Q:+d}")
+                    print(f"remove {s}#{i} (q=+{q_site}, {role_name}, depth={depth:.2f} Å, facet {fid})  | Q:{before:+d}→{after:+d}")
                 progressed = True
                 _stabilize_and_update_Q()
                 break
@@ -1010,15 +1085,91 @@ def charge_balance(
                 if _add_one_anion(allowed_now):
                     progressed = True
 
-    # --- Final parity guard (e.g., Q = +1) ---
-    if Q > 0:
+    # --- D) Final parity guard (e.g., Q = +1): try one anion add
+    if total_Q() > 0:
         surf_Q_end = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
         allowed_final = {fid for fid, q in surf_Q_end.items() if q > 0} or None
         ok = _add_one_anion(allowed_final) or _add_one_anion(None)
-        # Q already updated inside _add_one_anion
         if verbose and not ok:
             print("[parity] add-one-anion failed: no placeable site (likely plane/clash constraint).")
 
+    # --- E) CN polish: delete any leftover surface CN=2 cations; rebalance via Q<0 each time
+    def _polish_cn2_by_deletion_and_rebalance():
+        nonlocal symbols, pts
+        progressed = False
+        while True:
+            cn = coord_numbers_bipartite(symbols, pts, charges)
+            mem = _facet_memberships(pts, planes, surf_tol)
+
+            cand = []
+            for i, s in enumerate(symbols):
+                if charges.get(s, 0) <= 0:
+                    continue
+                if not mem[i]:
+                    continue
+                if int(round(cn[i])) != 2:
+                    continue
+
+                # shallowest incident facet (for logging/placement)
+                best = None
+                for fid, (n, d, *_rest) in enumerate(frames):
+                    depth = d - float(np.dot(pts[i], n))
+                    if depth < surf_tol:
+                        if best is None or depth < best[0]:
+                            best = (depth, fid)
+                if best is None:
+                    continue
+                depth, fid = best
+                uv = _plane_uv(frames, fid, pts[i])
+                dmin = _min_uv_dist(fid, uv)
+                fcount = edit_count_facet.get(fid, 0)
+                score = (dmin, -fcount, -depth, -i)
+                cand.append((score, i, s, depth, fid))
+
+            if not cand:
+                break
+
+            cand.sort(reverse=True)
+            _score, i, s, depth, fid = cand[0]
+
+            # record UVs BEFORE deletion for cross-manifold spacing
+            _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+            before = total_Q()
+            q_site = int(charges.get(s, 0))
+
+            # delete the cation
+            symbols.pop(i)
+            pts = np.delete(pts, i, axis=0)
+            after = total_Q()
+
+            if verbose:
+                # approximate role just for log (based on incident count after deletion; harmless if off by 1)
+                m = len(_incident_facets(min(i, len(symbols)-1), pts, frames, surf_tol)) if len(symbols) else 1
+                role_name = ["unique","edge","vertex"][min(max(m,1)-1,2)]
+                print(f"polish: REMOVE {s}#{i} (CN=2, q=+{q_site}, {role_name}, depth={depth:.2f} Å, facet {fid})  "
+                      f"| Q:{before:+d}→{after:+d}")
+
+            progressed = True
+
+            # immediately rebalance toward Q→0 using the standard Q<0 branch
+            _drive_Q_negative()
+
+        return progressed
+
+    _polish_cn2_by_deletion_and_rebalance()
+
+    if total_Q() > 0:
+        # try to add one anion on a cation-rich facet; then anywhere
+        surf_Q_end2 = facet_surface_charge(symbols, pts, planes, charges, surf_tol)
+        allowed_final2 = {fid for fid, q in surf_Q_end2.items() if q > 0} or None
+        ok = _add_one_anion(allowed_final2) or _add_one_anion(None)
+        if verbose and not ok:
+            print("[final] add-one-anion failed: no placeable site.")
+    elif total_Q() < 0:
+        # if polish somehow ended negative, drive it back up with your Q<0 routine
+        _drive_Q_negative()
+    
+    Q = total_Q()
     if verbose:
         print(f"# Q after  = {Q:+d}")
     if Q != 0 and verbose:
