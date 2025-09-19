@@ -16,9 +16,32 @@ from .nc_types import Config, Facet
 from .facets import expand_facets, detect_facets_from_nc, halfspaces, scan_facets_from_cif
 from .geometry import build_nanocrystal, dedupe_points, build_core_shell_by_labeling
 from .io_utils import write_xyz, write_manifest, center_coords
-from .passivation import collect_anion_candidates, charge_balance
-from .analysis import facet_families_overview, facet_atom_report
+from .passivation import collect_anion_candidates
+from .passivation_iterative import charge_balance_iterative
+from .analysis import facet_families_overview as facet_families_overview, facet_atom_report as facet_atom_report
 from .cleanup import prune_low_coord_sites
+
+# --- Backward-compat: if analysis module lacks some helpers, define lightweight fallbacks ---
+try:
+    from .analysis import facet_families_overview as facet_families_overview  # re-export if present
+except Exception:
+    def facet_families_overview(symbols, pts, planes, facets, surf_tol, charges):
+        # Minimal fallback: print per-facet atom counts and surface charge
+        print("\n=== FACET FAMILIES OVERVIEW (fallback) ===")
+        for fid, (n, d) in enumerate(planes):
+            shell = (d - np.dot(pts, n)) < surf_tol
+            Q = int(sum(charges.get(symbols[i],0) for i in np.where(shell)[0]))
+            f = facets[fid]
+            label = f"({f.h}{f.k}{f.l})"
+            richness = "cation-rich" if Q>0 else ("anion-rich" if Q<0 else "neutral")
+            print(f"  {label:>8s}  #atoms={int(np.sum(shell)):3d}  Q={Q:+d}  {richness}")
+
+try:
+    from .analysis import facet_atom_report as facet_atom_report  # re-export if present
+except Exception:
+    def facet_atom_report(symbols, pts, planes, facets, surf_tol, charges):
+        print("\n=== FACET ATOM REPORT (fallback) ===")
+        print(" (enable full analysis.py for detailed per-atom table)")
 from .twinbound import apply_twins, refill_against_template, merge_close_points_species_aware
 
 
@@ -39,32 +62,6 @@ def recut_with_planes(syms, pts, planes, tol=1e-6):
     syms2 = [s for s, keep in zip(syms, mask) if keep]
     pts2  = pts[mask]
     return syms2, pts2
-
-def _swap_all_dicoord_sites(syms, pts, charges, anion_target, cation_target, verbose=False):
-    """
-    Unconditional pre-pass:
-      - CN == 2 anions -> anion_target (e.g., Cl, −1)
-      - CN == 2 cations -> cation_target (e.g., Rb, +1)
-    CN == 1 are already removed after Wulff construction.
-    CN > 2 are left as-is.
-    """
-    from .analysis import coord_numbers
-    cn = coord_numbers(syms, pts)
-    out = list(syms)
-    n_an = n_cat = 0
-    for i, (s, cni) in enumerate(zip(syms, cn)):
-        if int(round(cni)) != 2:
-            continue
-        q = charges.get(s, 0)
-        if q < 0:
-            out[i] = anion_target
-            n_an += 1
-        elif q > 0:
-            out[i] = cation_target
-            n_cat += 1
-    if verbose:
-        print(f"    [pre] CN=2 swaps → anion:{n_an}, cation:{n_cat}")
-    return out
 
 def main(argv: List[str] | None = None) -> int:
     p = build_parser()
@@ -224,15 +221,6 @@ def main(argv: List[str] | None = None) -> int:
         facet_families_overview(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
         facet_atom_report(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
 
-        # --- Unconditional pre-treatment of dicoordinated sites ---
-#        syms = _swap_all_dicoord_sites(
-#            syms, pts,
-#            charges=cfg.charges,
-#            anion_target=cfg.passivation.ligand,
-#            cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
-#            verbose=args.verbose,
-#        )
-
         # 5) Write snapshot before passivation if requested
         prefix = os.path.splitext(os.path.basename(args.out))[0]
         if args.write_all:
@@ -249,15 +237,16 @@ def main(argv: List[str] | None = None) -> int:
 
         if args.verbose:
             print("\n[10] Balancing charge stepwise (outer anions first; then add/remove ligands if needed)...")
-        syms, pts = charge_balance(
+        syms, pts = charge_balance_iterative(
             syms, pts,
             outer_cands, subl_cands,
             cfg.charges, anion_lig,
             verbose=args.verbose,
             planes=planes, facets=facets, surf_tol=cfg.passivation.surf_tol,
-            rng=random,
+            rng=random.Random(getattr(args, "seed", None)),   # or keep `random` if you prefer
+            cif_path=cfg.materials[0].cif,
             prefer_remove_parity=(args.parity == "remove"),
-            cation_ligand=cation_lig,          # NEW
+            positive_q_strategy=args.positive_q_mode,
         )
 
         # 7) Final write
@@ -503,15 +492,6 @@ def main(argv: List[str] | None = None) -> int:
     facet_families_overview(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
     facet_atom_report(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
 
-    # --- Unconditional pre-treatment of dicoordinated sites ---
-#    syms = _swap_all_dicoord_sites(
-#        syms, pts,
-#        charges=cfg.charges,
-#        anion_target=cfg.passivation.ligand,
-#        cation_target=getattr(cfg.passivation, "cation_ligand", "Rb"),
-#        verbose=args.verbose,
-#    )
-
     prefix = os.path.splitext(os.path.basename(args.out))[0]
     if args.write_all:
         if args.verbose:
@@ -526,17 +506,18 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.verbose:
         print("\n[10] Balancing charge stepwise (outer anions first; then add/remove ligands if needed)...")
-    syms, pts = charge_balance(
+    syms, pts = charge_balance_iterative(
         syms, pts,
         outer_cands, subl_cands,
         cfg.charges, anion_lig,
         verbose=args.verbose,
         planes=planes, facets=facets, surf_tol=cfg.passivation.surf_tol,
-        rng=random,
+        rng=random.Random(getattr(args, "seed", None)),
+        cif_path=args.cif,
         prefer_remove_parity=(args.parity == "remove"),
-        cation_ligand=cation_lig,          # NEW
+        positive_q_strategy=args.positive_q_mode,
     )
-    
+
 
     if args.verbose:
         print(f"\n[11] Writing final XYZ to {args.out}")

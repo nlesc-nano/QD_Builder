@@ -43,6 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
              "'add' overshoots to Q=+1 then adds one ligand."
     )
 
+    p.add_argument(
+        "--positive-q-mode",
+        choices=["remove", "add"],
+        default="remove",
+        help="Strategy for neutralizing Q > 0: "
+             "'remove' cations (default; cation-deficient surface). "
+             "'add' more anions (ligand-rich surface)."
+    )
+
     pre = p.add_argument_group("preprocessing")
     pre.add_argument(
         "--prune-min-cn", type=int, default=2,
