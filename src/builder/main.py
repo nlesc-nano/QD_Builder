@@ -44,6 +44,72 @@ except Exception:
         print(" (enable full analysis.py for detailed per-atom table)")
 from .twinbound import apply_twins, refill_against_template, merge_close_points_species_aware
 
+def _print_stack_summary(symbols, charges, materials_cfg, ligand_symbol: str):
+    """
+    Print per-layer counts for core/shell systems.
+    Uses the element sets derived from each material's CIF structure.
+    """
+    from collections import Counter
+
+    cnt = Counter(symbols)
+    Q_total = sum(charges.get(el, 0) * v for el, v in cnt.items())
+
+    print("\n### CORE–SHELL SUMMARY ###")
+
+    for layer_idx, m in enumerate(materials_cfg):
+        label = "CORE" if layer_idx == 0 else f"SHELL {layer_idx}"
+        # parse element set directly from the CIF
+        try:
+            struct = Structure.from_file(m.cif)
+            elems = sorted(set(str(s.specie.symbol) for s in struct.sites))
+        except Exception:
+            elems = []
+
+        print(f"\n{label}:")
+        for el in elems:
+            if el == ligand_symbol:
+                continue
+            n = cnt.get(el, 0)
+            print(f"  number of {el}: {n}")
+
+    # ligand placeholders (global)
+    n_ligand = cnt.get(ligand_symbol, 0)
+    if n_ligand:
+        print(f"\nLigand placeholders ({ligand_symbol}): {n_ligand}")
+
+    print(f"\nTotal Charge = {Q_total:+d}")
+
+
+def _print_single_material_summary(symbols, charges, ligand_symbol: str, title: str = None):
+    from collections import Counter
+    cnt = Counter(symbols)
+
+    # role-based tallies
+    n_cations = sum(v for el, v in cnt.items() if charges.get(el, 0) > 0)
+    n_anions  = sum(v for el, v in cnt.items() if charges.get(el, 0) < 0 and el != ligand_symbol)
+    n_ligand  = cnt.get(ligand_symbol, 0)
+
+    # total Q
+    Q = sum(charges.get(el, 0) * v for el, v in cnt.items())
+
+    if title:
+        print(f"\n### {title} ###")
+    # print cations first, then anions, then ligands
+    for el, q in charges.items():
+        if el == ligand_symbol:
+            continue
+        if cnt.get(el, 0) > 0 and q > 0:
+            print(f"number of {el}: {cnt[el]}")
+    for el, q in charges.items():
+        if el == ligand_symbol:
+            continue
+        if cnt.get(el, 0) > 0 and q < 0:
+            print(f"number of {el}: {cnt[el]}")
+    if n_ligand:
+        print(f"number of ligand placeholder {ligand_symbol}: {n_ligand}")
+    # also print per-element lines in a stable order
+    print(f"\nTotal Charge = {Q:+d}")
+
 
 def count_near_plane(pts, n_hat, c, w=0.02):
     t = pts @ n_hat
@@ -113,39 +179,88 @@ def main(argv: List[str] | None = None) -> int:
             print(f"  - Regions: {[m.name for m in cfg.materials]}")
             print(f"  - Proper rotations only: {bool(cfg.proper_only)}")
             print(f"  - Pair opposites: {bool(cfg.pair_opposites)}")
-        
-        # 1) Build geometry using shell-first carve + relabel (default path)
+    
         if args.radius is None:
             raise SystemExit("Please pass -r/--radius to set the full NC size in stack mode.")
-        
         if len(cfg.materials) < 2:
             raise SystemExit("Stack mode requires at least two materials (core first, then shell).")
-        
-        core  = cfg.materials[0]   # core.cif + core.aspect (inner shape)
-        shell = cfg.materials[1]   # shell.cif + shell.aspect (outer shape)
-        
-        syms, pts = build_core_shell_by_labeling(
-            core=core,
-            shell=shell,
-            shell_R=float(args.radius),
-            seeds=shell.seeds,
-            charges=cfg.charges,
-            surf_tol=cfg.passivation.surf_tol,
-            verbose=args.verbose,
-            shrink_to_core_lattice=args.core_lattice_fit,
-            strain_width=args.core_strain_width,
-            center_mode=args.core_center,
-            print_bond_stats=args.bond_stats,   # <—
-        )
-
+    
+        # === MINIMAL CHANGE: cut once on OUTERMOST shell, then relabel regions ===
+        # Build OUTERMOST cut
+        outer_cfg = cfg.materials[-1]
+        struct_outer = Structure.from_file(outer_cfg.cif)
+        facets_outer = expand_facets(struct_outer, outer_cfg.seeds, proper_only=cfg.proper_only)
+        syms, pts, _ = build_nanocrystal(struct_outer, facets_outer, float(args.radius), aspect=outer_cfg.aspect)
+        syms, pts = dedupe_points(syms, pts, tol=1e-3)
+        if args.verbose:
+            print(f"    - Outermost cut atoms: {len(syms)} (from {outer_cfg.name})")
+    
+        # Helper: inside test for planes
+        def _inside(points, planes, tol=1e-6):
+            if not planes:
+                return np.zeros(len(points), dtype=bool)
+            A = np.stack([n for (n, d) in planes], axis=0)
+            b = np.array([d for (n, d) in planes], float)
+            return (points @ A.T <= (b[None, :] + tol)).all(axis=1)
+    
+        # Helper: cation/anion for a material from charges and its CIF species
+        def _cat_an_el_for(material_cfg):
+            s = Structure.from_file(material_cfg.cif)
+            elems = sorted(set(str(site.specie.symbol) for site in s.sites))
+            cat = next((e for e in elems if cfg.charges.get(e, 0) > 0), None)
+            an  = next((e for e in elems if cfg.charges.get(e, 0) < 0), None)
+            if cat is None or an is None:
+                raise SystemExit(f"Cannot infer cation/anion for {material_cfg.name}. Check CIF and charges.")
+            return cat, an
+    
+        # Build planes per layer (each with its own aspect) but same radius
+        layer_planes = []
+        for m in cfg.materials:
+            sm = Structure.from_file(m.cif)
+            fm = expand_facets(sm, m.seeds, proper_only=cfg.proper_only)
+            layer_planes.append(halfspaces(sm, fm, R=float(args.radius), aspect=m.aspect))
+    
+        inside_layers = [_inside(pts, pl) for pl in layer_planes]
+    
+        # Region masks: core = inside[0]; shell_k = inside[k] & ~inside[k-1]
+        region_masks = []
+        for k in range(len(cfg.materials)):
+            if k == 0:
+                region_masks.append(inside_layers[0])
+            else:
+                region_masks.append(inside_layers[k] & (~inside_layers[k-1]))
+    
+        # Relabel symbols per region by charge sign into that layer's elements
+        for k, m in enumerate(cfg.materials):
+            mask = region_masks[k]
+            if args.verbose:
+                lab = "CORE" if k == 0 else f"SHELL {k}"
+                print(f"    - Region {lab}: {int(mask.sum())} atoms (aspect={m.aspect})")
+            if not mask.any():
+                continue
+            cat_el, an_el = _cat_an_el_for(m)
+            idxs = np.where(mask)[0]
+            for i in idxs:
+                el = syms[i]
+                q = cfg.charges.get(el, 0)
+                if q > 0:
+                    syms[i] = cat_el
+                elif q < 0 and el != getattr(cfg.passivation, 'ligand', None):
+                    syms[i] = an_el
+                # neutral / ligand placeholders left unchanged
+    
+        if args.verbose:
+            print(f"\n[4] Composite particle atoms: {len(syms)}")
+    
         # --- OPTIONAL TWIN BOUNDARIES (stack mode) ---
         if getattr(cfg, "twins", None):
             if args.verbose:
                 print("\n[3a] Applying twin boundary transformations (stack mode)...")
-        
-            shell_struct = Structure.from_file(shell.cif)
-        
-            # 1) Apply the mirrors on the composite coords
+            # Use OUTERMOST shell lattice for twins and recut
+            outer_shell = cfg.materials[-1]
+            shell_struct = Structure.from_file(outer_shell.cif)
+    
+            # (1) Apply mirrors
             pts = apply_twins(
                 pts,
                 shell_struct.lattice.matrix,
@@ -154,46 +269,51 @@ def main(argv: List[str] | None = None) -> int:
                 species=syms,
                 charges=cfg.charges,
             )
-        
-            # 2) Recut with OUTER (shell) Wulff planes
-            s_shell = shell_struct
-            facets_shell = expand_facets(s_shell, shell.seeds, proper_only=cfg.proper_only)
-            planes_outer = halfspaces(s_shell, facets_shell, R=float(args.radius), aspect=shell.aspect)
+    
+            # (2) Recut with OUTER (outermost shell) Wulff planes
+            facets_shell = expand_facets(shell_struct, outer_shell.seeds, proper_only=cfg.proper_only)
+            planes_outer = halfspaces(shell_struct, facets_shell, R=float(args.radius), aspect=outer_shell.aspect)
             syms, pts = recut_with_planes(syms, pts, planes_outer, tol=1e-3)
-        
+    
             if args.verbose:
                 print(f"    - After twins+recut: {len(syms)} atoms")
-         
- 
-        if args.verbose:
-            print(f"\n[4] Composite particle atoms: {len(syms)}")
-         
+    
         # --- Write core.xyz and shell.xyz (behind --write-all) ---
         if args.write_all:
-            # Reconstruct inner mask using core aspect at same R on the shell lattice
-            s_shell = Structure.from_file(shell.cif)
-            facets_shell = expand_facets(s_shell, shell.seeds, proper_only=cfg.proper_only)
-            planes_core = halfspaces(s_shell, facets_shell, R=float(args.radius), aspect=core.aspect)
-
-            # inside test: n·x ≤ d + tol for all planes
-            A = np.stack([n for (n, d) in planes_core], axis=0)   # [P,3]
-            b = np.array([d for (n, d) in planes_core], float)    # [P]
-            inner_mask = (pts @ A.T <= (b[None, :] + 1e-6)).all(axis=1)
-
-            core_syms  = [s for s, keep in zip(syms, inner_mask)  if keep]
-            core_pts   =  pts[inner_mask]
-            shell_syms = [s for s, keep in zip(syms, ~inner_mask) if keep]
-            shell_pts  =  pts[~inner_mask]
-
+            # Reconstruct inner masks progressively to write split files
+            masks: List[np.ndarray] = []
+    
+            # Build inner to outer region masks using each material's aspect
+            layer_planes = []
+            for m in cfg.materials:
+                sm = Structure.from_file(m.cif)
+                fm = expand_facets(sm, m.seeds, proper_only=cfg.proper_only)
+                layer_planes.append(halfspaces(sm, fm, R=float(args.radius), aspect=m.aspect))
+    
+            def inside(pl):
+                A = np.stack([n for (n, d) in pl], axis=0)
+                b = np.array([d for (n, d) in pl], float)
+                return (pts @ A.T <= (b[None, :] + 1e-6)).all(axis=1)
+    
+            inside_layers = [inside(pl) for pl in layer_planes]
+            # Region masks: CORE = inside(core); SHELL k = inside(layer k) & ~inside(layer k-1)
+            region_masks = []
+            for k in range(len(cfg.materials)):
+                if k == 0:
+                    region_masks.append(inside_layers[0])
+                else:
+                    region_masks.append(inside_layers[k] & (~inside_layers[k-1]))
+    
             prefix = os.path.splitext(os.path.basename(args.out))[0]
-            if args.verbose:
-                print(f"    - Writing {prefix}_core.xyz ({len(core_syms)} atoms)")
-                print(f"    - Writing {prefix}_shell.xyz ({len(shell_syms)} atoms)")
-
-            write_xyz(f"{prefix}_core.xyz",  core_syms,  center_coords(core_pts)  if args.center else core_pts)
-            write_xyz(f"{prefix}_shell.xyz", shell_syms, center_coords(shell_pts) if args.center else shell_pts)
-
-        # 2) Optional prune
+            for k, mask in enumerate(region_masks):
+                tag = "core" if k == 0 else f"shell{k}"
+                part_syms = [s for s, keep in zip(syms, mask) if keep]
+                part_pts  =  pts[mask]
+                if args.verbose:
+                    print(f"    - Writing {prefix}_{tag}.xyz ({len(part_syms)} atoms)")
+                write_xyz(f"{prefix}_{tag}.xyz", part_syms, center_coords(part_pts) if args.center else part_pts)
+    
+        # --- Optional prune ---
         if args.prune_mono:
             if args.verbose:
                 print("\n[4b] Pruning low-coordination atoms (pre-facet detection)...")
@@ -202,39 +322,38 @@ def main(argv: List[str] | None = None) -> int:
             )
             if args.verbose:
                 print(f"    - Pruned {n_removed} atoms in {n_pass} pass(es); remaining {len(syms)} atoms")
-
-        # 3) Detect facets on composite
+    
+        # --- Detect facets on composite ---
         if args.verbose:
             print("\n[5] Detecting actual exposed facets (composite)...")
-        # Need a lattice for normals; use the core lattice as reference (only for normals in detect function)
-        core_cif = cfg.materials[0].cif
+        # Use outermost shell lattice only for normal directions in detect()
+        core_cif = cfg.materials[-1].cif
         struct = Structure.from_file(core_cif)
-        # Expand core seeds once to give detect() a reasonable initial set (not critical)
-        seeds0 = expand_facets(struct, cfg.materials[0].seeds, proper_only=cfg.proper_only)
+        seeds0 = expand_facets(struct, cfg.materials[-1].seeds, proper_only=cfg.proper_only)
         facets, planes = detect_facets_from_nc(syms, pts, struct.lattice, cfg.charges, seeds0, cfg.passivation.surf_tol)
         if args.verbose:
             print(f"    - Detected {len(facets)} facets")
-
-        # 4) Reports
+    
+        # --- Surface/CN reports ---
         if args.verbose:
             print("\n[6] Surface atom and CN reports (composite):")
         facet_families_overview(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
         facet_atom_report(syms, pts, planes, facets, surf_tol=cfg.passivation.surf_tol, charges=cfg.charges)
-
-        # 5) Write snapshot before passivation if requested
+    
+        # --- Write snapshot before passivation if requested ---
         prefix = os.path.splitext(os.path.basename(args.out))[0]
         if args.write_all:
             if args.verbose:
                 print(f"\n[7] Writing initial cut XYZ to {prefix}_cut.xyz")
             write_xyz(f"{prefix}_cut.xyz", syms, center_coords(pts) if args.center else pts)
-
-        # 6) Gather outer-layer anion candidates and balance
+    
+        # --- Gather outer-layer anion candidates and balance ---
         if args.verbose:
             print("\n[8] Gathering outer-layer anion candidates (composite)...")
         outer_cands, subl_cands = collect_anion_candidates(
             syms, pts, planes, cfg.charges, anion_lig, cfg.passivation.surf_tol, verbose=args.verbose
         )
-
+    
         if args.verbose:
             print("\n[10] Balancing charge stepwise (outer anions first; then add/remove ligands if needed)...")
         syms, pts = charge_balance_iterative(
@@ -243,29 +362,28 @@ def main(argv: List[str] | None = None) -> int:
             cfg.charges, anion_lig,
             verbose=args.verbose,
             planes=planes, facets=facets, surf_tol=cfg.passivation.surf_tol,
-            rng=random.Random(getattr(args, "seed", None)),   # or keep `random` if you prefer
-            cif_path=cfg.materials[0].cif,
+            rng=random.Random(getattr(args, "seed", None)),
+            cif_path=cfg.materials[-1].cif,  # outermost shell calibrates bipartite ruler
             prefer_remove_parity=(args.parity == "remove"),
             positive_q_strategy=args.positive_q_mode,
         )
-
-        # 7) Final write
+    
+        # --- Final write ---
         if args.verbose:
             print(f"\n[11] Writing final XYZ to {args.out}")
         final_pts = center_coords(pts) if args.center else pts
         write_xyz(args.out, syms, final_pts)
-
+    
         if args.verbose:
             print(f"[12] Writing JSON manifest to {prefix}.json")
         write_manifest(prefix, syms, cfg.charges)
-
+    
         if args.verbose:
-            from collections import Counter
-            cnt = Counter(syms)
             print("\n### ELEMENT COUNTS ###")
-            for k in sorted(cnt):
-                print(f" {k}: {cnt[k]}")
+            _print_stack_summary(syms, cfg.charges, cfg.materials, anion_lig)
+    
         return 0
+    
 
     # ---------------- SINGLE-MATERIAL MODE (legacy) ----------------
     if args.verbose:
@@ -532,8 +650,9 @@ def main(argv: List[str] | None = None) -> int:
         from collections import Counter
         cnt = Counter(syms)
         print("\n### ELEMENT COUNTS ###")
-        for k in sorted(cnt):
-            print(f" {k}: {cnt[k]}")
+        _print_single_material_summary(syms, cfg.charges, anion_lig, title="ROLE COUNTS (single material)")
+#        for k in sorted(cnt):
+#            print(f" {k}: {cnt[k]}")
 
     return 0
 
