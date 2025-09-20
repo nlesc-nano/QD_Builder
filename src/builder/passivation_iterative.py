@@ -584,11 +584,41 @@ def charge_balance_iterative(
         if verbose:
             print(f"[strategy] Q>0 → positive_q_strategy='{positive_q_strategy}' (remove cations or add anions)")
         if positive_q_strategy == "remove":
+            # --- transactional remove with rollback if we overshoot below zero ---
+            _sym0, _pts0 = list(symbols), pts.copy()
+            _Q_before = _total_Q(symbols, charges)
             progressed, symbols, pts = _priority3_balance_positive_q_remove(
-                symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol, uv_taken, edit_count_facet, uv_cache, ligand, verbose=verbose
+                symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol,
+                uv_taken, edit_count_facet, uv_cache, ligand, verbose=verbose
             )
             if progressed:
-                continue
+                _Q_after = _total_Q(symbols, charges)
+                if _Q_after < 0:
+                    # Revert the last cation removal and finish by adding ligands to reach Q=0
+                    if verbose:
+                        print("[rollback] Removal would flip Q positive→negative. Reverting and adding ligands to hit Q=0…")
+                    symbols, pts = _sym0, _pts0
+                    q_lig = abs(int(charges.get(ligand, -1))) or 1
+                    need = (_Q_before + q_lig - 1) // q_lig
+                    _added_any = False
+                    for _ in range(int(need)):
+                        ok, symbols, pts = _priority3_balance_positive_q_add(
+                            symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
+                            uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, verbose=verbose
+                        )
+                        if not ok:
+                            break
+                        _added_any = True
+                        if _total_Q(symbols, charges) == 0:
+                            break
+                    if _total_Q(symbols, charges) == 0:
+                        # Achieved neutrality; continue outer loop
+                        continue
+                    # If we couldn't add enough ligands, fall through to parity finisher below
+                    if _added_any:
+                        continue
+                else:
+                    continue
             # parity finisher
             progressed, symbols, pts = _priority3_balance_positive_q_add(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
