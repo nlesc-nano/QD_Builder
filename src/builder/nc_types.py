@@ -17,8 +17,9 @@ Plane = Tuple[np.ndarray, float]
 # Global passivation spec
 @dataclass(frozen=True)
 class PassivationSpec:
-    ligand: str
-    surf_tol: float
+    ligand: str                 # anion ligand (legacy)
+    surf_tol: float = 1.0
+    cation_ligand: Optional[str] = None
 
 # Stack building specs
 @dataclass(frozen=True)
@@ -60,5 +61,7 @@ class Config:
     passivation: PassivationSpec
     charges: Dict[str,int]
     materials: List[MaterialSpec]
+    twins: Optional[List[Dict[str, Any]]] = None
+
 
 
