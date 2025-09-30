@@ -43,6 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
              "'add' overshoots to Q=+1 then adds one ligand."
     )
 
+    p.add_argument(
+        "--positive-q-mode",
+        choices=["remove", "add"],
+        default="remove",
+        help="Strategy for neutralizing Q > 0: "
+             "'remove' cations (default; cation-deficient surface). "
+             "'add' more anions (ligand-rich surface)."
+    )
+
     pre = p.add_argument_group("preprocessing")
     pre.add_argument(
         "--prune-min-cn", type=int, default=2,
@@ -212,19 +221,54 @@ def _parse_aspect(val) -> Tuple[float, float, float]:
     raise TypeError(f"Unsupported shape.aspect type: {type(val).__name__}")
 
 # -------------------- YAML → Config --------------------
-# -------------------- YAML → Config --------------------
+def _normalize_twins(raw):
+    """
+    Accept twins: [ {...}, {...} ]  or twins: {...}  or missing/None.
+    Return list[dict] or None.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [dict(x) for x in raw]
+    return [dict(raw)]
 
 def parse_yaml_config(path: str) -> Config:
     with open(path, "r") as fh:
         cfg = yaml.safe_load(fh) or {}
 
     # ---- Global passivation + charges ----
-    passiv = cfg.get("passivation", {}) or {}
-    if "ligand" not in passiv:
-        raise KeyError("YAML: need passivation.ligand (global)")
+    pass_cfg = cfg.get("passivation") or {}
+    lig_old = pass_cfg.get("ligand")           # legacy key
+    lig_new = pass_cfg.get("anion_ligand")     # new key
+    cat_new = pass_cfg.get("cation_ligand")    # optional new key
+    surf_tol = float(pass_cfg.get("surf_tol", 1.0))
+
+    # Back-compat shim: accept either 'ligand' or 'anion_ligand'
+    if not lig_old:
+        if lig_new:
+            pass_cfg["ligand"] = lig_new
+            cfg["passivation"] = pass_cfg
+            lig_old = lig_new
+        else:
+            raise KeyError("YAML: need passivation.ligand or passivation.anion_ligand")
+
+    # Charges are required
+    if "charges" not in cfg:
+        raise KeyError("YAML: need 'charges' (global)")
+    # keep them numeric but allow +2/-1 in YAML
+    charges: Dict[str, int] = {str(k): int(v) for k, v in cfg["charges"].items()}
+
+    # Ensure ligand charges exist (harmless if already provided)
+    if lig_old not in charges:
+        charges[lig_old] = -1
+    if cat_new and (cat_new not in charges):
+        charges[cat_new] = +1
+
+    # Build the passivation spec (see nc_types.PassivationSpec update below)
     passiv_spec = PassivationSpec(
-        ligand=str(passiv["ligand"]),
-        surf_tol=float(passiv.get("surf_tol", 1.0)),
+        ligand=str(lig_old),                # anion ligand (legacy field)
+        surf_tol=surf_tol,
+        cation_ligand=str(cat_new) if cat_new else None,
     )
 
     if "charges" not in cfg:
@@ -234,6 +278,9 @@ def parse_yaml_config(path: str) -> Config:
     # ---- Global options ----
     proper_only = bool(cfg.get("symmetry", {}).get("proper_rotations_only", True))
     pair_opposites = bool(cfg.get("facet_options", {}).get("pair_opposites", True))
+
+    # ---- twins (top-level) ----
+    twins = _normalize_twins(cfg.get("twins"))
 
     # ---- Helper: parse facets list/mapping → List[Facet] ----
     def _parse_facets(raw) -> List[Facet]:
@@ -326,6 +373,7 @@ def parse_yaml_config(path: str) -> Config:
             seeds=[], aspect=(1.0, 1.0, 1.0),
             proper_only=proper_only, pair_opposites=pair_opposites,
             passivation=passiv_spec, charges=charges, materials=mats,
+            twins=twins,
         )
 
     # ---- SINGLE MODE (legacy) ----
@@ -345,5 +393,6 @@ def parse_yaml_config(path: str) -> Config:
         seeds=seeds, aspect=aspect,
         proper_only=proper_only, pair_opposites=pair_opposites,
         passivation=passiv_spec, charges=charges, materials=[],
+        twins=twins,   # <-- NEW
     )
 
