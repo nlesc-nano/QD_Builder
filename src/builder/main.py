@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import sys
+import logging
 import random
 from typing import List
 import numpy as np 
@@ -20,6 +21,12 @@ from .passivation import collect_anion_candidates
 from .passivation_iterative import charge_balance_iterative
 from .analysis import facet_families_overview as facet_families_overview, facet_atom_report as facet_atom_report
 from .cleanup import prune_low_coord_sites
+
+# A custom logging handler that forces a flush after every message.
+class FlushingStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
 # --- Backward-compat: if analysis module lacks some helpers, define lightweight fallbacks ---
 try:
@@ -130,6 +137,37 @@ def recut_with_planes(syms, pts, planes, tol=1e-6):
     return syms2, pts2
 
 def main(argv: List[str] | None = None) -> int:
+    # --- Unbuffered logging to stdout/stderr when requested ---
+    if os.environ.get("QD_BUILDER_UNBUFFERED"):
+        handler = FlushingStreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        if root_logger.hasHandlers():
+            root_logger.handlers.clear()
+        root_logger.addHandler(handler)
+    
+        # Proper stream wrappers that look like text files
+        import io
+    
+        class _LoggerWriter(io.TextIOBase):
+            def __init__(self, log_fn):
+                self._log_fn = log_fn
+            def write(self, s):
+                # splitlines keeps partial lines small; drop empty chunks
+                for part in s.splitlines():
+                    part = part.rstrip("\n")
+                    if part:
+                        self._log_fn(part)
+                return len(s)
+            def flush(self):
+                # must accept `self`
+                pass
+    
+        sys.stdout = _LoggerWriter(root_logger.info)
+        sys.stderr = _LoggerWriter(root_logger.warning)
+    
+    # ------------------------------------
     p = build_parser()
     args = p.parse_args(argv)
     random.seed(args.seed)
