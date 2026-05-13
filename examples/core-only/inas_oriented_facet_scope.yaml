@@ -1,0 +1,50 @@
+size_unit_cells: [2, 2, 2]
+
+facets:
+  # Family-scoped facets keep the default behavior: all symmetry-equivalent
+  # facets inherit the same gamma.
+  - hkl: "100"
+    scope: family
+    termination: cation_rich
+    gamma: 1.0
+  - hkl: "-1-1-1"
+    scope: family
+    termination: anion_rich
+    gamma: 1.0
+
+  # Facet-scoped facets are exact oriented-facet energies. All symmetry-
+  # equivalent orientations of this set must be listed explicitly.
+  - hkl: "111"
+    scope: facet
+    termination: cation_rich
+    gamma: 1.00
+  - hkl: "1-1-1"
+    scope: facet
+    termination: cation_rich
+    gamma: 1.15
+  - hkl: "-11-1"
+    scope: facet
+    termination: cation_rich
+    gamma: 0.90
+  - hkl: "-1-11"
+    scope: facet
+    termination: cation_rich
+    gamma: 1.05
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+
+charges:
+  In: +3
+  As: -3
+  Cl: -1
+
+symmetry:
+  proper_rotations_only: true
+
+construction_origin:
+  center_on_species: In
+
+experimental:
+  exhausted_positive_q_fallback: true

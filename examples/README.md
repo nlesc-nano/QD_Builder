@@ -13,6 +13,14 @@ python -m builder examples/cifs/InAs.cif examples/core-only/inas_wulff_size_cell
   -o examples/out/inas.xyz --verbose --positive-q-mode add
 ```
 
+Build an InAs Wulff particle where one symmetry-equivalent `{111}` cation-rich
+set is assigned explicit oriented-facet energies:
+
+```bash
+python -m builder examples/cifs/InAs.cif examples/core-only/inas_oriented_facet_scope.yaml \
+  -o examples/out/inas_oriented.xyz --verbose --positive-q-mode add
+```
+
 ## Core-Only Spherical Cut
 
 Build Pb4S3Br2 with an isotropic spherical outer shape instead of explicit

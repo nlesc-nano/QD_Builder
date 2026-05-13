@@ -896,6 +896,9 @@ def _resolve_facet_terminations_for_structure(
 ) -> list[Facet]:
     resolved: list[Facet] = []
     for f in seeds:
+        if getattr(f, "scope", "family") == "facet":
+            resolved.append(f)
+            continue
         term = getattr(f, "termination", None)
         if not term:
             resolved.append(f)

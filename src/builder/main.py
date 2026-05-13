@@ -458,6 +458,9 @@ def _surface_charge_for_signed_hkl(struct: Structure, hkl, charges) -> int:
 def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) -> List[Facet]:
     resolved: List[Facet] = []
     for f in seeds:
+        if getattr(f, "scope", "family") == "facet":
+            resolved.append(f)
+            continue
         term = getattr(f, "termination", None)
         if not term:
             resolved.append(f)
