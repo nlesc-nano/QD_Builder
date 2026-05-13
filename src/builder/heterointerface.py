@@ -918,7 +918,7 @@ def _resolve_facet_terminations_for_structure(
             ))
             scored.append((cand, q))
         chosen, _q = max(scored, key=lambda rec: rec[1]) if term == "cation_rich" else min(scored, key=lambda rec: rec[1])
-        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term))
+        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=getattr(f, "scope", "family")))
     return resolved
 
 

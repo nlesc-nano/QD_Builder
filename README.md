@@ -67,10 +67,16 @@ Single-material `size_unit_cells` is top-level:
 ```yaml
 size_unit_cells: [2, 2, 2]
 facets:
-  - family: "100"
+  - hkl: "100"
+    scope: family
     termination: cation_rich
     gamma: 1.0
 ```
+
+`scope: family` is the default and expands the given `hkl` to all
+symmetry-equivalent oriented facets. Use `scope: facet` only when assigning
+orientation-specific energies; in that case all symmetry-equivalent oriented
+facets must be listed explicitly.
 
 For core-shell, define size per layer:
 

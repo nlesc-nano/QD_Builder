@@ -12,6 +12,7 @@ class Facet:
     l: int
     gamma: float
     termination: Optional[str] = None
+    scope: str = "family"
 
 Plane = Tuple[np.ndarray, float]
 

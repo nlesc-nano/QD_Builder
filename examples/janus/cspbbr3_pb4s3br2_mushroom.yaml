@@ -30,8 +30,8 @@ candidates:
   # charge-compatible polar candidate.
   top: 1
   match: neutral-neutral
-  core_family: "100"
-  shell_family: "110"
+  core_hkl: "100"
+  shell_hkl: "110"
 
 build:
   mode: wulff_janus
@@ -45,7 +45,7 @@ build:
   core:
     size_unit_cells: [3, 3, 5]
     facets:
-      - family: "100"
+      - hkl: "100"
         gamma: 1.0
 
   shell:

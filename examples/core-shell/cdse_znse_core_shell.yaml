@@ -3,13 +3,13 @@ materials:
     cif: examples/cifs/CdSe_zb.cif
     size_unit_cells: [1.5, 1.5, 1.5]
     facets:
-      - family: "100"
+      - hkl: "100"
         termination: cation_rich
         gamma: 1.0
-      - family: "111"
+      - hkl: "111"
         termination: cation_rich
         gamma: 1.0
-      - family: "-1-1-1"
+      - hkl: "-1-1-1"
         termination: anion_rich
         gamma: 1.0
 
@@ -17,13 +17,13 @@ materials:
     cif: examples/cifs/ZnSe_zb.cif
     size_unit_cells: [1, 1, 1]
     facets:
-      - family: "100"
+      - hkl: "100"
         termination: cation_rich
         gamma: 1.0
-      - family: "111"
+      - hkl: "111"
         termination: cation_rich
         gamma: 1.0
-      - family: "-1-1-1"
+      - hkl: "-1-1-1"
         termination: anion_rich
         gamma: 1.0
 

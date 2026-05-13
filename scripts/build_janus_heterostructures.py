@@ -99,11 +99,16 @@ def _parse_facets(raw) -> list[Facet]:
     for item in raw:
         if not isinstance(item, dict):
             raise SystemExit("facet entries must be mappings")
-        hkl = _parse_hkl(item.get("hkl", item.get("family")))
+        if "family" in item:
+            raise SystemExit("Use hkl with scope: family instead of family")
+        hkl = _parse_hkl(item.get("hkl"))
         term = item.get("termination")
         if term is not None:
             term = str(term).strip().lower()
-        out.append(Facet(hkl[0], hkl[1], hkl[2], float(item.get("gamma", 1.0)), termination=term))
+        scope = str(item.get("scope", "family")).strip().lower()
+        if scope not in {"family", "facet"}:
+            raise SystemExit("facet scope must be 'family' or 'facet'")
+        out.append(Facet(hkl[0], hkl[1], hkl[2], float(item.get("gamma", 1.0)), termination=term, scope=scope))
     return out
 
 

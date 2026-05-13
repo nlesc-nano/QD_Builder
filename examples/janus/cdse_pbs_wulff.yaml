@@ -35,24 +35,24 @@ build:
   core:
     size_unit_cells: 2
     facets:
-      - family: "100"
+      - hkl: "100"
         gamma: 1.0
-      - family: "111"
+      - hkl: "111"
         termination: cation_rich
         gamma: 1.0
-      - family: "-1-1-1"
+      - hkl: "-1-1-1"
         termination: anion_rich
         gamma: 1.0
 
   shell:
     size_unit_cells: 2
     facets:
-      - family: "100"
+      - hkl: "100"
         gamma: 1.0
-      - family: "111"
+      - hkl: "111"
         termination: cation_rich
         gamma: 1.0
-      - family: "-1-1-1"
+      - hkl: "-1-1-1"
         termination: anion_rich
         gamma: 1.0
 

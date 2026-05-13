@@ -28,6 +28,9 @@ def expand_facets(s: Structure, seeds: list[Facet], proper_only: bool = True) ->
     out: dict[tuple[int,int,int], Facet] = {}
 
     for f in seeds:
+        scope = getattr(f, "scope", "family")
+        if scope == "facet":
+            continue
         n0 = unit_normal(s, (f.h, f.k, f.l))  # use your existing helper
         for op in ops:
             R = op.rotation_matrix
@@ -43,7 +46,34 @@ def expand_facets(s: Structure, seeds: list[Facet], proper_only: bool = True) ->
             g = math.gcd(math.gcd(abs(hkl[0]), abs(hkl[1])), abs(hkl[2]))
             hkl = (hkl[0] // g, hkl[1] // g, hkl[2] // g)
             # keep first gamma encountered for each signed hkl (or take the max/min—your choice)
-            out.setdefault(hkl, Facet(h=hkl[0], k=hkl[1], l=hkl[2], gamma=f.gamma))
+            out.setdefault(hkl, Facet(h=hkl[0], k=hkl[1], l=hkl[2], gamma=f.gamma, termination=f.termination, scope="family"))
+
+    explicit = [f for f in seeds if getattr(f, "scope", "family") == "facet"]
+    if explicit:
+        explicit_keys = {(f.h, f.k, f.l) for f in explicit}
+        required: set[tuple[int, int, int]] = set()
+        for f in explicit:
+            n0 = unit_normal(s, (f.h, f.k, f.l))
+            for op in ops:
+                R = op.rotation_matrix
+                if proper_only and np.linalg.det(R) < 0.999:
+                    continue
+                n = R @ n0
+                coeff = np.linalg.solve(recT, n)
+                hkl = tuple(int(round(c)) for c in coeff)
+                if hkl == (0, 0, 0):
+                    continue
+                g = math.gcd(math.gcd(abs(hkl[0]), abs(hkl[1])), abs(hkl[2]))
+                required.add((hkl[0] // g, hkl[1] // g, hkl[2] // g))
+        missing = sorted(required - explicit_keys)
+        if missing:
+            missing_s = ", ".join(f"({h}{k}{l})" for h, k, l in missing)
+            raise ValueError(
+                "scope: facet requires all symmetry-equivalent oriented facets to be defined. "
+                f"Missing: {missing_s}"
+            )
+        for f in explicit:
+            out[(f.h, f.k, f.l)] = Facet(f.h, f.k, f.l, f.gamma, termination=f.termination, scope="facet")
 
     return list(out.values())
 
