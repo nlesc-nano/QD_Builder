@@ -78,6 +78,9 @@ symmetry-equivalent oriented facets. Use `scope: facet` only when assigning
 orientation-specific energies; in that case all symmetry-equivalent oriented
 facets must be listed explicitly.
 
+See `examples/core-only/inas_oriented_facet_scope.yaml` for a full
+orientation-specific facet-energy example.
+
 For core-shell, define size per layer:
 
 ```yaml
