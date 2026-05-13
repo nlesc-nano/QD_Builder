@@ -475,7 +475,7 @@ def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) 
             chosen, _q = min(scored, key=lambda rec: rec[1])
         else:
             chosen = (f.h, f.k, f.l)
-        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term))
+        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=getattr(f, "scope", "family")))
     return resolved
 
 

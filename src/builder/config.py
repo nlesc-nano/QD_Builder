@@ -355,14 +355,13 @@ def parse_yaml_config(path: str) -> Config:
             for it in raw:
                 if isinstance(it, dict) and "hkl" in it and "gamma" in it:
                     items.append(it)
-                elif isinstance(it, dict) and "family" in it and "gamma" in it:
-                    items.append(it)
+                elif isinstance(it, dict) and "family" in it:
+                    raise ValueError("Use hkl with scope: family instead of family")
                 elif isinstance(it, (list, tuple)) and len(it) == 2:
                     items.append({"hkl": it[0], "gamma": it[1]})
                 else:
                     raise TypeError(
                         "facets/seeds list items must be dicts with keys {hkl,gamma}, "
-                        "{family,gamma}, "
                         "or 2-tuples [hkl, gamma]"
                     )
         else:
@@ -370,10 +369,17 @@ def parse_yaml_config(path: str) -> Config:
 
         g_by: Dict[tuple[int, int, int], float] = {}
         term_by: Dict[tuple[int, int, int], str | None] = {}
+        scope_by: Dict[tuple[int, int, int], str] = {}
         for f in items:
-            hkl_raw = f.get("hkl", f.get("family"))
+            if "family" in f:
+                raise ValueError("Use hkl with scope: family instead of family")
+            hkl_raw = f.get("hkl")
             h, k, l = _parse_hkl(hkl_raw)
             g_by[(h, k, l)] = float(f["gamma"])
+            scope = str(f.get("scope", "family")).strip().lower()
+            if scope not in {"family", "facet"}:
+                raise ValueError("facet scope must be 'family' or 'facet'")
+            scope_by[(h, k, l)] = scope
             term = f.get("termination")
             if term is not None:
                 term_s = str(term).strip().lower()
@@ -385,15 +391,18 @@ def parse_yaml_config(path: str) -> Config:
 
         if pair_opposites:
             for (h, k, l), g in list(g_by.items()):
+                if scope_by.get((h, k, l)) == "facet":
+                    continue
                 if term_by.get((h, k, l)) is not None:
                     continue
                 opp = (-h, -k, -l)
                 if opp not in g_by:
                     g_by[opp] = g
                     term_by[opp] = None
+                    scope_by[opp] = scope_by.get((h, k, l), "family")
 
         return [
-            Facet(h=h, k=k, l=l, gamma=g, termination=term_by.get((h, k, l)))
+            Facet(h=h, k=k, l=l, gamma=g, termination=term_by.get((h, k, l)), scope=scope_by.get((h, k, l), "family"))
             for (h, k, l), g in sorted(g_by.items())
         ]
 

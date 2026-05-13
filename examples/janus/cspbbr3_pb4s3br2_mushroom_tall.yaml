@@ -28,8 +28,8 @@ candidates:
   # Same interface as the mushroom example, with a taller perovskite core.
   top: 1
   match: neutral-neutral
-  core_family: "100"
-  shell_family: "110"
+  core_hkl: "100"
+  shell_hkl: "110"
 
 build:
   mode: wulff_janus
@@ -43,14 +43,14 @@ build:
   core:
     size_unit_cells: [2, 2, 3]
     facets:
-      - family: "100"
+      - hkl: "100"
         gamma: 1.0
-      - family: "110"
+      - hkl: "110"
         gamma: 1.0
-      - family: "111"
+      - hkl: "111"
         termination: cation_rich
         gamma: 1.0
-      - family: "-1-1-1"
+      - hkl: "-1-1-1"
         termination: anion_rich
         gamma: 1.0
 
