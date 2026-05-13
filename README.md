@@ -1,122 +1,100 @@
 # QD_Builder
 
-**Quantum Dot Builder** — Build and passivate zinc-blende nanocrystal models from CIF files using Wulff construction, facet-specific energies, and a coordination-aware ligand passivation workflow.
+QD_Builder builds and passivates quantum-dot models from CIF files. The main
+builder supports faceted Wulff cuts, spherical cuts, core-shell particles, and
+coordination-aware ligand passivation. The experimental Janus workflow builds
+heterointerfaces by scanning facet terminations and matching 2D interface
+lattices.
 
-Originally inspired by *NanoCrystal: A Web‑Based Crystallographic Tool for the Construction of Nanoparticles Based on Their Crystal Habit* ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/30351055/)), QD_Builder expands upon these concepts by integrating:
-
-- **Signed Miller indices**: separate energies for both polarities (e.g. `111` vs `‑1-1-1`).
-- **Coordination-aware ligand passivation**: swaps under-coordinated surface anions with ligands (e.g., Cl) in a facet-aware, balanced, and iterative fashion.
-- **Charge balance enforcement** via stepwise swaps, selective removals/additions, and parity-aware logic.
-- **Reporting tools**: per-atom/facet CN breakdowns, role classification (unique, edge, vertex), and outer vs sublayer distinction.
-
----
-
-##  Installation
-
-### Using Conda environment (recommended)
+## Install
 
 ```bash
-git clone git@github.com:nlesc-nano/QD_Builder.git
-cd QD_Builder
 conda env create -f environment.yml
 conda activate nc-builder
-```
-
-This sets up all dependencies, then installs QD_Builder in editable mode.
-
----
-
-### Using pip
-
-If you're in any Python environment:
-
-```bash
-git clone git@github.com:nlesc-nano/QD_Builder.git
-cd QD_Builder
 pip install -e .
 ```
 
-This installs the `nc-builder` command in your PATH, pointing to your local development copy.
-
----
-
-Alternatively, install directly from GitHub without cloning:
+or, in an existing Python environment:
 
 ```bash
-pip install git+ssh://git@github.com/nlesc-nano/QD_Builder.git
+pip install -e .
 ```
 
----
+## Main Builder
 
-##  Quick Usage Example
-
-Once installed, run:
+Core-only, size defined in YAML:
 
 ```bash
-nc-builder structure.cif config.yaml -r 24 -o final.xyz --verbose --center --write-all
+python -m builder examples/cifs/InAs.cif examples/core-only/inas_wulff_size_cells.yaml \
+  -o examples/out/inas.xyz --verbose --positive-q-mode add
 ```
 
-Key flags:
+Core-only spherical cut:
 
-| Flag           | Purpose                                          |
-|----------------|--------------------------------------------------|
-| `-r, --radius` | Wulff construction radius in Å                   |
-| `--center`     | Center output coordinates (origin at geometric center) |
-| `--write-all`  | Save intermediate files like `_cut.xyz`          |
-| `--verbose`    | Enable detailed logging of each step             |
-| `--parity {remove,add}` | Strategy for odd-charge resolution (`add` by default) |
-| `--no-prune-mono` | Skip the CN<2 cleanup step if desired         |
+```bash
+python -m builder examples/cifs/Pb4S3Br2_DFT.cif examples/core-only/pb4s3br2_sphere.yaml \
+  -o examples/out/pb4s3br2_sphere.xyz --verbose --positive-q-mode add
+```
 
----
+Core-shell:
 
-##  Example YAML Config
+```bash
+python -m builder examples/cifs/CdSe_zb.cif examples/core-shell/cdse_znse_core_shell.yaml \
+  -o examples/out/cdse_znse.xyz --verbose --positive-q-mode add
+```
+
+For core-shell mode, the positional CIF is ignored; material CIFs come from
+`materials[].cif` in the YAML.
+
+## Janus Heterostructures
+
+The Janus workflow is experimental and lives in a separate script:
+
+```bash
+python scripts/build_janus_heterostructures.py examples/janus/cdse_pbs_wulff.yaml
+```
+
+Example with a faceted CsPbBr3 side and spherical Pb4S3Br2 cap:
+
+```bash
+python scripts/build_janus_heterostructures.py examples/janus/cspbbr3_pb4s3br2_mushroom.yaml
+```
+
+## YAML Notes
+
+Single-material `size_unit_cells` is top-level:
 
 ```yaml
+size_unit_cells: [2, 2, 2]
 facets:
-  - hkl: 100
+  - family: "100"
+    termination: cation_rich
     gamma: 1.0
-  - hkl: 111
-    gamma: 0.8
-  - hkl: "-1-1-1"
-    gamma: 1.0
-
-passivation:
-  ligand: Cl
-  surf_tol: 2.0
-
-charges:
-  Cd:  +3
-  Se:  -3
-  Cl:  -1
 ```
 
-You can define facet energies separately for polar facets. Signed hkl values are supported in various formats: `111`, `-100`, `1-10`, `(1 1 1)`, `[-1,0,0]`, etc.
+For core-shell, define size per layer:
 
----
+```yaml
+materials:
+  - name: core
+    cif: examples/cifs/CdSe_zb.cif
+    size_unit_cells: [1.5, 1.5, 1.5]
+    facets: [...]
+  - name: shell
+    cif: examples/cifs/ZnSe_zb.cif
+    size_unit_cells: [1, 1, 1]
+    facets: [...]
+```
 
-##  How It Works
+Spherical cuts do not need `facets`:
 
-1. **NanoCrystal-style Wulff cut**: Builds the nanocrystal shape using input CIF and facet weights.
-2. **Pruning**: Removes dangling monocoordinated atoms (CN < 2) to clean artifacts.
-3. **Facet detection & reporting**: Identifies actual exposed facets and classifies surface atoms by CN, layer (outer vs sublayer), and role.
-4. **Layer-aware anion passivation**:
-   - Swaps under-coordinated anions for ligands (e.g., Se → Cl).
-   - Conducted facet-wise with distance spacing (farthest-point sampling), role prioritization, and charge balance logic.
-5. **Charge neutrality enforcement**: Uses a parity strategy (`add` or `remove`) to correct odd mismatches.
-6. **Fallbacks**: If balancing fails via swaps, the tool can remove previously placed ligands or add new ones at cation sites.
-7. **Output**: Final XYZ → `final.xyz`, plus optional logs, cut models, and manifests.
+```yaml
+shape:
+  mode: sphere
+  sphere_planes: 192
+```
 
----
+## More Examples
 
-##  Citation / Inspiration
-
-- Based on the **NanoCrystal** web tool (ACS JCIM 2018) ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/30351055/)), which used Wulff constructions to generate equilibrium-shaped nanocrystals.
-- Extends this with coordination-aware chemistry, ligand passivation, and in-depth surface analysis.
-
-If you use QD_Builder in your research, please cite this repository and the NanoCrystal paper.
-
----
-
-##  License
-
-Released under the **MIT License**. See the `LICENSE` file for full terms.
+See [examples/README.md](examples/README.md) for maintained example inputs and
+commands.

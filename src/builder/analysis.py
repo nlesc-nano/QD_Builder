@@ -140,6 +140,36 @@ def derive_pair_cuts_from_cif(
 
     return PairCuts(rc=rc)
 
+
+def merge_pair_cuts_from_cifs(
+    cif_paths: Iterable[str],
+    charges: Dict[str, int],
+    *,
+    safety: float = 1.00,
+) -> Optional[PairCuts]:
+    """
+    Build one coordination cutoff table from several material CIFs.
+
+    Single-material charge balancing calibrates from the same CIF used to build
+    the cluster.  Core/shell particles contain element pairs from multiple CIFs,
+    so stack mode needs the union of those per-material calibrations.
+    """
+    merged: Dict[Tuple[str, str], float] = {}
+    any_cut = False
+    for cif_path in cif_paths:
+        cuts = derive_pair_cuts_from_cif(cif_path, charges, safety=safety)
+        if cuts is None:
+            continue
+        any_cut = True
+        for key, value in cuts.rc.items():
+            if key in merged:
+                merged[key] = max(merged[key], value)
+            else:
+                merged[key] = value
+    if not any_cut:
+        return None
+    return PairCuts(rc=merged)
+
 def pretty_print_pair_cuts(cuts: Optional[PairCuts], pairs_hint: Optional[List[Tuple[str,str]]] = None):
     """One-line dump of key pair cutoffs (calibrated vs covalent fallback)."""
     if cuts is None:

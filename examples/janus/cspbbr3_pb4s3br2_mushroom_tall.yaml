@@ -1,0 +1,73 @@
+materials:
+  core:
+    name: CsPbBr3
+    cif: ../cifs/CsPbBr3.cif
+  shell:
+    name: Pb4S3Br2
+    cif: ../cifs/Pb4S3Br2_DFT.cif
+
+charges:
+  Cs: +1
+  Pb: +2
+  Br: -1
+  S: -2
+  Cl: -1
+
+scan:
+  max_index: 1
+  layer_tol: 0.08
+
+matching:
+  method: zsl
+  max_area: 600
+  max_length_tol: 0.08
+  max_angle_tol: 0.05
+  max_area_ratio_tol: 0.09
+
+candidates:
+  # Same interface as the mushroom example, with a taller perovskite core.
+  top: 1
+  match: neutral-neutral
+  core_family: "100"
+  shell_family: "110"
+
+build:
+  mode: wulff_janus
+  interface_distance: 2.8
+  min_separation: 1.2
+  match_core_footprint: true
+  footprint_margin: 1.0
+  footprint_shape: mushroom
+  mushroom_overhang: 6.0
+
+  core:
+    size_unit_cells: [2, 2, 3]
+    facets:
+      - family: "100"
+        gamma: 1.0
+      - family: "110"
+        gamma: 1.0
+      - family: "111"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "-1-1-1"
+        termination: anion_rich
+        gamma: 1.0
+
+  shell:
+    size_unit_cells: [2, 2, 3]
+    shape:
+      mode: sphere
+      sphere_planes: 192
+
+passivation:
+  enabled: true
+  ligand: Cl
+  surf_tol: 2.0
+  positive_q_mode: add
+  positive_q_mode_core: remove
+  positive_q_mode_shell: add
+
+output:
+  out_dir: janus_cspbbr3_pb4s3br2_mushroom_tall
+  prefix: cspbbr3_pb4s3br2
