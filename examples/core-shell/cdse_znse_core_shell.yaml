@@ -1,0 +1,47 @@
+materials:
+  - name: core
+    cif: examples/cifs/CdSe_zb.cif
+    size_unit_cells: [1.5, 1.5, 1.5]
+    facets:
+      - family: "100"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "111"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "-1-1-1"
+        termination: anion_rich
+        gamma: 1.0
+
+  - name: shell
+    cif: examples/cifs/ZnSe_zb.cif
+    size_unit_cells: [1, 1, 1]
+    facets:
+      - family: "100"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "111"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "-1-1-1"
+        termination: anion_rich
+        gamma: 1.0
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+
+charges:
+  Cd: +2
+  Zn: +2
+  Se: -2
+  Cl: -1
+
+symmetry:
+  proper_rotations_only: true
+
+construction_origin:
+  center_on_species: Se
+
+experimental:
+  exhausted_positive_q_fallback: true

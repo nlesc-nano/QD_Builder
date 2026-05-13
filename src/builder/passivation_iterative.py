@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import random
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Tuple, Optional
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial import cKDTree
 
-from .nc_types import Plane, Facet
+from .nc_types import Plane
 from .analysis import (
     PairCuts,
     derive_pair_cuts_from_cif,
@@ -15,6 +15,7 @@ from .analysis import (
     bulk_cn_opposite_by_interior,
 )
 from .analysis import _pair_cut as pc
+from .analysis import _pair_cut_calibrated
 from .passivation import (
     prepass_surface_cleanup,
     collect_anion_candidates,
@@ -25,14 +26,11 @@ from .passivation import (
     _facet_memberships,
     _collect_cation_sites,
 )
+from .io_utils import write_xyz, center_coords
 
 # Role ranks: 0=unique, 1=edge, 2=vertex
 ROLE_ORDER_VEU = ["unique", "edge", "vertex"]
 UVCache = Dict[Tuple[int, int], Tuple[float, float]]  # (facet_id, atom_idx) -> (u,v)
-
-# Global calibrated pair-cuts (set once in controller)
-_PAIR_CUTS_GLOBAL: Optional[PairCuts] = None
-
 
 def _total_Q(symbols: List[str], charges: Dict[str, int]) -> int:
     return int(sum(int(charges.get(s, 0)) for s in symbols))
@@ -50,6 +48,77 @@ def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64]) -> List[int
         if np.linalg.norm(pts[j] - xi) <= rc + 1e-12:
             out.append(j)
     return out
+
+
+def _ligand_protected_cation_mask(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    charges: Dict[str, int],
+    ligand: str,
+    pair_cuts: Optional[PairCuts],
+) -> NDArray[np.bool_]:
+    protected = np.zeros(len(symbols), dtype=bool)
+    lig_idx = [i for i, s in enumerate(symbols) if s == ligand]
+    cat_idx = [i for i, s in enumerate(symbols) if charges.get(s, 0) > 0]
+    if not lig_idx or not cat_idx:
+        return protected
+
+    max_rc = max(_pair_cut_calibrated(symbols[i], ligand, pair_cuts) for i in cat_idx)
+    lig_tree = cKDTree(pts[lig_idx])
+    for i in cat_idx:
+        hits = lig_tree.query_ball_point(pts[i], r=max_rc + 1e-6)
+        if not hits:
+            continue
+        rc = _pair_cut_calibrated(symbols[i], ligand, pair_cuts)
+        xi = pts[i]
+        for h in hits:
+            if np.linalg.norm(pts[lig_idx[h]] - xi) <= rc + 1e-6:
+                protected[i] = True
+                break
+    return protected
+
+
+def _prune_orphan_ligands(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    charges: Dict[str, int],
+    ligand: str,
+    pair_cuts: Optional[PairCuts],
+    *,
+    verbose: bool = True,
+) -> Tuple[List[str], NDArray[np.float64], int]:
+    lig_idx = [i for i, s in enumerate(symbols) if s == ligand]
+    cat_idx = [i for i, s in enumerate(symbols) if charges.get(s, 0) > 0]
+    if not lig_idx or not cat_idx:
+        orphan_idx = lig_idx
+    else:
+        max_rc = max(_pair_cut_calibrated(ligand, symbols[i], pair_cuts) for i in cat_idx)
+        cat_tree = cKDTree(pts[cat_idx])
+        orphan_idx = []
+        for i in lig_idx:
+            hits = cat_tree.query_ball_point(pts[i], r=max_rc + 1e-6)
+            has_host = False
+            xi = pts[i]
+            for h in hits:
+                j = cat_idx[h]
+                rc = _pair_cut_calibrated(ligand, symbols[j], pair_cuts)
+                if np.linalg.norm(pts[j] - xi) <= rc + 1e-6:
+                    has_host = True
+                    break
+            if not has_host:
+                orphan_idx.append(i)
+    if not orphan_idx:
+        return symbols, pts, 0
+
+    keep = np.ones(len(symbols), dtype=bool)
+    keep[orphan_idx] = False
+    before = _total_Q(symbols, charges)
+    symbols = [s for s, k in zip(symbols, keep) if k]
+    pts = pts[keep]
+    after = _total_Q(symbols, charges)
+    if verbose:
+        print(f"prune orphan {ligand}: removed {len(orphan_idx)} unbound ligand(s) | Q:{before:+d}→{after:+d}")
+    return symbols, pts, len(orphan_idx)
 
 
 def _get_uv(frames: List[Plane], fid: int, idx: int, pts: NDArray[np.float64], cache: UVCache) -> Tuple[float, float]:
@@ -116,6 +185,7 @@ def _priority2_remove_low_cn_cation_once(
     edit_count_facet: Dict[int, int],
     uv_cache: UVCache,
     ligand: str,
+    pair_cuts: Optional[PairCuts],
     *, verbose: bool = True
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     cands: List[Tuple[int, float, float, int, int]] = []  # (role_rank, -dmin, depth, fid, idx)
@@ -151,12 +221,15 @@ def _priority2_remove_low_cn_cation_once(
     _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
     removed_elem = symbols.pop(i)
     pts = np.delete(pts, i, axis=0)
+    symbols, pts, _ = _prune_orphan_ligands(
+        symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+    )
     after = _total_Q(symbols, charges)
     if verbose:
         print(f"   ↳ Q:{before:+d}→{after:+d} (removed {removed_elem})")
 
     # stabilization: convert native anions (not ligand) that dropped to CN<3 → ligand
-    cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
+    cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
     native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
     for j, sj in enumerate(list(symbols)):
         if charges.get(sj, 0) >= 0:
@@ -185,9 +258,10 @@ def _collect_anion_candidates_flat(
     charges: Dict[str, int],
     ligand: str,
     surf_tol: float,
+    pair_cuts: Optional[PairCuts],
 ) -> List[dict]:
     outer, subl = collect_anion_candidates(
-        symbols, pts, planes, charges, ligand, surf_tol, verbose=False, pair_cuts=_PAIR_CUTS_GLOBAL
+        symbols, pts, planes, charges, ligand, surf_tol, verbose=False, pair_cuts=pair_cuts
     )
     return list(outer) if len(outer) > 0 else list(outer) + list(subl)
 
@@ -205,10 +279,11 @@ def _priority3_balance_negative_q(
     uv_taken: Dict[int, List[Tuple[float, float]]],
     edit_count_facet: Dict[int, int],
     uv_cache: UVCache,
+    pair_cuts: Optional[PairCuts],
     *, verbose: bool = True,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     cand = _collect_anion_candidates_flat(
-        symbols, pts, planes_raw, charges, ligand, surf_tol
+        symbols, pts, planes_raw, charges, ligand, surf_tol, pair_cuts
     )
     if not cand:
         return False, symbols, pts
@@ -273,14 +348,22 @@ def _priority3_balance_positive_q_remove(
     edit_count_facet: Dict[int, int],
     uv_cache: UVCache,
     ligand: str,
+    pair_cuts: Optional[PairCuts],
+    positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
     *, verbose: bool = True
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     outer_thr = 0.35 * surf_tol
-    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
+    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts)
 
     cands_by_cn: Dict[int, List[Tuple[int, float, float, int, int, int]]] = {}
+    protected = _ligand_protected_cation_mask(symbols, pts, charges, ligand, pair_cuts)
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
+            continue
+        if positive_q_strategy_selector is not None:
+            if positive_q_strategy_selector(i, s, pts[i]) != "remove":
+                continue
+        if protected[i]:
             continue
         inc = _incident_facets(i, pts, frames, surf_tol)
         if not inc:
@@ -325,12 +408,15 @@ def _priority3_balance_positive_q_remove(
         _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
         removed_elem = symbols.pop(i)
         pts = np.delete(pts, i, axis=0)
+        symbols, pts, _ = _prune_orphan_ligands(
+            symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+        )
         after = _total_Q(symbols, charges)
         if verbose:
             print(f"   ↳ Q:{before:+d}→{after:+d} (removed {removed_elem})")
 
         # Post-stabilization: native anions (not ligand) that dropped to CN<3 → ligand
-        cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
+        cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
         native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
         for j, sj in enumerate(list(symbols)):
             if charges.get(sj, 0) >= 0:
@@ -369,13 +455,23 @@ def _priority3_balance_positive_q_add(
     add_count_facet: Dict[int, int],
     host_taken: Dict[int, int],
     uv_cache: UVCache,
-    *, verbose: bool = True
+    pair_cuts: Optional[PairCuts],
+    positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
+    *, verbose: bool = True,
+    include_sublayer: bool = False,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
-    # gather candidates (outer-only)
+    # gather candidates; include_sublayer=True expands search to sublayer atoms
     sites = _collect_cation_sites(
-        symbols, pts, planes_raw, charges, surf_tol, pair_cuts=_PAIR_CUTS_GLOBAL,
-        outer_only=True, allow_shared=True, include_sublayer=False
+        symbols, pts, planes_raw, charges, surf_tol, pair_cuts=pair_cuts,
+        outer_only=not include_sublayer, allow_shared=True,
+        include_sublayer=include_sublayer,
+        cn_bi=cn_bi,
     )
+    if positive_q_strategy_selector is not None:
+        sites = [
+            rec for rec in sites
+            if positive_q_strategy_selector(rec[0], symbols[rec[0]], pts[rec[0]]) == "add"
+        ]
     total_sites = len(sites)
     if verbose:
         d1 = sum(1 for rec in sites if rec[3] == 1)
@@ -434,15 +530,12 @@ def _priority3_balance_positive_q_add(
 
             _, (i, n_out, depth_min, dft, role_rank, fid) = candidate_best
 
-            # Validate deficit using robust bipartite bulk target
-            bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
-            cn_before_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
-            cn_before = int(cn_before_arr[i])
-            tgt = int(bulk_map.get(symbols[i], cn_before))
-            deficit_chk = max(0, tgt - cn_before)
+            # Validate deficit from the current loop's CN and candidate record.
+            cn_before = int(cn_bi[i])
+            deficit_chk = int(dft)
             if deficit_chk <= 0:
                 if verbose:
-                    print(f"[debug:add] veto: deficit_chk={deficit_chk} (cn_before={cn_before}, tgt={tgt}) for host {symbols[i]}#{i}")
+                    print(f"[debug:add] veto: deficit_chk={deficit_chk} (cn_before={cn_before}) for host {symbols[i]}#{i}")
                 continue  # try next candidate
 
             # place ligand along outward vector
@@ -470,13 +563,14 @@ def _priority3_balance_positive_q_add(
             add_count_facet[fid] = add_count_facet.get(fid, 0) + 1
             host_taken[i] = host_taken.get(i, 0) + 1
 
-            cn_after_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
+            cn_after_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
             cn_after = int(cn_after_arr[i])
             role_name = ROLE_ORDER_VEU[role_rank]
+            shell_label = "sublayer" if depth_min >= 0.35 * surf_tol else "outer"
             if verbose:
                 print(
                     f"add ligand {ligand} to {host_elem}#{i} "
-                    f"(CN_before={cn_before}, CN_after={cn_after}, role={role_name}, facet={fid}, shell=outer, deficit={deficit_chk}) "
+                    f"(CN_before={cn_before}, CN_after={cn_after}, role={role_name}, facet={fid}, shell={shell_label}, deficit={deficit_chk}) "
                     f"at +{offset:.2f} Å | Q:{before:+d}→{after:+d}"
                 )
             return True, symbols, pts  # single successful action
@@ -485,28 +579,160 @@ def _priority3_balance_positive_q_add(
     return False, symbols, pts
 
 
+def _experimental_exhausted_positive_q_fallback_once(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    frames: List[Plane],
+    planes_raw: List[Plane],
+    cn_bi: NDArray[np.int_],
+    charges: Dict[str, int],
+    ligand: str,
+    surf_tol: float,
+    pair_cuts: Optional[PairCuts],
+    *,
+    verbose: bool = True,
+) -> Tuple[bool, List[str], NDArray[np.float64]]:
+    """
+    Last-resort experimental Q>0 move. It is intentionally separate from the
+    normal priority stack and should only be called after existing remove/add
+    candidates are exhausted.
+    """
+    q_before = _total_Q(symbols, charges)
+    positive_charges = sorted({int(v) for v in charges.values() if int(v) > 0})
+    max_cation_q = max(positive_charges) if positive_charges else 1
+    if q_before > max_cation_q:
+        if verbose:
+            print(
+                "[experimental] skip fallback: residual positive charge is too large "
+                f"for a single cation/orphan-ligand cleanup (Q={q_before:+d})."
+            )
+        return False, symbols, pts
+
+    def simulate_remove(idx: int):
+        trial_symbols = list(symbols)
+        trial_pts = pts.copy()
+        removed = trial_symbols.pop(idx)
+        trial_pts = np.delete(trial_pts, idx, axis=0)
+        trial_symbols, trial_pts, n_orphan = _prune_orphan_ligands(
+            trial_symbols, trial_pts, charges, ligand, pair_cuts, verbose=False
+        )
+        native_anions = {el for el, val in charges.items() if val < 0 and el != ligand}
+        cn_after = coord_numbers_bipartite(trial_symbols, trial_pts, charges, pair_cuts=pair_cuts)
+        swapped = 0
+        swapped_logs: List[Tuple[int, str, int]] = []
+        for j, sj in enumerate(list(trial_symbols)):
+            if sj not in native_anions:
+                continue
+            cnj = int(cn_after[j])
+            if cnj >= 3:
+                continue
+            old = trial_symbols[j]
+            trial_symbols[j] = ligand
+            swapped += 1
+            swapped_logs.append((j, old, cnj))
+        return removed, trial_symbols, trial_pts, n_orphan, swapped, swapped_logs
+
+    cands = []
+    for i, s in enumerate(symbols):
+        if charges.get(s, 0) <= 0:
+            continue
+        inc = _incident_facets(i, pts, frames, surf_tol)
+        if not inc:
+            continue
+        ci = int(cn_bi[i])
+        if ci not in (3, 4):
+            continue
+        depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
+        _fid, depth = min(depths, key=lambda t: t[1])
+        inc_count = len(inc)
+        role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)
+        removed, trial_symbols, trial_pts, n_orphan, swapped, swapped_logs = simulate_remove(i)
+        after = _total_Q(trial_symbols, charges)
+        if after < 0:
+            continue
+        if abs(after) >= abs(q_before):
+            continue
+        cands.append((
+            after,
+            abs(after),
+            -n_orphan,
+            ci,
+            -role_rank,
+            depth,
+            i,
+            removed,
+            trial_symbols,
+            trial_pts,
+            n_orphan,
+            swapped,
+            swapped_logs,
+        ))
+
+    if not cands:
+        return False, symbols, pts
+
+    before = q_before
+    cands.sort(key=lambda t: (t[1], t[0], t[3], t[4], t[5], t[6]))
+    (
+        after,
+        _abs_after,
+        _neg_n_orphan,
+        cn_removed,
+        _neg_role,
+        depth,
+        idx,
+        removed,
+        trial_symbols,
+        trial_pts,
+        n_orphan,
+        swapped,
+        swapped_logs,
+    ) = cands[0]
+    if verbose:
+        print(
+            "[experimental] Existing Q>0 balancing exhausted; "
+            f"remove surface {removed}#{idx} (CN={cn_removed}, depth={depth:.2f} Å), "
+            f"then remove {n_orphan} orphan {ligand} ligand(s)."
+        )
+
+    for j, old, cnj in swapped_logs:
+        if verbose:
+            print(f"[experimental] stabilize: swap {old}#{j} (CN={cnj}) → {ligand}")
+
+    if verbose:
+        print(
+            "[experimental] fallback move complete "
+            f"| Q:{before:+d}→{after:+d}, orphan_ligands_removed={n_orphan}, "
+            f"native_anions_swapped={swapped}"
+        )
+    return True, trial_symbols, trial_pts
+
+
 # ---------- MASTER CONTROLLER ----------
 def charge_balance_iterative(
     symbols: List[str],
     pts: NDArray[np.float64],
-    outer_candidates: List[dict],
-    sublayer_candidates: List[dict],
     charges: Dict[str, int],
     ligand: str,
     verbose: bool,
     planes: List[Plane],
-    facets: List[Facet],
     surf_tol: float,
-    rng: random.Random,
     cif_path: str,
     *,
     positive_q_strategy: str = "remove",
-    prefer_remove_parity: bool = False,
+    write_all: bool = False,
+    prefix: str = "nc",
+    include_sublayer: bool = False,
+    experimental_exhausted_positive_q_fallback: bool = False,
+    pair_cuts_override: Optional[PairCuts] = None,
+    positive_q_strategy_by_z: Optional[Tuple[float, str, str]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
-    global _PAIR_CUTS_GLOBAL
-
     # Calibrate pair cuts from CIF once (robust bipartite ruler everywhere)
-    _PAIR_CUTS_GLOBAL = derive_pair_cuts_from_cif(cif_path, charges, safety=1.00)
+    pair_cuts = (
+        pair_cuts_override
+        if pair_cuts_override is not None
+        else derive_pair_cuts_from_cif(cif_path, charges, safety=1.00)
+    )
     if verbose:
         # print a few key pairs if possible
         elems = sorted(set(symbols))
@@ -519,20 +745,54 @@ def charge_balance_iterative(
                         break
             if len(hints) >= 4:
                 break
-        pretty_print_pair_cuts(_PAIR_CUTS_GLOBAL, pairs_hint=hints)
+        pretty_print_pair_cuts(pair_cuts, pairs_hint=hints)
+    # SAVE 1: Before Pre-Pass
+    if write_all:
+        write_xyz(f"{prefix}_01_before_prepass.xyz", symbols, center_coords(pts))
 
     # Prepass cleanup (prints its own actions)
     symbols, pts, uv_taken, edit_count_facet = prepass_surface_cleanup(
-        symbols, pts, planes, charges, ligand, surf_tol, pair_cuts=_PAIR_CUTS_GLOBAL, verbose=verbose
+        symbols, pts, planes, charges, ligand, surf_tol, pair_cuts=pair_cuts, verbose=verbose
     )
+    symbols, pts, _ = _prune_orphan_ligands(
+        symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+    )
+    if write_all:
+        write_xyz(f"{prefix}_02_after_prepass.xyz", symbols, center_coords(pts))
+
     add_count_facet: Dict[int, int] = defaultdict(int)
     host_taken: Dict[int, int] = {}
+    positive_q_strategy_selector = None
+    if positive_q_strategy_by_z is not None:
+        z_cut, core_strategy, shell_strategy = positive_q_strategy_by_z
+        core_strategy = str(core_strategy).strip().lower()
+        shell_strategy = str(shell_strategy).strip().lower()
+        valid = {"remove", "add", "skip", "none"}
+        if core_strategy not in valid or shell_strategy not in valid:
+            raise ValueError("positive_q_strategy_by_z strategies must be remove, add, skip, or none")
+
+        def _selector(_idx: int, _sym: str, xyz: NDArray[np.float64]) -> Optional[str]:
+            mode = core_strategy if float(xyz[2]) <= float(z_cut) else shell_strategy
+            return None if mode in {"skip", "none"} else mode
+
+        positive_q_strategy_selector = _selector
+
+    has_saved_stabilized = False
+
+    def _finish(
+        symbols: List[str],
+        pts: NDArray[np.float64],
+    ) -> Tuple[List[str], NDArray[np.float64]]:
+        symbols, pts, _ = _prune_orphan_ligands(
+            symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+        )
+        return symbols, pts
 
     while True:
         # Shared per-iteration state (with robust bipartite CN)
         frames = _build_facet_frames(planes)
         mem = _facet_memberships(pts, planes, surf_tol)
-        cn_bi = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=_PAIR_CUTS_GLOBAL)
+        cn_bi = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
         uv_cache: UVCache = {}
 
         Q = _total_Q(symbols, charges)
@@ -548,39 +808,92 @@ def charge_balance_iterative(
 
         # Priority 2
         progressed, symbols, pts = _priority2_remove_low_cn_cation_once(
-            symbols, pts, frames, mem, cn_bi, charges, surf_tol, uv_taken, edit_count_facet, uv_cache, ligand, verbose=verbose
+            symbols, pts, frames, mem, cn_bi, charges, surf_tol, uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose
         )
         if progressed:
             continue
 
+        # ---> SAVE 3: Structurally Stabilized, Before Electrical Balancing <---
+        if write_all and not has_saved_stabilized:
+            write_xyz(f"{prefix}_03_stabilized_pre_Q.xyz", symbols, center_coords(pts))
+            has_saved_stabilized = True
+
         # Electrical
         Q = _total_Q(symbols, charges)
         if Q == 0:
+            symbols, pts, n_orphan = _prune_orphan_ligands(
+                symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+            )
+            if n_orphan:
+                continue
             if verbose:
                 print("[done] Structural + electrical stability reached (Q=0, no CN≤2 on surface).")
-            return symbols, pts
+            return _finish(symbols, pts)
 
         if Q < 0:
             if verbose:
                 print("[strategy] Q<0 → swap stable anions (CN=3→4→5), V→E→U + FPS")
             progressed, symbols, pts = _priority3_balance_negative_q(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol, uv_taken, edit_count_facet, uv_cache,
-                verbose=verbose
+                pair_cuts, verbose=verbose
             )
             if progressed:
                 continue
-            # fallback: add anions on cation sites
-            progressed, symbols, pts = _priority3_balance_positive_q_add(
-                symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
-                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, verbose=verbose
-            )
-            if progressed:
-                continue
+            # Fallback additions are only valid if the ligand charge moves Q
+            # toward zero. For the common anion-ligand case, adding ligand
+            # under Q<0 would make the structure more negative.
+            if charges.get(ligand, 0) > 0:
+                progressed, symbols, pts = _priority3_balance_positive_q_add(
+                    symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
+                    uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
+                    include_sublayer=include_sublayer,
+                )
+                if progressed:
+                    continue
             if verbose:
                 print("[halt] Q<0 but no valid swaps/additions remain. Consider revising facet energies or inputs.")
-            return symbols, pts
+            return _finish(symbols, pts)
 
         # Q > 0
+        if positive_q_strategy_selector is not None:
+            if verbose:
+                print("[strategy] Q>0 → region-aware positive_q_strategy (core/shell by interface z)")
+            progressed, symbols, pts = _priority3_balance_positive_q_remove(
+                symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol,
+                uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts,
+                positive_q_strategy_selector=positive_q_strategy_selector,
+                verbose=verbose,
+            )
+            if progressed:
+                continue
+            progressed, symbols, pts = _priority3_balance_positive_q_add(
+                symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
+                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts,
+                positive_q_strategy_selector=positive_q_strategy_selector,
+                verbose=verbose,
+                include_sublayer=include_sublayer,
+            )
+            if progressed:
+                continue
+            if experimental_exhausted_positive_q_fallback:
+                progressed, symbols, pts = _experimental_exhausted_positive_q_fallback_once(
+                    symbols,
+                    pts,
+                    frames,
+                    planes,
+                    cn_bi,
+                    charges,
+                    ligand,
+                    surf_tol,
+                    pair_cuts,
+                    verbose=verbose,
+                )
+                if progressed:
+                    continue
+            if verbose:
+                print("[halt] Q>0 and no region-allowed remove/add candidates remain.")
+            return _finish(symbols, pts)
+
         if verbose:
             print(f"[strategy] Q>0 → positive_q_strategy='{positive_q_strategy}' (remove cations or add anions)")
         if positive_q_strategy == "remove":
@@ -589,7 +902,7 @@ def charge_balance_iterative(
             _Q_before = _total_Q(symbols, charges)
             progressed, symbols, pts = _priority3_balance_positive_q_remove(
                 symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol,
-                uv_taken, edit_count_facet, uv_cache, ligand, verbose=verbose
+                uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose
             )
             if progressed:
                 _Q_after = _total_Q(symbols, charges)
@@ -604,7 +917,8 @@ def charge_balance_iterative(
                     for _ in range(int(need)):
                         ok, symbols, pts = _priority3_balance_positive_q_add(
                             symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
-                            uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, verbose=verbose
+                            uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
+                            include_sublayer=include_sublayer,
                         )
                         if not ok:
                             break
@@ -614,29 +928,61 @@ def charge_balance_iterative(
                     if _total_Q(symbols, charges) == 0:
                         # Achieved neutrality; continue outer loop
                         continue
-                    # If we couldn't add enough ligands, fall through to parity finisher below
+                    # If we couldn't add enough ligands, try one final add move below.
                     if _added_any:
                         continue
                 else:
                     continue
-            # parity finisher
+            # Final add-ligand fallback.
             progressed, symbols, pts = _priority3_balance_positive_q_add(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
-                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, verbose=verbose
+                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
+                include_sublayer=include_sublayer,
             )
             if progressed:
                 continue
+            if experimental_exhausted_positive_q_fallback:
+                progressed, symbols, pts = _experimental_exhausted_positive_q_fallback_once(
+                    symbols,
+                    pts,
+                    frames,
+                    planes,
+                    cn_bi,
+                    charges,
+                    ligand,
+                    surf_tol,
+                    pair_cuts,
+                    verbose=verbose,
+                )
+                if progressed:
+                    continue
             if verbose:
                 print("[halt] Q>0 but no removable cations/additions available. Consider revising facet energies.")
-            return symbols, pts
+            return _finish(symbols, pts)
         else:
             # positive_q_strategy == "add"
             progressed, symbols, pts = _priority3_balance_positive_q_add(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
-                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, verbose=verbose
+                uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
+                include_sublayer=include_sublayer,
             )
             if progressed:
                 continue
+            if experimental_exhausted_positive_q_fallback:
+                progressed, symbols, pts = _experimental_exhausted_positive_q_fallback_once(
+                    symbols,
+                    pts,
+                    frames,
+                    planes,
+                    cn_bi,
+                    charges,
+                    ligand,
+                    surf_tol,
+                    pair_cuts,
+                    verbose=verbose,
+                )
+                if progressed:
+                    continue
             if verbose:
                 print("[halt] Q>0 and cannot add more ligands — likely surface fully saturated.")
-            return symbols, pts
+            return _finish(symbols, pts)

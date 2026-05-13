@@ -72,21 +72,6 @@ def _unit_normals(planes):
     L[L == 0] = 1.0
     return N / L
 
-def nearest_plane_and_distance(R: np.ndarray, planes):
-    """
-    For each point x, return (idx, d_perp) of the nearest plane boundary
-    of polyhedron { n·x ≤ d }. d_perp ≥ 0 inside.
-    """
-    A = np.stack([n for (n, d) in planes], axis=0)   # [P,3]
-    b = np.array([d for (n, d) in planes], float)    # [P]
-    norms = np.linalg.norm(A, axis=1); norms[norms == 0] = 1.0
-    slack = b[None, :] - R @ A.T                    # ≥0 inside
-    d_perp = slack / norms[None, :]                 # [N,P]
-    idx = np.argmin(d_perp, axis=1)
-    dmin = d_perp[np.arange(len(R)), idx]
-    return idx, dmin
-
-
 def cell_columns(A: Array) -> Array:
     A = np.asarray(A, float)
     if A.shape != (3, 3):
@@ -108,136 +93,6 @@ def interplanar_spacing(A_cols: Array, hkl: Iterable[int]) -> float:
     hkl = np.asarray(hkl, float).ravel()
     n_unnorm = np.linalg.solve(np.asarray(A_cols).T, hkl)
     return 1.0 / np.linalg.norm(n_unnorm)
-
-def _mirror_transform(n_hat: Array, p0: Array):
-    n_hat = np.asarray(n_hat, float) / np.linalg.norm(n_hat)
-    p0    = np.asarray(p0, float)
-    def M(X: Array) -> Array:
-        X = np.asarray(X, float)
-        # vectorized reflection across plane (n_hat, p0)
-        return X - 2.0 * np.outer((X - p0) @ n_hat, n_hat)
-    return M
-
-def _point_in_halfspaces(pts: Array, H: Array, h: Array, tol: float = 1e-6) -> Array:
-    # H x <= h  (row-wise); returns boolean mask for pts inside polyhedron
-    return (H @ pts.T <= (h + tol)).all(axis=0)
-
-def _inside_intervals(tvals: Array, intervals: List[Tuple[float, float]]) -> Array:
-    mask = np.zeros_like(tvals, dtype=bool)
-    for lo, hi in intervals:
-        a, b = (lo, hi) if lo <= hi else (hi, lo)
-        mask |= (tvals >= a) & (tvals <= b)
-    return mask
-
-def _make_twin_transform(
-    A_cols: Array,
-    n_hat: Array,
-    plane_point: Array,
-    shift_layers: float,
-    d_hkl: float,
-    parallel_shift_fractional: Array
-):
-    """
-    T(X) = mirror_{(n_hat, plane_point)}(X) + (shift_layers * d_hkl * n_hat) + A_cols @ parallel_shift_fractional
-    """
-    A = np.asarray(A_cols, float)
-    M = _mirror_transform(n_hat, plane_point)
-    s_perp = float(shift_layers) * float(d_hkl) * n_hat
-    s_par  = (A @ np.asarray(parallel_shift_fractional, float).reshape(3, 1)).reshape(3,)
-    def T(X: Array) -> Array:
-        return M(X) + s_par + s_perp
-    return T
-
-def refill_by_twin_template(
-    *,
-    # geometry / lattice
-    A_cols: Array,
-    hkl: Iterable[int],
-    plane_point: Array,                        # point on the mirror plane (e.g., midplane)
-    intervals_angstrom: List[Tuple[float,float]],
-    parallel_shift_fractional: Array,         # [fu,fv,fw] w.r.t. a,b,c
-    shift_layers: float,                      # multiples of d_(hkl)
-    # NC data
-    parent_pos: Array,                        # current NC positions BEFORE twin ops? (see call below)
-    parent_species: List[str],
-    # polytope for the *original* Wulff (size/shape)
-    halfspaces_H: Array,
-    halfspaces_h: Array,
-    # controls
-    refill_min_separation: float = 1.2,
-    refill_dedup_tolerance: float = 3.0,
-    # optional species swap within the slab
-    swap_sublattice: Dict[str, str] | None = None,
-) -> Tuple[Array, List[str]]:
-    """
-    Generate the ideal *twin-slab* occupancy as a template by transforming the
-    parent lattice via the configured twin (mirror + shifts), then add only the
-    missing atoms up to the *original* Wulff boundary.
-
-    Returns (new_positions, new_species) to append.
-    """
-    parent_pos  = np.asarray(parent_pos, float)
-    parent_spec = np.asarray(parent_species, object)
-
-    n_hat = plane_normal_from_hkl(A_cols, hkl)
-    d_hkl = interplanar_spacing(A_cols, hkl)
-    T     = _make_twin_transform(A_cols, n_hat, np.asarray(plane_point, float),
-                                 shift_layers, d_hkl, parallel_shift_fractional)
-
-    # 1) Build the twin template by transforming the *parent* lattice
-    templ_pos = T(parent_pos)
-    templ_spec = parent_spec.copy()
-
-    # 2) Keep only points that lie inside the requested slab intervals (in *twin* coordinates)
-    tvals = (templ_pos - plane_point) @ n_hat
-    slab_mask = _inside_intervals(tvals, intervals_angstrom)
-    templ_pos  = templ_pos[slab_mask]
-    templ_spec = templ_spec[slab_mask]
-
-    # 3) Clip to the original Wulff polyhedron (size/shape defined by original lattice)
-    if halfspaces_H is not None and halfspaces_h is not None:
-        in_poly = _point_in_halfspaces(templ_pos, halfspaces_H, halfspaces_h, tol=1e-6)
-        templ_pos  = templ_pos[in_poly]
-        templ_spec = templ_spec[in_poly]
-
-    # 4) Species swap rule inside the slab (Cd<->Se etc.), if requested
-    if swap_sublattice:
-        swap = {str(k): str(v) for k, v in swap_sublattice.items()}
-        templ_spec = np.array([swap.get(s, s) for s in templ_spec], dtype=object)
-
-    # 5) Deduplicate vs the *current NC atoms after twin ops so far*.
-    #    NOTE: the caller should pass "current_nc_pos" to this filter, not "parent_pos".
-    #    If that's not possible in your call site, change 'existing_pos' below.
-    existing_pos = parent_pos  # UPDATE to 'current_nc_pos' at call site (see section 2)
-
-    tree_exist = cKDTree(existing_pos)
-    dmin, _    = tree_exist.query(templ_pos, k=1, distance_upper_bound=refill_dedup_tolerance)
-    add_mask   = np.isinf(dmin)  # only positions not already present (within dedup_tol)
-
-    cand_pos  = templ_pos[add_mask]
-    cand_spec = templ_spec[add_mask].tolist()
-
-    if len(cand_pos) == 0:
-        return np.zeros((0, 3)), []
-
-    # 6) Enforce min separation vs existing AND among candidates (greedy)
-    acc_pos: list[Array] = []
-    acc_spec: list[str]  = []
-    for p, s in zip(cand_pos, cand_spec):
-        # check vs existing
-        if tree_exist.query(p, distance_upper_bound=refill_min_separation)[0] != np.inf:
-            continue
-        # check vs accepted
-        if acc_pos:
-            if cKDTree(np.array(acc_pos)).query(p, distance_upper_bound=refill_min_separation)[0] != np.inf:
-                continue
-        acc_pos.append(p)
-        acc_spec.append(s)
-
-    if not acc_pos:
-        return np.zeros((0, 3)), []
-
-    return np.array(acc_pos), acc_spec
 
 def reflect_about_plane(R: Array, n_hat: Array, c: float) -> Array:
     """
@@ -315,108 +170,6 @@ def merge_close_points_species_aware(
     sorted_idx = np.sort(idx)
     return [syms[i] for i in sorted_idx], pts[sorted_idx]
 
-
-def _planes_arrays(planes):
-    """planes -> (A, b, norms). planes is [(n,d)] with n not necessarily unit length."""
-    A = np.stack([n for (n, d) in planes], axis=0)   # [P,3]
-    b = np.array([d for (n, d) in planes], float)    # [P]
-    norms = np.linalg.norm(A, axis=1)                # [P]
-    norms[norms == 0] = 1.0
-    return A, b, norms
-
-def min_distance_to_poly_planes(R: np.ndarray, planes, positive_inside: bool = True) -> np.ndarray:
-    """
-    For NC defined by n·x ≤ d, returns per-point *perpendicular* distance
-    to the nearest plane boundary (>=0 inside). If normals aren't unit,
-    we normalize by ||n||.
-    """
-    A, b, norms = _planes_arrays(planes)
-    # slack = d - n·x  (>=0 inside), divide by ||n||
-    slack = b[None, :] - R @ A.T
-    d_perp = slack / norms[None, :]
-    dmin = d_perp.min(axis=1)
-    return dmin if positive_inside else -dmin
-
-# twinbound.py
-
-# ... (keep all other functions as they are) ...
-
-def refill_from_original_template(
-    cur_syms: list,
-    cur_pts: np.ndarray,
-    tpl_syms: list,
-    tpl_pts: np.ndarray,
-    planes, # These are the planes of the ORIGINAL Wulff shape
-    n_hat: np.ndarray,
-    origin: np.ndarray,
-    intervals_A: List[Tuple[float, float]],
-    min_sep_tol: float = 1.0,
-    pad_A: float = 1e-3,
-) -> Tuple[list, np.ndarray]:
-    """
-    Refills voids created by a twin glide using a fully twinned template, but
-    constrains the new atoms to lie within the original Wulff shape boundary.
-    """
-    if tpl_pts.size == 0 or cur_pts.size == 0:
-        return cur_syms, cur_pts
-
-    print(f"[refill] Starting boundary-aware refill against twinned template.")
-
-    # 1. Use a KDTree to find which points from the twinned template are missing
-    #    from the current (sheared) nanocrystal.
-    kdtree = KDTree(cur_pts)
-    dist, _ = kdtree.query(tpl_pts, k=1)
-    missing_mask = (dist > min_sep_tol)
-
-    if not np.any(missing_mask):
-        print("[refill] No missing template sites detected. Nothing to add.")
-        return cur_syms, cur_pts
-
-    candidate_pts = tpl_pts[missing_mask]
-    candidate_syms = [s for s, m in zip(tpl_syms, missing_mask) if m]
-    print(f"[refill] Found {len(candidate_pts)} potential missing sites.")
-
-    # 2. **CRITICAL FILTER**: Keep only candidates that are inside the original
-    #    Wulff shape, defined by the 'planes' argument (n·x <= d).
-    A = np.stack([n for (n, d) in planes], axis=0)
-    b = np.array([d for (n, d) in planes], float)
-    
-    # A point `p` is inside if (p @ A.T - b) <= 0 for all planes.
-    # We add a small tolerance to avoid floating point issues at the surface.
-    inside_wulff_mask = (candidate_pts @ A.T <= (b[None, :] + 1e-6)).all(axis=1)
-    
-    candidate_pts = candidate_pts[inside_wulff_mask]
-    candidate_syms = [s for s, m in zip(candidate_syms, inside_wulff_mask) if m]
-
-    if not candidate_syms:
-        print("[refill] No missing sites are located inside the Wulff boundary.")
-        return cur_syms, cur_pts
-    print(f"[refill] {len(candidate_pts)} sites are inside the Wulff boundary.")
-
-    # 3. **SIDE-FILLING FILTER**: Further restrict candidates to the layer-range
-    #    of the original twin intervals to fill gaps "on the sides".
-    t_cand = (candidate_pts - origin) @ n_hat
-    in_interval_mask = np.zeros(len(candidate_pts), dtype=bool)
-    for (ta, tb) in intervals_A:
-        a, b_upper = min(ta, tb), max(ta, tb)
-        in_interval_mask |= (t_cand >= (a - pad_A)) & (t_cand <= (b_upper + pad_A))
-
-    added_pts = candidate_pts[in_interval_mask]
-    added_syms = [s for s, m in zip(candidate_syms, in_interval_mask) if m]
-
-    if not added_syms:
-        print("[refill] No sites to add after final interval check.")
-        return cur_syms, cur_pts
-
-    print(f"[refill] Adding {len(added_syms)} sites to fill voids within the twin slab region.")
-
-    # 4. Combine the original points with the new, filtered, refilled points.
-    final_syms = cur_syms + added_syms
-    final_pts = np.vstack([cur_pts, added_pts])
-
-    return final_syms, final_pts
-
-# ... (keep all other functions as they are) ...
 
 def refill_against_template(
     cur_syms: list,
@@ -588,9 +341,6 @@ def refill_against_template(
 # -----------------------------
 # ------ Public API -----------
 # -----------------------------
-# twinbound.py
-
-# ... (other functions like parse_hkl, refill_from_original_template, etc. remain here) ...
 
 def apply_twin_directive(
     R: Array,
@@ -599,11 +349,15 @@ def apply_twin_directive(
     default_origin: Union[str, Iterable[float]] = "center",
     species: Optional[List[str]] = None,
     charges: Optional[Dict[str, int]] = None,
-    perform_stitch: bool = True,  # <-- MODIFICATION: Stitching is now optional
+    perform_stitch: bool = True,
 ) -> Array:
     """
-    Twin directive with mirror/glide and optional sublattice swap.
-    ... (docstring) ...
+    Apply one twin directive to positions.
+
+    The selected slab is reflected across an HKL plane and can optionally be
+    shifted along the plane normal and/or by an in-plane glide. If species are
+    supplied, a sublattice swap can be applied to atoms inside the transformed
+    slab.
     """
     import numpy as _np
 
@@ -662,7 +416,7 @@ def apply_twin_directive(
     else:
         s_normal = 0.0
 
-    # ---------- NEW: Parallel (in-plane) shift ----------
+    # ---------- Parallel (in-plane) shift ----------
     ref = _np.array([1.0, 0.0, 0.0])
     if abs(_np.dot(ref, n_hat)) > 0.9:
         ref = _np.array([0.0, 1.0, 0.0])
@@ -736,8 +490,6 @@ def apply_twin_directive(
                     s = species_out[idx]
                     species_out[idx] = swap_map.get(s, s)
 
-        # --------------- NEW: stitch the region beyond the domain ---------------
-        # <-- MODIFICATION: This entire block is now conditional
         if perform_stitch:
             stitch_mode = str(directive.get("stitch_beyond", "none")).lower()
             if stitch_mode not in ("none", "auto", "positive", "negative", "true", "false"):
@@ -785,7 +537,7 @@ def apply_twins(
     default_origin: Union[str, Iterable[float]] = "center",
     species: Optional[List[str]] = None,
     charges: Optional[Dict[str, int]] = None,
-    **kwargs,  # <-- MODIFICATION: Accept keyword arguments
+    **kwargs,
 ) -> Array:
     """
     Apply multiple twin directives (list or single dict).
@@ -803,270 +555,6 @@ def apply_twins(
             default_origin=default_origin,
             species=species,
             charges=charges,
-            **kwargs,  # <-- MODIFICATION: Pass arguments to the directive handler
+            **kwargs,
         )
     return R_out
-
-
-def apply_twin_directive_old(
-    R: Array,
-    A: Array,
-    directive: Dict[str, Any],
-    default_origin: Union[str, Iterable[float]] = "center",
-    species: Optional[List[str]] = None,
-    charges: Optional[Dict[str, int]] = None,
-) -> Array:
-    """
-    Twin directive with mirror/glide and optional sublattice swap.
-
-    New keys for *parallel* (in-plane) shift:
-      - parallel_shift_cart: [sx, sy, sz] in Å (will be projected into the plane)
-      - parallel_shift_fractional: [u, v, w] in lattice fractions (Å = A_cols @ [u,v,w], then projected)
-      - parallel_shift_angstrom: [p1, p2] components along an orthonormal in-plane basis {e1,e2}
-        (we construct e1,e2 ⟂ n̂ deterministically)
-
-    Normal (along n̂) shift (backward compatible):
-      - operation: "mirror" | "mirror+shift"
-      - shift_angstrom: s_n (Å along +n̂)
-      - shift_layers:   λ_n  (Δ = λ_n * d_(hkl) along +n̂)
-      - shift_unitcell_fraction: f (Δ = 3f * d_(111) for cubic (111); general users should prefer the keys above)
-
-    Other existing keys unchanged:
-      hkl, origin, (intervals|segments)_(angstrom|layers), snap_to_layers,
-      mirror_at, merge_tolerance, interval_pad, swap_sublattice.
-    """
-    import numpy as _np
-
-    # ---------- Plane / lattice ----------
-    if "hkl" not in directive:
-        raise ValueError("Twin directive requires 'hkl'.")
-    A_cols = cell_columns(A)
-    hkl = parse_hkl(directive["hkl"])
-    n_hat = plane_normal_from_hkl(A_cols, hkl)
-    d_hkl = interplanar_spacing(A_cols, hkl)
-
-    origin = _resolve_origin(R, directive.get("origin", default_origin))
-
-    # ---------- Intervals (Å) ----------
-    segments = (
-        directive.get("intervals_angstrom")
-        or directive.get("segments_angstrom")
-        or directive.get("intervals")
-        or directive.get("segments")
-    )
-    segments_layers = directive.get("segments_layers") or directive.get("intervals_layers")
-    if segments is None and segments_layers is None:
-        raise ValueError("Provide 'intervals_angstrom' (or aliases) or 'intervals_layers' in twins.")
-
-    segs_A: List[Tuple[float, float]] = []
-    if segments is not None:
-        for (t1, t2) in segments:
-            segs_A.append((float(t1), float(t2)))
-    if segments_layers is not None:
-        for (n1, n2) in segments_layers:
-            segs_A.append((float(n1) * d_hkl, float(n2) * d_hkl))
-
-    # ---------- Behavior knobs ----------
-    snap = bool(directive.get("snap_to_layers", False))
-    mirror_at = str(directive.get("mirror_at", "midplane")).lower()
-    tol_merge = float(directive.get("merge_tolerance", 0.0))
-    pad = float(directive.get("interval_pad", 1e-3))
-
-    # ---------- Normal (along n̂) shift ----------
-    operation = str(directive.get("operation", "mirror")).lower()
-    if operation not in ("mirror", "mirror+shift"):
-        raise ValueError(f"Unknown twin operation '{operation}'.")
-    shift_ang = directive.get("shift_angstrom", None)
-    shift_layers = directive.get("shift_layers", None)
-    shift_uc = directive.get("shift_unitcell_fraction", None)  # convenience for cubic (111)
-
-    if operation == "mirror+shift":
-        if shift_ang is not None:
-            s_normal = float(shift_ang)
-        elif shift_layers is not None:
-            s_normal = float(shift_layers) * d_hkl
-        elif shift_uc is not None:
-            # For cubic (111): |[111]| = a√3 and d_(111)=a/√3 → Δ = 3f d_(111)
-            s_normal = 3.0 * float(shift_uc) * d_hkl
-        else:
-            s_normal = 0.5 * d_hkl
-    else:
-        s_normal = 0.0
-
-    # ---------- NEW: Parallel (in-plane) shift ----------
-    # Build an orthonormal in-plane basis {e1, e2}
-    # Pick a stable reference not parallel to n̂:
-    ref = _np.array([1.0, 0.0, 0.0])
-    if abs(_np.dot(ref, n_hat)) > 0.9:
-        ref = _np.array([0.0, 1.0, 0.0])
-    e1 = _np.cross(n_hat, ref);  e1 /= _np.linalg.norm(e1)
-    e2 = _np.cross(n_hat, e1);   e2 /= _np.linalg.norm(e2)
-
-    # Accept one of the parallel specs (priority order)
-    par = directive.get("parallel_shift_angstrom", None)          # [p1, p2] along e1,e2
-    par_cart = directive.get("parallel_shift_cart", None)          # [sx, sy, sz] Å
-    par_frac = directive.get("parallel_shift_fractional", None)    # [u, v, w] lattice fractions
-
-    v_parallel = _np.zeros(3, float)
-    if par is not None:
-        p1, p2 = float(par[0]), float(par[1])
-        v_parallel = p1 * e1 + p2 * e2
-    elif par_cart is not None:
-        v = _np.asarray(par_cart, float)
-        v_parallel = v - _np.dot(v, n_hat) * n_hat   # project into plane
-    elif par_frac is not None:
-        f = _np.asarray(par_frac, float)
-        v = A_cols @ f
-        v_parallel = v - _np.dot(v, n_hat) * n_hat   # project into plane
-    # else: no parallel shift
-
-    # ---------- Sublattice swap config ----------
-    swap_cfg = directive.get("swap_sublattice", False)
-    swap_map: Dict[str, str] = {}
-    if swap_cfg:
-        if isinstance(swap_cfg, dict):
-            swap_map = {str(k): str(v) for k, v in swap_cfg.items()}
-        else:
-            if charges is None:
-                raise ValueError("swap_sublattice requested but 'charges' not provided to apply_twins().")
-            pos = [e for e, q in charges.items() if q > 0]
-            neg = [e for e, q in charges.items() if q < 0]
-            if len(pos) == 1 and len(neg) == 1:
-                swap_map = {pos[0]: neg[0], neg[0]: pos[0]}
-            else:
-                raise ValueError("auto swap needs exactly one cation and one anion in 'charges'.")
-
-    # ---------- Signed coordinate along +n̂ ----------
-    t = (R - origin) @ n_hat
-    tmin, tmax = float(t.min()), float(t.max())
-    print(f"[twin] hkl={tuple(int(x) for x in hkl)}  t-range Å: [{tmin:.3f},{tmax:.3f}]  d_(hkl)={d_hkl:.4f}  "
-          f"op={operation}  shift_normal={s_normal:.4f} Å  |shift_parallel|={_np.linalg.norm(v_parallel):.4f} Å")
-
-    R_out = R.copy()
-    species_out = list(species) if species is not None else None
-
-    for (t_a, t_b) in segs_A:
-        if t_a > t_b:
-            t_a, t_b = t_b, t_a
-        mask = (t >= (t_a - pad)) & (t <= (t_b + pad))
-        n_sel = int(mask.sum())
-        if n_sel == 0:
-            print(f"[twin]   segment [{t_a:.3f},{t_b:.3f}] Å  -> selected 0 (skip)")
-            continue
-
-        # reflection plane (midplane preserves extent)
-        t_ref = t_a if mirror_at == "entry" else 0.5 * (t_a + t_b)
-        c = t_ref + _np.dot(n_hat, origin)
-        if snap:
-            c = round((t_ref) / d_hkl) * d_hkl + _np.dot(n_hat, origin)
-
-        # reflect geometry
-        R_slab = reflect_about_plane(R_out[mask], n_hat, c)
-
-        # compose total translation: normal + parallel
-        delta = s_normal * n_hat + v_parallel
-        if _np.any(delta):
-            R_slab = R_slab + delta[None, :]
-
-        # commit geometry
-        R_out[mask] = R_slab
-
-        # swap species inside the mirrored slab (labels only)
-        if species_out is not None and swap_map:
-            for idx, keep in enumerate(mask):
-                if keep:
-                    s = species_out[idx]
-                    species_out[idx] = swap_map.get(s, s)
-
-        # --------------- NEW: stitch the region beyond the domain ---------------
-        stitch_mode = str(directive.get("stitch_beyond", "none")).lower()
-        if stitch_mode not in ("none", "auto", "positive", "negative", "true", "false"):
-            raise ValueError("stitch_beyond must be one of: none|auto|positive|negative")
-
-        if stitch_mode in ("true", "false"):
-            stitch_mode = "auto" if stitch_mode == "true" else "none"
-
-        if stitch_mode != "none":
-            # decide which side to stitch
-            if stitch_mode == "auto":
-                side = "positive" if (0.5 * (t_a + t_b)) >= 0.0 else "negative"
-            else:
-                side = stitch_mode
-
-            if side == "positive":
-                mask_beyond = (t > (t_b + pad))    # strictly beyond the exit
-            else:
-                mask_beyond = (t < (t_a - pad))    # strictly before the entry
-
-            # don't touch the slab we just mirrored
-            mask_beyond = mask_beyond & (~mask)
-
-            # undo only the parallel glide by default
-            undo_parallel = (-v_parallel)
-            # optionally undo the normal component too (usually false)
-            if bool(directive.get("stitch_include_normal", False)):
-                undo_parallel = undo_parallel + (-s_normal) * n_hat
-
-            if np.any(undo_parallel):
-                R_out[mask_beyond] = R_out[mask_beyond] + undo_parallel[None, :]
-
-        # -----------------------------------------------------------------------
-
-        if tol_merge > 0:
-            R_out = merge_close_points(R_out, tol_merge)
-
-        print(f"[twin]   segment [{t_a:.3f},{t_b:.3f}]  selected={n_sel}  plane c={c:.4f}")
-
-    # push species back
-    if species is not None and species_out is not None:
-        species[:] = species_out
-
-    return R_out
-
-
-def apply_twins_old(
-    R: Array,
-    A: Array,
-    twins_config: Union[List[Dict[str, Any]], Dict[str, Any]],
-    default_origin: Union[str, Iterable[float]] = "center",
-    species: Optional[List[str]] = None,
-    charges: Optional[Dict[str, int]] = None,   # <-- NEW
-) -> Array:
-    """
-    Apply multiple twin directives (list or single dict).
-    Supports species-aware options and auto sublattice swap via `charges`.
-    """
-    if isinstance(twins_config, dict):
-        directives = [twins_config]
-    else:
-        directives = list(twins_config)
-
-    R_out = R.copy()
-    for d in directives:
-        R_out = apply_twin_directive(
-            R_out, A, d,
-            default_origin=default_origin,
-            species=species,
-            charges=charges,          # <-- pass through
-        )
-    return R_out
-
-
-# -----------------------------
-# ---- Optional ASE shim  -----
-# -----------------------------
-def apply_twins_to_ase(
-    atoms,  # ASE Atoms
-    twins_config: Union[List[Dict[str, Any]], Dict[str, Any]],
-    default_origin: Union[str, Iterable[float]] = "center",
-):
-    """
-    Convenience wrapper if your pipeline uses ASE.
-    Modifies atoms.positions in-place and returns the atoms object.
-    """
-    A_cols = cell_columns(np.array(atoms.cell))  # ASE stores rows; cell_columns handles it
-    R = atoms.get_positions()
-    R2 = apply_twins(R, A_cols, twins_config, default_origin=default_origin)
-    atoms.set_positions(R2)
-    return atoms
-

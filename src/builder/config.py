@@ -12,7 +12,8 @@ except ImportError:
 
 from .nc_types import (
     Config, Facet,
-    PassivationSpec, MaterialSpec, BuildSpec, AlignSpec, StrainPolicy
+    PassivationSpec, MaterialSpec, BuildSpec, AlignSpec, StrainPolicy,
+    FacetReconstructionSpec,
 )
 
 # -------------------- CLI --------------------
@@ -22,26 +23,19 @@ def build_parser() -> argparse.ArgumentParser:
         prog="nc-builder",
         description="Coordination-aware Wulff-cut nanocrystal builder with surface passivation."
     )
-    # NOTE: In stack mode, --cif / --radius are ignored (sizes & CIFs come from YAML)
+    # In stack mode, the positional CIF is ignored because CIFs come from YAML;
+    # radius is still the outer Wulff radius.
     p.add_argument("cif", help="Input bulk CIF file (ignored in stack mode)")
     p.add_argument("yaml", help="YAML recipe file (single or multi-material)")
-    p.add_argument("-r", "--radius", type=float, required=True,
-                   help="Target Wulff radius (Å) for single-material mode")
+    p.add_argument("-r", "--radius", type=float, default=None,
+                   help="Target outer Wulff radius (Å)")
+    p.add_argument("-size-unit-cells", "--size-unit-cells", type=float, default=None,
+                   help="Material-scaled size: set Wulff radius to this many shortest lattice vectors; floats like 1.5 are allowed.")
 
     p.add_argument("-o", "--out", default="nanocrystal.xyz", help="Output XYZ path (final)")
     p.add_argument("--write-all", action="store_true", help="Also write *_cut.xyz")
     p.add_argument("--center", action="store_true", help="Center the particle at the COM before writing")
-    p.add_argument("--seed", type=int, default=42, help="Random seed for tie-breaks and placement")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
-
-    p.add_argument(
-        "--parity",
-        choices=["remove", "add"],
-        default="remove",
-        help="Odd-parity resolution after outer swaps: "
-             "'remove' stops at Q=-1 then removes one ligand (default). "
-             "'add' overshoots to Q=+1 then adds one ligand."
-    )
 
     p.add_argument(
         "--positive-q-mode",
@@ -69,9 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Wulff / symmetry
     w = p.add_argument_group("wulff / symmetry")
-    w.add_argument("--pair-opposites", action="store_true", default=True,
-                   help="If a signed facet (hkl) is provided without its antipode (-h -k -l), "
-                        "auto-add the opposite with the same gamma (default: on).")
     # Tri-state via None so YAML can decide if CLI not set
     try:
         import argparse as _ap
@@ -92,12 +83,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Anisotropy along lattice a,b,c axes (default from YAML or 1 1 1). "
              "Examples: platelet 1 1 0.3; rod 0.7 0.7 2.0"
-    )
-
-    p.add_argument(
-        "--core-by-labeling",
-        action="store_true",
-        help="Build shell NC at -r, carve inner core using core.aspect, and relabel cation/anion inside."
     )
 
     # Core lattice fit / interface strain (optional)
@@ -121,13 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference point for the affine map center: 'com' (inner-core COM) or 'origin' (0,0,0)."
     )
 
-    diag = p.add_argument_group("diagnostics")
-    diag.add_argument(
-        "--bond-stats",
-        action="store_true",
-        help="Print cation–anion nearest-neighbor distance stats for core/interface/shell (pre/post shrink)."
-    )
-    
     # Facet scan (pre-run diagnostic)
     scan = p.add_argument_group("facet scan")
     scan.add_argument("--scan-facets", action="store_true",
@@ -171,9 +149,10 @@ def _parse_hkl(val) -> tuple[int, int, int]:
     # string
     if isinstance(val, str):
         s = val.strip()
-        # 1) Try three full signed integers anywhere
-        nums = re.findall(r'(?<!\d)[+-]?\d+(?!\d)', s)
-        if len(nums) == 3:
+        # 1) Try three full signed integers when separated by non-sign delimiters.
+        # Compact strings like "-1-1-1" are handled by the per-digit branch below.
+        nums = re.findall(r'(?<![\d+-])[+-]?\d+(?!\d)', s)
+        if len(nums) == 3 and re.search(r'[\s,;\[\]()]', s):
             h, k, l = (int(nums[0]), int(nums[1]), int(nums[2]))
             if (h, k, l) == (0, 0, 0):
                 raise ValueError("hkl cannot be (0,0,0)")
@@ -220,6 +199,24 @@ def _parse_aspect(val) -> Tuple[float, float, float]:
         raise ValueError(f"Cannot parse shape.aspect string: {val!r}")
     raise TypeError(f"Unsupported shape.aspect type: {type(val).__name__}")
 
+
+def _parse_size_unit_cells(val) -> Tuple[float, float, float]:
+    if val is None:
+        raise ValueError("size_unit_cells cannot be None")
+    if isinstance(val, (int, float)):
+        x = float(val)
+        return (x, x, x)
+    if isinstance(val, (list, tuple)) and len(val) == 3:
+        return (float(val[0]), float(val[1]), float(val[2]))
+    if isinstance(val, str):
+        toks = [t for t in re.split(r"[,\s]+", val.strip("[]() ")) if t]
+        if len(toks) == 1:
+            x = float(toks[0])
+            return (x, x, x)
+        if len(toks) == 3:
+            return (float(toks[0]), float(toks[1]), float(toks[2]))
+    raise TypeError("size_unit_cells must be a number or three values")
+
 # -------------------- YAML → Config --------------------
 def _normalize_twins(raw):
     """
@@ -231,6 +228,61 @@ def _normalize_twins(raw):
     if isinstance(raw, list):
         return [dict(x) for x in raw]
     return [dict(raw)]
+
+
+def _parse_optional_bool(raw, *, field: str) -> bool | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        val = raw.strip().lower()
+        if val in {"true", "yes", "on", "1"}:
+            return True
+        if val in {"false", "no", "off", "0"}:
+            return False
+    raise TypeError(f"{field} must be a boolean")
+
+
+def _parse_facet_reconstruction(raw) -> FacetReconstructionSpec:
+    if raw is None:
+        return FacetReconstructionSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("facet_reconstruction must be a mapping")
+
+    enabled = _parse_optional_bool(raw.get("enabled"), field="facet_reconstruction.enabled")
+    if enabled is False:
+        return FacetReconstructionSpec()
+
+    facets_raw = raw.get("facets") or []
+    if not isinstance(facets_raw, list):
+        raise TypeError("facet_reconstruction.facets must be a list")
+
+    facets: List[tuple] = []
+    for entry in facets_raw:
+        if isinstance(entry, dict) and "hkl" in entry:
+            hkl = _parse_hkl(entry["hkl"])
+        elif isinstance(entry, (list, tuple)) and len(entry) == 3:
+            hkl = (int(entry[0]), int(entry[1]), int(entry[2]))
+        else:
+            raise TypeError(
+                f"facet_reconstruction.facets entry must be a dict with 'hkl' key: {entry!r}"
+            )
+        facets.append(hkl)
+
+    cation_ligand = raw.get("cation_ligand")
+    cation_ligand_charge = raw.get("cation_ligand_charge")
+    if cation_ligand is not None and cation_ligand_charge is None:
+        raise ValueError(
+            "facet_reconstruction.cation_ligand_charge is required when cation_ligand is set"
+        )
+
+    return FacetReconstructionSpec(
+        enabled=enabled if enabled is not None else bool(facets),
+        facets=tuple(facets),
+        cation_ligand=str(cation_ligand) if cation_ligand else None,
+        cation_ligand_charge=int(cation_ligand_charge) if cation_ligand_charge is not None else None,
+    )
 
 def parse_yaml_config(path: str) -> Config:
     with open(path, "r") as fh:
@@ -264,16 +316,12 @@ def parse_yaml_config(path: str) -> Config:
     if cat_new and (cat_new not in charges):
         charges[cat_new] = +1
 
-    # Build the passivation spec (see nc_types.PassivationSpec update below)
+    # Build the passivation spec.
     passiv_spec = PassivationSpec(
         ligand=str(lig_old),                # anion ligand (legacy field)
         surf_tol=surf_tol,
         cation_ligand=str(cat_new) if cat_new else None,
     )
-
-    if "charges" not in cfg:
-        raise KeyError("YAML: need 'charges' (global)")
-    charges: Dict[str, int] = {str(k): int(v) for k, v in cfg["charges"].items()}
 
     # ---- Global options ----
     proper_only = bool(cfg.get("symmetry", {}).get("proper_rotations_only", True))
@@ -281,6 +329,17 @@ def parse_yaml_config(path: str) -> Config:
 
     # ---- twins (top-level) ----
     twins = _normalize_twins(cfg.get("twins"))
+    construction_origin = cfg.get("construction_origin")
+    if construction_origin is not None and not isinstance(construction_origin, dict):
+        raise TypeError("construction_origin must be a mapping, e.g. {center_on_species: In}")
+    facet_reconstruction = _parse_facet_reconstruction(cfg.get("facet_reconstruction"))
+    experimental = cfg.get("experimental") or {}
+    if not isinstance(experimental, dict):
+        raise TypeError("experimental must be a mapping")
+
+    # Register cation_ligand charge if provided
+    if facet_reconstruction.cation_ligand and facet_reconstruction.cation_ligand not in charges:
+        charges[facet_reconstruction.cation_ligand] = facet_reconstruction.cation_ligand_charge or +1
 
     # ---- Helper: parse facets list/mapping → List[Facet] ----
     def _parse_facets(raw) -> List[Facet]:
@@ -296,28 +355,62 @@ def parse_yaml_config(path: str) -> Config:
             for it in raw:
                 if isinstance(it, dict) and "hkl" in it and "gamma" in it:
                     items.append(it)
+                elif isinstance(it, dict) and "family" in it and "gamma" in it:
+                    items.append(it)
                 elif isinstance(it, (list, tuple)) and len(it) == 2:
                     items.append({"hkl": it[0], "gamma": it[1]})
                 else:
                     raise TypeError(
-                        "facets/seeds list items must be dicts with keys {hkl,gamma} "
+                        "facets/seeds list items must be dicts with keys {hkl,gamma}, "
+                        "{family,gamma}, "
                         "or 2-tuples [hkl, gamma]"
                     )
         else:
             raise TypeError("facets/seeds must be a list or a mapping of hkl->gamma")
 
         g_by: Dict[tuple[int, int, int], float] = {}
+        term_by: Dict[tuple[int, int, int], str | None] = {}
         for f in items:
-            h, k, l = _parse_hkl(f["hkl"])
+            hkl_raw = f.get("hkl", f.get("family"))
+            h, k, l = _parse_hkl(hkl_raw)
             g_by[(h, k, l)] = float(f["gamma"])
+            term = f.get("termination")
+            if term is not None:
+                term_s = str(term).strip().lower()
+                if term_s not in {"cation_rich", "anion_rich"}:
+                    raise ValueError("facet termination must be 'cation_rich' or 'anion_rich'")
+                term_by[(h, k, l)] = term_s
+            else:
+                term_by[(h, k, l)] = None
 
         if pair_opposites:
             for (h, k, l), g in list(g_by.items()):
+                if term_by.get((h, k, l)) is not None:
+                    continue
                 opp = (-h, -k, -l)
                 if opp not in g_by:
                     g_by[opp] = g
+                    term_by[opp] = None
 
-        return [Facet(h=h, k=k, l=l, gamma=g) for (h, k, l), g in sorted(g_by.items())]
+        return [
+            Facet(h=h, k=k, l=l, gamma=g, termination=term_by.get((h, k, l)))
+            for (h, k, l), g in sorted(g_by.items())
+        ]
+
+    def _parse_shape(raw) -> tuple[Tuple[float, float, float], str, int]:
+        aspect = (1.0, 1.0, 1.0)
+        mode = "wulff"
+        sphere_planes = 192
+        if isinstance(raw, dict):
+            if "aspect" in raw:
+                aspect = _parse_aspect(raw.get("aspect"))
+            mode = str(raw.get("mode", mode)).strip().lower()
+            sphere_planes = int(raw.get("sphere_planes", sphere_planes))
+        if mode not in {"wulff", "sphere"}:
+            raise ValueError("shape.mode must be 'wulff' or 'sphere'")
+        if sphere_planes < 12:
+            raise ValueError("shape.sphere_planes must be at least 12")
+        return aspect, mode, sphere_planes
 
     # ---- STACK MODE (multi-material) ----
     if "materials" in cfg:
@@ -332,19 +425,21 @@ def parse_yaml_config(path: str) -> Config:
             cif = str(m["cif"])
 
             # facets or seeds (accept either key)
-            raw_facets = m.get("facets", m.get("seeds"))
-            seeds = _parse_facets(raw_facets)
+            aspect, shape_mode, sphere_planes = _parse_shape(m.get("shape"))
 
-            # aspect (per-material); accept m.shape.aspect or default 1,1,1
-            aspect = (1.0, 1.0, 1.0)
-            if isinstance(m.get("shape"), dict):
-                aspect = _parse_aspect(m["shape"].get("aspect"))
+            raw_facets = m.get("facets", m.get("seeds"))
+            if raw_facets is None and shape_mode == "sphere":
+                seeds = []
+            else:
+                seeds = _parse_facets(raw_facets)
 
             # build (optional; provide safe defaults so YAML can omit it)
             b = m.get("build", {}) or {}
+            size_raw = m.get("size_unit_cells", b.get("size_unit_cells"))
             build = BuildSpec(
                 radius=float(b["radius"]) if "radius" in b else None,
                 radius_scale=float(b["radius_scale"]) if "radius_scale" in b else None,
+                size_unit_cells=_parse_size_unit_cells(size_raw) if size_raw is not None else None,
                 interface_clearance=float(b.get("interface_clearance", 1.6)),
             )
 
@@ -365,34 +460,51 @@ def parse_yaml_config(path: str) -> Config:
                 )
 
             mats.append(MaterialSpec(
-                name=name, cif=cif, seeds=seeds, aspect=aspect, build=build, align=align
+                name=name,
+                cif=cif,
+                seeds=seeds,
+                aspect=aspect,
+                build=build,
+                shape_mode=shape_mode,
+                sphere_planes=sphere_planes,
+                align=align,
             ))
 
         return Config(
             mode="stack",
-            seeds=[], aspect=(1.0, 1.0, 1.0),
+            seeds=[], aspect=(1.0, 1.0, 1.0), shape_mode="wulff", sphere_planes=192,
+            size_unit_cells=None,
             proper_only=proper_only, pair_opposites=pair_opposites,
             passivation=passiv_spec, charges=charges, materials=mats,
             twins=twins,
+            construction_origin=construction_origin,
+            facet_reconstruction=facet_reconstruction,
+            experimental=experimental,
         )
 
     # ---- SINGLE MODE (legacy) ----
     # top-level: accept 'facets' or 'seeds'
+    aspect, shape_mode, sphere_planes = _parse_shape(cfg.get("shape"))
+    size_unit_cells = (
+        _parse_size_unit_cells(cfg.get("size_unit_cells"))
+        if cfg.get("size_unit_cells") is not None
+        else None
+    )
+
     top_facets = cfg.get("facets", cfg.get("seeds"))
-    if top_facets is None:
+    if top_facets is None and shape_mode != "sphere":
         raise KeyError("YAML: need 'facets' (or 'seeds') for single mode")
 
-    seeds = _parse_facets(top_facets)
-
-    aspect = (1.0, 1.0, 1.0)
-    if isinstance(cfg.get("shape"), dict):
-        aspect = _parse_aspect(cfg["shape"].get("aspect"))
+    seeds = [] if top_facets is None else _parse_facets(top_facets)
 
     return Config(
         mode="single",
-        seeds=seeds, aspect=aspect,
+        seeds=seeds, aspect=aspect, shape_mode=shape_mode, sphere_planes=sphere_planes,
+        size_unit_cells=size_unit_cells,
         proper_only=proper_only, pair_opposites=pair_opposites,
         passivation=passiv_spec, charges=charges, materials=[],
-        twins=twins,   # <-- NEW
+        twins=twins,
+        construction_origin=construction_origin,
+        facet_reconstruction=facet_reconstruction,
+        experimental=experimental,
     )
-

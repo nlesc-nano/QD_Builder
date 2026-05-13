@@ -16,11 +16,12 @@ def center_coords(pts: NDArray[np.float64]) -> NDArray[np.float64]:
     com = np.mean(pts, axis=0)
     return pts - com
 
-def write_manifest(prefix: str, symbols: List[str], charges: dict):
+def write_manifest(prefix: str, symbols: List[str], charges: dict, extra: dict | None = None):
     out = {
         "counts": Counter(symbols),
         "total_charge": int(sum(charges[s] for s in symbols if s in charges)),
     }
+    if extra:
+        out.update(extra)
     with open(f"{prefix}.json", "w") as fh:
         json.dump(out, fh, indent=2, default=int)
-

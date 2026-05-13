@@ -1,0 +1,67 @@
+materials:
+  core:
+    name: CdSe
+    cif: ../cifs/CdSe_zb.cif
+  shell:
+    name: PbS
+    cif: ../cifs/PbS.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Pb: +2
+  S: -2
+  Cl: -1
+
+scan:
+  max_index: 1
+  layer_tol: 0.08
+
+matching:
+  method: zsl
+  max_area: 600
+  max_length_tol: 0.08
+  max_angle_tol: 0.05
+  max_area_ratio_tol: 0.09
+
+candidates:
+  top: 1
+
+build:
+  mode: wulff_janus
+  interface_distance: 2.8
+  min_separation: 1.2
+
+  core:
+    size_unit_cells: 2
+    facets:
+      - family: "100"
+        gamma: 1.0
+      - family: "111"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "-1-1-1"
+        termination: anion_rich
+        gamma: 1.0
+
+  shell:
+    size_unit_cells: 2
+    facets:
+      - family: "100"
+        gamma: 1.0
+      - family: "111"
+        termination: cation_rich
+        gamma: 1.0
+      - family: "-1-1-1"
+        termination: anion_rich
+        gamma: 1.0
+
+passivation:
+  enabled: true
+  ligand: Cl
+  surf_tol: 2.0
+  positive_q_mode: add
+
+output:
+  out_dir: janus_cdse_pbs_wulff
+  prefix: cdse_pbs_wulff
