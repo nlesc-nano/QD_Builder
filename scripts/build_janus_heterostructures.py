@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Janus/interface-cell passivation: Q>0 strategy for atoms on the core side")
     parser.add_argument("--positive-q-mode-shell", choices=["remove", "add", "skip", "none"],
                         help="Janus/interface-cell passivation: Q>0 strategy for atoms on the shell side")
-    parser.add_argument("--out-dir", default="janus_candidates")
+    parser.add_argument("--out-dir", default="examples/out/janus/candidates")
     parser.add_argument("--prefix", default="janus")
     parser.add_argument("--no-zsl", action="store_true", help="Disable ZSL filtering; normally not recommended")
     parser.add_argument("--zsl-max-area", type=float, default=400.0)

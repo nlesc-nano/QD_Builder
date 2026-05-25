@@ -63,5 +63,5 @@ passivation:
   positive_q_mode_shell: add
 
 output:
-  out_dir: janus_cspbbr3_pb4s3br2_mushroom
+  out_dir: examples/out/janus/cspbbr3_pb4s3br2_mushroom
   prefix: cspbbr3_pb4s3br2

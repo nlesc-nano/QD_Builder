@@ -63,5 +63,5 @@ passivation:
   positive_q_mode: add
 
 output:
-  out_dir: janus_cdse_pbs_wulff
+  out_dir: examples/out/janus/cdse_pbs_wulff
   prefix: cdse_pbs_wulff

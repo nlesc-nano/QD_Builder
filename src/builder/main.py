@@ -34,9 +34,13 @@ from .cleanup import prune_low_coord_sites
 from .stack import (
     build_layer_planes,
     cumulative_size_unit_cells,
+    reference_radius_from_size,
     region_masks_from_layer_planes,
     relabel_regions_by_material,
+    select_geometry_reference,
+    size_unit_cells_to_aspect,
     size_unit_cells_to_radius_aspect,
+    validate_stack_symmetry,
 )
 from .twin_workflow import apply_single_material_twins
 from .facet_reconstruction import reconstruct_polar_facets
@@ -478,6 +482,8 @@ def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) 
             chosen, _q = min(scored, key=lambda rec: rec[1])
         else:
             chosen = (f.h, f.k, f.l)
+        # Bulk slab scoring uses max projection; Wulff halfspaces expose the opposite polar layer.
+        chosen = (-chosen[0], -chosen[1], -chosen[2])
         resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=getattr(f, "scope", "family")))
     return resolved
 
@@ -498,6 +504,8 @@ def _run_passivation_and_write_outputs(
     pair_cuts_override: PairCuts | None = None,
     output_layer_planes=None,
     output_materials=None,
+    region_masks=None,
+    stack_passivation: bool = False,
 ):
     prefix = os.path.splitext(args.out)[0]
 
@@ -522,6 +530,8 @@ def _run_passivation_and_write_outputs(
             getattr(cfg, "experimental", {}).get("exhausted_positive_q_fallback", False)
         ),
         pair_cuts_override=pair_cuts_override,
+        region_masks=region_masks,
+        stack_passivation=stack_passivation,
     )
 
     if cfg.facet_reconstruction.enabled:
@@ -833,7 +843,19 @@ def main(argv: List[str] | None = None) -> int:
     # ------------------------------------
     p = build_parser()
     args = p.parse_args(argv)
+    if len(args.inputs) == 1:
+        args.yaml = args.inputs[0]
+        args.cif = None
+    elif len(args.inputs) == 2:
+        args.cif, args.yaml = args.inputs[0], args.inputs[1]
+    else:
+        p.error("expected one argument (YAML for stack mode) or two arguments (CIF YAML for single-material mode)")
+
     cfg: Config = parse_yaml_config(args.yaml)
+    if cfg.mode != "stack" and args.cif is None:
+        p.error("single-material mode requires: nc-builder STRUCT.cif RECIPE.yaml")
+    if cfg.mode == "stack" and args.cif is None:
+        args.cif = cfg.materials[0].cif
     # --- Passivation ligand selection (backward compatible) ---
     pass_cfg = getattr(cfg, "passivation", None)
     if pass_cfg:
@@ -884,16 +906,25 @@ def main(argv: List[str] | None = None) -> int:
             raise SystemExit("Stack mode requires at least two materials (core first, then shell).")
     
         cumulative_sizes = cumulative_size_unit_cells(cfg.materials)
+        try:
+            validate_stack_symmetry(cfg.materials)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        reference_cfg = select_geometry_reference(
+            cfg.materials,
+            mode=cfg.stack.geometry_reference,
+        )
+        struct_ref = Structure.from_file(reference_cfg.cif)
         resolved_materials = []
         for material in cfg.materials:
-            sm = Structure.from_file(material.cif)
+            mat_struct = Structure.from_file(material.cif)
             resolved_materials.append(dataclasses.replace(
                 material,
-                seeds=_resolve_facet_terminations(sm, material.seeds, cfg.charges),
+                seeds=_resolve_facet_terminations(mat_struct, material.seeds, cfg.charges),
             ))
+        core_cfg = resolved_materials[0]
 
-        # === MINIMAL CHANGE: cut once on OUTERMOST shell, then relabel regions ===
-        # Build OUTERMOST cut
         outer_idx = len(resolved_materials) - 1
         active_layer_indices = list(range(len(resolved_materials)))
         if cumulative_sizes is not None:
@@ -909,26 +940,32 @@ def main(argv: List[str] | None = None) -> int:
             if not active_layer_indices:
                 raise SystemExit("At least one material must have nonzero size_unit_cells in stack mode.")
         outer_cfg = resolved_materials[outer_idx]
-        struct_outer = Structure.from_file(outer_cfg.cif)
         if cumulative_sizes is None:
-            radius_eff = _radius_from_size_args(struct_outer, args)
+            radius_eff = _radius_from_size_args(struct_ref, args)
             aspect_outer = outer_cfg.aspect
         else:
-            radius_eff, aspect_outer = size_unit_cells_to_radius_aspect(struct_outer, cumulative_sizes[outer_idx])
+            radius_eff, aspect_outer = reference_radius_from_size(struct_ref, cumulative_sizes[outer_idx])
+
+        if args.verbose:
+            print(
+                f"    - Geometry reference lattice: {reference_cfg.name} ({reference_cfg.cif}); "
+                f"policy={cfg.stack.geometry_reference}; core material: {core_cfg.name}"
+            )
+
         if outer_cfg.shape_mode == "sphere":
             facets_outer = []
             syms, pts, _ = build_spherical_nanocrystal(
-                struct_outer,
+                struct_ref,
                 radius_eff,
                 n_planes=outer_cfg.sphere_planes,
             )
         else:
-            facets_outer = expand_facets(struct_outer, outer_cfg.seeds, proper_only=cfg.proper_only)
-            syms, pts, _ = build_nanocrystal(struct_outer, facets_outer, radius_eff, aspect=aspect_outer)
-        syms, pts = dedupe_points(syms, pts, tol=1e-3)
+            facets_outer = expand_facets(struct_ref, outer_cfg.seeds, proper_only=cfg.proper_only)
+            syms, pts, _ = build_nanocrystal(struct_ref, facets_outer, radius_eff, aspect=aspect_outer)
+        syms, pts = dedupe_points(syms, pts)
         if args.verbose:
             if cumulative_sizes is not None:
-                print("    - Cumulative size_unit_cells:")
+                print("    - Cumulative size_unit_cells (replica topology on reference lattice):")
                 prev_size = np.zeros(3, dtype=float)
                 for idx, (m, size) in enumerate(zip(resolved_materials, cumulative_sizes)):
                     if idx > 0 and np.allclose(size, prev_size, atol=1e-12):
@@ -938,25 +975,31 @@ def main(argv: List[str] | None = None) -> int:
                         )
                         prev_size = np.asarray(size, dtype=float)
                         continue
-                    r_i, aspect_i = size_unit_cells_to_radius_aspect(Structure.from_file(m.cif), size)
+                    r_i, aspect_i = reference_radius_from_size(struct_ref, size)
+                    r_phys, _ = size_unit_cells_to_radius_aspect(Structure.from_file(m.cif), size)
                     print(
                         f"      {m.name}: size={tuple(f'{x:g}' for x in size)} "
-                        f"-> radius={r_i:.6f} Å, aspect={tuple(round(x, 4) for x in aspect_i)}"
+                        f"-> radius={r_i:.6f} Å (ref), aspect={tuple(round(x, 4) for x in aspect_i)}; "
+                        f"physical_if_native={r_phys:.6f} Å"
                     )
                     prev_size = np.asarray(size, dtype=float)
             if outer_cfg.shape_mode == "sphere":
                 print(
                     f"    - Outermost spherical cut atoms: {len(syms)} "
-                    f"(from {outer_cfg.name}, planes={outer_cfg.sphere_planes})"
+                    f"(reference={reference_cfg.name}, planes={outer_cfg.sphere_planes})"
                 )
             else:
-                print(f"    - Outermost cut atoms: {len(syms)} (from {outer_cfg.name})")
-    
+                print(
+                    f"    - Outermost cut atoms: {len(syms)} "
+                    f"(reference={reference_cfg.name}, outer layer={outer_cfg.name})"
+                )
+
         layer_planes = build_layer_planes(
             resolved_materials,
-            radius_eff,
+            struct_ref,
             cfg.proper_only,
             cumulative_sizes=cumulative_sizes,
+            radius=radius_eff if cumulative_sizes is None else None,
         )
         region_masks = region_masks_from_layer_planes(pts, layer_planes)
         syms = relabel_regions_by_material(
@@ -968,17 +1011,133 @@ def main(argv: List[str] | None = None) -> int:
             verbose=args.verbose,
         )
 
-        if args.core_lattice_fit:
+        syms, pts = _prune_before_facet_detection(syms, pts, args=args)
+        region_masks = region_masks_from_layer_planes(pts, layer_planes)
+
+        stack_pair_cuts = merge_pair_cuts_from_cifs(
+            [resolved_materials[idx].cif for idx in active_layer_indices],
+            cfg.charges,
+            safety=1.00,
+        )
+
+        surface_cfg = resolved_materials[outer_idx]
+        struct = struct_ref
+        if surface_cfg.shape_mode == "sphere":
+            seeds0 = []
+            passivation_planes = sphere_halfspaces(radius_eff, n_planes=surface_cfg.sphere_planes)
+            if args.verbose:
+                print(
+                    "\n[5] Using synthetic spherical surface planes "
+                    f"(composite, {len(passivation_planes)} planes); Miller facet report skipped."
+                )
+        else:
+            seeds0 = expand_facets(struct_ref, surface_cfg.seeds, proper_only=cfg.proper_only)
+            _facets, passivation_planes = _detect_facets_and_report(
+                syms,
+                pts,
+                struct,
+                cfg.charges,
+                seeds0,
+                cfg.passivation.surf_tol,
+                label=" (composite)",
+                verbose=args.verbose,
+            )
+
+        if args.verbose:
+            print(f"\n[4] Composite particle atoms (pre-passivation): {len(syms)}")
+
+        # --- OPTIONAL TWIN BOUNDARIES (stack mode) ---
+        if getattr(cfg, "twins", None):
+            if args.verbose:
+                print("\n[3a] Applying twin boundary transformations (stack mode)...")
+            # Use reference lattice for twins and recut
+            outer_shell = resolved_materials[outer_idx]
+
+            # (1) Apply mirrors
+            pts = apply_twins(
+                pts,
+                struct_ref.lattice.matrix,
+                cfg.twins,
+                default_origin="center",
+                species=syms,
+                charges=cfg.charges,
+            )
+
+            # (2) Recut with outer Wulff planes on reference lattice
+            if outer_shell.shape_mode == "sphere":
+                planes_outer = sphere_halfspaces(radius_eff, n_planes=outer_shell.sphere_planes)
+            else:
+                facets_shell = expand_facets(struct_ref, outer_shell.seeds, proper_only=cfg.proper_only)
+                planes_outer = halfspaces(struct_ref, facets_shell, R=radius_eff, aspect=aspect_outer)
+            syms, pts = recut_with_planes(syms, pts, planes_outer)
+    
+            if args.verbose:
+                print(f"    - After twins+recut: {len(syms)} atoms")
+            if surface_cfg.shape_mode == "sphere":
+                passivation_planes = sphere_halfspaces(radius_eff, n_planes=surface_cfg.sphere_planes)
+            else:
+                _facets, passivation_planes = _detect_facets_and_report(
+                    syms,
+                    pts,
+                    struct,
+                    cfg.charges,
+                    seeds0,
+                    cfg.passivation.surf_tol,
+                    label=" (composite, post-twin)",
+                    verbose=args.verbose,
+                )
+
+        # --- Write core.xyz and shell.xyz (behind --write-all) ---
+        if args.write_all:
+            region_masks = region_masks_from_layer_planes(pts, layer_planes)
+            layer_prefix = os.path.splitext(args.out)[0]
+            for k, mask in enumerate(region_masks):
+                tag = "core" if k == 0 else f"shell{k}"
+                part_syms = [s for s, keep in zip(syms, mask) if keep]
+                part_pts = pts[mask]
+                layer_path = f"{layer_prefix}_{tag}.xyz"
+                if args.verbose:
+                    print(f"    - Writing {layer_path} ({len(part_syms)} atoms)")
+                part_pts_out = center_coords(part_pts) if args.center else part_pts
+                part_syms_out, part_pts_out = _ordered_xyz_view(
+                    part_syms,
+                    part_pts_out,
+                    cfg.charges,
+                    anion_lig,
+                )
+                write_xyz(layer_path, part_syms_out, part_pts_out)
+
+        syms, pts = _run_passivation_and_write_outputs(
+            syms,
+            pts,
+            args=args,
+            cfg=cfg,
+            anion_lig=anion_lig,
+            planes=passivation_planes,
+            cif_path=surface_cfg.cif,
+            struct=struct,
+            facet_seeds=seeds0,
+            material_label=surface_cfg.name,
+            construction_radius_override=radius_eff,
+            pair_cuts_override=stack_pair_cuts,
+            output_layer_planes=layer_planes,
+            output_materials=resolved_materials,
+            region_masks=region_masks,
+            stack_passivation=True,
+        )
+
+        use_core_lattice_fit = not args.no_core_lattice_fit
+        if use_core_lattice_fit:
+            region_masks = region_masks_from_layer_planes(pts, layer_planes)
             if args.verbose:
                 print("\n[3b] Applying core lattice fit with smooth interface blend...")
             try:
-                core_struct = Structure.from_file(resolved_materials[0].cif)
-                shell_struct = Structure.from_file(resolved_materials[-1].cif)
+                core_struct = Structure.from_file(core_cfg.cif)
                 pts = apply_core_lattice_fit(
                     pts,
                     region_masks[0],
                     layer_planes[0],
-                    shell_struct.lattice.matrix,
+                    struct_ref.lattice.matrix,
                     core_struct.lattice.matrix,
                     strain_width=args.core_strain_width,
                     center_mode=args.core_center,
@@ -989,108 +1148,12 @@ def main(argv: List[str] | None = None) -> int:
                         f"(width={args.core_strain_width:.3f} Å, center={args.core_center})"
                     )
             except np.linalg.LinAlgError:
-                print("WARNING: shell lattice not invertible; skipping core lattice fit.")
-    
-        if args.verbose:
-            print(f"\n[4] Composite particle atoms: {len(syms)}")
-    
-        # --- OPTIONAL TWIN BOUNDARIES (stack mode) ---
-        if getattr(cfg, "twins", None):
+                print("WARNING: reference lattice not invertible; skipping core lattice fit.")
+            if args.center:
+                pts = center_coords(pts)
+            write_xyz(args.out, syms, pts)
             if args.verbose:
-                print("\n[3a] Applying twin boundary transformations (stack mode)...")
-            # Use OUTERMOST shell lattice for twins and recut
-            outer_shell = resolved_materials[outer_idx]
-            shell_struct = Structure.from_file(outer_shell.cif)
-    
-            # (1) Apply mirrors
-            pts = apply_twins(
-                pts,
-                shell_struct.lattice.matrix,
-                cfg.twins,
-                default_origin="center",
-                species=syms,
-                charges=cfg.charges,
-            )
-    
-            # (2) Recut with OUTER (outermost shell) Wulff planes
-            if outer_shell.shape_mode == "sphere":
-                planes_outer = sphere_halfspaces(radius_eff, n_planes=outer_shell.sphere_planes)
-            else:
-                facets_shell = expand_facets(shell_struct, outer_shell.seeds, proper_only=cfg.proper_only)
-                planes_outer = halfspaces(shell_struct, facets_shell, R=radius_eff, aspect=aspect_outer)
-            syms, pts = recut_with_planes(syms, pts, planes_outer, tol=1e-3)
-    
-            if args.verbose:
-                print(f"    - After twins+recut: {len(syms)} atoms")
-    
-        # --- Write core.xyz and shell.xyz (behind --write-all) ---
-        if args.write_all:
-            region_masks = region_masks_from_layer_planes(pts, layer_planes)
-            prefix = os.path.splitext(os.path.basename(args.out))[0]
-            for k, mask in enumerate(region_masks):
-                tag = "core" if k == 0 else f"shell{k}"
-                part_syms = [s for s, keep in zip(syms, mask) if keep]
-                part_pts  =  pts[mask]
-                if args.verbose:
-                    print(f"    - Writing {prefix}_{tag}.xyz ({len(part_syms)} atoms)")
-                part_pts_out = center_coords(part_pts) if args.center else part_pts
-                part_syms_out, part_pts_out = _ordered_xyz_view(
-                    part_syms,
-                    part_pts_out,
-                    cfg.charges,
-                    anion_lig,
-                )
-                write_xyz(f"{prefix}_{tag}.xyz", part_syms_out, part_pts_out)
-    
-        syms, pts = _prune_before_facet_detection(syms, pts, args=args)
-
-        stack_pair_cuts = merge_pair_cuts_from_cifs(
-            [resolved_materials[idx].cif for idx in active_layer_indices],
-            cfg.charges,
-            safety=1.00,
-        )
-    
-        # --- Detect facets on composite ---
-        # Use outermost shell lattice only for normal directions in detect()
-        core_cif = resolved_materials[outer_idx].cif
-        struct = Structure.from_file(core_cif)
-        if resolved_materials[outer_idx].shape_mode == "sphere":
-            seeds0 = []
-            planes = sphere_halfspaces(radius_eff, n_planes=resolved_materials[outer_idx].sphere_planes)
-            if args.verbose:
-                print(
-                    "\n[5] Using synthetic spherical surface planes "
-                    f"(composite, {len(planes)} planes); Miller facet report skipped."
-                )
-        else:
-            seeds0 = expand_facets(struct, resolved_materials[outer_idx].seeds, proper_only=cfg.proper_only)
-            _facets, planes = _detect_facets_and_report(
-                syms,
-                pts,
-                struct,
-                cfg.charges,
-                seeds0,
-                cfg.passivation.surf_tol,
-                label=" (composite)",
-                verbose=args.verbose,
-            )
-    
-        syms, pts = _run_passivation_and_write_outputs(
-            syms,
-            pts,
-            args=args,
-            cfg=cfg,
-            anion_lig=anion_lig,
-            planes=planes,
-            cif_path=resolved_materials[outer_idx].cif,
-            struct=struct,
-            facet_seeds=seeds0,
-            material_label=resolved_materials[outer_idx].name,
-            construction_radius_override=radius_eff,
-            pair_cuts_override=stack_pair_cuts,
-            output_layer_planes=layer_planes,
-            output_materials=resolved_materials,
-        )
+                print(f"[12] Rewrote passivated structure after core lattice fit → {args.out}")
     
         if args.verbose:
             print("\n### ELEMENT COUNTS ###")

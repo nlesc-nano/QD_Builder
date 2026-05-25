@@ -39,8 +39,21 @@ python -m builder examples/cifs/Pb4S3Br2_DFT.cif examples/core-only/pb4s3br2_sph
 Core-shell:
 
 ```bash
-python -m builder examples/cifs/CdSe_zb.cif examples/core-shell/cdse_znse_core_shell.yaml \
+python -m builder examples/core-shell/cdse_znse_core_shell.yaml \
   -o examples/out/cdse_znse.xyz --verbose --positive-q-mode add
+```
+
+For core-shell, only the YAML is required (material CIFs come from `materials[].cif`):
+
+```bash
+python -m builder examples/core-shell/cdse_znse_core_shell.yaml -o examples/out/cdse_znse.xyz --positive-q-mode add
+```
+
+Single-material still uses CIF + YAML:
+
+```bash
+python -m builder examples/cifs/CdSe_zb.cif examples/core-only/inas_wulff_size_cells.yaml \
+  -o examples/out/inas.xyz --positive-q-mode add
 ```
 
 For core-shell mode, the positional CIF is ignored; material CIFs come from
@@ -53,6 +66,8 @@ The Janus workflow is experimental and lives in a separate script:
 ```bash
 python scripts/build_janus_heterostructures.py examples/janus/cdse_pbs_wulff.yaml
 ```
+
+Outputs are written under `examples/out/janus/` (see each example YAML `output.out_dir`).
 
 Example with a faceted CsPbBr3 side and spherical Pb4S3Br2 cap:
 
@@ -94,6 +109,23 @@ materials:
     size_unit_cells: [1, 1, 1]
     facets: [...]
 ```
+
+Stack-mode notes:
+
+- Stack mode takes the YAML recipe only; each material's CIF path comes from
+  the YAML `materials:` block (no CLI CIF argument).
+- The shared Wulff replica lattice defaults to the **core** material CIF
+  (`stack.geometry_reference: core`). Use `shortest` for legacy behavior.
+- All materials must share the same CIF space group (e.g. F-43m for zinc-blende).
+- `size_unit_cells` define replica topology; the shared geometry reference uses
+  the shortest lattice parameter among the materials so swapping core/shell
+  identity preserves the discrete Wulff shape.
+- Core lattice fit is enabled by default; passivation runs on the shared reference
+  geometry first, then core atoms are warped to the core CIF metric. Pass
+  `--no-core-lattice-fit` to disable.
+- Isovalent cations (e.g. Zn2+ and Cd2+) share bond cutoffs and bulk-CN targets
+  in stack passivation so swapped core/shell identities yield identical
+  stoichiometry.
 
 Spherical cuts do not need `facets`:
 

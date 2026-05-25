@@ -69,5 +69,5 @@ passivation:
   positive_q_mode_shell: add
 
 output:
-  out_dir: janus_cspbbr3_pb4s3br2_mushroom_tall
+  out_dir: examples/out/janus/cspbbr3_pb4s3br2_mushroom_tall
   prefix: cspbbr3_pb4s3br2

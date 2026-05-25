@@ -25,6 +25,9 @@ from .passivation import (
     _record_uv_allfacets,
     _facet_memberships,
     _collect_cation_sites,
+    _atom_region_index,
+    _try_q_neutral_cation_removal_bundle,
+    atom_regions_from_masks,
 )
 from .io_utils import write_xyz, center_coords
 
@@ -34,6 +37,60 @@ UVCache = Dict[Tuple[int, int], Tuple[float, float]]  # (facet_id, atom_idx) -> 
 
 def _total_Q(symbols: List[str], charges: Dict[str, int]) -> int:
     return int(sum(int(charges.get(s, 0)) for s in symbols))
+
+
+def _surface_low_cn_cations_remain(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    frames: List[Plane],
+    cn_bi: NDArray[np.int_],
+    charges: Dict[str, int],
+    surf_tol: float,
+) -> bool:
+    outer_thr = 0.35 * surf_tol
+    for i, s in enumerate(symbols):
+        if charges.get(s, 0) <= 0:
+            continue
+        if int(cn_bi[i]) > 2:
+            continue
+        inc = _incident_facets(i, pts, frames, surf_tol)
+        if not inc:
+            continue
+        depths = [frames[fid][1] - float(np.dot(pts[i], frames[fid][0])) for fid in inc]
+        if min(depths) >= outer_thr:
+            continue
+        return True
+    return False
+
+
+def _min_ligand_ligand_spacing(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    ligand: str,
+) -> float:
+    idx = [i for i, s in enumerate(symbols) if s == ligand]
+    if len(idx) < 2:
+        return 2.5
+    dmin = float("inf")
+    for a_pos, i in enumerate(idx):
+        for j in idx[a_pos + 1:]:
+            d = float(np.linalg.norm(pts[i] - pts[j]))
+            if 1e-9 < d < dmin:
+                dmin = d
+    return 1.05 * dmin if np.isfinite(dmin) else 2.5
+
+
+def _ligand_position_allowed(
+    new_pos: NDArray[np.float64],
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    ligand: str,
+) -> bool:
+    idx = [i for i, s in enumerate(symbols) if s == ligand]
+    if not idx:
+        return True
+    min_dist = _min_ligand_ligand_spacing(symbols, pts, ligand)
+    return all(float(np.linalg.norm(new_pos - pts[i])) >= min_dist - 1e-6 for i in idx)
 
 
 def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64]) -> List[int]:
@@ -86,6 +143,7 @@ def _prune_orphan_ligands(
     pair_cuts: Optional[PairCuts],
     *,
     verbose: bool = True,
+    atom_regions: Optional[List[int]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], int]:
     lig_idx = [i for i, s in enumerate(symbols) if s == ligand]
     cat_idx = [i for i, s in enumerate(symbols) if charges.get(s, 0) > 0]
@@ -115,6 +173,8 @@ def _prune_orphan_ligands(
     before = _total_Q(symbols, charges)
     symbols = [s for s, k in zip(symbols, keep) if k]
     pts = pts[keep]
+    if atom_regions is not None:
+        atom_regions[:] = [r for r, k in zip(atom_regions, keep) if k]
     after = _total_Q(symbols, charges)
     if verbose:
         print(f"prune orphan {ligand}: removed {len(orphan_idx)} unbound ligand(s) | Q:{before:+d}→{after:+d}")
@@ -186,9 +246,15 @@ def _priority2_remove_low_cn_cation_once(
     uv_cache: UVCache,
     ligand: str,
     pair_cuts: Optional[PairCuts],
-    *, verbose: bool = True
+    *,
+    verbose: bool = True,
+    stack_passivation: bool = False,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    region_removals: Optional[Dict[int, int]] = None,
+    atom_regions: Optional[List[int]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
-    cands: List[Tuple[int, float, float, int, int]] = []  # (role_rank, -dmin, depth, fid, idx)
+    use_stack = stack_passivation
+    cands: List[Tuple] = []
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
@@ -208,22 +274,64 @@ def _priority2_remove_low_cn_cation_once(
             dmin = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken)
         else:
             dmin = float("inf")
-        cands.append((role_rank, -dmin, depth, fid, i))
+        if use_stack:
+            reg = _atom_region_index(i, region_masks, atom_regions)
+            reg_count = region_removals.get(reg, 0) if region_removals is not None else 0
+            cands.append((reg_count, role_rank, -dmin, depth, fid, i))
+        else:
+            cands.append((role_rank, -dmin, depth, fid, i))
 
     if not cands:
         return False, symbols, pts
 
-    cands.sort(key=lambda t: (-t[0], t[1], t[2], t[4]))
-    role_rank, _negdmin, depth, fid, i = cands[0]
+    if use_stack:
+        cands.sort(key=lambda t: (t[0], -t[1], t[2], t[3], t[5]))
+        _reg, role_rank, _negdmin, depth, fid, i = cands[0]
+    else:
+        cands.sort(key=lambda t: (-t[0], t[1], t[2], t[4]))
+        role_rank, _negdmin, depth, fid, i = cands[0]
+
+    q_cat = int(charges.get(symbols[i], 0))
+    q_now = _total_Q(symbols, charges)
+    if use_stack and q_cat > 0 and q_now - q_cat < 0:
+        cn_now = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        for _r, _rr, _nd, _dp, _f, alt_i in cands:
+            ok, pts = _try_q_neutral_cation_removal_bundle(
+                symbols, pts, frames, charges, ligand, surf_tol, pair_cuts,
+                uv_taken, edit_count_facet, mem, cn_now, alt_i,
+                region_masks=region_masks, region_removals=region_removals,
+                atom_regions=atom_regions, verbose=verbose,
+            )
+            if ok:
+                cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+                native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
+                for j, sj in enumerate(list(symbols)):
+                    if charges.get(sj, 0) >= 0 or sj == ligand or sj not in native_anions:
+                        continue
+                    if len(_incident_facets(j, pts, frames, surf_tol)) == 0:
+                        continue
+                    if int(cn2[j]) < 3:
+                        old = symbols[j]
+                        symbols[j] = ligand
+                        if verbose:
+                            print(f"stabilize: swap {old}#{j} → {ligand} (neighbor CN<3)")
+                return True, symbols, pts
+        return False, symbols, pts
+
     before = _total_Q(symbols, charges)
     if verbose:
         print(f"remove {symbols[i]}#{i} (CN={int(cn_bi[i])}, role={ROLE_ORDER_VEU[role_rank]}, facet={fid}, depth={depth:.2f} Å)")
     _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+    reg_removed = _atom_region_index(i, region_masks, atom_regions)
     removed_elem = symbols.pop(i)
     pts = np.delete(pts, i, axis=0)
+    if atom_regions is not None:
+        atom_regions.pop(i)
     symbols, pts, _ = _prune_orphan_ligands(
-        symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+        symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
     )
+    if use_stack and region_removals is not None:
+        region_removals[reg_removed] = region_removals.get(reg_removed, 0) + 1
     after = _total_Q(symbols, charges)
     if verbose:
         print(f"   ↳ Q:{before:+d}→{after:+d} (removed {removed_elem})")
@@ -259,9 +367,12 @@ def _collect_anion_candidates_flat(
     ligand: str,
     surf_tol: float,
     pair_cuts: Optional[PairCuts],
+    *,
+    ignore_deficit: bool = False,
 ) -> List[dict]:
     outer, subl = collect_anion_candidates(
-        symbols, pts, planes, charges, ligand, surf_tol, verbose=False, pair_cuts=pair_cuts
+        symbols, pts, planes, charges, ligand, surf_tol, verbose=False,
+        pair_cuts=pair_cuts, ignore_deficit=ignore_deficit,
     )
     return list(outer) if len(outer) > 0 else list(outer) + list(subl)
 
@@ -281,9 +392,11 @@ def _priority3_balance_negative_q(
     uv_cache: UVCache,
     pair_cuts: Optional[PairCuts],
     *, verbose: bool = True,
+    stack_passivation: bool = False,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     cand = _collect_anion_candidates_flat(
-        symbols, pts, planes_raw, charges, ligand, surf_tol, pair_cuts
+        symbols, pts, planes_raw, charges, ligand, surf_tol, pair_cuts,
+        ignore_deficit=stack_passivation,
     )
     if not cand:
         return False, symbols, pts
@@ -350,7 +463,8 @@ def _priority3_balance_positive_q_remove(
     ligand: str,
     pair_cuts: Optional[PairCuts],
     positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
-    *, verbose: bool = True
+    *, verbose: bool = True,
+    atom_regions: Optional[List[int]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     outer_thr = 0.35 * surf_tol
     bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts)
@@ -408,8 +522,10 @@ def _priority3_balance_positive_q_remove(
         _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
         removed_elem = symbols.pop(i)
         pts = np.delete(pts, i, axis=0)
+        if atom_regions is not None:
+            atom_regions.pop(i)
         symbols, pts, _ = _prune_orphan_ligands(
-            symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+            symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
         )
         after = _total_Q(symbols, charges)
         if verbose:
@@ -459,6 +575,9 @@ def _priority3_balance_positive_q_add(
     positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
     *, verbose: bool = True,
     include_sublayer: bool = False,
+    stack_passivation: bool = False,
+    atom_regions: Optional[List[int]] = None,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     # gather candidates; include_sublayer=True expands search to sublayer atoms
     sites = _collect_cation_sites(
@@ -552,11 +671,17 @@ def _priority3_balance_positive_q_add(
             except Exception:
                 offset = 2.5
             new_pos = pts[i] + n_vec * offset
+            if stack_passivation and not _ligand_position_allowed(new_pos, symbols, pts, ligand):
+                if verbose:
+                    print(f"[debug:add] veto: ligand spacing for host {symbols[i]}#{i}")
+                continue
 
             host_elem = symbols[i]
             before = _total_Q(symbols, charges)
             symbols.append(ligand)
             pts = np.vstack([pts, new_pos])
+            if atom_regions is not None:
+                atom_regions.append(_atom_region_index(i, region_masks, atom_regions))
             after = _total_Q(symbols, charges)
 
             _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
@@ -726,6 +851,8 @@ def charge_balance_iterative(
     experimental_exhausted_positive_q_fallback: bool = False,
     pair_cuts_override: Optional[PairCuts] = None,
     positive_q_strategy_by_z: Optional[Tuple[float, str, str]] = None,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    stack_passivation: bool = False,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     # Calibrate pair cuts from CIF once (robust bipartite ruler everywhere)
     pair_cuts = (
@@ -750,12 +877,21 @@ def charge_balance_iterative(
     if write_all:
         write_xyz(f"{prefix}_01_before_prepass.xyz", symbols, center_coords(pts))
 
+    region_removals: Dict[int, int] = defaultdict(int)
+    atom_regions: Optional[List[int]] = None
+    if stack_passivation and region_masks is not None:
+        atom_regions = atom_regions_from_masks(len(symbols), region_masks)
+
     # Prepass cleanup (prints its own actions)
     symbols, pts, uv_taken, edit_count_facet = prepass_surface_cleanup(
-        symbols, pts, planes, charges, ligand, surf_tol, pair_cuts=pair_cuts, verbose=verbose
+        symbols, pts, planes, charges, ligand, surf_tol, pair_cuts=pair_cuts, verbose=verbose,
+        stack_passivation=stack_passivation,
+        region_masks=region_masks if stack_passivation else None,
+        region_removals=region_removals if stack_passivation else None,
+        atom_regions=atom_regions,
     )
     symbols, pts, _ = _prune_orphan_ligands(
-        symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+        symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
     )
     if write_all:
         write_xyz(f"{prefix}_02_after_prepass.xyz", symbols, center_coords(pts))
@@ -784,7 +920,7 @@ def charge_balance_iterative(
         pts: NDArray[np.float64],
     ) -> Tuple[List[str], NDArray[np.float64]]:
         symbols, pts, _ = _prune_orphan_ligands(
-            symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+            symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
         )
         return symbols, pts
 
@@ -808,7 +944,11 @@ def charge_balance_iterative(
 
         # Priority 2
         progressed, symbols, pts = _priority2_remove_low_cn_cation_once(
-            symbols, pts, frames, mem, cn_bi, charges, surf_tol, uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose
+            symbols, pts, frames, mem, cn_bi, charges, surf_tol, uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose,
+            stack_passivation=stack_passivation,
+            region_masks=region_masks if stack_passivation else None,
+            region_removals=region_removals if stack_passivation else None,
+            atom_regions=atom_regions,
         )
         if progressed:
             continue
@@ -822,10 +962,16 @@ def charge_balance_iterative(
         Q = _total_Q(symbols, charges)
         if Q == 0:
             symbols, pts, n_orphan = _prune_orphan_ligands(
-                symbols, pts, charges, ligand, pair_cuts, verbose=verbose
+                symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
             )
             if n_orphan:
                 continue
+            if stack_passivation:
+                cn_check = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+                if _surface_low_cn_cations_remain(symbols, pts, frames, cn_check, charges, surf_tol):
+                    if verbose:
+                        print("[loop] Q=0 but surface CN≤2 cations remain — continuing structural cleanup...")
+                    continue
             if verbose:
                 print("[done] Structural + electrical stability reached (Q=0, no CN≤2 on surface).")
             return _finish(symbols, pts)
@@ -835,7 +981,7 @@ def charge_balance_iterative(
                 print("[strategy] Q<0 → swap stable anions (CN=3→4→5), V→E→U + FPS")
             progressed, symbols, pts = _priority3_balance_negative_q(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol, uv_taken, edit_count_facet, uv_cache,
-                pair_cuts, verbose=verbose
+                pair_cuts, verbose=verbose, stack_passivation=stack_passivation,
             )
             if progressed:
                 continue
@@ -847,6 +993,9 @@ def charge_balance_iterative(
                     symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
                     uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
                     include_sublayer=include_sublayer,
+                    stack_passivation=stack_passivation,
+                    atom_regions=atom_regions,
+                    region_masks=region_masks if stack_passivation else None,
                 )
                 if progressed:
                     continue
@@ -872,6 +1021,9 @@ def charge_balance_iterative(
                 positive_q_strategy_selector=positive_q_strategy_selector,
                 verbose=verbose,
                 include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
             )
             if progressed:
                 continue
@@ -919,6 +1071,8 @@ def charge_balance_iterative(
                             symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
                             uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
                             include_sublayer=include_sublayer,
+                            atom_regions=atom_regions,
+                            region_masks=region_masks,
                         )
                         if not ok:
                             break
@@ -938,6 +1092,9 @@ def charge_balance_iterative(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
                 uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
                 include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
             )
             if progressed:
                 continue
@@ -965,6 +1122,9 @@ def charge_balance_iterative(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol,
                 uv_taken, edit_count_facet, add_count_facet, host_taken, uv_cache, pair_cuts, verbose=verbose,
                 include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
             )
             if progressed:
                 continue
