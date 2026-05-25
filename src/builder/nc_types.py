@@ -75,6 +75,11 @@ class MaterialSpec:
     sphere_planes: int = 192
     align: Optional[AlignSpec] = None
 
+@dataclass(frozen=True)
+class StackSpec:
+    """Stack-mode options (core-shell builds)."""
+    geometry_reference: str = "core"  # core | shortest | shell
+
 # Unified config returned by parse_yaml_config
 @dataclass(frozen=True)
 class Config:
@@ -93,3 +98,4 @@ class Config:
     construction_origin: Optional[Dict[str, Any]] = None
     facet_reconstruction: FacetReconstructionSpec = field(default_factory=FacetReconstructionSpec)
     experimental: Dict[str, Any] = field(default_factory=dict)
+    stack: StackSpec = field(default_factory=StackSpec)

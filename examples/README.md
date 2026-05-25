@@ -36,14 +36,14 @@ python -m builder examples/cifs/Pb4S3Br2_DFT.cif examples/core-only/pb4s3br2_sph
 Build CdSe/ZnSe with per-layer `size_unit_cells`:
 
 ```bash
-python -m builder examples/cifs/CdSe_zb.cif examples/core-shell/cdse_znse_core_shell.yaml \
+python -m builder examples/core-shell/cdse_znse_core_shell.yaml \
   -o examples/out/cdse_znse.xyz --verbose --positive-q-mode add
 ```
 
 Build a core-crown platelet-like shell where the shell grows only in x/y:
 
 ```bash
-python -m builder examples/cifs/CdSe_zb.cif examples/core-shell/cdse_znse_core_crown.yaml \
+python -m builder examples/core-shell/cdse_znse_core_crown.yaml \
   -o examples/out/cdse_znse_crown.xyz --verbose --positive-q-mode add
 ```
 
@@ -56,6 +56,8 @@ outer shapes:
 python scripts/build_janus_heterostructures.py examples/janus/cdse_pbs_wulff.yaml
 ```
 
+Outputs land in `examples/out/janus/cdse_pbs_wulff/`.
+
 Build a CsPbBr3/Pb4S3Br2 Janus heterostructure with a faceted perovskite side,
 a spherical Pb4S3Br2 shell cap, and a mushroom footprint that permits a
 controlled shell overhang:
@@ -64,11 +66,15 @@ controlled shell overhang:
 python scripts/build_janus_heterostructures.py examples/janus/cspbbr3_pb4s3br2_mushroom.yaml
 ```
 
+Outputs land in `examples/out/janus/cspbbr3_pb4s3br2_mushroom/`.
+
 The taller variant uses the same interface selection but a thicker core:
 
 ```bash
 python scripts/build_janus_heterostructures.py examples/janus/cspbbr3_pb4s3br2_mushroom_tall.yaml
 ```
+
+Outputs land in `examples/out/janus/cspbbr3_pb4s3br2_mushroom_tall/`.
 
 ## Utility Scripts
 

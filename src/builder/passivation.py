@@ -149,6 +149,168 @@ def _role_by_geometry(i: int, fid: int,
 # Candidate collection (no mutation)
 # --------------------------------------
 
+# --------------------------------------
+# Region / charge-neutral bundle helpers
+# --------------------------------------
+
+def _atom_region_index(
+    i: int,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    atom_regions: Optional[List[int]] = None,
+) -> int:
+    if atom_regions is not None and 0 <= i < len(atom_regions):
+        reg = int(atom_regions[i])
+        if reg >= 0:
+            return reg
+    if region_masks is None:
+        return 0
+    for k, mask in enumerate(region_masks):
+        if i < len(mask) and bool(mask[i]):
+            return k
+    return max(0, len(region_masks) - 1)
+
+
+def atom_regions_from_masks(
+    n_atoms: int,
+    region_masks: List[NDArray[np.bool_]],
+) -> List[int]:
+    out = [-1] * n_atoms
+    for k, mask in enumerate(region_masks):
+        for i in range(n_atoms):
+            if i < len(mask) and bool(mask[i]):
+                out[i] = k
+    return out
+
+
+def _native_anion_elements(charges: Dict[str, int], ligand: str) -> Set[str]:
+    return {el for el, q in charges.items() if q < 0 and el != ligand}
+
+
+def _bond_neighbor_indices(
+    i: int,
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    pair_cuts: PairCuts | None = None,
+) -> List[int]:
+    from .analysis import _pair_cut, _pair_cut_calibrated
+    xi = pts[i]
+    out: List[int] = []
+    for j, sj in enumerate(symbols):
+        if j == i:
+            continue
+        rc = _pair_cut_calibrated(symbols[i], sj, pair_cuts) if pair_cuts is not None else _pair_cut(symbols[i], sj)
+        if rc <= 0:
+            continue
+        if float(np.linalg.norm(pts[j] - xi)) <= rc + 1e-12:
+            out.append(j)
+    return out
+
+
+def _pick_bundle_anion_indices(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    cn: NDArray[np.int_],
+    charges: Dict[str, int],
+    ligand: str,
+    mem: List[List[int]],
+    cation_idx: int,
+    *,
+    need: int = 2,
+    pair_cuts: PairCuts | None = None,
+) -> List[int]:
+    """Pick surface native anions whose swap to ligand balances removing one +2 cation."""
+    native = _native_anion_elements(charges, ligand)
+    picked: List[int] = []
+    seen: set[int] = set()
+
+    def _try_add(idx: int, priority: int, bucket: List[Tuple[int, int, int]]) -> None:
+        if idx in seen or idx == cation_idx:
+            return
+        if symbols[idx] not in native:
+            return
+        if int(cn[idx]) > 3:
+            return
+        if not mem[idx]:
+            return
+        bucket.append((priority, int(cn[idx]), idx))
+
+    bucket: List[Tuple[int, int, int]] = []
+    for j in _bond_neighbor_indices(cation_idx, symbols, pts, pair_cuts):
+        _try_add(j, 0, bucket)
+    for i, s in enumerate(symbols):
+        _try_add(i, 1, bucket)
+
+    bucket.sort(key=lambda t: (t[0], t[1], t[2]))
+    for _prio, _cnv, idx in bucket:
+        if len(picked) >= need:
+            break
+        picked.append(idx)
+        seen.add(idx)
+    return picked
+
+
+def _try_q_neutral_cation_removal_bundle(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    frames: List[tuple],
+    charges: Dict[str, int],
+    ligand: str,
+    surf_tol: float,
+    pair_cuts: PairCuts | None,
+    uv_taken: Dict[int, List[Tuple[float, float]]],
+    edit_count_facet: Dict[int, int],
+    mem: List[List[int]],
+    cn: NDArray[np.int_],
+    cation_idx: int,
+    *,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    region_removals: Optional[Dict[int, int]] = None,
+    atom_regions: Optional[List[int]] = None,
+    verbose: bool = False,
+) -> Tuple[bool, NDArray[np.float64]]:
+    """
+    Remove one surface CN<=2 cation and swap two surface anions to ligand (net Q=0).
+    """
+    q_cat = int(charges.get(symbols[cation_idx], 0))
+    if q_cat <= 0:
+        return False, pts
+    # Two anion swaps (+2 for -2→-1) balance one +2 cation removal.
+    anion_swaps = _pick_bundle_anion_indices(
+        symbols, pts, cn, charges, ligand, mem, cation_idx, need=2, pair_cuts=pair_cuts,
+    )
+    if len(anion_swaps) < 2:
+        return False, pts
+
+    reg_removed = _atom_region_index(cation_idx, region_masks, atom_regions)
+    before = int(sum(int(charges.get(s, 0)) for s in symbols))
+    for ai in anion_swaps:
+        old = symbols[ai]
+        if verbose:
+            print(
+                f"bundle: swap anion {old}#{ai} (CN={int(cn[ai])}) → {ligand} "
+                f"(companion to cation removal #{cation_idx})"
+            )
+        symbols[ai] = ligand
+        _record_uv_allfacets(ai, pts, frames, surf_tol, uv_taken, edit_count_facet)
+
+    cat_el = symbols[cation_idx]
+    if verbose:
+        print(f"bundle: remove cation {cat_el}#{cation_idx} (CN={int(cn[cation_idx])})")
+    _record_uv_allfacets(cation_idx, pts, frames, surf_tol, uv_taken, edit_count_facet)
+    symbols.pop(cation_idx)
+    pts = np.delete(pts, cation_idx, axis=0)
+    if atom_regions is not None:
+        atom_regions.pop(cation_idx)
+
+    after = int(sum(int(charges.get(s, 0)) for s in symbols))
+    if verbose and after != before:
+        print(f"   ↳ bundle Q:{before:+d}→{after:+d} (expected unchanged)")
+
+    if region_removals is not None:
+        region_removals[reg_removed] = region_removals.get(reg_removed, 0) + 1
+    return True, pts
+
+
 def prepass_surface_cleanup(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -159,6 +321,10 @@ def prepass_surface_cleanup(
     pair_cuts: PairCuts | None = None,
     *,
     verbose: bool = False,
+    stack_passivation: bool = False,
+    region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    region_removals: Optional[Dict[int, int]] = None,
+    atom_regions: Optional[List[int]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[int, List[Tuple[float, float]]], Dict[int, int]]:
     """
     Always run before charge balancing:
@@ -183,6 +349,8 @@ def prepass_surface_cleanup(
     changed = True
     while changed:
         changed = False
+        mem = _facet_members()
+        cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
         # A. swap anions CN<=2
         for i, s in enumerate(symbols):
             if not _is_surface(i, mem):
@@ -224,13 +392,52 @@ def prepass_surface_cleanup(
                 dmin = float("inf") if not taken else min(hypot(uv[0]-x, uv[1]-y) for (x,y) in taken)
                 cands.append((dmin, -depth, -i, i, s, fid))
             if not cands: break
-            cands.sort(reverse=True)
+            if stack_passivation:
+                cands.sort(key=lambda t: (
+                    region_removals.get(_atom_region_index(t[3], region_masks, atom_regions), 0) if region_removals is not None else 0,
+                    -t[0], -t[1],
+                ))
+            else:
+                cands.sort(reverse=True)
             _, _, _, i, s, _fid = cands[0]
+            q_cat = int(charges.get(s, 0))
+            q_now = int(sum(int(charges.get(sym, 0)) for sym in symbols))
+            if stack_passivation and q_cat > 0 and q_now - q_cat < 0:
+                ok, pts = _try_q_neutral_cation_removal_bundle(
+                    symbols, pts, frames, charges, anion_ligand, surf_tol, pair_cuts,
+                    uv_taken, edit_count_facet, mem, cn, i,
+                    region_masks=region_masks, region_removals=region_removals,
+                    atom_regions=atom_regions, verbose=verbose,
+                )
+                if ok:
+                    changed = True
+                    break
+                # try next candidate in another region
+                progressed_bundle = False
+                for _, _, _, alt_i, alt_s, _ in cands[1:]:
+                    ok, pts = _try_q_neutral_cation_removal_bundle(
+                        symbols, pts, frames, charges, anion_ligand, surf_tol, pair_cuts,
+                        uv_taken, edit_count_facet, mem, cn, alt_i,
+                        region_masks=region_masks, region_removals=region_removals,
+                        atom_regions=atom_regions, verbose=verbose,
+                    )
+                    if ok:
+                        changed = True
+                        progressed_bundle = True
+                        break
+                if progressed_bundle:
+                    break
+                break
             if verbose:
                 print(f"prepass: remove cation {s}#{i} (CN={int(round(cn[i]))})")
             _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+            reg_removed = _atom_region_index(i, region_masks, atom_regions)
             symbols.pop(i)
             pts = np.delete(pts, i, axis=0)
+            if atom_regions is not None:
+                atom_regions.pop(i)
+            if stack_passivation and region_removals is not None:
+                region_removals[reg_removed] = region_removals.get(reg_removed, 0) + 1
             changed = True
 
     return symbols, pts, uv_taken, edit_count_facet

@@ -7,27 +7,28 @@ from typing import List
 import numpy as np
 from scipy.spatial import cKDTree
 
+from .constants import EPS
 from .nc_types import Facet, Plane
 from .facets import halfspaces
 
-EPS = 1e-3
+PLANE_EPS = EPS
 
 # ---------- Common helpers ----------
 
 def rep_ranges(lattice, maxd: float):
     a, b, c = lattice.matrix
-    n = lambda v: int(math.ceil((maxd + EPS) / np.linalg.norm(v))) + 1
+    n = lambda v: int(math.ceil((maxd + PLANE_EPS) / np.linalg.norm(v))) + 1
     return (range(-n(a), n(a)+1), range(-n(b), n(b)+1), range(-n(c), n(c)+1))
 
 def inside(pts: np.ndarray, planes: List[Plane]) -> np.ndarray:
     mask = np.ones(len(pts), dtype=bool)
     for n, d in planes:
-        mask &= (pts @ n) <= (d + EPS)
+        mask &= (pts @ n) <= (d + PLANE_EPS)
         if not mask.any():
             break
     return mask
 
-def dedupe_points(symbols: List[str], pts: np.ndarray, tol: float = 1e-3):
+def dedupe_points(symbols: List[str], pts: np.ndarray, tol: float = PLANE_EPS):
     """
     Remove near-duplicates (within tol) while preserving order.
     """
@@ -45,7 +46,7 @@ def dedupe_points(symbols: List[str], pts: np.ndarray, tol: float = 1e-3):
     return [s for s, k in zip(symbols, keep) if k], pts[keep]
 
 
-def recut_with_planes(syms: List[str], pts: np.ndarray, planes: List[Plane], tol: float = 1e-6):
+def recut_with_planes(syms: List[str], pts: np.ndarray, planes: List[Plane], tol: float = PLANE_EPS):
     """
     Keep only atoms satisfying all Wulff halfspaces n.x <= d + tol.
     """

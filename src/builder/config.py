@@ -13,7 +13,7 @@ except ImportError:
 from .nc_types import (
     Config, Facet,
     PassivationSpec, MaterialSpec, BuildSpec, AlignSpec, StrainPolicy,
-    FacetReconstructionSpec,
+    FacetReconstructionSpec, StackSpec,
 )
 
 # -------------------- CLI --------------------
@@ -23,10 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="nc-builder",
         description="Coordination-aware Wulff-cut nanocrystal builder with surface passivation."
     )
-    # In stack mode, the positional CIF is ignored because CIFs come from YAML;
-    # radius is still the outer Wulff radius.
-    p.add_argument("cif", help="Input bulk CIF file (ignored in stack mode)")
-    p.add_argument("yaml", help="YAML recipe file (single or multi-material)")
+    p.add_argument(
+        "inputs",
+        nargs="+",
+        metavar="INPUT",
+        help="Stack mode: YAML recipe only. Single-material: CIF file then YAML recipe.",
+    )
     p.add_argument("-r", "--radius", type=float, default=None,
                    help="Target outer Wulff radius (Å)")
     p.add_argument("-size-unit-cells", "--size-unit-cells", type=float, default=None,
@@ -91,7 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--core-lattice-fit",
         action="store_true",
         help="After relabeling, shrink inner core atoms with an affine map to the core CIF lattice, "
-             "and apply a smooth strain blend near the core boundary."
+             "and apply a smooth strain blend near the core boundary. "
+             "Enabled by default in stack mode unless --no-core-lattice-fit is set."
+    )
+    strain.add_argument(
+        "--no-core-lattice-fit",
+        action="store_true",
+        help="Disable core lattice affine fit in stack mode (fit is on by default for core-shell)."
     )
     strain.add_argument(
         "--core-strain-width",
@@ -336,6 +344,13 @@ def parse_yaml_config(path: str) -> Config:
     experimental = cfg.get("experimental") or {}
     if not isinstance(experimental, dict):
         raise TypeError("experimental must be a mapping")
+    stack_raw = cfg.get("stack") or {}
+    if not isinstance(stack_raw, dict):
+        raise TypeError("stack must be a mapping")
+    geometry_reference = str(stack_raw.get("geometry_reference", "core")).strip().lower()
+    if geometry_reference not in {"core", "shortest", "shell"}:
+        raise ValueError("stack.geometry_reference must be 'core', 'shortest', or 'shell'")
+    stack_spec = StackSpec(geometry_reference=geometry_reference)
 
     # Register cation_ligand charge if provided
     if facet_reconstruction.cation_ligand and facet_reconstruction.cation_ligand not in charges:
@@ -489,6 +504,7 @@ def parse_yaml_config(path: str) -> Config:
             construction_origin=construction_origin,
             facet_reconstruction=facet_reconstruction,
             experimental=experimental,
+            stack=stack_spec,
         )
 
     # ---- SINGLE MODE (legacy) ----
@@ -516,4 +532,5 @@ def parse_yaml_config(path: str) -> Config:
         construction_origin=construction_origin,
         facet_reconstruction=facet_reconstruction,
         experimental=experimental,
+        stack=stack_spec,
     )

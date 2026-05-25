@@ -153,6 +153,9 @@ def merge_pair_cuts_from_cifs(
     Single-material charge balancing calibrates from the same CIF used to build
     the cluster.  Core/shell particles contain element pairs from multiple CIFs,
     so stack mode needs the union of those per-material calibrations.
+
+    Isovalent species (e.g. Zn2+ and Cd2+) share the same cutoff for each
+    opposite-charge partner so identical geometry yields identical CNs.
     """
     merged: Dict[Tuple[str, str], float] = {}
     any_cut = False
@@ -168,7 +171,39 @@ def merge_pair_cuts_from_cifs(
                 merged[key] = value
     if not any_cut:
         return None
-    return PairCuts(rc=merged)
+    return harmonize_pair_cuts_by_charge(PairCuts(rc=merged), charges)
+
+
+def harmonize_pair_cuts_by_charge(cuts: PairCuts, charges: Dict[str, int]) -> PairCuts:
+    """
+    Unify cutoffs among isovalent element pairs so coordination on shared
+    geometry does not depend on chemical label (e.g. Zn2+ vs Cd2+).
+    """
+    rc = dict(cuts.rc)
+    elems = set(charges.keys())
+    for a, b in rc:
+        elems.add(a)
+        elems.add(b)
+
+    by_charge: Dict[int, set[str]] = {}
+    for el in elems:
+        by_charge.setdefault(int(charges.get(el, 0)), set()).add(el)
+
+    charge_vals = sorted(by_charge.keys())
+    for qa in charge_vals:
+        for qb in charge_vals:
+            if qa * qb >= 0:
+                continue
+            max_cut = 0.0
+            for a in by_charge[qa]:
+                for b in by_charge[qb]:
+                    key = _pair_key(a, b)
+                    val = rc.get(key, _pair_cut(a, b))
+                    max_cut = max(max_cut, val)
+            for a in by_charge[qa]:
+                for b in by_charge[qb]:
+                    rc[_pair_key(a, b)] = max_cut
+    return PairCuts(rc=rc)
 
 def pretty_print_pair_cuts(cuts: Optional[PairCuts], pairs_hint: Optional[List[Tuple[str,str]]] = None):
     """One-line dump of key pair cutoffs (calibrated vs covalent fallback)."""
@@ -313,6 +348,13 @@ def bulk_cn_opposite_by_interior(
         if vals.size == 0:
             vals = cn[(arr_sym == el)]
         bulk[el] = int(np.bincount(vals.astype(int)).argmax()) if vals.size else 0
+
+    by_charge: Dict[int, int] = {}
+    for el, val in bulk.items():
+        q = int(charges.get(el, 0))
+        by_charge[q] = max(by_charge.get(q, 0), int(val))
+    for el in bulk:
+        bulk[el] = by_charge[int(charges.get(el, 0))]
     return bulk
 
 def bulk_cn_by_interior(

@@ -18,7 +18,6 @@ ENV/
 env/
 *.conda
 *.ipynb_checkpoints
-*.DS_Store
 
 # Build
 build/
@@ -33,6 +32,7 @@ src/*.egg-info/
 *.swp
 *~
 *.bak
+CLAUDE.md
 
 # OS
 .DS_Store
@@ -41,3 +41,17 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Generated builder outputs (keep directory placeholders only)
+tests/out/*
+!tests/out/.gitkeep
+examples/out/*
+!examples/out/.gitkeep
+!examples/out/README.md
+
+# Stray artifacts at repository root from local runs
+/*.xyz
+/*.json
+/*.csv
+/*.zip
+cache/
+size_cell_scan/
