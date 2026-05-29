@@ -118,8 +118,8 @@ Stack-mode notes:
   (`stack.geometry_reference: core`). Use `shortest` for legacy behavior.
 - All materials must share the same CIF space group (e.g. F-43m for zinc-blende).
 - `size_unit_cells` define replica topology; the shared geometry reference uses
-  the shortest lattice parameter among the materials so swapping core/shell
-  identity preserves the discrete Wulff shape.
+  the selected reference lattice so shared-cation and shared-anion stacks with
+  matching replica counts preserve the same discrete Wulff topology.
 - Core lattice fit is enabled by default; passivation runs on the shared reference
   geometry first, then core atoms are warped to the core CIF metric. Pass
   `--no-core-lattice-fit` to disable.

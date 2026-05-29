@@ -91,8 +91,17 @@ def _center_from_name(stem: str) -> str:
 
 
 def _row_from_manifest(rep: float, json_path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    actual_rep = data.get("actual_size_unit_cells")
+    if actual_rep is None:
+        # Fall back to construction_radius_ang divided by min lattice if present
+        actual_radius = data.get("actual_radius_ang", data.get("construction_radius_ang"))
+        if actual_radius is not None:
+            actual_rep = float(actual_radius) / 5.0  # approximate min lattice
+        else:
+            actual_rep = rep
     return {
         "rep": _format_rep(rep),
+        "actual_rep": _format_rep(actual_rep),
         "center": _center_from_name(json_path.stem),
         "file": json_path.with_suffix(".xyz").name,
         "json": json_path.name,
@@ -120,6 +129,7 @@ def _table_data(
     count_cols = _count_columns(rows, charges=charges, ligands=ligands)
     headers = [
         "rep",
+        "actual_rep",
         "center",
         *count_cols,
         "Q",
@@ -133,6 +143,7 @@ def _table_data(
         counts = row.get("counts", {})
         table_rows.append([
             row["rep"],
+            row["actual_rep"],
             row["center"],
             *[counts.get(el, 0) for el in count_cols],
             row["total_charge"],
@@ -192,6 +203,7 @@ def _write_csv(
     count_cols = _count_columns(rows, charges=charges, ligands=ligands)
     fields = [
         "rep",
+        "actual_rep",
         "center",
         *count_cols,
         "total_charge",
@@ -215,7 +227,7 @@ def _print_collected_row(row: dict[str, Any], count_cols: list[str]) -> None:
     counts = row.get("counts", {})
     counts_text = " ".join(f"{el}={counts.get(el, 0)}" for el in count_cols)
     print(
-        f"[row] rep={row['rep']} center={row['center']} "
+        f"[row] rep={row['rep']} actual_rep={row['actual_rep']} center={row['center']} "
         f"{counts_text} Q={row['total_charge']} "
         f"D_in={_fmt(row['input_D_nm'])} nm D_final={_fmt(row['final_D_nm'])} nm "
         f"file={row['file']}",

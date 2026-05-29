@@ -1,7 +1,7 @@
 materials:
   - name: core
     cif: examples/cifs/ZnSe_zb.cif
-    size_unit_cells: [4, 4, 1]
+    size_unit_cells: [3, 3, 1]
     facets:
       - hkl: "100"
         termination: cation_rich

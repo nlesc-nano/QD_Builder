@@ -28,6 +28,24 @@ def inside(pts: np.ndarray, planes: List[Plane]) -> np.ndarray:
             break
     return mask
 
+def auto_shift_planes(
+    coords: np.ndarray,
+    planes: List[Plane],
+    threshold: float = 0.05,
+    shift_amount: float = 0.25,
+) -> List[Plane]:
+    shifted_planes = []
+    for n, d in planes:
+        dists = coords @ n
+        diffs = np.abs(dists - d)
+        if np.any(diffs < threshold):
+            old_d = d
+            d = d + shift_amount
+            normal_str = f"[{n[0]:.2f}, {n[1]:.2f}, {n[2]:.2f}]"
+            print(f"[wulff:shift] Auto-shifted facet (normal: {normal_str}) plane outward by +{shift_amount:.2f} Å (from d={old_d:.4f} to {d:.4f}) to avoid cutting through atomic layer.")
+        shifted_planes.append((n, d))
+    return shifted_planes
+
 def dedupe_points(symbols: List[str], pts: np.ndarray, tol: float = PLANE_EPS):
     """
     Remove near-duplicates (within tol) while preserving order.
@@ -82,6 +100,22 @@ def build_nanocrystal(
         base = base - np.asarray(origin_shift, float)
     site_symbols = [site.specie.symbol for site in struct.sites]
 
+    # Pre-generate all candidate coordinates to run auto-shifting
+    all_coords_list = []
+    for i, j, k in product(rx, ry, rz):
+        shift = (i * struct.lattice.matrix[0]
+                 + j * struct.lattice.matrix[1]
+                 + k * struct.lattice.matrix[2])
+        all_coords_list.append(base + shift)
+    all_coords = np.vstack(all_coords_list)
+
+    # Automatically shift planes to avoid cutting through atomic layers
+    planes = auto_shift_planes(all_coords, planes, threshold=0.05, shift_amount=0.25)
+
+    # In case maxd increased, update ranges
+    maxd = max(d for _, d in planes)
+    rx, ry, rz = rep_ranges(struct.lattice, maxd)
+
     syms: List[str] = []
     pts: List[np.ndarray] = []
 
@@ -93,9 +127,8 @@ def build_nanocrystal(
         mask = inside(coords, planes)
         idxs = np.where(mask)[0]
         if idxs.size:
-            # Index the Python list with Python ints
             syms.extend(site_symbols[idx] for idx in idxs.tolist())
-            pts.extend(coords[idxs])  # coords is NumPy → fancy indexing is fine
+            pts.extend(coords[idxs])
 
     return syms, np.asarray(pts, float), planes
 
@@ -123,10 +156,6 @@ def build_spherical_nanocrystal(
 ):
     """
     Build a near-spherical particle from a bulk Structure.
-
-    This approximates the isotropic Wulff limit gamma(n)=constant using many
-    uniformly distributed halfspaces. It intentionally does not use Miller
-    facet energies.
     """
     planes = sphere_halfspaces(R, n_planes=n_planes)
     maxd = float(R)
@@ -136,6 +165,22 @@ def build_spherical_nanocrystal(
     if origin_shift is not None:
         base = base - np.asarray(origin_shift, float)
     site_symbols = [site.specie.symbol for site in struct.sites]
+
+    # Pre-generate all candidate coordinates to run auto-shifting
+    all_coords_list = []
+    for i, j, k in product(rx, ry, rz):
+        shift = (i * struct.lattice.matrix[0]
+                 + j * struct.lattice.matrix[1]
+                 + k * struct.lattice.matrix[2])
+        all_coords_list.append(base + shift)
+    all_coords = np.vstack(all_coords_list)
+
+    # Automatically shift planes to avoid cutting through atomic layers
+    planes = auto_shift_planes(all_coords, planes, threshold=0.05, shift_amount=0.25)
+
+    # In case maxd increased, update ranges
+    maxd = max(d for _, d in planes)
+    rx, ry, rz = rep_ranges(struct.lattice, maxd)
 
     syms: List[str] = []
     pts: List[np.ndarray] = []
