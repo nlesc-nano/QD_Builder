@@ -896,33 +896,35 @@ def _resolve_facet_terminations_for_structure(
 ) -> list[Facet]:
     resolved: list[Facet] = []
     for f in seeds:
-        if getattr(f, "scope", "family") == "facet":
-            resolved.append(f)
-            continue
         term = getattr(f, "termination", None)
         if not term:
             resolved.append(f)
             continue
-        hkl = (abs(int(f.h)), abs(int(f.k)), abs(int(f.l)))
+        scope = getattr(f, "scope", "family")
+        hkl_in = (int(f.h), int(f.k), int(f.l))
+        hkl = hkl_in if scope == "facet" else tuple(abs(x) for x in hkl_in)
         if hkl == (0, 0, 0):
             resolved.append(f)
             continue
-        scored = []
-        for cand in (hkl, (-hkl[0], -hkl[1], -hkl[2])):
-            n = unit_normal(struct, cand)
-            coords = np.asarray([site.coords for site in struct.sites], float)
-            proj = coords @ n
-            top = float(np.max(proj))
-            tol = max(1e-4, 1e-3 * max(1.0, abs(top)))
-            q = int(sum(
-                charges.get(str(site.specie.symbol), 0)
-                for site, p in zip(struct.sites, proj)
-                if top - float(p) <= tol
-            ))
-            scored.append((cand, q))
-        chosen, _q = max(scored, key=lambda rec: rec[1]) if term == "cation_rich" else min(scored, key=lambda rec: rec[1])
+        if scope == "facet":
+            chosen = hkl
+        else:
+            scored = []
+            for cand in (hkl, (-hkl[0], -hkl[1], -hkl[2])):
+                n = unit_normal(struct, cand)
+                coords = np.asarray([site.coords for site in struct.sites], float)
+                proj = coords @ n
+                top = float(np.max(proj))
+                tol = max(1e-4, 1e-3 * max(1.0, abs(top)))
+                q = int(sum(
+                    charges.get(str(site.specie.symbol), 0)
+                    for site, p in zip(struct.sites, proj)
+                    if top - float(p) <= tol
+                ))
+                scored.append((cand, q))
+            chosen, _q = max(scored, key=lambda rec: rec[1]) if term == "cation_rich" else min(scored, key=lambda rec: rec[1])
         chosen = (-chosen[0], -chosen[1], -chosen[2])
-        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=getattr(f, "scope", "family")))
+        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=scope))
     return resolved
 
 

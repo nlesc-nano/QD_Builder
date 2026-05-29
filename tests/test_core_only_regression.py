@@ -96,3 +96,41 @@ def test_inp_anion_rich_charge_balance_add_mode() -> None:
     syms, _ = _read_xyz(out)
     counts = Counter(syms)
     assert counts["In"] > counts["P"] or counts["Cl"] > 0
+
+
+def test_mixed_family_facet_scope_keeps_full_oriented_set() -> None:
+    """Terminated family facets must not be swallowed by explicit facet entries."""
+    from builder.config import parse_yaml_config
+    from builder.facets import expand_facets
+    from builder.main import _resolve_facet_terminations
+
+    cif = ROOT / "examples/cifs/InAs.cif"
+    yaml_path = ROOT / "examples/core-only/inas_oriented_facet_scope.yaml"
+    struct = Structure.from_file(cif)
+    cfg = parse_yaml_config(str(yaml_path))
+
+    seeds = _resolve_facet_terminations(struct, cfg.seeds, cfg.charges)
+    expanded = expand_facets(struct, seeds, proper_only=cfg.proper_only)
+    hkl111 = {
+        (f.h, f.k, f.l)
+        for f in expanded
+        if sorted(abs(x) for x in (f.h, f.k, f.l)) == [1, 1, 1]
+    }
+
+    assert len(hkl111) == 8, sorted(hkl111)
+
+    out = ROOT / "tests/out/inas_oriented_scope_regression.xyz"
+    _run_builder(cif, yaml_path, out, positive_q_mode="add")
+    cut_atoms = int(out.with_name(out.stem + "_cut.xyz").read_text().split()[0])
+    manifest = json.loads(out.with_suffix(".json").read_text())
+
+    assert cut_atoms == 421
+    assert manifest["counts"] == {"In": 153, "Cl": 110, "As": 106}
+    assert manifest["total_charge"] == 31
+
+
+if __name__ == "__main__":
+    test_inp_anion_rich_termination_at_cut()
+    test_inp_anion_rich_charge_balance_add_mode()
+    test_mixed_family_facet_scope_keeps_full_oriented_set()
+    print("core-only regression tests passed")

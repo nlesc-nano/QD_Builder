@@ -325,11 +325,15 @@ def prepass_surface_cleanup(
     region_masks: Optional[List[NDArray[np.bool_]]] = None,
     region_removals: Optional[Dict[int, int]] = None,
     atom_regions: Optional[List[int]] = None,
+    prepass_mode: str = "standard",
+    prepass_min_cn_terrace: int = 2,
+    prepass_min_cn_edge: int = 2,
+    prepass_min_cn_vertex: int = 2,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[int, List[Tuple[float, float]]], Dict[int, int]]:
     """
     Always run before charge balancing:
-      • swap all surface anions with CN<=2 to the anion ligand (e.g., Se2- -> Cl-)
-      • remove all surface cations with CN<=2 (spacing-aware)
+      • swap all surface anions with CN<=min_cn to the anion ligand (e.g., Se2- -> Cl-)
+      • remove all surface cations with CN<min_cn (spacing-aware)
     Returns (symbols, pts, uv_taken, edit_count_facet) to seed spacing state.
     """
     from .analysis import coord_numbers_bipartite
@@ -338,48 +342,77 @@ def prepass_surface_cleanup(
     uv_taken: Dict[int, List[Tuple[float, float]]] = {}
     edit_count_facet: Dict[int, int] = {}
 
+    def _is_homogeneous_intersection(fids: List[int], planes_list: List[Plane]) -> bool:
+        if len(fids) <= 1:
+            return True
+        sigs = []
+        for fid in fids:
+            n, d = planes_list[fid]
+            sig = tuple(np.round(sorted(np.abs(n)), 4))
+            sigs.append(sig)
+        return all(s == sigs[0] for s in sigs)
+
     def _facet_members() -> List[List[int]]:
         return _facet_memberships(pts, planes, surf_tol)
 
     def _is_surface(i: int, mem: List[List[int]]) -> bool:
         return len(mem[i]) > 0
 
-    mem = _facet_members()
-    cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-    changed = True
-    while changed:
-        changed = False
-        mem = _facet_members()
-        cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        # A. swap anions CN<=2
-        for i, s in enumerate(symbols):
-            if not _is_surface(i, mem):
-                continue
-            if charges.get(s, 0) >= 0:
-                continue
-            if s == anion_ligand:
-                continue
-            if cn[i] <= 2:
-                if verbose:
-                    print(f"prepass: swap anion {s}#{i} (CN={int(cn[i])}) → {anion_ligand}")
-                symbols[i] = anion_ligand
-                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
-                changed = True
-        if changed:
-            mem = _facet_members()
-            cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+    edges_by_facet = verts_by_facet = None
+    edge_tol = max(0.25 * surf_tol, 0.35)
+    vertex_tol = max(0.75 * surf_tol, 0.75)
+    if prepass_mode == "role-aware":
+        try:
+            edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+        except Exception:
+            edges_by_facet = verts_by_facet = None
 
-        # B. remove all cation CN<=2 (spacing-aware)
+    mem = _facet_members()
+    # Run prepass surface cleanup exactly once (non-cascading) to prevent crystal erosion
+    if True:
+        # B. remove all cation CN<min_cn (spacing-aware) until converged
         while True:
-            mem = _facet_members()
             cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
             cands = []
             for i, s in enumerate(symbols):
                 if charges.get(s, 0) <= 0: continue
                 if not _is_surface(i, mem): continue
-                if int(round(cn[i])) > 2: continue
+
+                cation_cn = int(round(cn[i]))
+                role = 0
+                if prepass_mode == "role-aware":
+                    fid_for_role = min(
+                        mem[i],
+                        key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])),
+                    )
+                    if edges_by_facet is not None and verts_by_facet is not None:
+                        _role_name, role = _role_by_geometry(
+                            i, fid_for_role, pts, frames,
+                            edges_by_facet, verts_by_facet, edge_tol, vertex_tol,
+                        )
+                    else:
+                        m_count = len(mem[i])
+                        role = 0 if m_count == 1 else (1 if m_count == 2 else 2)
+                    
+                    # Demote heterogeneous intersections to terrace
+                    if role in {1, 2}:
+                        if not _is_homogeneous_intersection(mem[i], planes):
+                            role = 0
+                            
+                    if role == 0:
+                        min_cn = prepass_min_cn_terrace
+                    elif role == 1:
+                        min_cn = prepass_min_cn_edge
+                    else:
+                        min_cn = prepass_min_cn_vertex
+                else:
+                    min_cn = 3
+
+                if cation_cn >= min_cn: continue
+
                 best = None
-                for fid, (n, d, *_rest) in enumerate(frames):
+                for fid in mem[i]:
+                    n, d, *_rest = frames[fid]
                     depth = d - float(np.dot(pts[i], n))
                     if depth < surf_tol:
                         if best is None or depth < best[0]:
@@ -390,16 +423,30 @@ def prepass_surface_cleanup(
                 from math import hypot
                 taken = uv_taken.get(fid, [])
                 dmin = float("inf") if not taken else min(hypot(uv[0]-x, uv[1]-y) for (x,y) in taken)
-                cands.append((dmin, -depth, -i, i, s, fid))
+                cands.append((dmin, -depth, -i, i, s, fid, role))
             if not cands: break
             if stack_passivation:
                 cands.sort(key=lambda t: (
                     region_removals.get(_atom_region_index(t[3], region_masks, atom_regions), 0) if region_removals is not None else 0,
                     -t[0], -t[1],
                 ))
+                _, _, _, i, s, _fid, role = cands[0]
             else:
                 cands.sort(reverse=True)
-            _, _, _, i, s, _fid = cands[0]
+                if verbose:
+                    print(f"prepass: remove {len(cands)} low-CN cation(s) in batch")
+                remove_idxs = sorted({t[3] for t in cands}, reverse=True)
+                for t in cands:
+                    _dmin, _neg_depth, _neg_i, i_rec, _s_rec, _fid_rec, _role_rec = t
+                    _record_uv_allfacets(i_rec, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                for i_rm in remove_idxs:
+                    symbols.pop(i_rm)
+                    pts = np.delete(pts, i_rm, axis=0)
+                    mem.pop(i_rm)
+                    if atom_regions is not None:
+                        atom_regions.pop(i_rm)
+                changed = True
+                continue
             q_cat = int(charges.get(s, 0))
             q_now = int(sum(int(charges.get(sym, 0)) for sym in symbols))
             if stack_passivation and q_cat > 0 and q_now - q_cat < 0:
@@ -410,11 +457,12 @@ def prepass_surface_cleanup(
                     atom_regions=atom_regions, verbose=verbose,
                 )
                 if ok:
+                    mem = _facet_members()
                     changed = True
                     break
                 # try next candidate in another region
                 progressed_bundle = False
-                for _, _, _, alt_i, alt_s, _ in cands[1:]:
+                for _, _, _, alt_i, alt_s, _, _ in cands[1:]:
                     ok, pts = _try_q_neutral_cation_removal_bundle(
                         symbols, pts, frames, charges, anion_ligand, surf_tol, pair_cuts,
                         uv_taken, edit_count_facet, mem, cn, alt_i,
@@ -422,6 +470,7 @@ def prepass_surface_cleanup(
                         atom_regions=atom_regions, verbose=verbose,
                     )
                     if ok:
+                        mem = _facet_members()
                         changed = True
                         progressed_bundle = True
                         break
@@ -429,16 +478,57 @@ def prepass_surface_cleanup(
                     break
                 break
             if verbose:
-                print(f"prepass: remove cation {s}#{i} (CN={int(round(cn[i]))})")
+                role_str = f" (role={'terrace' if role == 0 else ('edge' if role == 1 else 'vertex')})" if prepass_mode == "role-aware" else ""
+                print(f"prepass: remove cation {s}#{i} (CN={int(round(cn[i]))}{role_str})")
             _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
             reg_removed = _atom_region_index(i, region_masks, atom_regions)
             symbols.pop(i)
             pts = np.delete(pts, i, axis=0)
+            mem.pop(i)
             if atom_regions is not None:
                 atom_regions.pop(i)
             if stack_passivation and region_removals is not None:
                 region_removals[reg_removed] = region_removals.get(reg_removed, 0) + 1
             changed = True
+
+        # A. remove highly undercoordinated surface anions CN<=1, swap CN==2 to anion_ligand
+        cn  = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        to_remove = []
+        changed_swap = False
+        for i, s in enumerate(symbols):
+            if not _is_surface(i, mem):
+                continue
+            if charges.get(s, 0) >= 0:
+                continue
+            if s == anion_ligand:
+                continue
+            
+            anion_cn = int(round(cn[i]))
+            if anion_cn <= 1:
+                to_remove.append(i)
+            elif anion_cn == 2:
+                if verbose:
+                    print(f"prepass: swap anion {s}#{i} (CN={anion_cn}) → {anion_ligand}")
+                symbols[i] = anion_ligand
+                _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                changed_swap = True
+        
+        if to_remove:
+            if verbose:
+                for idx in to_remove:
+                    print(f"prepass: remove unstable surface anion {symbols[idx]}#{idx} (CN={int(cn[idx])})")
+            
+            keep_mask = np.ones(len(symbols), dtype=bool)
+            keep_mask[to_remove] = False
+            
+            symbols = [symbols[j] for j in range(len(symbols)) if keep_mask[j]]
+            pts = pts[keep_mask]
+            
+            mem = _facet_members()
+            cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        elif changed_swap:
+            mem = _facet_members()
+            cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
 
     return symbols, pts, uv_taken, edit_count_facet
 

@@ -7,8 +7,8 @@ dependencies:
   - scipy>=1.11
   - pyyaml
   - pymatgen>=2023.7
+  - rdkit
   - pip
   - pip:
       # editable install of THIS repo (requires you've cloned it first)
       - -e .
-

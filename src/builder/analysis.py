@@ -577,3 +577,470 @@ def facet_families_overview(
         label = f"({f.h}{f.k}{f.l})"
         richness = "cation-rich" if Q>0 else ("anion-rich" if Q<0 else "neutral")
         print(f"  {label:>8s}  #atoms={len(shell):3d}  Q={Q:+d}  {richness}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Virtual Sites and Strict Outward-Pointing Coordination Matching
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    ln = float(np.linalg.norm(v))
+    return v / ln if ln > 1e-12 else np.zeros_like(v)
+
+
+def _bulk_ideal_direction_sets(
+    site_sym: str,
+    bulk_struct,
+    charges: Dict[str, int],
+) -> List[List[np.ndarray]]:
+    """
+    Return all distinct first-shell opposite-charge direction sets for `site_sym`.
+
+    This supports lattices with non-tetrahedral coordination and multiple
+    crystallographic environments for the same species. Direction sets stay in
+    the CIF Cartesian frame; they are not reoriented from facet normals.
+    """
+    if bulk_struct is None or not hasattr(bulk_struct, "sites") or not hasattr(bulk_struct, "lattice"):
+        return []
+
+    site_q = int(charges.get(site_sym, 0))
+    if site_q == 0:
+        return []
+
+    opp_sites = [
+        s for s in bulk_struct.sites
+        if int(charges.get(str(s.specie.symbol), 0)) * site_q < 0
+    ]
+    if not opp_sites:
+        return []
+
+    latt = bulk_struct.lattice
+    direction_sets: List[List[np.ndarray]] = []
+    seen: Set[Tuple[Tuple[float, float, float], ...]] = set()
+    for ref_site in bulk_struct.sites:
+        if str(ref_site.specie.symbol) != site_sym:
+            continue
+        ref_cart = np.asarray(ref_site.coords, float)
+        candidates: List[Tuple[float, np.ndarray]] = []
+        for opp in opp_sites:
+            opp_cart = np.asarray(opp.coords, float)
+            for ia in range(-1, 2):
+                for ib in range(-1, 2):
+                    for ic in range(-1, 2):
+                        shift = ia * latt.matrix[0] + ib * latt.matrix[1] + ic * latt.matrix[2]
+                        vec = opp_cart + shift - ref_cart
+                        dist = float(np.linalg.norm(vec))
+                        if dist > 0.1:
+                            candidates.append((dist, vec))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda rec: rec[0])
+        d_min = candidates[0][0]
+        dirs: List[np.ndarray] = []
+        for dist, vec in candidates:
+            if dist >= 1.2 * d_min:
+                break
+            unit = _unit(vec)
+            if all(float(np.dot(unit, old)) < 0.99 for old in dirs):
+                dirs.append(unit)
+        if not dirs:
+            continue
+        key = tuple(sorted(tuple(np.round(v, 6)) for v in dirs))
+        if key in seen:
+            continue
+        seen.add(key)
+        direction_sets.append(dirs)
+    return direction_sets
+
+
+def _actual_opposite_bond_vectors(
+    syms: List[str],
+    pts: NDArray,
+    idx: int,
+    charges: Dict[str, int],
+    cuts: Optional[PairCuts],
+) -> List[np.ndarray]:
+    sym_i = syms[idx]
+    q_i = int(charges.get(sym_i, 0))
+    if q_i == 0:
+        return []
+    vectors: List[np.ndarray] = []
+    for j, sym_j in enumerate(syms):
+        if j == idx:
+            continue
+        if int(charges.get(sym_j, 0)) * q_i >= 0:
+            continue
+        vec = np.asarray(pts[j], float) - np.asarray(pts[idx], float)
+        dist = float(np.linalg.norm(vec))
+        if 0.1 < dist <= _pair_cut_calibrated(sym_i, sym_j, cuts):
+            vectors.append(vec / dist)
+    return vectors
+
+
+def _match_missing_ideal_dirs(
+    actual_vecs: List[np.ndarray],
+    ideal_dirs: List[np.ndarray],
+    min_dot: float = 0.70,
+) -> Tuple[List[np.ndarray], float]:
+    assigned: Set[int] = set()
+    score = 0.0
+    for actual in actual_vecs:
+        actual = _unit(actual)
+        best_idx = -1
+        best_dot = -2.0
+        for k, ideal in enumerate(ideal_dirs):
+            if k in assigned:
+                continue
+            dot = float(np.dot(actual, ideal))
+            if dot > best_dot:
+                best_idx = k
+                best_dot = dot
+        if best_idx >= 0 and best_dot >= min_dot:
+            assigned.add(best_idx)
+            score += best_dot
+        else:
+            score -= 1.0
+
+    missing = [np.asarray(ideal_dirs[k], float) for k in range(len(ideal_dirs)) if k not in assigned]
+    score -= 0.25 * abs(len(missing) - max(0, len(ideal_dirs) - len(actual_vecs)))
+    return missing, score
+
+
+def _surface_outward_direction(
+    idx: int,
+    pts: NDArray,
+    planes: List[Plane],
+    surf_tol: float,
+) -> np.ndarray:
+    """Use the local facet normal, or summed incident normals on edges/vertices."""
+    pts = np.asarray(pts, float)
+    incident = []
+    nearest: Optional[Tuple[float, np.ndarray]] = None
+    for normal, d in planes:
+        n = _unit(np.asarray(normal, float))
+        depth = float(d) - float(np.dot(pts[idx], n))
+        if nearest is None or depth < nearest[0]:
+            nearest = (depth, n)
+        if depth < surf_tol:
+            incident.append((depth, n))
+    if incident:
+        outer = [_n for depth, _n in incident if depth < 0.35 * surf_tol]
+        normals = outer if outer else [n for _, n in incident]
+        summed = _unit(np.sum(normals, axis=0))
+        if np.linalg.norm(summed) > 1e-12:
+            return summed
+    if nearest is not None:
+        return nearest[1]
+    return _unit(pts[idx] - pts.mean(axis=0))
+
+
+def compute_strict_missing_bond_vectors(
+    syms: List[str],
+    pts: NDArray,
+    charges: Dict[str, int],
+    cuts: Optional[PairCuts],
+    bulk_struct,
+    surf_mask: NDArray,
+    planes: List[Plane],
+    surf_tol: float,
+) -> Dict[int, List[np.ndarray]]:
+    """
+    Compute missing first-shell polyhedron slots without outward fallback.
+
+    The returned vectors are unmatched bulk bond directions in the CIF Cartesian
+    frame. Vectors are never flipped; inward or ambiguous slots are rejected.
+    """
+    pts = np.asarray(pts, float)
+    direction_cache: Dict[str, List[List[np.ndarray]]] = {}
+    result: Dict[int, List[np.ndarray]] = {}
+
+    for idx in np.where(surf_mask)[0]:
+        sym = syms[int(idx)]
+        if int(charges.get(sym, 0)) == 0:
+            continue
+        if sym not in direction_cache:
+            direction_cache[sym] = _bulk_ideal_direction_sets(sym, bulk_struct, charges)
+        direction_sets = direction_cache[sym]
+        if not direction_sets:
+            continue
+
+        actual_vecs = _actual_opposite_bond_vectors(syms, pts, int(idx), charges, cuts)
+        if not actual_vecs:
+            continue
+
+        best_missing: List[np.ndarray] = []
+        best_score = -float("inf")
+        for ideal_dirs in direction_sets:
+            missing, score = _match_missing_ideal_dirs(actual_vecs, ideal_dirs)
+            if score > best_score:
+                best_score = score
+                best_missing = missing
+
+        outward = _surface_outward_direction(int(idx), pts, planes, surf_tol)
+        strict = []
+        for vec in best_missing:
+            vec = _unit(vec)
+            if np.linalg.norm(vec) < 1e-12:
+                continue
+            if float(np.dot(vec, outward)) > 0.05:
+                strict.append(vec)
+        strict.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
+        if strict:
+            result[int(idx)] = strict
+
+    return result
+
+
+def _match_actual_to_ideal(
+    actual_bond_vecs: List[np.ndarray],
+    ideal_dirs: List[np.ndarray],
+) -> List[np.ndarray]:
+    """
+    Greedily assign each actual bond to the closest ideal direction.
+    Returns the list of ideal directions that had NO actual bond assigned to them
+    (the "missing bond" directions).
+    """
+    if not ideal_dirs:
+        return []
+    assigned_ideal: Set[int] = set()
+    remaining_actual = list(range(len(actual_bond_vecs)))
+
+    for i_actual in remaining_actual:
+        a_vec = actual_bond_vecs[i_actual]
+        best_ideal = -1
+        best_dot = -2.0
+        for i_ideal, i_dir in enumerate(ideal_dirs):
+            if i_ideal in assigned_ideal:
+                continue
+            dot = float(np.dot(a_vec, i_dir))
+            if dot > best_dot:
+                best_dot = dot
+                best_ideal = i_ideal
+        if best_ideal >= 0 and best_dot > 0.3:   # 0.3 ≈ 72.5°, generous threshold
+            assigned_ideal.add(best_ideal)
+
+    missing = [ideal_dirs[i] for i in range(len(ideal_dirs)) if i not in assigned_ideal]
+    return missing
+
+
+def compute_cif_virtual_sites(
+    syms: List[str],
+    pts: NDArray,
+    charges: Dict[str, int],
+    cuts: Optional[PairCuts],
+    bulk_struct,
+    surf_mask: NDArray,
+    planes: List[Plane],
+    surf_tol: float,
+) -> List[Dict]:
+    """
+    Finds strict missing neighbors, projects their exact ideal bulk Cartesian 
+    positions in the nanocrystal frame using CIF translation vectors, clusters 
+    overlapping vacancies (<0.2 Å), and returns a list of merged virtual sites 
+    sorted by multiplicity (descending).
+    
+    Each merged site dict contains:
+      - 'pos': Cartesian intersection position (average of projected positions)
+      - 'hosts': List of host cation indices coordinating this site
+      - 'multiplicity': Number of host cations
+      - 'u_vecs': Dict mapping host_idx -> unit vector pointing from host to pos
+    """
+    if bulk_struct is None or not hasattr(bulk_struct, "sites") or not hasattr(bulk_struct, "lattice"):
+        return []
+
+    pts = np.asarray(pts, float)
+    tree = cKDTree(pts)
+    raw_virtual_sites = []
+
+    # 1. Calibrate constant fractional shift between NC and bulk reference structure
+    f_coords = bulk_struct.lattice.get_fractional_coords(pts)
+    best_f_shift = np.zeros(3)
+    found_shift = False
+
+    bulk_species = {s.specie.symbol for s in bulk_struct.sites}
+    ref_idx = -1
+    for idx in range(len(syms)):
+        if syms[idx] in bulk_species:
+            ref_idx = idx
+            break
+
+    if ref_idx >= 0:
+        ref_sym = syms[ref_idx]
+        ref_sites = [s for s in bulk_struct.sites if s.specie.symbol == ref_sym]
+        ref_f = f_coords[ref_idx]
+        for site in ref_sites:
+            candidate_shift = (site.frac_coords - ref_f) % 1
+            
+            # test on first few bulk-native atoms of the NC
+            test_indices = []
+            for j in range(min(50, len(syms))):
+                if syms[j] in bulk_species:
+                    test_indices.append(j)
+                    
+            if not test_indices:
+                best_f_shift = candidate_shift
+                found_shift = True
+                break
+                
+            all_match = True
+            for j in test_indices:
+                shifted_f = (f_coords[j] + candidate_shift + 0.5) % 1 - 0.5
+                j_sites = [s for s in bulk_struct.sites if s.specie.symbol == syms[j]]
+                if not j_sites:
+                    all_match = False
+                    break
+                min_diff = min(
+                    float(np.linalg.norm((s.frac_coords - shifted_f + 0.5) % 1 - 0.5))
+                    for s in j_sites
+                )
+                if min_diff > 0.05:
+                    all_match = False
+                    break
+                    
+            if all_match:
+                best_f_shift = candidate_shift
+                found_shift = True
+                break
+
+    # Map each surface atom to its bulk CIF neighbor mapping
+    for idx in np.where(surf_mask)[0]:
+        sym_i = syms[int(idx)]
+        site_q = int(charges.get(sym_i, 0))
+        if site_q == 0:
+            continue
+
+        # 2. Map to reference bulk site in unit cell (with shift un-biasing)
+        f_coord_unshifted = (f_coords[int(idx)] + best_f_shift + 0.5) % 1 - 0.5
+        site_idx = int(np.argmin([
+            float(np.linalg.norm((site.frac_coords - f_coord_unshifted + 0.5) % 1 - 0.5))
+            for site in bulk_struct.sites
+        ]))
+        bulk_site = bulk_struct.sites[site_idx]
+
+        # 2. Get first-shell opposite-charge bulk neighbors
+        all_neigh = bulk_struct.get_neighbors(bulk_site, r=4.5)
+        if not all_neigh:
+            continue
+        min_dist = min(neigh.nn_distance for neigh in all_neigh)
+        bulk_neighbors = [
+            neigh for neigh in all_neigh 
+            if neigh.nn_distance <= 1.15 * min_dist
+            and int(charges.get(str(neigh.specie.symbol), 0)) * site_q < 0
+        ]
+        if not bulk_neighbors:
+            continue
+
+        # Build set of ideal bulk neighbor vectors and target coords
+        ideal_neigh_list = []
+        for neigh in bulk_neighbors:
+            vec_ij = neigh.coords - bulk_site.coords
+            ideal_neigh_list.append({
+                "vec": vec_ij,
+                "u_vec": _unit(vec_ij),
+                "sym": str(neigh.specie.symbol),
+            })
+
+        # 3. Find actual neighbors in the nanocrystal
+        max_rcut = max(
+            _pair_cut_calibrated(sym_i, s2, cuts)
+            for s2 in set(syms)
+            if charges.get(s2, 0) * site_q < 0
+        ) if any(charges.get(s2, 0) * site_q < 0 for s2 in set(syms)) else 4.0
+
+        neigh_idxs = tree.query_ball_point(pts[idx], r=max_rcut)
+        actual_vecs = []
+        for j in neigh_idxs:
+            if j == idx:
+                continue
+            if charges.get(syms[j], 0) * site_q >= 0:
+                continue
+            d = pts[j] - pts[idx]
+            dist = float(np.linalg.norm(d))
+            if 0.1 < dist <= _pair_cut_calibrated(sym_i, syms[j], cuts):
+                actual_vecs.append(_unit(d))
+
+        # 4. Map actual bonds to ideal bulk neighbors to identify missing ones
+        assigned_ideal = set()
+        for u_a in actual_vecs:
+            best_idx = -1
+            best_dot = -2.0
+            for k, ideal in enumerate(ideal_neigh_list):
+                if k in assigned_ideal:
+                    continue
+                dot = float(np.dot(u_a, ideal["u_vec"]))
+                if dot > best_dot:
+                    best_idx = k
+                    best_dot = dot
+            if best_idx >= 0 and best_dot >= 0.70:
+                assigned_ideal.add(best_idx)
+
+        # 5. Extract strict missing vacancies pointing outward
+        outward = _surface_outward_direction(int(idx), pts, planes, surf_tol)
+        for k, ideal in enumerate(ideal_neigh_list):
+            if k in assigned_ideal:
+                continue
+            u_ideal = ideal["u_vec"]
+            if float(np.dot(u_ideal, outward)) > 0.05:
+                # Perfect Cartesian position where this bulk vacancy sits!
+                vacant_pos = pts[idx] + ideal["vec"]
+                raw_virtual_sites.append({
+                    "host_idx": int(idx),
+                    "u_vec": u_ideal,
+                    "pos": vacant_pos,
+                })
+
+    n_raw = len(raw_virtual_sites)
+    if n_raw == 0:
+        return []
+
+    # 6. Graph-based proximity clustering (threshold 0.2 Å for exact unit cell alignment)
+    adj = {i: [] for i in range(n_raw)}
+    for i1 in range(n_raw):
+        for i2 in range(i1 + 1, n_raw):
+            d = float(np.linalg.norm(raw_virtual_sites[i1]["pos"] - raw_virtual_sites[i2]["pos"]))
+            if d < 0.2:
+                adj[i1].append(i2)
+                adj[i2].append(i1)
+
+    visited = [False] * n_raw
+    components = []
+    for node in range(n_raw):
+        if visited[node]:
+            continue
+        comp = []
+        queue = [node]
+        visited[node] = True
+        while queue:
+            curr = queue.pop(0)
+            comp.append(curr)
+            for neighbor in adj[curr]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+        components.append(comp)
+
+    # 7. Build final merged virtual sites
+    merged_sites = []
+    for comp in components:
+        members = [raw_virtual_sites[k] for k in comp]
+        hosts = list(set(m["host_idx"] for m in members))
+        merged_pos = np.mean([m["pos"] for m in members], axis=0)
+        
+        # Build host-specific direction vectors pointing to this intersection position
+        u_vecs = {}
+        for h in hosts:
+            u_vecs[h] = _unit(merged_pos - pts[h])
+
+        merged_sites.append({
+            "pos": merged_pos,
+            "hosts": hosts,
+            "multiplicity": len(hosts),
+            "u_vecs": u_vecs,
+        })
+
+    # Sort by multiplicity descending
+    merged_sites.sort(key=lambda x: x["multiplicity"], reverse=True)
+    return merged_sites
+
+
+

@@ -13,6 +13,8 @@ from .analysis import (
     pretty_print_pair_cuts,
     coord_numbers_bipartite,
     bulk_cn_opposite_by_interior,
+    compute_strict_missing_bond_vectors,
+    compute_cif_virtual_sites,
 )
 from .analysis import _pair_cut as pc
 from .analysis import _pair_cut_calibrated
@@ -25,6 +27,8 @@ from .passivation import (
     _record_uv_allfacets,
     _facet_memberships,
     _collect_cation_sites,
+    _intersections_geometry,
+    _role_by_geometry,
     _atom_region_index,
     _try_q_neutral_cation_removal_bundle,
     atom_regions_from_masks,
@@ -34,6 +38,34 @@ from .io_utils import write_xyz, center_coords
 # Role ranks: 0=unique, 1=edge, 2=vertex
 ROLE_ORDER_VEU = ["unique", "edge", "vertex"]
 UVCache = Dict[Tuple[int, int], Tuple[float, float]]  # (facet_id, atom_idx) -> (u,v)
+
+
+def derive_true_bulk_cn_from_cif(
+    cif_path: str,
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts] = None,
+) -> Dict[str, int]:
+    import re
+    from pymatgen.core import Structure
+    try:
+        struct = Structure.from_file(cif_path)
+        bulk_cn = {}
+        for site in struct.sites:
+            el = re.sub(r'[^a-zA-Z]', '', site.species_string)
+            if el not in bulk_cn:
+                neighs = struct.get_neighbors(site, r=4.5)
+                cn_count = 0
+                for n_site in neighs:
+                    n_el = re.sub(r'[^a-zA-Z]', '', n_site.species_string)
+                    if charges.get(el, 0) * charges.get(n_el, 0) < 0:
+                        rc = _pair_cut_calibrated(el, n_el, pair_cuts)
+                        if n_site.nn_distance <= rc + 0.15:
+                            cn_count += 1
+                bulk_cn[el] = max(bulk_cn.get(el, 0), cn_count)
+        return bulk_cn
+    except Exception:
+        return {}
+
 
 def _total_Q(symbols: List[str], charges: Dict[str, int]) -> int:
     return int(sum(int(charges.get(s, 0)) for s in symbols))
@@ -46,16 +78,51 @@ def _surface_low_cn_cations_remain(
     cn_bi: NDArray[np.int_],
     charges: Dict[str, int],
     surf_tol: float,
+    *,
+    prepass_mode: str = "standard",
+    prepass_min_cn_terrace: int = 2,
+    prepass_min_cn_edge: int = 2,
+    prepass_min_cn_vertex: int = 2,
 ) -> bool:
     outer_thr = 0.35 * surf_tol
+    edges_by_facet = verts_by_facet = None
+    edge_tol = max(0.25 * surf_tol, 0.35)
+    vertex_tol = max(0.75 * surf_tol, 0.75)
+    if prepass_mode == "role-aware":
+        try:
+            edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+        except Exception:
+            edges_by_facet = verts_by_facet = None
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
-            continue
-        if int(cn_bi[i]) > 2:
             continue
         inc = _incident_facets(i, pts, frames, surf_tol)
         if not inc:
             continue
+
+        cation_cn = int(cn_bi[i])
+        role = 0
+        if prepass_mode == "role-aware":
+            if edges_by_facet is not None and verts_by_facet is not None:
+                fid_min = min(inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
+                _role_name, role = _role_by_geometry(
+                    i, fid_min, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
+                )
+            else:
+                m_count = len(inc)
+                role = 0 if m_count == 1 else (1 if m_count == 2 else 2)
+            if role == 0:
+                min_cn = prepass_min_cn_terrace
+            elif role == 1:
+                min_cn = prepass_min_cn_edge
+            else:
+                min_cn = prepass_min_cn_vertex
+        else:
+            min_cn = 3
+
+        if cation_cn >= min_cn:
+            continue
+
         depths = [frames[fid][1] - float(np.dot(pts[i], frames[fid][0])) for fid in inc]
         if min(depths) >= outer_thr:
             continue
@@ -91,6 +158,128 @@ def _ligand_position_allowed(
         return True
     min_dist = _min_ligand_ligand_spacing(symbols, pts, ligand)
     return all(float(np.linalg.norm(new_pos - pts[i])) >= min_dist - 1e-6 for i in idx)
+
+
+def _get_vacant_directions_for_site(
+    j: int,
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    ref_struct,
+    pt_tree: cKDTree,
+) -> List[np.ndarray]:
+    if ref_struct is None:
+        return []
+    try:
+        f_coord = ref_struct.lattice.get_fractional_coords(pts[j])
+        site_idx = int(np.argmin([
+            float(np.linalg.norm((site.frac_coords - f_coord + 0.5) % 1 - 0.5))
+            for site in ref_struct.sites
+        ]))
+        bulk_site = ref_struct.sites[site_idx]
+        all_neigh = ref_struct.get_neighbors(bulk_site, r=4.5)
+        if not all_neigh:
+            return []
+        min_dist = min(neigh.nn_distance for neigh in all_neigh)
+        bulk_neighbors = [neigh for neigh in all_neigh if neigh.nn_distance <= 1.15 * min_dist]
+        ideal_vectors = []
+        for neigh in bulk_neighbors:
+            vec = neigh.coords - bulk_site.coords
+            ln = float(np.linalg.norm(vec))
+            if ln > 1e-8:
+                ideal_vectors.append(vec / ln)
+        actual_vectors = []
+        neighbor_ids = pt_tree.query_ball_point(pts[j], r=4.5)
+        for act_idx in neighbor_ids:
+            if act_idx == j:
+                continue
+            rc = pc(symbols[j], symbols[act_idx])
+            if rc <= 0:
+                continue
+            if float(np.linalg.norm(pts[act_idx] - pts[j])) <= rc + 1e-12:
+                vec = pts[act_idx] - pts[j]
+                ln = float(np.linalg.norm(vec))
+                if ln > 1e-8:
+                    actual_vectors.append(vec / ln)
+        vacant_vectors = []
+        for t_k in ideal_vectors:
+            is_occupied = False
+            for v_a in actual_vectors:
+                if float(np.dot(v_a, t_k)) > 0.90:
+                    is_occupied = True
+                    break
+            if not is_occupied:
+                vacant_vectors.append(t_k)
+        return vacant_vectors
+    except Exception:
+        return []
+
+
+def _trial_ligand_addition_score(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    charges: Dict[str, int],
+    ligand: str,
+    pair_cuts: Optional[PairCuts],
+    new_pos: NDArray[np.float64],
+    *,
+    host_idx: int,
+    cn_before: NDArray[np.int_],
+    pt_tree: cKDTree,
+    bulk_map: Optional[Dict[str, int]] = None,
+    max_search_cut: float = 5.0,
+    ref_struct = None,
+) -> Tuple[int, int, int, int]:
+    """
+    Score a proposed ligand placement by the local CN gain it creates on nearby
+    positive cations. Returns:
+      (score, host_gain, touched_cations, overcoord_penalty)
+    """
+    host_pos = pts[host_idx]
+    local_cut = max(4.5, float(max_search_cut))
+
+    score = 0
+    host_gain = 0
+    touched = 0
+    over_penalty = 0
+    neighbor_ids = pt_tree.query_ball_point(np.asarray(new_pos, float), r=local_cut)
+    for j in neighbor_ids:
+        sj = symbols[j]
+        if charges.get(sj, 0) <= 0:
+            continue
+        dist = float(np.linalg.norm(pts[j] - new_pos))
+        rc = _pair_cut_calibrated(sj, ligand, pair_cuts)
+        if dist > rc:
+            continue
+
+        # Cone directional filter to prevent spillover/false overcoordination penalties on adjacent fully-coordinated cations
+        if j != host_idx and ref_struct is not None:
+            vacant_dirs = _get_vacant_directions_for_site(j, symbols, pts, ref_struct, pt_tree)
+            u_j = (new_pos - pts[j]) / (dist + 1e-12)
+            if not any(float(np.dot(u_j, t_k)) > 0.80 for t_k in vacant_dirs):
+                continue
+
+        before = int(cn_before[j])
+        after = before + 1
+        if after != before:
+            touched += 1
+        bulk_target = int(bulk_map.get(sj, after) if bulk_map is not None else after)
+        before_clamped = min(before, bulk_target)
+        after_clamped = min(after, bulk_target)
+        gain = max(0, after_clamped - before_clamped)
+        if j == host_idx:
+            host_gain = gain
+        score += 6 * gain
+        if after > bulk_target:
+            over = after - bulk_target
+            over_penalty += over
+            score -= 8 * over
+
+    # Prefer placements that touch multiple nearby cations and do not just
+    # rebalance the host atom in isolation.
+    score += 2 * max(0, touched - 1)
+    # Tiny bias toward staying close to the host when scores are otherwise equal.
+    score += int(round(10.0 / max(1.0, float(np.linalg.norm(np.asarray(new_pos, float) - host_pos)))))
+    return score, host_gain, touched, over_penalty
 
 
 def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64]) -> List[int]:
@@ -252,17 +441,52 @@ def _priority2_remove_low_cn_cation_once(
     region_masks: Optional[List[NDArray[np.bool_]]] = None,
     region_removals: Optional[Dict[int, int]] = None,
     atom_regions: Optional[List[int]] = None,
+    prepass_mode: str = "standard",
+    prepass_min_cn_terrace: int = 2,
+    prepass_min_cn_edge: int = 2,
+    prepass_min_cn_vertex: int = 2,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     use_stack = stack_passivation
     cands: List[Tuple] = []
+    edges_by_facet = verts_by_facet = None
+    edge_tol = max(0.25 * surf_tol, 0.35)
+    vertex_tol = max(0.75 * surf_tol, 0.75)
+    if prepass_mode == "role-aware":
+        try:
+            edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+        except Exception:
+            edges_by_facet = verts_by_facet = None
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
-        if int(cn_bi[i]) > 2:
-            continue
+
         inc = _incident_facets(i, pts, frames, surf_tol)
         if not inc:
             continue
+
+        cation_cn = int(cn_bi[i])
+        role = 0
+        if prepass_mode == "role-aware":
+            fid_for_role = min(inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
+            if edges_by_facet is not None and verts_by_facet is not None:
+                _role_name, role = _role_by_geometry(
+                    i, fid_for_role, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
+                )
+            else:
+                m_count = len(inc)
+                role = 0 if m_count == 1 else (1 if m_count == 2 else 2)
+            if role == 0:
+                min_cn = prepass_min_cn_terrace
+            elif role == 1:
+                min_cn = prepass_min_cn_edge
+            else:
+                min_cn = prepass_min_cn_vertex
+        else:
+            min_cn = 3
+
+        if cation_cn >= min_cn:
+            continue
+
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
         fid, depth = min(depths, key=lambda t: t[1])
         inc_count = len(inc)
@@ -465,9 +689,11 @@ def _priority3_balance_positive_q_remove(
     positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
     *, verbose: bool = True,
     atom_regions: Optional[List[int]] = None,
+    cif_path: Optional[str] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     outer_thr = 0.35 * surf_tol
-    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts)
+    true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts=pair_cuts) if cif_path else None
+    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts, true_bulk_cn=true_bulk_cn)
 
     cands_by_cn: Dict[int, List[Tuple[int, float, float, int, int, int]]] = {}
     protected = _ligand_protected_cation_mask(symbols, pts, charges, ligand, pair_cuts)
@@ -489,11 +715,7 @@ def _priority3_balance_positive_q_remove(
             continue
         ci = int(cn_bi[i])
         tgt = int(bulk_map.get(s, ci))
-        deficit = max(0, tgt - ci)
-        if deficit <= 0:
-            continue  # bulk-like; don't remove
-        if ci < 3:
-            continue  # handled by Priority 2
+        deficit = tgt - ci
         inc_count = len(inc)
         role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)  # V>E>U for removal
         uv = _get_uv(frames, fid, i, pts, uv_cache)
@@ -508,11 +730,9 @@ def _priority3_balance_positive_q_remove(
     if not cands_by_cn:
         return False, symbols, pts
 
-    for cn_tier in sorted(cands_by_cn.keys()):  # 3 -> 4 -> 5 -> ...
-        if cn_tier < 3:
-            continue
+    for cn_tier in sorted(cands_by_cn.keys()):  # 1 -> 2 -> 3 -> ...
         lst = cands_by_cn[cn_tier]
-        lst.sort(key=lambda t: (-t[0], t[1], t[2], t[4]))
+        lst.sort(key=lambda t: (-t[5], -t[0], t[1], t[2], t[4]))
         role_rank, neg_dmin, depth, fid, i, deficit = lst[0]
 
         before = _total_Q(symbols, charges)
@@ -578,13 +798,38 @@ def _priority3_balance_positive_q_add(
     stack_passivation: bool = False,
     atom_regions: Optional[List[int]] = None,
     region_masks: Optional[List[NDArray[np.bool_]]] = None,
+    cif_path: Optional[str] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     # gather candidates; include_sublayer=True expands search to sublayer atoms
+    true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts=pair_cuts) if cif_path else None
+    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts, true_bulk_cn=true_bulk_cn)
+    pt_tree = cKDTree(np.asarray(pts, float))
+    ref_struct = None
+    if cif_path:
+        try:
+            from pymatgen.core import Structure
+            ref_struct = Structure.from_file(cif_path)
+        except Exception as e:
+            if verbose:
+                print(f"[debug:add] Reference CIF load failed for template directions: {e}. Using outward normals only.")
+    edges_by_facet = verts_by_facet = None
+    edge_tol = max(0.25 * surf_tol, 0.35)
+    vertex_tol = max(0.75 * surf_tol, 0.75)
+    try:
+        edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+    except Exception:
+        edges_by_facet = verts_by_facet = None
     sites = _collect_cation_sites(
         symbols, pts, planes_raw, charges, surf_tol, pair_cuts=pair_cuts,
         outer_only=not include_sublayer, allow_shared=True,
         include_sublayer=include_sublayer,
         cn_bi=cn_bi,
+        bulk_cn=bulk_map,
+        frames=frames if edges_by_facet is not None and verts_by_facet is not None else None,
+        edges_by_facet=edges_by_facet,
+        verts_by_facet=verts_by_facet,
+        edge_tol=edge_tol,
+        vertex_tol=vertex_tol,
     )
     if positive_q_strategy_selector is not None:
         sites = [
@@ -609,9 +854,10 @@ def _priority3_balance_positive_q_add(
             by_def[dft].append((i, n_out, depth_min, dft, role_rank, fid))
     if not by_def:
         return False, symbols, pts
-    ordered_defs = ([1] if 1 in by_def and by_def[1] else []) + sorted([k for k in by_def.keys() if k >= 2])
+    # Prioritize largest deficit first for physical structural stability
+    ordered_defs = sorted(by_def.keys(), reverse=True)
 
-    # Try deficits in order; within each, try roles UNIQUE(0)→EDGE(1)→VERTEX(2)
+    # Try deficits in descending order; within each, try roles VERTEX(2)→EDGE(1)→UNIQUE(0)
     for def_tier in ordered_defs:
         pool = by_def.get(def_tier, [])
         if not pool:
@@ -619,86 +865,255 @@ def _priority3_balance_positive_q_add(
         if verbose:
             print(f"[summary:add:pick] chosen_deficit={def_tier} | pool={len(pool)}")
 
-        for role in (0, 1, 2):
-            sub = [rec for rec in pool if rec[4] == role and host_taken.get(rec[0], 0) < 1]
-            if not sub:
-                continue
+        # Eligibility must follow the current CN deficit. A CN=2 edge/vertex
+        # that already received one ligand can still be CN=3 and legitimately
+        # need one more ligand; comparing previous additions against the
+        # recomputed deficit incorrectly suppresses that second repair.
+        sub = list(pool)
+        if not sub:
+            continue
 
-            # Round-robin across facets: fewest additions so far; within facet, FPS + shallow
-            from math import hypot
-            min_count = min((add_count_facet.get(fid, 0) for (_, _, _, _, _, fid) in sub), default=0)
-            candidate_best = None
-            for fid in sorted(set(rec[5] for rec in sub)):
-                if add_count_facet.get(fid, 0) != min_count:
-                    continue
-                facet_pool = [rec for rec in sub if rec[5] == fid]
-                best = None
-                for (i, n_out, depth_min, dft, role_rank, fid2) in facet_pool:
-                    uv = _get_uv(frames, fid, i, pts, uv_cache)
-                    taken = uv_taken.get(fid, [])
-                    dmin = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken) if taken else float("inf")
-                    key = (dmin, -depth_min, -i)
-                    cand = (key, (i, n_out, depth_min, dft, role_rank, fid))
-                    if best is None or cand[0] > best[0]:
-                        best = cand
-                if best is not None and (candidate_best is None or best[0] > candidate_best[0]):
-                    candidate_best = best
+        # Score each host by its best physically allowed ligand placement.
+        # 1. Pre-compute strict missing bond vectors for hosts in this tier
+        sub_mask = np.zeros(len(symbols), dtype=bool)
+        for (i, n_out, depth_min, dft, role_rank, fid) in sub:
+            sub_mask[i] = True
 
-            if candidate_best is None:
-                continue  # try next role or deficit
-
-            _, (i, n_out, depth_min, dft, role_rank, fid) = candidate_best
-
-            # Validate deficit from the current loop's CN and candidate record.
-            cn_before = int(cn_bi[i])
-            deficit_chk = int(dft)
-            if deficit_chk <= 0:
-                if verbose:
-                    print(f"[debug:add] veto: deficit_chk={deficit_chk} (cn_before={cn_before}) for host {symbols[i]}#{i}")
-                continue  # try next candidate
-
-            # place ligand along outward vector
-            n_vec = n_out
-            ln = float(np.linalg.norm(n_vec))
-            if ln < 1e-8:
-                n_vec = frames[fid][0]
-                ln = float(np.linalg.norm(n_vec))
-            if ln > 1e-8:
-                n_vec = n_vec / ln
+        strict_missing = {}
+        if ref_struct is not None:
             try:
-                rc = pc(symbols[i], ligand)
-                offset = (0.95 * rc) if rc > 0 else 2.5
-            except Exception:
-                offset = 2.5
-            new_pos = pts[i] + n_vec * offset
-            if stack_passivation and not _ligand_position_allowed(new_pos, symbols, pts, ligand):
-                if verbose:
-                    print(f"[debug:add] veto: ligand spacing for host {symbols[i]}#{i}")
-                continue
-
-            host_elem = symbols[i]
-            before = _total_Q(symbols, charges)
-            symbols.append(ligand)
-            pts = np.vstack([pts, new_pos])
-            if atom_regions is not None:
-                atom_regions.append(_atom_region_index(i, region_masks, atom_regions))
-            after = _total_Q(symbols, charges)
-
-            _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
-            add_count_facet[fid] = add_count_facet.get(fid, 0) + 1
-            host_taken[i] = host_taken.get(i, 0) + 1
-
-            cn_after_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-            cn_after = int(cn_after_arr[i])
-            role_name = ROLE_ORDER_VEU[role_rank]
-            shell_label = "sublayer" if depth_min >= 0.35 * surf_tol else "outer"
-            if verbose:
-                print(
-                    f"add ligand {ligand} to {host_elem}#{i} "
-                    f"(CN_before={cn_before}, CN_after={cn_after}, role={role_name}, facet={fid}, shell={shell_label}, deficit={deficit_chk}) "
-                    f"at +{offset:.2f} Å | Q:{before:+d}→{after:+d}"
+                strict_missing = compute_strict_missing_bond_vectors(
+                    symbols,
+                    pts,
+                    charges,
+                    pair_cuts,
+                    ref_struct,
+                    sub_mask,
+                    planes_raw,
+                    surf_tol,
                 )
-            return True, symbols, pts  # single successful action
+            except Exception as e:
+                if verbose:
+                    print(f"[debug:add] compute_strict_missing_bond_vectors failed for host tier: {e}. Falling back to outward normal.")
+
+        # 2. Pre-compute unified CIF-Intersection virtual sites for this tier
+        sub_records = {rec[0]: rec for rec in sub}
+        host_candidates_map = defaultdict(list)
+
+        merged_cif_sites = []
+        if ref_struct is not None:
+            try:
+                merged_cif_sites = compute_cif_virtual_sites(
+                    symbols,
+                    pts,
+                    charges,
+                    pair_cuts,
+                    ref_struct,
+                    sub_mask,
+                    planes_raw,
+                    surf_tol,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"[debug:add] compute_cif_virtual_sites failed for host tier: {e}. Falling back to standard normal.")
+
+        if merged_cif_sites:
+            # We have exact crystallographic virtual sites (single and bridges)
+            for site in merged_cif_sites:
+                new_pos = site["pos"]
+                hosts = site["hosts"]
+                multiplicity = site["multiplicity"]
+                # Use the first host as the primary scoring host
+                primary_host = hosts[0]
+                rec = sub_records.get(primary_host)
+                if rec is None:
+                    continue
+                u_vec = site["u_vecs"][primary_host]
+                
+                host_candidates_map[primary_host].append({
+                    "pos": new_pos,
+                    "u_vec": u_vec,
+                    "placed_via_bulk": True,
+                    "is_bridge": (multiplicity >= 2),
+                    "record": rec,
+                })
+        else:
+            # Fallback to standard host-centered candidates along outward normal
+            for (i, n_out, depth_min, dft, role_rank, fid) in sub:
+                try:
+                    rc = pc(symbols[i], ligand)
+                    offset = (0.95 * rc) if rc > 0 else 2.5
+                except Exception:
+                    offset = 2.5
+                
+                u_vec = n_out / (float(np.linalg.norm(n_out)) + 1e-12)
+                pos = pts[i] + u_vec * offset
+                
+                host_candidates_map[i].append({
+                    "pos": pos,
+                    "u_vec": u_vec,
+                    "placed_via_bulk": False,
+                    "is_bridge": False,
+                    "record": (i, n_out, depth_min, dft, role_rank, fid),
+                    "offset": offset,
+                })
+
+        # 3. Evaluate all candidates from all hosts in sub
+        candidate_best = None
+        for primary_host, cands in host_candidates_map.items():
+            best_local = None
+            for cand in cands:
+                new_pos = cand["pos"]
+                u_vec = cand["u_vec"]
+                placed_via_bulk = cand["placed_via_bulk"]
+                is_bridge = cand["is_bridge"]
+                (i_rec, n_out, depth_min, dft, role_rank, fid) = cand["record"]
+                offset = cand.get("offset", float(np.linalg.norm(new_pos - pts[primary_host])))
+
+                if stack_passivation and not _ligand_position_allowed(new_pos, symbols, pts, ligand):
+                    continue
+
+                score, host_gain, touched, over_penalty = _trial_ligand_addition_score(
+                    symbols,
+                    pts,
+                    charges,
+                    ligand,
+                    pair_cuts,
+                    new_pos,
+                    host_idx=primary_host,
+                    cn_before=cn_bi,
+                    pt_tree=pt_tree,
+                    bulk_map=bulk_map,
+                    max_search_cut=max(4.5, abs(_pair_cut_calibrated(symbols[primary_host], ligand, pair_cuts)) + 1.0),
+                    ref_struct=ref_struct,
+                )
+
+                # Multi-cation repair bonus
+                cn3_repaired = 0
+                local_cut = max(4.5, float(abs(_pair_cut_calibrated(symbols[primary_host], ligand, pair_cuts)) + 1.0))
+                neighbor_ids = pt_tree.query_ball_point(np.asarray(new_pos, float), r=local_cut)
+                for j in neighbor_ids:
+                    sj = symbols[j]
+                    if charges.get(sj, 0) <= 0:
+                        continue
+                    dist = float(np.linalg.norm(pts[j] - new_pos))
+                    rc = _pair_cut_calibrated(sj, ligand, pair_cuts)
+                    if dist > rc:
+                        continue
+                    before = int(cn_bi[j])
+                    bulk_target = int(bulk_map.get(sj, before + 1) if bulk_map is not None else before + 1)
+                    if before == bulk_target - 1:
+                        cn3_repaired += 1
+                
+                if cn3_repaired >= 2:
+                    score += 20 * (cn3_repaired - 1)
+
+                inc_facets = _incident_facets(primary_host, pts, frames, surf_tol)
+                add_side_count = (
+                    float(np.mean([add_count_facet.get(f, 0) for f in inc_facets]))
+                    if inc_facets else 0.0
+                )
+                edit_side_count = (
+                    float(np.mean([edit_count_facet.get(f, 0) for f in inc_facets]))
+                    if inc_facets else 0.0
+                )
+                side_balance = -(add_side_count + 0.25 * edit_side_count)
+
+                uv = _get_uv(frames, fid, primary_host, pts, uv_cache)
+                taken = uv_taken.get(fid, [])
+                from math import hypot
+                dmin = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken) if taken else float("inf")
+                repair_rank = max(int(cn3_repaired), int(touched))
+                cand_tuple = (
+                    repair_rank,
+                    score,
+                    host_gain,
+                    touched,
+                    role_rank,
+                    side_balance,
+                    dmin,
+                    -depth_min,
+                    -primary_host,
+                    fid,
+                    new_pos,
+                    u_vec,
+                    placed_via_bulk,
+                    tuple(sorted(inc_facets)),
+                    add_side_count,
+                    edit_side_count,
+                    offset,
+                )
+                if best_local is None or cand_tuple[:9] > best_local[:9]:
+                    best_local = cand_tuple
+            
+            if best_local is not None:
+                if candidate_best is None or best_local[:9] > candidate_best[0]:
+                    candidate_best = (best_local[:9], best_local, cand["record"])
+
+        if candidate_best is None:
+            continue
+
+        _key, (
+            repair_rank,
+            score,
+            host_gain,
+            touched,
+            role_rank_chk,
+            side_balance,
+            dmin,
+            _neg_depth,
+            _neg_i,
+            _fid,
+            new_pos,
+            u_vec,
+            placed_via_bulk,
+            inc_facets_key,
+            add_side_count,
+            edit_side_count,
+            offset,
+        ), (i, n_out, depth_min, dft, role_rank, fid) = candidate_best
+
+        # Validate deficit from the current loop's CN and candidate record.
+        cn_before = int(cn_bi[i])
+        deficit_chk = int(dft)
+        if deficit_chk <= 0:
+            if verbose:
+                print(f"[debug:add] veto: deficit_chk={deficit_chk} (cn_before={cn_before}) for host {symbols[i]}#{i}")
+            continue  # try next candidate
+        if verbose:
+            print(
+                f"[debug:add] host score={score}, repair_rank={repair_rank}, host_gain={host_gain}, "
+                f"touched={touched}, role={ROLE_ORDER_VEU[role_rank]}, inc={list(inc_facets_key)}, "
+                f"side_add={add_side_count:.2f}, side_edit={edit_side_count:.2f}, "
+                f"dmin={dmin:.3f}, bulk={placed_via_bulk}"
+            )
+
+        host_elem = symbols[i]
+        before = _total_Q(symbols, charges)
+        symbols.append(ligand)
+        pts = np.vstack([pts, new_pos])
+        if atom_regions is not None:
+            atom_regions.append(_atom_region_index(i, region_masks, atom_regions))
+        after = _total_Q(symbols, charges)
+
+        _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
+        for add_fid in inc_facets_key:
+            add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
+        if not inc_facets_key:
+            add_count_facet[fid] = add_count_facet.get(fid, 0) + 1
+        host_taken[i] = host_taken.get(i, 0) + 1
+
+        cn_after_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        cn_after = int(cn_after_arr[i])
+        role_name = ROLE_ORDER_VEU[role_rank]
+        shell_label = "sublayer" if depth_min >= 0.35 * surf_tol else "outer"
+        if verbose:
+            print(
+                f"add ligand {ligand} to {host_elem}#{i} "
+                f"(CN_before={cn_before}, CN_after={cn_after}, role={role_name}, facet={fid}, shell={shell_label}, deficit={deficit_chk}) "
+                f"at +{offset:.2f} Å | Q:{before:+d}→{after:+d}"
+            )
+        return True, symbols, pts  # single successful action
 
     # If we reach here, we found no acceptable candidate in any tier
     return False, symbols, pts
@@ -758,6 +1173,13 @@ def _experimental_exhausted_positive_q_fallback_once(
         return removed, trial_symbols, trial_pts, n_orphan, swapped, swapped_logs
 
     cands = []
+    edges_by_facet = verts_by_facet = None
+    edge_tol = max(0.25 * surf_tol, 0.35)
+    vertex_tol = max(0.75 * surf_tol, 0.75)
+    try:
+        edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+    except Exception:
+        edges_by_facet = verts_by_facet = None
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
@@ -768,9 +1190,13 @@ def _experimental_exhausted_positive_q_fallback_once(
         if ci not in (3, 4):
             continue
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
-        _fid, depth = min(depths, key=lambda t: t[1])
+        fid_min, depth = min(depths, key=lambda t: t[1])
         inc_count = len(inc)
         role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)
+        if edges_by_facet is not None and verts_by_facet is not None:
+            _role_name, role_rank = _role_by_geometry(
+                i, fid_min, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
+            )
         removed, trial_symbols, trial_pts, n_orphan, swapped, swapped_logs = simulate_remove(i)
         after = _total_Q(trial_symbols, charges)
         if after < 0:
@@ -785,6 +1211,8 @@ def _experimental_exhausted_positive_q_fallback_once(
             -role_rank,
             depth,
             i,
+            fid_min,
+            tuple(sorted(inc)),
             removed,
             trial_symbols,
             trial_pts,
@@ -806,6 +1234,8 @@ def _experimental_exhausted_positive_q_fallback_once(
         _neg_role,
         depth,
         idx,
+        fid_min,
+        inc_key,
         removed,
         trial_symbols,
         trial_pts,
@@ -816,7 +1246,9 @@ def _experimental_exhausted_positive_q_fallback_once(
     if verbose:
         print(
             "[experimental] Existing Q>0 balancing exhausted; "
-            f"remove surface {removed}#{idx} (CN={cn_removed}, depth={depth:.2f} Å), "
+            f"remove surface {removed}#{idx} "
+            f"(CN={cn_removed}, role={ROLE_ORDER_VEU[-_neg_role]}, facet={fid_min}, "
+            f"inc={list(inc_key)}, depth={depth:.2f} Å), "
             f"then remove {n_orphan} orphan {ligand} ligand(s)."
         )
 
@@ -831,6 +1263,259 @@ def _experimental_exhausted_positive_q_fallback_once(
             f"native_anions_swapped={swapped}"
         )
     return True, trial_symbols, trial_pts
+
+
+def _optimize_ligand_distribution_at_neutrality(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    frames: List[Plane],
+    planes: List[Plane],
+    cn_bi: NDArray[np.int_],
+    charges: Dict[str, int],
+    ligand: str,
+    surf_tol: float,
+    pair_cuts: Optional[PairCuts],
+    *,
+    verbose: bool = True,
+    cif_path: Optional[str] = None,
+    atom_regions: Optional[List[int]] = None,
+) -> Tuple[List[str], NDArray[np.float64]]:
+    """
+    Safely migrates existing ligands from fully-coordinated donor cations (CN >= T - 1 after removal)
+    to highly undercoordinated acceptor cations (CN <= T - 2 before migration) to optimize overall surface stability.
+    """
+    true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts=pair_cuts) if cif_path else None
+    bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes, surf_tol, charges, pair_cuts=pair_cuts, true_bulk_cn=true_bulk_cn)
+    
+    ref_struct = None
+    if cif_path:
+        try:
+            from pymatgen.core import Structure
+            ref_struct = Structure.from_file(cif_path)
+        except Exception as e:
+            if verbose:
+                print(f"[debug:migrate] Reference CIF load failed: {e}. Using outward normals.")
+
+    def calculate_fitness(cn_current: NDArray[np.int_]) -> int:
+        fit = 0
+        for i, s in enumerate(symbols):
+            if charges.get(s, 0) <= 0:
+                continue
+            T_i = int(bulk_map.get(s, 4))
+            c = int(cn_current[i])
+            if c >= T_i:
+                fit += 0
+            elif c == T_i - 1:
+                fit += -1
+            else:
+                fit += -10
+        return fit
+
+    migration_count = 0
+
+    while True:
+        cn_current = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        pt_tree = cKDTree(np.asarray(pts, float))
+        min_spacing = _min_ligand_ligand_spacing(symbols, pts, ligand)
+        
+        acceptors = []
+        for i, s in enumerate(symbols):
+            if charges.get(s, 0) <= 0:
+                continue
+            T_i = int(bulk_map.get(s, 4))
+            if int(cn_current[i]) <= T_i - 2:
+                acceptors.append(i)
+        
+        if not acceptors:
+            break
+
+        ligand_indices = [idx for idx, s in enumerate(symbols) if s == ligand]
+        if not ligand_indices:
+            break
+
+        best_migration = None
+        best_delta_fit = 0
+
+        for l_idx in ligand_indices:
+            hosts = []
+            for i, s in enumerate(symbols):
+                if charges.get(s, 0) <= 0:
+                    continue
+                rc = _pair_cut_calibrated(s, ligand, pair_cuts)
+                if float(np.linalg.norm(pts[i] - pts[l_idx])) <= rc + 1e-12:
+                    hosts.append(i)
+            
+            if not hosts:
+                continue
+
+            safe_donor = True
+            for h in hosts:
+                T_h = int(bulk_map.get(symbols[h], 4))
+                if int(cn_current[h]) - 1 < T_h - 1:
+                    safe_donor = False
+                    break
+            
+            if not safe_donor:
+                continue
+
+            cn_temp = cn_current.copy()
+            for h in hosts:
+                cn_temp[h] -= 1
+
+            candidate_positions = []
+            for i in acceptors:
+                try:
+                    rc = pc(symbols[i], ligand)
+                    offset = (0.95 * rc) if rc > 0 else 2.5
+                except Exception:
+                    offset = 2.5
+
+                inc = _incident_facets(i, pts, frames, surf_tol)
+                
+                n_unit = []
+                for (n_f, d_f) in planes:
+                    ln_f = np.linalg.norm(n_f) + 1e-12
+                    n_unit.append(np.asarray(n_f, float) / ln_f)
+                
+                vec = np.zeros(3, float)
+                for fid in inc:
+                    vec += n_unit[fid]
+                ln = np.linalg.norm(vec)
+                n_out = n_unit[inc[0]] if ln < 1e-8 else (vec / ln)
+
+                placed_via_bulk = False
+                direction_pool = [n_out]
+                if ref_struct is not None:
+                    try:
+                        f_coord = ref_struct.lattice.get_fractional_coords(pts[i])
+                        site_idx = int(np.argmin([
+                            float(np.linalg.norm((site.frac_coords - f_coord + 0.5) % 1 - 0.5))
+                            for site in ref_struct.sites
+                        ]))
+                        bulk_site = ref_struct.sites[site_idx]
+                        all_neigh = ref_struct.get_neighbors(bulk_site, r=4.5)
+                        if all_neigh:
+                            min_dist = min(neigh.nn_distance for neigh in all_neigh)
+                            bulk_neighbors = [neigh for neigh in all_neigh if neigh.nn_distance <= 1.15 * min_dist]
+                            ideal_vectors = []
+                            for neigh in bulk_neighbors:
+                                vec_ideal = neigh.coords - bulk_site.coords
+                                ln_ideal = float(np.linalg.norm(vec_ideal))
+                                if ln_ideal > 1e-8:
+                                    ideal_vectors.append(vec_ideal / ln_ideal)
+                            
+                            actual_vectors = []
+                            neighbor_ids = pt_tree.query_ball_point(pts[i], r=4.5)
+                            for act_idx in neighbor_ids:
+                                if act_idx == i or act_idx == l_idx:
+                                    continue
+                                rc_neigh = pc(symbols[i], symbols[act_idx])
+                                if rc_neigh <= 0:
+                                    continue
+                                if float(np.linalg.norm(pts[act_idx] - pts[i])) <= rc_neigh + 1e-12:
+                                    vec_act = pts[act_idx] - pts[i]
+                                    ln_act = float(np.linalg.norm(vec_act))
+                                    if ln_act > 1e-8:
+                                        actual_vectors.append(vec_act / ln_act)
+                            
+                            vacant_vectors = []
+                            for t_k in ideal_vectors:
+                                is_occupied = False
+                                for v_a in actual_vectors:
+                                    if float(np.dot(v_a, t_k)) > 0.90:
+                                        is_occupied = True
+                                        break
+                                if not is_occupied:
+                                    vacant_vectors.append(t_k)
+                            
+                            if vacant_vectors:
+                                direction_pool = vacant_vectors
+                                placed_via_bulk = True
+                    except Exception:
+                        pass
+                
+                for vec in direction_pool:
+                    ln_v = float(np.linalg.norm(vec))
+                    if ln_v > 1e-8:
+                        candidate_positions.append({
+                            "pos": pts[i] + (vec / ln_v) * offset,
+                            "placed_via_bulk": placed_via_bulk,
+                            "hosts": [i]
+                        })
+
+            for idx_a1, i1 in enumerate(acceptors):
+                for i2 in acceptors[idx_a1 + 1:]:
+                    if float(np.linalg.norm(pts[i1] - pts[i2])) > 4.5:
+                        continue
+                    
+                    rc1 = pc(symbols[i1], ligand)
+                    rc2 = pc(symbols[i2], ligand)
+                    
+                    cands1 = [c for c in candidate_positions if c["hosts"] == [i1]]
+                    cands2 = [c for c in candidate_positions if c["hosts"] == [i2]]
+                    for c1 in cands1:
+                        for c2 in cands2:
+                            if float(np.linalg.norm(c1["pos"] - c2["pos"])) < 1.8:
+                                p_bridge = (c1["pos"] + c2["pos"]) / 2.0
+                                if float(np.linalg.norm(p_bridge - pts[i1])) <= rc1 + 0.15 and \
+                                   float(np.linalg.norm(p_bridge - pts[i2])) <= rc2 + 0.15:
+                                    candidate_positions.append({
+                                        "pos": p_bridge,
+                                        "placed_via_bulk": c1["placed_via_bulk"] or c2["placed_via_bulk"],
+                                        "hosts": [i1, i2]
+                                    })
+
+            for cand in candidate_positions:
+                new_pos = cand["pos"]
+                
+                too_close = False
+                for other_l in ligand_indices:
+                    if other_l == l_idx:
+                        continue
+                    if float(np.linalg.norm(new_pos - pts[other_l])) < min_spacing - 1e-6:
+                        too_close = True
+                        break
+                
+                if too_close:
+                    continue
+
+                cn_after = cn_temp.copy()
+                local_cut = 5.0
+                neighbor_ids = pt_tree.query_ball_point(np.asarray(new_pos, float), r=local_cut)
+                for j in neighbor_ids:
+                    sj = symbols[j]
+                    if charges.get(sj, 0) <= 0:
+                        continue
+                    dist = float(np.linalg.norm(pts[j] - new_pos))
+                    rc = _pair_cut_calibrated(sj, ligand, pair_cuts)
+                    if dist <= rc:
+                        if ref_struct is not None:
+                            vacant_dirs = _get_vacant_directions_for_site(j, symbols, pts, ref_struct, pt_tree)
+                            u_j = (new_pos - pts[j]) / (dist + 1e-12)
+                            if not any(float(np.dot(u_j, t_k)) > 0.80 for t_k in vacant_dirs):
+                                continue
+                        cn_after[j] += 1
+
+                delta_fit = calculate_fitness(cn_after) - calculate_fitness(cn_current)
+                if delta_fit > best_delta_fit:
+                    best_delta_fit = delta_fit
+                    best_migration = (delta_fit, l_idx, new_pos, cand["hosts"], hosts)
+
+        if best_migration is not None:
+            delta_fit, l_idx, new_pos, host_list, donor_hosts = best_migration
+            if verbose:
+                donors_str = ", ".join(f"{symbols[d]}#{d} (CN={int(cn_current[d])})" for d in donor_hosts)
+                acceptors_str = ", ".join(f"{symbols[a]}#{a} (CN={int(cn_current[a])})" for a in host_list)
+                print(f"[passivation:migrate] Migrated ligand {ligand}#{l_idx} binding {donors_str} → {acceptors_str} (Delta Fitness: +{delta_fit})")
+            pts[l_idx] = new_pos
+            migration_count += 1
+        else:
+            break
+
+    if verbose and migration_count > 0:
+        print(f"[passivation:migrate] Completed {migration_count} ligand migrations successfully.")
+    
+    return symbols, pts
 
 
 # ---------- MASTER CONTROLLER ----------
@@ -853,6 +1538,10 @@ def charge_balance_iterative(
     positive_q_strategy_by_z: Optional[Tuple[float, str, str]] = None,
     region_masks: Optional[List[NDArray[np.bool_]]] = None,
     stack_passivation: bool = False,
+    prepass_mode: str = "standard",
+    prepass_min_cn_terrace: int = 2,
+    prepass_min_cn_edge: int = 2,
+    prepass_min_cn_vertex: int = 2,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     # Calibrate pair cuts from CIF once (robust bipartite ruler everywhere)
     pair_cuts = (
@@ -889,10 +1578,21 @@ def charge_balance_iterative(
         region_masks=region_masks if stack_passivation else None,
         region_removals=region_removals if stack_passivation else None,
         atom_regions=atom_regions,
+        prepass_mode=prepass_mode,
+        prepass_min_cn_terrace=prepass_min_cn_terrace,
+        prepass_min_cn_edge=prepass_min_cn_edge,
+        prepass_min_cn_vertex=prepass_min_cn_vertex,
     )
     symbols, pts, _ = _prune_orphan_ligands(
         symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
     )
+    # Update planes to reflect the new shrunk boundary of the nanocrystal after prepass
+    new_planes = []
+    for n, d in planes:
+        d_new = float(np.max(pts @ n) + 1e-5)
+        new_planes.append((n, d_new))
+    planes = new_planes
+
     if write_all:
         write_xyz(f"{prefix}_02_after_prepass.xyz", symbols, center_coords(pts))
 
@@ -949,6 +1649,10 @@ def charge_balance_iterative(
             region_masks=region_masks if stack_passivation else None,
             region_removals=region_removals if stack_passivation else None,
             atom_regions=atom_regions,
+            prepass_mode=prepass_mode,
+            prepass_min_cn_terrace=prepass_min_cn_terrace,
+            prepass_min_cn_edge=prepass_min_cn_edge,
+            prepass_min_cn_vertex=prepass_min_cn_vertex,
         )
         if progressed:
             continue
@@ -966,11 +1670,24 @@ def charge_balance_iterative(
             )
             if n_orphan:
                 continue
+
+            # Post-passivation ligand migration/redistribution to resolve highly undercoordinated sites
+            symbols, pts = _optimize_ligand_distribution_at_neutrality(
+                symbols, pts, frames, planes, cn_bi, charges, ligand, surf_tol, pair_cuts,
+                verbose=verbose, cif_path=cif_path, atom_regions=atom_regions
+            )
+
             if stack_passivation:
                 cn_check = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-                if _surface_low_cn_cations_remain(symbols, pts, frames, cn_check, charges, surf_tol):
+                if _surface_low_cn_cations_remain(
+                    symbols, pts, frames, cn_check, charges, surf_tol,
+                    prepass_mode=prepass_mode,
+                    prepass_min_cn_terrace=prepass_min_cn_terrace,
+                    prepass_min_cn_edge=prepass_min_cn_edge,
+                    prepass_min_cn_vertex=prepass_min_cn_vertex,
+                ):
                     if verbose:
-                        print("[loop] Q=0 but surface CN≤2 cations remain — continuing structural cleanup...")
+                        print("[loop] Q=0 but surface low CN cations remain — continuing structural cleanup...")
                     continue
             if verbose:
                 print("[done] Structural + electrical stability reached (Q=0, no CN≤2 on surface).")
@@ -996,6 +1713,7 @@ def charge_balance_iterative(
                     stack_passivation=stack_passivation,
                     atom_regions=atom_regions,
                     region_masks=region_masks if stack_passivation else None,
+                    cif_path=cif_path,
                 )
                 if progressed:
                     continue
@@ -1012,6 +1730,7 @@ def charge_balance_iterative(
                 uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts,
                 positive_q_strategy_selector=positive_q_strategy_selector,
                 verbose=verbose,
+                cif_path=cif_path,
             )
             if progressed:
                 continue
@@ -1024,6 +1743,7 @@ def charge_balance_iterative(
                 stack_passivation=stack_passivation,
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
             )
             if progressed:
                 continue
@@ -1054,7 +1774,8 @@ def charge_balance_iterative(
             _Q_before = _total_Q(symbols, charges)
             progressed, symbols, pts = _priority3_balance_positive_q_remove(
                 symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol,
-                uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose
+                uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose,
+                cif_path=cif_path,
             )
             if progressed:
                 _Q_after = _total_Q(symbols, charges)
@@ -1073,6 +1794,7 @@ def charge_balance_iterative(
                             include_sublayer=include_sublayer,
                             atom_regions=atom_regions,
                             region_masks=region_masks,
+                            cif_path=cif_path,
                         )
                         if not ok:
                             break
@@ -1095,6 +1817,7 @@ def charge_balance_iterative(
                 stack_passivation=stack_passivation,
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
             )
             if progressed:
                 continue
@@ -1125,6 +1848,7 @@ def charge_balance_iterative(
                 stack_passivation=stack_passivation,
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
             )
             if progressed:
                 continue

@@ -14,6 +14,9 @@ from .nc_types import (
     Config, Facet,
     PassivationSpec, MaterialSpec, BuildSpec, AlignSpec, StrainPolicy,
     FacetReconstructionSpec, StackSpec,
+    NeutralLigandPass, NeutralLigandPostTreatSpec,
+    LigandExchangePass, LigandExchangePostTreatSpec,
+    SurfaceReconstructionSpec, PostTreatmentSpec,
 )
 
 # -------------------- CLI --------------------
@@ -60,6 +63,30 @@ def build_parser() -> argparse.ArgumentParser:
     pre.add_argument(
         "--no-prune-mono", dest="prune_mono", action="store_false",
         help="Disable the pre-pass pruning step."
+    )
+    pre.add_argument(
+        "--prepass-mode",
+        choices=["standard", "role-aware"],
+        default=None,
+        help="Prepass cleaning mode: 'standard' (original CN<=2 pruning, default) or 'role-aware'."
+    )
+    pre.add_argument(
+        "--prepass-min-cn-terrace",
+        type=int,
+        default=None,
+        help="Minimum coordination number to keep for terrace atoms in role-aware mode (default: 3)."
+    )
+    pre.add_argument(
+        "--prepass-min-cn-edge",
+        type=int,
+        default=None,
+        help="Minimum coordination number to keep for edge atoms in role-aware mode (default: 3)."
+    )
+    pre.add_argument(
+        "--prepass-min-cn-vertex",
+        type=int,
+        default=None,
+        help="Minimum coordination number to keep for vertex atoms in role-aware mode (default: 1)."
     )
     p.set_defaults(prune_mono=True)
 
@@ -126,8 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Min vacuum thickness in Å for scan (default: 20).")
     scan.add_argument("--scan-shifts", type=int, default=8,
                       help="Number of evenly-spaced terminations to sample with unsymmetrized slabs (default: 8).")
-     
- 
+
     return p
 
 # -------------------- YAML helpers --------------------
@@ -292,6 +318,242 @@ def _parse_facet_reconstruction(raw) -> FacetReconstructionSpec:
         cation_ligand_charge=int(cation_ligand_charge) if cation_ligand_charge is not None else None,
     )
 
+
+def _parse_neutral_ligands(raw) -> NeutralLigandPostTreatSpec:
+    """Parse the optional neutral_ligands: block from a YAML passivation dict."""
+    if raw is None:
+        return NeutralLigandPostTreatSpec()  # disabled by default
+    if not isinstance(raw, dict):
+        raise TypeError("neutral_ligands must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return NeutralLigandPostTreatSpec(enabled=False)
+
+    # -- Parse passes list --
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("neutral_ligands.passes must be a list")
+
+    valid_targets = {"anion", "cation", "both"}
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"neutral_ligands.passes[{i}] must be a mapping")
+        target = str(entry.get("target", "")).strip().lower()
+        if target not in valid_targets:
+            raise ValueError(
+                f"neutral_ligands.passes[{i}].target must be one of {valid_targets!r}, got {target!r}"
+            )
+        smiles = str(entry.get("smiles", "")).strip()
+        if not smiles:
+            raise ValueError(f"neutral_ligands.passes[{i}].smiles is required")
+        distribution = str(entry.get("distribution", "random")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(
+                f"neutral_ligands.passes[{i}].distribution must be one of {valid_distributions!r}"
+            )
+        ratio = float(entry.get("ratio", 1.0))
+        if not (0.0 < ratio <= 1.0):
+            raise ValueError(
+                f"neutral_ligands.passes[{i}].ratio must be in (0, 1], got {ratio}"
+            )
+        passes.append(NeutralLigandPass(
+            target=target,
+            smiles=smiles,
+            distribution=distribution,
+            ratio=ratio,
+        ))
+
+    # -- Shared placement options --
+    ff = str(raw.get("ff", "uff")).strip().lower()
+    if ff not in {"uff", "mmff"}:
+        raise ValueError(f"neutral_ligands.ff must be 'uff' or 'mmff', got {ff!r}")
+    refinement_passes = int(raw.get("refinement_passes", 2))
+    sterics_mode = str(raw.get("sterics_mode", "vdw")).strip().lower()
+    if sterics_mode not in {"heavy", "all", "vdw"}:
+        raise ValueError(f"neutral_ligands.sterics_mode must be 'heavy', 'all', or 'vdw'")
+    offset_out = float(raw.get("offset_out", 0.5))
+    seed = int(raw.get("seed", 1337))
+
+    return NeutralLigandPostTreatSpec(
+        enabled=True,
+        passes=tuple(passes),
+        ff=ff,
+        refinement_passes=refinement_passes,
+        sterics_mode=sterics_mode,
+        offset_out=offset_out,
+        seed=seed,
+    )
+
+
+def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
+    if raw is None:
+        return LigandExchangePostTreatSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.ligand_exchange must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return LigandExchangePostTreatSpec(enabled=False)
+
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("post_treatment.ligand_exchange.passes must be a list")
+
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"ligand_exchange.passes[{i}] must be a mapping")
+        replace = str(entry.get("replace", "")).strip()
+        if not replace:
+            raise ValueError(f"ligand_exchange.passes[{i}].replace is required")
+        charge = int(entry.get("charge", 0))
+        if charge not in {-1, +1}:
+            raise ValueError(f"ligand_exchange.passes[{i}].charge currently supports -1 or +1")
+        smiles_raw = entry.get("smiles")
+        if isinstance(smiles_raw, str):
+            smiles = (smiles_raw.strip(),)
+        elif isinstance(smiles_raw, (list, tuple)):
+            smiles = tuple(str(s).strip() for s in smiles_raw)
+        else:
+            raise TypeError(f"ligand_exchange.passes[{i}].smiles must be a string or list")
+        smiles = tuple(s for s in smiles if s)
+        if not smiles:
+            raise ValueError(f"ligand_exchange.passes[{i}].smiles is required")
+        distribution = str(entry.get("distribution", "random")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(
+                f"ligand_exchange.passes[{i}].distribution must be one of {valid_distributions!r}"
+            )
+        ratio = float(entry.get("ratio", 1.0))
+        if not (0.0 < ratio <= 1.0):
+            raise ValueError(f"ligand_exchange.passes[{i}].ratio must be in (0, 1], got {ratio}")
+        passes.append(LigandExchangePass(
+            replace=replace,
+            charge=charge,
+            smiles=smiles,
+            distribution=distribution,
+            ratio=ratio,
+        ))
+
+    ff = str(raw.get("ff", "uff")).strip().lower()
+    if ff not in {"uff", "mmff"}:
+        raise ValueError(f"ligand_exchange.ff must be 'uff' or 'mmff', got {ff!r}")
+    sterics_mode = str(raw.get("sterics_mode", "vdw")).strip().lower()
+    if sterics_mode not in {"heavy", "all", "vdw"}:
+        raise ValueError("ligand_exchange.sterics_mode must be 'heavy', 'all', or 'vdw'")
+
+    return LigandExchangePostTreatSpec(
+        enabled=True,
+        passes=tuple(passes),
+        ff=ff,
+        refinement_passes=int(raw.get("refinement_passes", 2)),
+        sterics_mode=sterics_mode,
+        seed=int(raw.get("seed", 1337)),
+    )
+
+
+def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconstructionSpec:
+    if raw is None:
+        return SurfaceReconstructionSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.surface_reconstruction must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return SurfaceReconstructionSpec(enabled=False)
+
+    facets_raw = raw.get("facets", "auto")
+    auto_facets = facets_raw is None or (isinstance(facets_raw, str) and facets_raw.strip().lower() == "auto")
+    facets: List[tuple[int, int, int]] = []
+    if not auto_facets:
+        if not isinstance(facets_raw, list):
+            raise TypeError("post_treatment.surface_reconstruction.facets must be 'auto' or a list")
+        for entry in facets_raw:
+            if isinstance(entry, dict) and "hkl" in entry:
+                facets.append(_parse_hkl(entry["hkl"]))
+            else:
+                facets.append(_parse_hkl(entry))
+
+    target_reduction = float(raw.get("target_reduction", 0.5))
+    if not (0.0 < target_reduction <= 1.0):
+        raise ValueError("post_treatment.surface_reconstruction.target_reduction must be in (0, 1]")
+
+    min_sep_raw = raw.get("min_separation", None)
+    min_separation = None
+    if min_sep_raw is not None and not (isinstance(min_sep_raw, str) and min_sep_raw.strip().lower() == "auto"):
+        min_separation = float(min_sep_raw)
+        if min_separation <= 0.0:
+            raise ValueError("post_treatment.surface_reconstruction.min_separation must be positive or 'auto'")
+
+    distribution = str(raw.get("distribution", "fps")).strip().lower()
+    if distribution != "fps":
+        raise ValueError("post_treatment.surface_reconstruction.distribution currently supports only 'fps'")
+
+    return SurfaceReconstructionSpec(
+        enabled=True,
+        ligand=str(raw.get("ligand", default_ligand)),
+        facets=tuple(facets),
+        auto_facets=auto_facets,
+        target_reduction=target_reduction,
+        min_separation=min_separation,
+        distribution=distribution,
+        seed=int(raw.get("seed", 1337)),
+    )
+
+
+def _surface_reconstruction_from_legacy(raw, *, default_ligand: str) -> SurfaceReconstructionSpec:
+    """Compatibility shim for the old top-level facet_reconstruction block."""
+    if raw is None:
+        return SurfaceReconstructionSpec()
+    if not isinstance(raw, dict):
+        return SurfaceReconstructionSpec()
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return SurfaceReconstructionSpec()
+    sr_raw = {
+        "enabled": True,
+        "ligand": raw.get("ligand", default_ligand),
+        "facets": raw.get("facets", "auto"),
+        "target_reduction": raw.get("target_reduction", 0.5),
+        "min_separation": raw.get("min_separation", None),
+        "distribution": raw.get("distribution", "fps"),
+        "seed": raw.get("seed", 1337),
+    }
+    return _parse_surface_reconstruction(sr_raw, default_ligand=default_ligand)
+
+
+def _parse_post_treatment(raw, *, pass_cfg: dict, default_ligand: str, legacy_recon_raw) -> PostTreatmentSpec:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment must be a mapping")
+
+    neutral_raw = raw.get("neutral_ligands", raw.get("neutral-ligands"))
+    if neutral_raw is None:
+        neutral_raw = pass_cfg.get("neutral_ligands")
+    neutral_ligands = _parse_neutral_ligands(neutral_raw)
+
+    exchange_raw = raw.get("ligand_exchange", raw.get("ligand-exchange"))
+    ligand_exchange = _parse_ligand_exchange(exchange_raw)
+
+    surface_raw = raw.get("surface_reconstruction", raw.get("surface-reconstruction"))
+    surface_reconstruction = _parse_surface_reconstruction(surface_raw, default_ligand=default_ligand)
+    if not surface_reconstruction.enabled:
+        surface_reconstruction = _surface_reconstruction_from_legacy(
+            legacy_recon_raw, default_ligand=default_ligand
+        )
+
+    return PostTreatmentSpec(
+        surface_reconstruction=surface_reconstruction,
+        neutral_ligands=neutral_ligands,
+        ligand_exchange=ligand_exchange,
+    )
+
+
 def parse_yaml_config(path: str) -> Config:
     with open(path, "r") as fh:
         cfg = yaml.safe_load(fh) or {}
@@ -325,10 +587,21 @@ def parse_yaml_config(path: str) -> Config:
         charges[cat_new] = +1
 
     # Build the passivation spec.
+    prepass_mode = str(pass_cfg.get("prepass_mode", "standard")).strip().lower()
+    prepass_min_cn_terrace = int(pass_cfg.get("prepass_min_cn_terrace", 3))
+    prepass_min_cn_edge = int(pass_cfg.get("prepass_min_cn_edge", 3))
+    prepass_min_cn_vertex = int(pass_cfg.get("prepass_min_cn_vertex", 1 if prepass_mode == "role-aware" else 3))
+
+    legacy_neutral_ligands = _parse_neutral_ligands(pass_cfg.get("neutral_ligands"))
     passiv_spec = PassivationSpec(
         ligand=str(lig_old),                # anion ligand (legacy field)
         surf_tol=surf_tol,
         cation_ligand=str(cat_new) if cat_new else None,
+        prepass_mode=prepass_mode,
+        prepass_min_cn_terrace=prepass_min_cn_terrace,
+        prepass_min_cn_edge=prepass_min_cn_edge,
+        prepass_min_cn_vertex=prepass_min_cn_vertex,
+        neutral_ligands=legacy_neutral_ligands,
     )
 
     # ---- Global options ----
@@ -341,6 +614,12 @@ def parse_yaml_config(path: str) -> Config:
     if construction_origin is not None and not isinstance(construction_origin, dict):
         raise TypeError("construction_origin must be a mapping, e.g. {center_on_species: In}")
     facet_reconstruction = _parse_facet_reconstruction(cfg.get("facet_reconstruction"))
+    post_treatment = _parse_post_treatment(
+        cfg.get("post_treatment", cfg.get("post-treatment")),
+        pass_cfg=pass_cfg,
+        default_ligand=str(lig_old),
+        legacy_recon_raw=cfg.get("facet_reconstruction"),
+    )
     experimental = cfg.get("experimental") or {}
     if not isinstance(experimental, dict):
         raise TypeError("experimental must be a mapping")
@@ -355,6 +634,8 @@ def parse_yaml_config(path: str) -> Config:
     # Register cation_ligand charge if provided
     if facet_reconstruction.cation_ligand and facet_reconstruction.cation_ligand not in charges:
         charges[facet_reconstruction.cation_ligand] = facet_reconstruction.cation_ligand_charge or +1
+    if post_treatment.surface_reconstruction.ligand and post_treatment.surface_reconstruction.ligand not in charges:
+        charges[post_treatment.surface_reconstruction.ligand] = -1
 
     # ---- Helper: parse facets list/mapping → List[Facet] ----
     def _parse_facets(raw) -> List[Facet]:
@@ -503,6 +784,7 @@ def parse_yaml_config(path: str) -> Config:
             twins=twins,
             construction_origin=construction_origin,
             facet_reconstruction=facet_reconstruction,
+            post_treatment=post_treatment,
             experimental=experimental,
             stack=stack_spec,
         )
@@ -531,6 +813,7 @@ def parse_yaml_config(path: str) -> Config:
         twins=twins,
         construction_origin=construction_origin,
         facet_reconstruction=facet_reconstruction,
+        post_treatment=post_treatment,
         experimental=experimental,
         stack=stack_spec,
     )

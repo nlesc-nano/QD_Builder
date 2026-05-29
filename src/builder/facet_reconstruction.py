@@ -30,6 +30,7 @@ Lannoo formula (Harrison 1980, zinc-blende CN_bulk=4):
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -37,7 +38,7 @@ from numpy.typing import NDArray
 
 from .analysis import PairCuts, _pair_cut_calibrated, coord_numbers_bipartite, derive_pair_cuts_from_cif
 from .facets import detect_facets_from_nc
-from .nc_types import Facet, FacetReconstructionSpec, Plane
+from .nc_types import Facet, FacetReconstructionSpec, SurfaceReconstructionSpec, Plane
 
 CN_BULK = 4
 DEFAULT_LIGAND_CN_REF = 3
@@ -57,6 +58,26 @@ class FacetCharge:
     q_lannoo: float   # split-weighted sum of Lannoo charges
     q_per_active: float
     termination: str  # "anion-rich" | "cation-rich" | "balanced"
+
+
+@dataclass(frozen=True)
+class PolarFacetReport:
+    fid: int
+    hkl: Tuple[int, int, int]
+    n_surface: int
+    n_cation_def: int
+    n_anion_def: int
+    q_cation: float
+    q_anion: float
+    q_net: float
+
+    @property
+    def polarity(self) -> str:
+        if self.q_net > 1e-9:
+            return "positive"
+        if self.q_net < -1e-9:
+            return "negative"
+        return "balanced"
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +273,709 @@ def _total_q(symbols: List[str], charges: Dict[str, int]) -> int:
 
 def _hkl_family(hkl: Tuple[int, int, int]) -> Tuple[int, int, int]:
     return tuple(sorted((abs(int(hkl[0])), abs(int(hkl[1])), abs(int(hkl[2])))))
+
+
+def _native_core_species_from_struct(struct, charges: Dict[str, int], ligand: str) -> Set[str]:
+    if struct is not None and hasattr(struct, "sites"):
+        species = {str(site.specie.symbol) for site in struct.sites}
+    else:
+        organic = {"H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"}
+        species = {s for s, q in charges.items() if int(q) != 0 and s not in organic}
+    species.discard(ligand)
+    return species
+
+
+def _bulk_ideal_direction_sets(
+    site_sym: str,
+    bulk_struct,
+    charges: Dict[str, int],
+) -> List[List[np.ndarray]]:
+    """
+    Return all distinct first-shell opposite-charge direction sets for a species.
+
+    Do not assume tetrahedral coordination or one crystallographic site per
+    element.  If the CIF contains multiple local environments for the same
+    species, each environment contributes one candidate direction set.
+    """
+    if bulk_struct is None or not hasattr(bulk_struct, "sites") or not hasattr(bulk_struct, "lattice"):
+        return []
+
+    site_q = int(charges.get(site_sym, 0))
+    if site_q == 0:
+        return []
+
+    lattice = bulk_struct.lattice
+    opp_sites = [
+        s for s in bulk_struct.sites
+        if int(charges.get(str(s.specie.symbol), 0)) * site_q < 0
+    ]
+    if not opp_sites:
+        return []
+
+    direction_sets: List[List[np.ndarray]] = []
+    seen_keys: Set[Tuple[Tuple[float, float, float], ...]] = set()
+    for ref_site in bulk_struct.sites:
+        if str(ref_site.specie.symbol) != site_sym:
+            continue
+
+        ref_cart = np.asarray(ref_site.coords, float)
+        candidates: List[Tuple[float, np.ndarray]] = []
+        for opp in opp_sites:
+            opp_cart = np.asarray(opp.coords, float)
+            for ia in range(-1, 2):
+                for ib in range(-1, 2):
+                    for ic in range(-1, 2):
+                        shift = ia * lattice.matrix[0] + ib * lattice.matrix[1] + ic * lattice.matrix[2]
+                        vec = opp_cart + shift - ref_cart
+                        dist = float(np.linalg.norm(vec))
+                        if dist > 0.1:
+                            candidates.append((dist, vec))
+
+        if not candidates:
+            continue
+        candidates.sort(key=lambda rec: rec[0])
+        d_min = candidates[0][0]
+        dirs: List[np.ndarray] = []
+        for dist, vec in candidates:
+            if dist >= 1.2 * d_min:
+                break
+            unit = vec / np.linalg.norm(vec)
+            if all(float(np.dot(unit, old)) < 0.99 for old in dirs):
+                dirs.append(unit)
+
+        if not dirs:
+            continue
+        key = tuple(sorted(tuple(np.round(v, 6)) for v in dirs))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        direction_sets.append(dirs)
+
+    return direction_sets
+
+
+def _bulk_cn_refs_from_struct(
+    bulk_struct,
+    charges: Dict[str, int],
+    species: Set[str],
+) -> Dict[str, int]:
+    refs: Dict[str, int] = {}
+    for sym in species:
+        sets = _bulk_ideal_direction_sets(sym, bulk_struct, charges)
+        if sets:
+            refs[sym] = max(len(dirs) for dirs in sets)
+        else:
+            refs[sym] = CN_BULK
+    return refs
+
+
+def _surface_recon_atom_q(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+    active_species: Set[str],
+    cn_refs: Optional[Dict[str, int]] = None,
+) -> NDArray[np.float64]:
+    """Lannoo-style q_i = formal * (1 - min(CN,CNref)/CNref) for selected core species."""
+    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+    q = np.zeros(len(symbols), dtype=float)
+    for i, sym in enumerate(symbols):
+        if sym not in active_species:
+            continue
+        formal = int(charges.get(sym, 0))
+        if formal == 0:
+            continue
+        cn_ref = max(1, int((cn_refs or {}).get(sym, CN_BULK)))
+        q[i] = float(formal) * (1.0 - min(int(cn[i]), cn_ref) / cn_ref)
+    return q
+
+
+def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
+    memberships: List[List[int]] = [[] for _ in range(len(pts))]
+    for fid, (n, d) in enumerate(planes):
+        n = np.asarray(n, float)
+        for i in np.where((float(d) - pts @ n) < surf_tol)[0]:
+            memberships[int(i)].append(fid)
+    return memberships
+
+
+def _surface_recon_facet_rows(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    facets: List[Facet],
+    planes: List[Plane],
+    charges: Dict[str, int],
+    surf_tol: float,
+    atom_q: NDArray[np.float64],
+) -> List[FacetCharge]:
+    memberships = _facet_memberships(pts, planes, surf_tol)
+    rows: List[FacetCharge] = []
+    for fid, (facet, (n, d)) in enumerate(zip(facets, planes)):
+        shell = [int(i) for i in np.where((float(d) - pts @ n) < surf_tol)[0]]
+        if not shell:
+            continue
+        q_total = 0.0
+        n_active = 0
+        q_formal = 0.0
+        for i in shell:
+            w = 1.0 / max(1, len(memberships[i]))
+            q_formal += w * float(charges.get(symbols[i], 0))
+            qi = float(atom_q[i])
+            if abs(qi) > 1e-12:
+                n_active += 1
+                q_total += w * qi
+        term = "anion-rich" if q_total < -1e-9 else ("cation-rich" if q_total > 1e-9 else "balanced")
+        rows.append(FacetCharge(
+            fid=fid,
+            hkl=(facet.h, facet.k, facet.l),
+            n_surface=len(shell),
+            n_active=n_active,
+            q_formal=q_formal,
+            q_lannoo=q_total,
+            q_per_active=q_total / n_active if n_active else 0.0,
+            termination=term,
+        ))
+    return rows
+
+
+def _surface_recon_reports(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    facets: List[Facet],
+    planes: List[Plane],
+    charges: Dict[str, int],
+    surf_tol: float,
+    atom_q: NDArray[np.float64],
+) -> List[PolarFacetReport]:
+    memberships = _facet_memberships(pts, planes, surf_tol)
+    reports: List[PolarFacetReport] = []
+    for fid, (facet, (n, d)) in enumerate(zip(facets, planes)):
+        shell = [int(i) for i in np.where((float(d) - pts @ n) < surf_tol)[0]]
+        if not shell:
+            continue
+
+        n_cat = 0
+        n_an = 0
+        q_cat = 0.0
+        q_an = 0.0
+        for i in shell:
+            qi = float(atom_q[i])
+            if abs(qi) < 1e-12:
+                continue
+            if int(charges.get(symbols[i], 0)) > 0:
+                n_cat += 1
+            elif int(charges.get(symbols[i], 0)) < 0:
+                n_an += 1
+            w = 1.0 / max(1, len(memberships[i]))
+            if qi > 0:
+                q_cat += w * qi
+            else:
+                q_an += w * qi
+
+        reports.append(PolarFacetReport(
+            fid=fid,
+            hkl=(facet.h, facet.k, facet.l),
+            n_surface=len(shell),
+            n_cation_def=n_cat,
+            n_anion_def=n_an,
+            q_cation=q_cat,
+            q_anion=q_an,
+            q_net=q_cat + q_an,
+        ))
+    return reports
+
+
+def _print_polar_report(
+    reports: List[PolarFacetReport],
+    header: str,
+    target_hkls: Set[Tuple[int, int, int]],
+    before: Optional[Dict[Tuple[int, int, int], PolarFacetReport]] = None,
+) -> None:
+    print(f"\n=== POLAR FACET RESIDUAL CHARGE — {header} ===")
+    delta_col = "  ΔQ_net" if before is not None else ""
+    print(
+        "  fid      hkl    polarity    Nsurf  Cat_def  An_def"
+        "    Q_cat    Q_anion    Q_net" + delta_col + "   action"
+    )
+    for r in reports:
+        if r.hkl not in target_hkls and abs(r.q_net) < 1e-9:
+            continue
+        hkl_str = f"({r.hkl[0]} {r.hkl[1]} {r.hkl[2]})"
+        if r.q_net < -1e-9:
+            action = "swap anions"
+        elif r.q_net > 1e-9:
+            action = "add ligands"
+        else:
+            action = "-"
+        sel = " *" if r.hkl in target_hkls else ""
+        delta = ""
+        if before is not None:
+            rb = before.get(r.hkl)
+            dq = r.q_net - (rb.q_net if rb is not None else 0.0)
+            delta = f"  {dq:+7.3f}"
+        print(
+            f"  {r.fid:3d}  {hkl_str:>11s}  {r.polarity:<9s}"
+            f"  {r.n_surface:5d}  {r.n_cation_def:7d}  {r.n_anion_def:6d}"
+            f"  {r.q_cation:+7.3f}  {r.q_anion:+9.3f}  {r.q_net:+7.3f}"
+            f"{delta}   {action}{sel}"
+        )
+
+
+def _native_pair_cut(native_species: Set[str], charges: Dict[str, int], pair_cuts: Optional[PairCuts]) -> float:
+    native = sorted(s for s in native_species if charges.get(s, 0) != 0)
+    best = 0.0
+    for i, s1 in enumerate(native):
+        for s2 in native[i + 1:]:
+            if charges.get(s1, 0) * charges.get(s2, 0) < 0:
+                best = max(best, _pair_cut_calibrated(s1, s2, pair_cuts))
+    return best if best > 0 else 3.0
+
+
+def _auto_sublattice_min_separation(
+    points: NDArray[np.float64],
+    native_bond_cut: float,
+) -> float:
+    """
+    Minimum spacing for reconstruction swaps on one ionic sublattice.
+
+    The native cation-anion cutoff is too short for this purpose: nearest
+    anion-anion surface neighbors are second-neighbor distances in the crystal.
+    Use the candidate same-sublattice nearest-neighbor distance when available
+    and keep a conservative bond-cut based floor for small candidate sets.
+    """
+    pts = np.asarray(points, float)
+    floor = 1.75 * float(native_bond_cut)
+    if len(pts) < 2:
+        return floor
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    d[d < 1e-8] = np.inf
+    nearest = d.min(axis=1)
+    nearest = nearest[np.isfinite(nearest)]
+    if len(nearest) == 0:
+        return floor
+    return max(floor, 1.05 * float(np.median(nearest)))
+
+
+def _fps_indices(
+    points: NDArray[np.float64],
+    n_pick: int,
+    min_separation: float,
+    seed: int,
+) -> List[int]:
+    if n_pick <= 0 or len(points) == 0:
+        return []
+    rng = np.random.default_rng(seed)
+    pts_arr = np.asarray(points, float)
+    centroid = pts_arr.mean(axis=0)
+    first_pool = np.where(np.linalg.norm(pts_arr - centroid, axis=1) >= 0.0)[0]
+    first = int(first_pool[np.argmax(np.linalg.norm(pts_arr[first_pool] - centroid, axis=1))])
+    selected = [first]
+    remaining = set(range(len(points)))
+    remaining.remove(first)
+    while remaining and len(selected) < n_pick:
+        rem = np.array(sorted(remaining), dtype=int)
+        dmin = np.min(np.linalg.norm(pts_arr[rem, None, :] - pts_arr[np.array(selected)][None, :, :], axis=2), axis=1)
+        allowed = rem[dmin >= min_separation]
+        if len(allowed) == 0:
+            break
+        allowed_dmin = np.array([dmin[np.where(rem == idx)[0][0]] for idx in allowed])
+        max_d = float(np.max(allowed_dmin))
+        tied = allowed[np.where(np.abs(allowed_dmin - max_d) < 1e-9)[0]]
+        nxt = int(rng.choice(tied))
+        selected.append(nxt)
+        remaining.remove(nxt)
+    return selected
+
+
+def _greedy_independent_indices(points: NDArray[np.float64], min_separation: float) -> List[int]:
+    pts = np.asarray(points, float)
+    if len(pts) == 0:
+        return []
+    centroid = pts.mean(axis=0)
+    order = sorted(
+        range(len(pts)),
+        key=lambda i: (-float(np.linalg.norm(pts[i] - centroid)), i),
+    )
+    selected: List[int] = []
+    for i in order:
+        if all(float(np.linalg.norm(pts[i] - pts[j])) >= min_separation for j in selected):
+            selected.append(i)
+    return selected
+
+
+def _maximum_independent_indices(
+    points: NDArray[np.float64],
+    min_separation: float,
+) -> List[int]:
+    """
+    Return the largest non-adjacent subset under the distance constraint.
+
+    For the small per-facet candidate sets typical here, use exact branch and
+    bound.  For very large facets, fall back to a deterministic maximal set so
+    runtime stays bounded.
+    """
+    pts = np.asarray(points, float)
+    n = len(pts)
+    if n <= 1:
+        return list(range(n))
+    if n > 64:
+        return _greedy_independent_indices(pts, min_separation)
+
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    adj = [0] * n
+    for i in range(n):
+        mask = 0
+        for j in range(n):
+            if i != j and d[i, j] < min_separation:
+                mask |= 1 << j
+        adj[i] = mask
+
+    greedy = _greedy_independent_indices(pts, min_separation)
+    best_mask = 0
+    for i in greedy:
+        best_mask |= 1 << i
+    best_count = len(greedy)
+
+    def branch(chosen_mask: int, remaining_mask: int) -> None:
+        nonlocal best_mask, best_count
+        if remaining_mask == 0:
+            count = chosen_mask.bit_count()
+            if count > best_count:
+                best_count = count
+                best_mask = chosen_mask
+            return
+        if chosen_mask.bit_count() + remaining_mask.bit_count() <= best_count:
+            return
+
+        rem_indices = [i for i in range(n) if (remaining_mask >> i) & 1]
+        v = max(rem_indices, key=lambda i: (adj[i] & remaining_mask).bit_count())
+
+        branch(chosen_mask | (1 << v), remaining_mask & ~(1 << v) & ~adj[v])
+        branch(chosen_mask, remaining_mask & ~(1 << v))
+
+    branch(0, (1 << n) - 1)
+    return [i for i in range(n) if (best_mask >> i) & 1]
+
+
+def _surface_outward_direction(idx: int, pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> np.ndarray:
+    nearest: Optional[Tuple[float, np.ndarray]] = None
+    incident: List[np.ndarray] = []
+    for n, d in planes:
+        n = np.asarray(n, float)
+        nn = np.linalg.norm(n)
+        if nn > 1e-12:
+            n = n / nn
+        depth = float(d) - float(np.dot(pts[idx], n))
+        if nearest is None or depth < nearest[0]:
+            nearest = (depth, n)
+        if depth < surf_tol:
+            incident.append(n)
+    if incident:
+        vec = np.sum(incident, axis=0)
+        nv = np.linalg.norm(vec)
+        if nv > 1e-12:
+            return vec / nv
+    return nearest[1] if nearest is not None else np.array([0.0, 0.0, 1.0])
+
+
+def _missing_vectors_for_hosts(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    host_indices: List[int],
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+    bulk_struct,
+) -> Dict[int, List[np.ndarray]]:
+    if not host_indices:
+        return {}
+    try:
+        from .neutral_ligand_posttreat import compute_missing_bond_vectors
+        mask = np.zeros(len(symbols), dtype=bool)
+        for i in host_indices:
+            mask[i] = True
+        return compute_missing_bond_vectors(symbols, pts, charges, pair_cuts, bulk_struct, mask)
+    except Exception:
+        return {}
+
+
+def _actual_opposite_bond_vectors(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    host_idx: int,
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+) -> List[np.ndarray]:
+    host_sym = symbols[host_idx]
+    host_q = int(charges.get(host_sym, 0))
+    if host_q == 0:
+        return []
+    vecs: List[np.ndarray] = []
+    for j, sym_j in enumerate(symbols):
+        if j == host_idx:
+            continue
+        if int(charges.get(sym_j, 0)) * host_q >= 0:
+            continue
+        cutoff = _pair_cut_calibrated(host_sym, sym_j, pair_cuts)
+        vec = np.asarray(pts[j], float) - np.asarray(pts[host_idx], float)
+        dist = float(np.linalg.norm(vec))
+        if 0.1 < dist <= cutoff:
+            vecs.append(vec / dist)
+    return vecs
+
+
+def _match_missing_ideal_dirs(
+    actual_vecs: List[np.ndarray],
+    ideal_dirs: List[np.ndarray],
+    *,
+    min_dot: float = 0.70,
+) -> Tuple[List[np.ndarray], float]:
+    assigned: Set[int] = set()
+    score = 0.0
+    for actual in actual_vecs:
+        actual = np.asarray(actual, float)
+        if np.linalg.norm(actual) < 1e-12:
+            continue
+        actual = actual / np.linalg.norm(actual)
+        best_idx = -1
+        best_dot = -2.0
+        for k, ideal in enumerate(ideal_dirs):
+            if k in assigned:
+                continue
+            dot = float(np.dot(actual, ideal))
+            if dot > best_dot:
+                best_idx = k
+                best_dot = dot
+        if best_idx >= 0 and best_dot >= min_dot:
+            assigned.add(best_idx)
+            score += best_dot
+        else:
+            score -= 1.0
+    missing = [np.asarray(ideal_dirs[k], float) for k in range(len(ideal_dirs)) if k not in assigned]
+    score -= 0.25 * abs(len(missing) - max(0, len(ideal_dirs) - len(actual_vecs)))
+    return missing, score
+
+
+def _strict_missing_vectors_for_hosts(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    host_indices: List[int],
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+    bulk_struct,
+    planes: List[Plane],
+    surf_tol: float,
+) -> Dict[int, List[np.ndarray]]:
+    """
+    Missing first-shell directions from the bulk coordination polyhedron.
+
+    This intentionally has no radial/outward fallback and never flips a vector:
+    if a crystallographic missing slot cannot be identified, the host is not
+    used for reconstruction ligand compensation.
+    """
+    direction_cache: Dict[str, List[List[np.ndarray]]] = {}
+    result: Dict[int, List[np.ndarray]] = {}
+    for host_idx in host_indices:
+        host_sym = symbols[host_idx]
+        if host_sym not in direction_cache:
+            direction_cache[host_sym] = _bulk_ideal_direction_sets(host_sym, bulk_struct, charges)
+        direction_sets = direction_cache[host_sym]
+        if not direction_sets:
+            continue
+
+        actual = _actual_opposite_bond_vectors(symbols, pts, host_idx, charges, pair_cuts)
+        if not actual:
+            continue
+
+        best_missing: List[np.ndarray] = []
+        best_score = -float("inf")
+        for ideal_dirs in direction_sets:
+            missing, score = _match_missing_ideal_dirs(actual, ideal_dirs)
+            if score > best_score:
+                best_score = score
+                best_missing = missing
+
+        if not best_missing:
+            continue
+
+        outward = _surface_outward_direction(host_idx, pts, planes, surf_tol)
+        outward_slots = []
+        for vec in best_missing:
+            vec = np.asarray(vec, float)
+            norm = np.linalg.norm(vec)
+            if norm < 1e-12:
+                continue
+            vec = vec / norm
+            if float(np.dot(vec, outward)) > 0.05:
+                outward_slots.append(vec)
+        if outward_slots:
+            outward_slots.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
+            result[host_idx] = outward_slots
+    return result
+
+
+def _ligand_add_positions_for_slots(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    slots: List[Tuple[int, np.ndarray]],
+    ligand: str,
+    pair_cuts: Optional[PairCuts],
+) -> List[np.ndarray]:
+    positions: List[np.ndarray] = []
+    for host_idx, vec in slots:
+        vec = np.asarray(vec, float)
+        if np.linalg.norm(vec) < 1e-12:
+            continue
+        vec = vec / np.linalg.norm(vec)
+        host = symbols[host_idx]
+        bond_len = 0.84 * _pair_cut_calibrated(host, ligand, pair_cuts)
+        positions.append(np.asarray(pts[host_idx], float) + bond_len * vec)
+    return positions
+
+
+def _slot_points(slots: List[Tuple[int, np.ndarray]], pts: NDArray[np.float64]) -> NDArray[np.float64]:
+    if not slots:
+        return np.zeros((0, 3), float)
+    return np.asarray([pts[host_idx] for host_idx, _ in slots], float)
+
+
+def _choose_missing_vectors_for_host(
+    host_idx: int,
+    n_slots: int,
+    missing: Dict[int, List[np.ndarray]],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    surf_tol: float,
+) -> List[np.ndarray]:
+    outward = _surface_outward_direction(host_idx, pts, planes, surf_tol)
+    vecs = missing.get(host_idx) or [outward]
+    cleaned = []
+    for v in vecs:
+        v = np.asarray(v, float)
+        if np.linalg.norm(v) < 1e-12:
+            continue
+        v = v / np.linalg.norm(v)
+        if float(np.dot(v, outward)) < 0.0:
+            v = -v
+        cleaned.append(v)
+    if not cleaned:
+        cleaned = [outward]
+    cleaned.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
+    while len(cleaned) < n_slots:
+        cleaned.append(outward)
+    return cleaned[:n_slots]
+
+
+def _build_compensation_slots(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    host_indices: List[int],
+    cn: NDArray[np.int_],
+    cn_refs: Dict[str, int],
+    missing: Dict[int, List[np.ndarray]],
+    planes: List[Plane],
+    surf_tol: float,
+) -> List[Tuple[int, np.ndarray]]:
+    slots: List[Tuple[int, np.ndarray]] = []
+    for host_idx in host_indices:
+        cn_ref = max(1, int(cn_refs.get(symbols[host_idx], CN_BULK)))
+        deficit = max(0, cn_ref - int(cn[host_idx]))
+        if deficit <= 0:
+            continue
+        vectors = missing.get(host_idx, [])
+        for vec in vectors[:deficit]:
+            slots.append((host_idx, vec))
+    return slots
+
+
+def _select_compensation_slots(
+    slots: List[Tuple[int, np.ndarray]],
+    pts: NDArray[np.float64],
+    n_needed: int,
+    min_separation: float,
+    seed: int,
+) -> List[Tuple[int, np.ndarray]]:
+    if n_needed <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    available = list(slots)
+    selected: List[Tuple[int, np.ndarray]] = []
+    centroid = pts[[host for host, _ in available]].mean(axis=0) if available else np.zeros(3)
+
+    while available and len(selected) < n_needed:
+        allowed: List[Tuple[int, np.ndarray]] = []
+        for slot in available:
+            host_idx = slot[0]
+            host_pos = pts[host_idx]
+            ok = True
+            for selected_host, _ in selected:
+                if host_idx == selected_host:
+                    continue
+                if float(np.linalg.norm(host_pos - pts[selected_host])) < min_separation:
+                    ok = False
+                    break
+            if ok:
+                allowed.append(slot)
+        if not allowed:
+            break
+
+        if selected:
+            selected_hosts = np.asarray([pts[host_idx] for host_idx, _ in selected], float)
+            scored = []
+            for slot in allowed:
+                host_idx, vec = slot
+                dist_to_selected = float(np.min(np.linalg.norm(selected_hosts - pts[host_idx], axis=1)))
+                radial = float(np.linalg.norm(pts[host_idx] - centroid))
+                outward = float(np.linalg.norm(np.asarray(vec, float)))
+                scored.append((dist_to_selected, radial, outward, -host_idx, slot))
+            best_dist = max(s[0] for s in scored)
+            tied = [s for s in scored if abs(s[0] - best_dist) < 1e-9]
+            chosen = tied[int(rng.integers(len(tied)))][-1]
+        else:
+            scored = [
+                (float(np.linalg.norm(pts[slot[0]] - centroid)), float(np.linalg.norm(np.asarray(slot[1], float))), -slot[0], slot)
+                for slot in allowed
+            ]
+            best_radial = max(s[0] for s in scored)
+            tied = [s for s in scored if abs(s[0] - best_radial) < 1e-9]
+            chosen = tied[int(rng.integers(len(tied)))][-1]
+
+        selected.append(chosen)
+        available.remove(chosen)
+
+    return selected
+
+
+def _ligand_add_positions_for_cations(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    cation_indices: List[int],
+    charges: Dict[str, int],
+    ligand: str,
+    pair_cuts: Optional[PairCuts],
+    planes: List[Plane],
+    surf_tol: float,
+    bulk_struct,
+) -> List[np.ndarray]:
+    if not cation_indices:
+        return []
+    missing = _missing_vectors_for_hosts(symbols, pts, cation_indices, charges, pair_cuts, bulk_struct)
+
+    positions: List[np.ndarray] = []
+    for i in cation_indices:
+        outward = _surface_outward_direction(i, pts, planes, surf_tol)
+        vecs = missing.get(i) or [outward]
+        vecs = [v / np.linalg.norm(v) for v in vecs if np.linalg.norm(v) > 1e-12]
+        if not vecs:
+            vecs = [outward]
+        vecs.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
+        vec = vecs[0]
+        if float(np.dot(vec, outward)) < 0:
+            vec = -vec
+        host = symbols[i]
+        bond_len = 0.84 * _pair_cut_calibrated(host, ligand, pair_cuts)
+        positions.append(np.asarray(pts[i], float) + bond_len * vec)
+    return positions
 
 
 # --------------------------------------------------------------------------
@@ -546,150 +1270,324 @@ def reconstruct_polar_facets(
     ligand: str,
     surf_tol: float,
     cif_path: str,
-    spec: FacetReconstructionSpec,
+    spec: FacetReconstructionSpec | SurfaceReconstructionSpec,
     charge_balance_fn,
     verbose: bool,
     write_all: bool,
     prefix: str,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
-    Lannoo polar-facet reconstruction.
+    Simplified polar-facet reconstruction post-treatment.
 
-    Works on the post-passivation structure directly — no stripping.
-    Ligand bonds count toward CN, so the Lannoo charge reflects only residual
-    dangling bonds that global passivation could not neutralize.
+    The reconstruction runs after ordinary charge-balance passivation.  It
+    computes residual polar-facet charge from CN-deficient native ions, swaps a
+    sparse subset of native anions on negative polar facets to the reconstruction
+    ligand, and compensates each swap by adding one ligand to an available
+    positive polar surface site.
     """
-    if not spec.enabled or not spec.facets:
+    if not spec.enabled:
         return symbols, pts
 
-    configured_hkls: Set[Tuple[int, int, int]] = set(spec.facets)
-    target_hkls: Set[Tuple[int, int, int]] = set(configured_hkls)
+    recon_ligand = getattr(spec, "ligand", None) or ligand
+    configured_hkls: Set[Tuple[int, int, int]] = set(getattr(spec, "facets", ()) or ())
+    auto_facets = bool(getattr(spec, "auto_facets", False) or not configured_hkls)
+    target_reduction = float(getattr(spec, "target_reduction", 0.5))
+    seed = int(getattr(spec, "seed", 1337))
     pair_cuts = derive_pair_cuts_from_cif(cif_path, charges, safety=1.00)
 
     print(f"\n{'='*60}")
-    print(f"[recon] Polar-facet reconstruction configured from: {sorted(configured_hkls)}")
-    print(f"[recon] Q_total = {_total_q(symbols, charges):+d}  (should be 0 after global passivation)")
+    print("[post-treatment:surface-reconstruction] Simplified polar reconstruction")
+    print(f"[recon] ligand={recon_ligand!r}  facets={'auto' if auto_facets else sorted(configured_hkls)}  "
+          f"target_reduction={target_reduction:.2f}")
+    print(f"[recon] Q_total = {_total_q(symbols, charges):+d}  (expected 0 after charge-balance passivation)")
 
-    # Detect native scaffold planes (geometry only; defines atom membership)
+    native_species = _native_core_species_from_struct(struct, charges, recon_ligand)
+    if not native_species:
+        print("[recon] No native inorganic species found; skipping.")
+        print('='*60)
+        return symbols, pts
+
+    # Detect native scaffold planes (geometry only; defines atom membership).
     all_facets, all_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, ligand, surf_tol
+        symbols, pts, struct, charges, facet_seeds, recon_ligand, surf_tol
     )
-    detected_hkls = {(f.h, f.k, f.l) for f in all_facets}
-    missing = configured_hkls - detected_hkls
-    if missing:
-        print(f"[recon] WARNING: hkl(s) not detected in native scaffold: {missing}")
+    if not all_planes:
+        print("[recon] No facets detected on native scaffold; skipping.")
+        print('='*60)
+        return symbols, pts
 
-    # Phase 1: Lannoo charges on the post-passivation structure
-    # CN includes bonds to both native atoms and ligands (so passivated atoms show q=0)
-    atom_q = _lannoo_all_atoms(symbols, pts, charges, ligand, pair_cuts)
-    rows_before = _compute_facet_charges(
-        symbols, pts, all_facets, all_planes, charges, ligand, surf_tol, atom_q
+    active_species = set(native_species)
+    cn_refs = _bulk_cn_refs_from_struct(struct, charges, active_species)
+    atom_q = _surface_recon_atom_q(symbols, pts, charges, pair_cuts, active_species, cn_refs)
+    reports_before = _surface_recon_reports(
+        symbols, pts, all_facets, all_planes, charges, surf_tol, atom_q
     )
-    configured_families = {_hkl_family(hkl) for hkl in configured_hkls}
+    configured_families = {_hkl_family(hkl) for hkl in configured_hkls} if configured_hkls else set()
     target_hkls = {
         r.hkl
-        for r in rows_before
-        if abs(r.q_lannoo) > 1e-9 and _hkl_family(r.hkl) in configured_families
+        for r in reports_before
+        if abs(r.q_net) > 1e-9 and (auto_facets or _hkl_family(r.hkl) in configured_families)
     }
-    print(f"[recon] Treating detected configured polar-family facets: {sorted(target_hkls)}")
     if not target_hkls:
-        print("[recon] No polar facets with non-zero Lannoo charge found; skipping.")
+        print("[recon] No polar facets with residual CN-deficit charge found; skipping.")
+        print('='*60)
         return symbols, pts
-    _print_lannoo_table(rows_before, "BEFORE reconstruction", target_hkls)
+    print(f"[recon] Treating polar facets: {sorted(target_hkls)}")
+    _print_polar_report(reports_before, "BEFORE reconstruction", target_hkls)
 
-    # Phase 1b: strip all ligands from selected cation-rich facets before any
-    # facet-by-facet vacancy treatment. This prevents old global passivation
-    # ligands from defining the polar reconstruction chemistry.
-    symbols, pts, strip_log = _strip_ligands_from_cation_rich_facets(
+    memberships = _facet_memberships(pts, all_planes, surf_tol)
+    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+
+    neg_fids = {
+        r.fid for r in reports_before
+        if r.hkl in target_hkls and r.q_net < -1e-9
+    }
+    pos_fids = {
+        r.fid for r in reports_before
+        if r.hkl in target_hkls and r.q_net > +1e-9
+    }
+
+    anion_candidates: List[int] = []
+    cation_candidates: List[int] = []
+    for i, sym in enumerate(symbols):
+        if sym not in native_species:
+            continue
+        q_formal = int(charges.get(sym, 0))
+        cn_ref = max(1, int(cn_refs.get(sym, CN_BULK)))
+        if q_formal == 0 or int(cn[i]) >= cn_ref:
+            continue
+        fids = set(memberships[i])
+        if q_formal < 0 and fids & neg_fids:
+            anion_candidates.append(i)
+        elif q_formal > 0 and fids & pos_fids:
+            cation_candidates.append(i)
+
+    if not anion_candidates:
+        print("[recon] No CN-deficient native anions found on negative polar facets; skipping.")
+        print('='*60)
+        return symbols, pts
+    if not cation_candidates:
+        print("[recon] No available cation-rich sites found for compensating ligand addition; skipping.")
+        print('='*60)
+        return symbols, pts
+
+    ligand_charge = int(charges.get(recon_ligand, -1))
+    if ligand_charge >= 0:
+        print(
+            f"[recon] Reconstruction ligand {recon_ligand!r} has charge {ligand_charge:+d}; "
+            "negative ligand charge is required for anion-swap compensation. Skipping."
+        )
+        print('='*60)
+        return symbols, pts
+    add_charge_unit = abs(ligand_charge)
+    replacement_delta: Dict[int, float] = {}
+    swap_charge_delta: Dict[int, int] = {}
+    for i in anion_candidates:
+        formal_delta = ligand_charge - int(charges.get(symbols[i], 0))
+        if formal_delta <= 0:
+            continue
+        old_q = float(atom_q[i])
+        cn_ref = max(1, int(cn_refs.get(symbols[i], CN_BULK)))
+        lig_q = float(ligand_charge) * (1.0 - min(int(cn[i]), cn_ref) / cn_ref)
+        replacement_delta[i] = max(0.05, lig_q - old_q)
+        swap_charge_delta[i] = int(formal_delta)
+    anion_candidates = [i for i in anion_candidates if i in swap_charge_delta]
+    if not anion_candidates:
+        print(
+            f"[recon] No anion swaps produce positive compensation charge with ligand {recon_ligand!r}; skipping."
+        )
+        print('='*60)
+        return symbols, pts
+
+    native_cut = _native_pair_cut(native_species, charges, pair_cuts)
+    min_separation = getattr(spec, "min_separation", None)
+    if min_separation is None:
+        min_separation = _auto_sublattice_min_separation(pts[anion_candidates], native_cut)
+    min_separation = float(min_separation)
+
+    cation_missing = _strict_missing_vectors_for_hosts(
         symbols,
         pts,
-        rows_before,
-        all_planes,
+        cation_candidates,
         charges,
-        ligand,
-        target_hkls,
-        surf_tol,
         pair_cuts,
-        verbose,
+        struct,
+        all_planes,
+        surf_tol,
     )
-    stripped_facets, stripped_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, ligand, surf_tol
+    compensation_slots = _build_compensation_slots(
+        symbols,
+        pts,
+        cation_candidates,
+        cn,
+        cn_refs,
+        cation_missing,
+        all_planes,
+        surf_tol,
     )
-    atom_q_stripped = _lannoo_all_atoms(symbols, pts, charges, ligand, pair_cuts)
-    rows_stripped = _compute_facet_charges(
-        symbols, pts, stripped_facets, stripped_planes, charges, ligand, surf_tol, atom_q_stripped
+    capacity_slots = _select_compensation_slots(
+        compensation_slots,
+        pts,
+        len(compensation_slots),
+        min_separation,
+        seed + 17,
     )
-    _print_lannoo_table(rows_stripped, "AFTER cation-rich ligand strip / before vacancy treatment", target_hkls)
+    compensation_capacity = len(capacity_slots) * add_charge_unit
+    if compensation_capacity <= 0:
+        print("[recon] No positive-facet missing coordination slots available for compensation; skipping.")
+        print('='*60)
+        return symbols, pts
 
-    # Phase 2: one local reconstruction event per polar facet, then total
-    # charge balance is applied after every facet has been visited.
-    before_by_hkl = {r.hkl: r for r in rows_before}
-    target_rows = [
-        (before_by_hkl[r.hkl], r, stripped_planes[r.fid])
-        for r in rows_stripped
-        if r.hkl in target_hkls and r.hkl in before_by_hkl
-    ]
-    target_rows.sort(key=lambda t: abs(t[0].q_lannoo), reverse=True)
+    reports_by_fid = {r.fid: r for r in reports_before}
+    selected_anions: List[int] = []
+    selected_charge_delta = 0
+    plan_rows: List[Tuple[Tuple[int, int, int], float, int, int, int, int, int]] = []
+    neg_reports = sorted(
+        [reports_by_fid[fid] for fid in neg_fids],
+        key=lambda r: abs(r.q_net),
+        reverse=True,
+    )
 
-    move_log: Dict[Tuple[int, int, int], List[str]] = {}
+    for facet_counter, report in enumerate(neg_reports):
+        if selected_charge_delta >= compensation_capacity:
+            break
+        local_candidates = [
+            i for i in anion_candidates
+            if report.fid in memberships[i]
+            and all(float(np.linalg.norm(pts[i] - pts[j])) >= min_separation for j in selected_anions)
+        ]
+        if not local_candidates:
+            plan_rows.append((report.hkl, report.q_net, 0, 0, 0, 0, 0))
+            continue
 
-    for original_row, row, (n_vec, d_val) in target_rows:
-        hkl = original_row.hkl
-        print(f"\n[recon] Facet {hkl}: original {original_row.termination}, "
-              f"Q_Lannoo={original_row.q_lannoo:+.3f}, N_surface={row.n_surface}")
+        max_local_idx = _maximum_independent_indices(pts[local_candidates], min_separation)
+        max_nonadjacent = [local_candidates[k] for k in max_local_idx]
+        avg_delta = float(np.mean([replacement_delta[i] for i in max_nonadjacent])) if max_nonadjacent else 0.25
+        requested = int(math.ceil(abs(report.q_net) * target_reduction / max(avg_delta, 1e-9)))
+        requested = max(1, requested)
+        remaining_charge = compensation_capacity - selected_charge_delta
+        requested_pool = max_nonadjacent
+        if requested < len(max_nonadjacent):
+            requested_local = _fps_indices(
+                pts[max_nonadjacent],
+                requested,
+                min_separation,
+                seed + 101 * (facet_counter + 1),
+            )
+            requested_pool = [max_nonadjacent[k] for k in requested_local]
 
-        # Re-detect planes after each facet's reconstruction (sequential dependency)
-        _cur_facets, cur_planes = _native_facets_and_planes(
-            symbols, pts, struct, charges, facet_seeds, ligand, surf_tol
+        chosen: List[int] = []
+        chosen_charge = 0
+        for idx in requested_pool:
+            dq = swap_charge_delta[idx]
+            if chosen_charge + dq > remaining_charge:
+                continue
+            chosen.append(idx)
+            chosen_charge += dq
+
+        selected_anions.extend(chosen)
+        selected_charge_delta += chosen_charge
+        max_charge = sum(swap_charge_delta[i] for i in max_nonadjacent)
+        plan_rows.append((
+            report.hkl,
+            report.q_net,
+            requested,
+            len(max_nonadjacent),
+            max_charge,
+            chosen_charge,
+            len(chosen),
+        ))
+
+    while selected_anions and selected_charge_delta % add_charge_unit != 0:
+        dropped = selected_anions.pop()
+        selected_charge_delta -= swap_charge_delta[dropped]
+
+    picked_anions = selected_anions
+    needed_added_ligands = selected_charge_delta // add_charge_unit
+    picked_slots = capacity_slots[:needed_added_ligands]
+    if len(picked_slots) < needed_added_ligands:
+        print(
+            f"[recon] Compensation slot selection produced only {len(picked_slots)} slots "
+            f"for {needed_added_ligands} required ligands; skipping."
         )
+        print('='*60)
+        return symbols, pts
 
-        symbols, pts, moves = _reconstruct_facet_spaced(
-            symbols, pts, hkl, n_vec, d_val, cur_planes,
-            charges, ligand, surf_tol, pair_cuts, verbose,
-            original_q_lannoo=original_row.q_lannoo,
+    if not picked_anions:
+        print(
+            f"[recon] Spacing constraint rejected all anion swaps "
+            f"(min_separation={min_separation:.2f} Å); skipping."
         )
-        move_log[hkl] = moves
+        print('='*60)
+        return symbols, pts
 
-    # Lannoo report after reconstruction (before global rebalance)
+    print(f"\n=== SURFACE RECONSTRUCTION PLAN ===")
+    print(
+        "        hkl    Q_net_before  requested  max_nonadjacent"
+        "  max_ΔQ  selected_ΔQ  applied"
+    )
+    for hkl, q_before, requested, max_allowed, max_charge, chosen_charge, applied in plan_rows:
+        hkl_str = f"({hkl[0]} {hkl[1]} {hkl[2]})"
+        print(
+            f"  {hkl_str:>11s}  {q_before:+12.3f}"
+            f"  {requested:9d}  {max_allowed:15d}"
+            f"  {max_charge:6d}  {chosen_charge:11d}  {applied:7d}"
+        )
+    print(
+        f"[recon] compensation capacity: {len(capacity_slots)} missing-coordination "
+        f"{recon_ligand} slots "
+        f"= {-compensation_capacity:+d} charge"
+    )
+    print(
+        f"[recon] selected swaps: +{selected_charge_delta:d} charge; "
+        f"adding {needed_added_ligands:d} {recon_ligand} ligands "
+        f"({needed_added_ligands * ligand_charge:+d} charge)"
+    )
+    print(
+        f"[recon] applied total swaps={len(picked_anions)}, "
+        f"min_separation={min_separation:.2f} Å"
+    )
+
+    new_symbols = list(symbols)
+    new_pts = np.asarray(pts, float).copy()
+    for idx in picked_anions:
+        old = new_symbols[idx]
+        new_symbols[idx] = recon_ligand
+        if verbose:
+            print(f"[recon] swap {old}#{idx} CN={int(cn[idx])} -> {recon_ligand}")
+
+    add_positions = _ligand_add_positions_for_slots(
+        new_symbols, new_pts, picked_slots, recon_ligand, pair_cuts
+    )
+    if len(add_positions) != len(picked_slots):
+        print(
+            f"[recon] Internal slot geometry issue: generated {len(add_positions)} ligand positions "
+            f"for {len(picked_slots)} selected slots; skipping."
+        )
+        print('='*60)
+        return symbols, pts
+    for (host_idx, _vec), pos in zip(picked_slots, add_positions):
+        new_symbols.append(recon_ligand)
+        new_pts = np.vstack([new_pts, np.asarray(pos, float)])
+        if verbose:
+            print(f"[recon] add {recon_ligand} on {symbols[host_idx]}#{host_idx}")
+
+    symbols, pts = new_symbols, new_pts
+
     post_facets, post_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, ligand, surf_tol
+        symbols, pts, struct, charges, facet_seeds, recon_ligand, surf_tol
     )
-    atom_q_post = _lannoo_all_atoms(symbols, pts, charges, ligand, pair_cuts)
-    rows_after = _compute_facet_charges(
-        symbols, pts, post_facets, post_planes, charges, ligand, surf_tol, atom_q_post
+    post_atom_q = _surface_recon_atom_q(symbols, pts, charges, pair_cuts, native_species, cn_refs)
+    reports_after = _surface_recon_reports(
+        symbols, pts, post_facets, post_planes, charges, surf_tol, post_atom_q
     )
-    _print_lannoo_table(rows_after, "AFTER reconstruction / before global rebalance", target_hkls)
+    before_by_hkl = {r.hkl: r for r in reports_before}
+    _print_polar_report(reports_after, "AFTER reconstruction", target_hkls, before=before_by_hkl)
 
-    # Phase 3: one final global charge-balance pass.
-    # include_sublayer=True because reconstruction may leave undercoordinated cations
-    # in the sublayer (As→Cl swaps shorten the effective bond, reducing nearby cation CN).
-    Q_now = _total_q(symbols, charges)
-    print(f"\n[recon] Final global charge balance (Q_total={Q_now:+d})...")
-    symbols, pts = charge_balance_fn(
-        symbols, pts, charges, ligand,
-        verbose=verbose,
-        planes=post_planes,
-        surf_tol=surf_tol,
-        cif_path=cif_path,
-        positive_q_strategy="remove",
-        write_all=write_all,
-        prefix=f"{prefix}_recon",
-        include_sublayer=True,
+    print(
+        f"[recon] Done. swapped={len(picked_anions)} added={len(add_positions)} "
+        f"Q_total={_total_q(symbols, charges):+d}"
     )
-
-    # Final Lannoo report
-    final_facets, final_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, ligand, surf_tol
-    )
-    atom_q_final = _lannoo_all_atoms(symbols, pts, charges, ligand, pair_cuts)
-    rows_final = _compute_facet_charges(
-        symbols, pts, final_facets, final_planes, charges, ligand, surf_tol, atom_q_final
-    )
-    _print_lannoo_table(rows_final, "FINAL (after global rebalance)", target_hkls)
-    _print_reconstruction_summary(
-        rows_before, rows_stripped, rows_after, rows_final, target_hkls, strip_log, move_log
-    )
-    print(f"[recon] Done. Q_total = {_total_q(symbols, charges):+d}")
     print('='*60)
 
     return symbols, pts

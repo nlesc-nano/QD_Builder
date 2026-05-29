@@ -4,6 +4,101 @@ from dataclasses import dataclass, field
 from typing import Tuple, List, Dict, Optional, Any
 import numpy as np
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Neutral-ligand post-treatment types (declared first; used by PassivationSpec)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class NeutralLigandPass:
+    """
+    A single pass in the neutral-ligand post-treatment.
+
+    target      : 'cation' | 'anion' | 'both'
+    smiles      : SMILES string of the neutral molecule (kept in neutral form).
+    distribution: 'random' | 'segmented' | 'uniform'
+    ratio       : fraction of eligible sites to passivate (0.0 – 1.0).
+    """
+    target: str
+    smiles: str
+    distribution: str = "random"
+    ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class NeutralLigandPostTreatSpec:
+    """
+    Configuration for the optional neutral-ligand post-treatment step.
+    Executed after charge-balance (Q=0) to passivate remaining structurally
+    undercoordinated surface sites with neutral organic/inorganic ligands.
+    """
+    enabled: bool = False
+    passes: Tuple[NeutralLigandPass, ...] = ()
+    ff: str = "uff"               # RDKit force-field for 3-D embedding
+    refinement_passes: int = 2     # steric rotational-scan passes
+    sterics_mode: str = "vdw"      # heavy | all | vdw
+    offset_out: float = 0.5        # extra Å along anchor direction
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
+class LigandExchangePass:
+    """
+    Replace native charge-balance ligands with charged ligands built from SMILES.
+
+    replace     : native ligand symbol to replace, e.g. "Cl".
+    charge      : final molecular ligand charge; currently supports -1 and +1.
+    smiles      : one or more neutral precursor SMILES.
+    distribution: 'random' | 'segmented' | 'uniform'
+    ratio       : fraction of eligible native ligands to exchange.
+    """
+    replace: str
+    charge: int
+    smiles: Tuple[str, ...]
+    distribution: str = "random"
+    ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class LigandExchangePostTreatSpec:
+    """
+    Optional post-treatment ligand exchange.
+    Runs after coordination-based post-treatments and substitutes already placed
+    native charge-balance ligands without changing their validated virtual site.
+    """
+    enabled: bool = False
+    passes: Tuple[LigandExchangePass, ...] = ()
+    ff: str = "uff"
+    refinement_passes: int = 2
+    sterics_mode: str = "vdw"
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
+class SurfaceReconstructionSpec:
+    """
+    Simplified polar-surface reconstruction post-treatment.
+
+    The step computes residual Lannoo-like facet charges after charge-balance
+    passivation, sparsely swaps native anions on negative polar facets to the
+    reconstruction ligand, and compensates each swap by adding one ligand to an
+    available cation-rich polar site.
+    """
+    enabled: bool = False
+    ligand: Optional[str] = None
+    facets: Tuple[Tuple[int, int, int], ...] = ()
+    auto_facets: bool = True
+    target_reduction: float = 0.5
+    min_separation: Optional[float] = None
+    distribution: str = "fps"
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
+class PostTreatmentSpec:
+    surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
+    neutral_ligands: NeutralLigandPostTreatSpec = field(default_factory=NeutralLigandPostTreatSpec)
+    ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
+
 # Basic
 @dataclass(frozen=True)
 class Facet:
@@ -22,6 +117,13 @@ class PassivationSpec:
     ligand: str                 # anion ligand (legacy)
     surf_tol: float = 1.0
     cation_ligand: Optional[str] = None
+    prepass_mode: str = "standard"
+    prepass_min_cn_terrace: int = 3
+    prepass_min_cn_edge: int = 3
+    prepass_min_cn_vertex: int = 3
+    neutral_ligands: NeutralLigandPostTreatSpec = field(
+        default_factory=NeutralLigandPostTreatSpec
+    )
 
 
 @dataclass(frozen=True)
@@ -97,5 +199,6 @@ class Config:
     twins: Optional[List[Dict[str, Any]]] = None
     construction_origin: Optional[Dict[str, Any]] = None
     facet_reconstruction: FacetReconstructionSpec = field(default_factory=FacetReconstructionSpec)
+    post_treatment: PostTreatmentSpec = field(default_factory=PostTreatmentSpec)
     experimental: Dict[str, Any] = field(default_factory=dict)
     stack: StackSpec = field(default_factory=StackSpec)

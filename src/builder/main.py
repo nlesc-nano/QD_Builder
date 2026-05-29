@@ -6,6 +6,7 @@ import logging
 import copy
 import re
 import dataclasses
+from collections import Counter
 from typing import List
 import numpy as np 
 
@@ -165,7 +166,25 @@ def _stack_size_metrics(symbols, pts, charges, ligand_symbol: str, materials_cfg
     return out
 
 
-def _print_stack_summary(symbols, charges, materials_cfg, ligand_symbol: str, *, pts=None, layer_planes=None):
+def _charge_with_ligand_exchange(symbols, charges, ligand_exchange_charge_ledger=None):
+    """Total charge with exchanged ligands counted by their YAML molecular charge."""
+    ledger = ligand_exchange_charge_ledger or []
+    q_element = int(sum(int(charges.get(sym, 0)) for sym in symbols))
+    q_ignored = int(sum(int(entry.get("ignored_element_charge", 0)) for entry in ledger))
+    q_exchange = int(sum(int(entry.get("charge", 0)) for entry in ledger))
+    return q_element, q_ignored, q_exchange, q_element - q_ignored + q_exchange
+
+
+def _print_stack_summary(
+    symbols,
+    charges,
+    materials_cfg,
+    ligand_symbol: str,
+    *,
+    pts=None,
+    layer_planes=None,
+    ligand_exchange_charge_ledger=None,
+):
     """
     Print per-layer counts for core/shell systems.
     Uses the element sets derived from each material's CIF structure.
@@ -173,7 +192,9 @@ def _print_stack_summary(symbols, charges, materials_cfg, ligand_symbol: str, *,
     from collections import Counter
 
     cnt = Counter(symbols)
-    Q_total = sum(charges.get(el, 0) * v for el, v in cnt.items())
+    Q_element, Q_ignored, Q_exchange, Q_total = _charge_with_ligand_exchange(
+        symbols, charges, ligand_exchange_charge_ledger
+    )
     region_masks = None
     if pts is not None and layer_planes is not None:
         region_masks = region_masks_from_layer_planes(np.asarray(pts, float), layer_planes)
@@ -210,17 +231,30 @@ def _print_stack_summary(symbols, charges, materials_cfg, ligand_symbol: str, *,
     if n_ligand:
         print(f"\nLigand placeholders ({ligand_symbol}): {n_ligand}")
 
+    if ligand_exchange_charge_ledger:
+        print(f"\nElement-symbol Charge = {Q_element:+d}")
+        print(f"Ignored exchanged-ligand element charge = {-Q_ignored:+d}")
+        print(f"YAML exchanged-ligand charge = {Q_exchange:+d}")
     print(f"\nTotal Charge = {Q_total:+d}")
 
 
-def _print_single_material_summary(symbols, charges, ligand_symbol: str, title: str = None):
+def _print_single_material_summary(
+    symbols,
+    charges,
+    ligand_symbol: str,
+    title: str = None,
+    *,
+    ligand_exchange_charge_ledger=None,
+):
     from collections import Counter
     cnt = Counter(symbols)
 
     n_ligand  = cnt.get(ligand_symbol, 0)
 
     # total Q
-    Q = sum(charges.get(el, 0) * v for el, v in cnt.items())
+    Q_element, Q_ignored, Q_exchange, Q = _charge_with_ligand_exchange(
+        symbols, charges, ligand_exchange_charge_ledger
+    )
 
     if title:
         print(f"\n### {title} ###")
@@ -237,7 +271,10 @@ def _print_single_material_summary(symbols, charges, ligand_symbol: str, title: 
             print(f"number of {el}: {cnt[el]}")
     if n_ligand:
         print(f"number of ligand placeholder {ligand_symbol}: {n_ligand}")
-    # also print per-element lines in a stable order
+    if ligand_exchange_charge_ledger:
+        print(f"\nElement-symbol Charge = {Q_element:+d}")
+        print(f"Ignored exchanged-ligand element charge = {-Q_ignored:+d}")
+        print(f"YAML exchanged-ligand charge = {Q_exchange:+d}")
     print(f"\nTotal Charge = {Q:+d}")
 
 
@@ -462,29 +499,36 @@ def _surface_charge_for_signed_hkl(struct: Structure, hkl, charges) -> int:
 def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) -> List[Facet]:
     resolved: List[Facet] = []
     for f in seeds:
-        if getattr(f, "scope", "family") == "facet":
-            resolved.append(f)
-            continue
         term = getattr(f, "termination", None)
         if not term:
             resolved.append(f)
             continue
 
-        hkl = (abs(int(f.h)), abs(int(f.k)), abs(int(f.l)))
+        scope = getattr(f, "scope", "family")
+        hkl_in = (int(f.h), int(f.k), int(f.l))
+        hkl = hkl_in if scope == "facet" else tuple(abs(x) for x in hkl_in)
         if hkl == (0, 0, 0):
             resolved.append(f)
             continue
-        candidates = [hkl, (-hkl[0], -hkl[1], -hkl[2])]
-        scored = [(cand, _surface_charge_for_signed_hkl(struct, cand, charges)) for cand in candidates]
-        if term == "cation_rich":
-            chosen, _q = max(scored, key=lambda rec: rec[1])
-        elif term == "anion_rich":
-            chosen, _q = min(scored, key=lambda rec: rec[1])
+
+        if scope == "facet":
+            # Facet-scoped hkl is an exact exposed orientation supplied by the
+            # recipe. Wulff halfspaces expose the layer opposite the plane
+            # normal, so only flip the construction normal; do not choose
+            # between the two signed terminations.
+            chosen = hkl
         else:
-            chosen = (f.h, f.k, f.l)
+            candidates = [hkl, (-hkl[0], -hkl[1], -hkl[2])]
+            scored = [(cand, _surface_charge_for_signed_hkl(struct, cand, charges)) for cand in candidates]
+            if term == "cation_rich":
+                chosen, _q = max(scored, key=lambda rec: rec[1])
+            elif term == "anion_rich":
+                chosen, _q = min(scored, key=lambda rec: rec[1])
+            else:
+                chosen = hkl_in
         # Bulk slab scoring uses max projection; Wulff halfspaces expose the opposite polar layer.
         chosen = (-chosen[0], -chosen[1], -chosen[2])
-        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=getattr(f, "scope", "family")))
+        resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=scope))
     return resolved
 
 
@@ -532,9 +576,26 @@ def _run_passivation_and_write_outputs(
         pair_cuts_override=pair_cuts_override,
         region_masks=region_masks,
         stack_passivation=stack_passivation,
+        prepass_mode=cfg.passivation.prepass_mode,
+        prepass_min_cn_terrace=cfg.passivation.prepass_min_cn_terrace,
+        prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
+        prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
     )
 
-    if cfg.facet_reconstruction.enabled:
+    surface_reconstruction_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "surface_reconstruction",
+        cfg.facet_reconstruction,
+    )
+    if surface_reconstruction_spec.enabled:
+        from functools import partial
+        balance_fn = partial(
+            charge_balance_iterative,
+            prepass_mode=cfg.passivation.prepass_mode,
+            prepass_min_cn_terrace=cfg.passivation.prepass_min_cn_terrace,
+            prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
+            prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
+        )
         syms, pts = reconstruct_polar_facets(
             syms,
             pts,
@@ -544,11 +605,48 @@ def _run_passivation_and_write_outputs(
             ligand=anion_lig,
             surf_tol=cfg.passivation.surf_tol,
             cif_path=cif_path,
-            spec=cfg.facet_reconstruction,
-            charge_balance_fn=charge_balance_iterative,
+            spec=surface_reconstruction_spec,
+            charge_balance_fn=balance_fn,
             verbose=args.verbose,
             write_all=args.write_all,
             prefix=prefix,
+        )
+
+    ligand_exchange_charge_ledger = []
+
+    # ── Charged ligand exchange (optional; after reconstruction, before neutral ligands)
+    ligand_exchange_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "ligand_exchange",
+        None,
+    )
+    if ligand_exchange_spec is not None and ligand_exchange_spec.enabled:
+        from .ligand_exchange_posttreat import run_ligand_exchange_posttreatment
+        syms, pts, ligand_exchange_charge_ledger = run_ligand_exchange_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path
+        )
+        if ligand_exchange_charge_ledger:
+            q_element, q_ignored, q_exchange, q_total = _charge_with_ligand_exchange(
+                syms, cfg.charges, ligand_exchange_charge_ledger
+            )
+            print(
+                "[ligand-exchange:charge] "
+                f"element-symbol Q={q_element:+d}, "
+                f"ignored exchanged-ligand element Q={-q_ignored:+d}, "
+                f"YAML exchanged-ligand Q={q_exchange:+d}, "
+                f"total Q={q_total:+d}"
+            )
+
+    # ── Neutral-ligand post-treatment (optional; final post-treatment step) ───
+    neutral_ligand_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "neutral_ligands",
+        cfg.passivation.neutral_ligands,
+    )
+    if neutral_ligand_spec.enabled:
+        from .neutral_ligand_posttreat import run_neutral_ligand_posttreatment
+        syms, pts = run_neutral_ligand_posttreatment(
+            syms, pts, cfg, struct, planes
         )
 
     if args.verbose:
@@ -568,6 +666,11 @@ def _run_passivation_and_write_outputs(
         if construction_radius_override is not None
         else _radius_from_size_args(struct, args)
     )
+    actual_radius = max(d for _, d in planes) if planes else construction_radius
+    a, b, c = struct.lattice.matrix
+    min_lat = min(float(np.linalg.norm(a)), float(np.linalg.norm(b)), float(np.linalg.norm(c)))
+    actual_size_cells = actual_radius / min_lat
+
     construction_diameter = 2.0 * construction_radius
     size_metrics = get_cluster_size_metrics(
         final_pts,
@@ -593,6 +696,7 @@ def _run_passivation_and_write_outputs(
         print(
             "[size-summary] "
             f"input_estimate: R={construction_radius:.3f} Å, D={construction_diameter:.3f} Å | "
+            f"actual_used: R={actual_radius:.3f} Å (cell_size={actual_size_cells:.2f}) | "
             f"final_obtained: R={size_metrics['R_eff_hull']:.3f} Å, "
             f"D={size_metrics['diameter_hull']:.3f} Å"
         )
@@ -614,15 +718,28 @@ def _run_passivation_and_write_outputs(
     extra = {
         "material": material_label,
         "size_unit_cells": args.size_unit_cells,
+        "actual_size_unit_cells": actual_size_cells,
         "construction_radius_ang": construction_radius,
+        "actual_radius_ang": actual_radius,
         "construction_diameter_ang": construction_diameter,
         "size_metrics": size_metrics,
     }
     if stack_sizes:
         extra["stack_size_metrics"] = stack_sizes
+    if ligand_exchange_charge_ledger:
+        q_element, q_ignored, q_exchange, q_total = _charge_with_ligand_exchange(
+            syms, cfg.charges, ligand_exchange_charge_ledger
+        )
+        extra.update({
+            "element_symbol_charge": q_element,
+            "ignored_exchanged_ligand_element_charge": q_ignored,
+            "yaml_exchanged_ligand_charge": q_exchange,
+            "total_charge": q_total,
+            "ligand_exchange_charge_ledger": ligand_exchange_charge_ledger,
+        })
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
-    return syms, pts
+    return syms, pts, ligand_exchange_charge_ledger
 
 
 def _print_surface_reports(syms, pts, planes, facets, charges, surf_tol: float, *, label: str, verbose: bool):
@@ -763,13 +880,21 @@ def _print_native_surface_reports_after_charge_balance(
     )
 
 
-def _prune_before_facet_detection(syms, pts, *, args):
+def _prune_before_facet_detection(syms, pts, *, args, cfg=None):
     if not args.prune_mono:
         return syms, pts
+    
+    # Determine the prune threshold dynamically
+    min_cn = args.prune_min_cn
+    if cfg is not None and getattr(cfg, "passivation", None) is not None:
+        pass_spec = cfg.passivation
+        if pass_spec.prepass_mode == "role-aware":
+            min_cn = min(min_cn, pass_spec.prepass_min_cn_vertex)
+
     if args.verbose:
-        print("\n[4b] Pruning low-coordination atoms (pre-facet detection)...")
+        print(f"\n[4b] Pruning low-coordination atoms (pre-facet detection, min_cn={min_cn})...")
     syms, pts, n_removed, n_pass = prune_low_coord_sites(
-        syms, pts, min_cn=args.prune_min_cn, max_passes=args.prune_passes, verbose=args.verbose
+        syms, pts, min_cn=min_cn, max_passes=args.prune_passes, verbose=args.verbose
     )
     if args.verbose:
         print(f"    - Pruned {n_removed} atoms in {n_pass} pass(es); remaining {len(syms)} atoms")
@@ -852,6 +977,26 @@ def main(argv: List[str] | None = None) -> int:
         p.error("expected one argument (YAML for stack mode) or two arguments (CIF YAML for single-material mode)")
 
     cfg: Config = parse_yaml_config(args.yaml)
+    # Merge CLI options into PassivationSpec
+    pass_spec = cfg.passivation
+    updated_pass_fields = {}
+    if getattr(args, "prepass_mode", None) is not None:
+        updated_pass_fields["prepass_mode"] = args.prepass_mode
+    if getattr(args, "prepass_min_cn_terrace", None) is not None:
+        updated_pass_fields["prepass_min_cn_terrace"] = args.prepass_min_cn_terrace
+    if getattr(args, "prepass_min_cn_edge", None) is not None:
+        updated_pass_fields["prepass_min_cn_edge"] = args.prepass_min_cn_edge
+    if getattr(args, "prepass_min_cn_vertex", None) is not None:
+        updated_pass_fields["prepass_min_cn_vertex"] = args.prepass_min_cn_vertex
+    
+    # If prepass_mode was overridden to role-aware and vertex was not specified, default to 1
+    if updated_pass_fields.get("prepass_mode") == "role-aware" and "prepass_min_cn_vertex" not in updated_pass_fields and pass_spec.prepass_min_cn_vertex == 3:
+        updated_pass_fields["prepass_min_cn_vertex"] = 1
+
+    if updated_pass_fields:
+        pass_spec = dataclasses.replace(pass_spec, **updated_pass_fields)
+        cfg = dataclasses.replace(cfg, passivation=pass_spec)
+
     if cfg.mode != "stack" and args.cif is None:
         p.error("single-material mode requires: nc-builder STRUCT.cif RECIPE.yaml")
     if cfg.mode == "stack" and args.cif is None:
@@ -892,7 +1037,7 @@ def main(argv: List[str] | None = None) -> int:
                 pc = r["polar_count"]; nt = r["n_terms_checked"]
                 print(f"  hkl={r['hkl']!s:>10}  fam={r['family']:<6}  {pol:9}  ({pc}/{nt} terminations polar)")
         # continue with the normal run afterwards
-    
+
     if cfg.mode == "stack":
         # Multi-material: YAML drives CIFs; CLI radius sets the outer cut.
         _validate_ligand_not_native([m.cif for m in cfg.materials], anion_lig)
@@ -1011,7 +1156,7 @@ def main(argv: List[str] | None = None) -> int:
             verbose=args.verbose,
         )
 
-        syms, pts = _prune_before_facet_detection(syms, pts, args=args)
+        syms, pts = _prune_before_facet_detection(syms, pts, args=args, cfg=cfg)
         region_masks = region_masks_from_layer_planes(pts, layer_planes)
 
         stack_pair_cuts = merge_pair_cuts_from_cifs(
@@ -1107,7 +1252,7 @@ def main(argv: List[str] | None = None) -> int:
                 )
                 write_xyz(layer_path, part_syms_out, part_pts_out)
 
-        syms, pts = _run_passivation_and_write_outputs(
+        syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
             syms,
             pts,
             args=args,
@@ -1164,6 +1309,7 @@ def main(argv: List[str] | None = None) -> int:
                 anion_lig,
                 pts=pts,
                 layer_planes=layer_planes,
+                ligand_exchange_charge_ledger=ligand_exchange_charge_ledger,
             )
     
         return 0
@@ -1301,7 +1447,7 @@ def main(argv: List[str] | None = None) -> int:
                 planes_geo=_planes_geo,
             )
 
-        syms, pts = _prune_before_facet_detection(syms, pts, args=args)
+        syms, pts = _prune_before_facet_detection(syms, pts, args=args, cfg=cfg)
 
         report_label = f" ({variant_label})" if multiple_variants else ""
         if cfg.shape_mode == "sphere":
@@ -1323,7 +1469,7 @@ def main(argv: List[str] | None = None) -> int:
                 verbose=args.verbose,
             )
 
-        syms, pts = _run_passivation_and_write_outputs(
+        syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
             syms,
             pts,
             args=run_args,
@@ -1339,7 +1485,13 @@ def main(argv: List[str] | None = None) -> int:
         if args.verbose:
             print("\n### ELEMENT COUNTS ###")
             title = f"ROLE COUNTS (single material{report_label})"
-            _print_single_material_summary(syms, cfg.charges, anion_lig, title=title)
+            _print_single_material_summary(
+                syms,
+                cfg.charges,
+                anion_lig,
+                title=title,
+                ligand_exchange_charge_ledger=ligand_exchange_charge_ledger,
+            )
 
     return 0
 
