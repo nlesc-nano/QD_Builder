@@ -138,12 +138,11 @@ def _min_ligand_ligand_spacing(
     idx = [i for i, s in enumerate(symbols) if s == ligand]
     if len(idx) < 2:
         return 2.5
-    dmin = float("inf")
-    for a_pos, i in enumerate(idx):
-        for j in idx[a_pos + 1:]:
-            d = float(np.linalg.norm(pts[i] - pts[j]))
-            if 1e-9 < d < dmin:
-                dmin = d
+    
+    ligand_pts = np.asarray(pts[idx], float)
+    tree = cKDTree(ligand_pts)
+    dists, _ = tree.query(ligand_pts, k=2)
+    dmin = np.min(dists[:, 1])
     return 1.05 * dmin if np.isfinite(dmin) else 2.5
 
 
@@ -282,16 +281,24 @@ def _trial_ligand_addition_score(
     return score, host_gain, touched, over_penalty
 
 
-def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64]) -> List[int]:
-    xi = pts[i]
+def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64], pt_tree: Optional[cKDTree] = None) -> List[int]:
+    if pt_tree is None:
+        pt_tree = cKDTree(pts)
+    
+    uniq = set(symbols)
+    max_rc = max(pc(symbols[i], s) for s in uniq) if uniq else 0.0
+    if max_rc <= 0:
+        return []
+        
+    idxs = pt_tree.query_ball_point(pts[i], r=max_rc)
     out: List[int] = []
-    for j, sj in enumerate(symbols):
+    for j in idxs:
         if j == i:
             continue
-        rc = pc(symbols[i], sj)
+        rc = pc(symbols[i], symbols[j])
         if rc <= 0:
             continue
-        if np.linalg.norm(pts[j] - xi) <= rc + 1e-12:
+        if np.linalg.norm(pts[j] - pts[i]) <= rc + 1e-12:
             out.append(j)
     return out
 
@@ -390,7 +397,8 @@ def _priority1_swap_undercoord_anions_once(
     ligand: str,
     surf_tol: float,
     uv_cache: UVCache,
-    *, verbose: bool = True
+    *, verbose: bool = True,
+    pt_tree: Optional[cKDTree] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     for i, s in enumerate(list(symbols)):
         if charges.get(s, 0) >= 0:
@@ -399,11 +407,11 @@ def _priority1_swap_undercoord_anions_once(
             continue
         if int(cn_bi[i]) > 2:
             continue
-        if len(_incident_facets(i, pts, frames, surf_tol)) == 0:
+        if not mem[i]:
             continue
         # avoid creating new CN<3 cations
         harmful = False
-        for j in _neighbors(i, symbols, pts):
+        for j in _neighbors(i, symbols, pts, pt_tree=pt_tree):
             if charges.get(symbols[j], 0) <= 0:
                 continue
             if int(cn_bi[j]) <= 3:
@@ -959,9 +967,8 @@ def _priority3_balance_positive_q_add(
                 })
 
         # 3. Evaluate all candidates from all hosts in sub
-        candidate_best = None
+        all_valid_candidates = []
         for primary_host, cands in host_candidates_map.items():
-            best_local = None
             for cand in cands:
                 new_pos = cand["pos"]
                 u_vec = cand["u_vec"]
@@ -970,7 +977,7 @@ def _priority3_balance_positive_q_add(
                 (i_rec, n_out, depth_min, dft, role_rank, fid) = cand["record"]
                 offset = cand.get("offset", float(np.linalg.norm(new_pos - pts[primary_host])))
 
-                if stack_passivation and not _ligand_position_allowed(new_pos, symbols, pts, ligand):
+                if stack_passivation and not include_sublayer and not _ligand_position_allowed(new_pos, symbols, pts, ligand):
                     continue
 
                 score, host_gain, touched, over_penalty = _trial_ligand_addition_score(
@@ -1020,100 +1027,156 @@ def _priority3_balance_positive_q_add(
                 side_balance = -(add_side_count + 0.25 * edit_side_count)
 
                 uv = _get_uv(frames, fid, primary_host, pts, uv_cache)
-                taken = uv_taken.get(fid, [])
-                from math import hypot
-                dmin = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken) if taken else float("inf")
                 repair_rank = max(int(cn3_repaired), int(touched))
-                cand_tuple = (
-                    repair_rank,
-                    score,
-                    host_gain,
-                    touched,
-                    role_rank,
-                    side_balance,
-                    dmin,
-                    -depth_min,
-                    -primary_host,
-                    fid,
-                    new_pos,
-                    u_vec,
-                    placed_via_bulk,
-                    tuple(sorted(inc_facets)),
-                    add_side_count,
-                    edit_side_count,
-                    offset,
-                )
-                if best_local is None or cand_tuple[:9] > best_local[:9]:
-                    best_local = cand_tuple
-            
-            if best_local is not None:
-                if candidate_best is None or best_local[:9] > candidate_best[0]:
-                    candidate_best = (best_local[:9], best_local, cand["record"])
+                cand_rec = {
+                    "repair_rank": repair_rank,
+                    "score": score,
+                    "host_gain": host_gain,
+                    "touched": touched,
+                    "role_rank": role_rank,
+                    "side_balance": side_balance,
+                    "fid": fid,
+                    "pos": new_pos,
+                    "u_vec": u_vec,
+                    "placed_via_bulk": placed_via_bulk,
+                    "inc_facets_key": tuple(sorted(inc_facets)),
+                    "add_side_count": add_side_count,
+                    "edit_side_count": edit_side_count,
+                    "offset": offset,
+                    "dft_val": dft,
+                    "primary_host": primary_host,
+                    "depth_min": depth_min
+                }
+                all_valid_candidates.append(cand_rec)
 
-        if candidate_best is None:
+        if not all_valid_candidates:
             continue
 
-        _key, (
-            repair_rank,
-            score,
-            host_gain,
-            touched,
-            role_rank_chk,
-            side_balance,
-            dmin,
-            _neg_depth,
-            _neg_i,
-            _fid,
-            new_pos,
-            u_vec,
-            placed_via_bulk,
-            inc_facets_key,
-            add_side_count,
-            edit_side_count,
-            offset,
-        ), (i, n_out, depth_min, dft, role_rank, fid) = candidate_best
+        # Dynamic 3D Farthest Point Sampling (FPS) Min-Max Batch Selection
+        q_initial = _total_Q(symbols, charges)
+        ligand_q_change = abs(charges.get(ligand, 1))
+        max_to_add = max(1, int(q_initial // ligand_q_change))
 
-        # Validate deficit from the current loop's CN and candidate record.
-        cn_before = int(cn_bi[i])
-        deficit_chk = int(dft)
-        if deficit_chk <= 0:
+        # 1. Identify pre-existing ligand positions to calculate distance to
+        ligand_indices = [idx for idx, s in enumerate(symbols) if s == ligand]
+        existing_ligand_pts = pts[ligand_indices] if ligand_indices else np.zeros((0, 3))
+
+        committed_positions = []
+        committed_hosts = set()
+        batch_to_place = []
+
+        d_exclude = 1.8 if include_sublayer else 3.0
+
+        # Group candidates by (repair_rank, score) to prioritize structural deficits and chemical scores,
+        # allowing different roles (vertex, edge, unique) with the same score to be evaluated together on equal footing
+        tiers = defaultdict(list)
+        for c in all_valid_candidates:
+            tiers[(c["repair_rank"], c["score"])].append(c)
+
+        # Process tiers in descending order (highest repair_rank, highest score first)
+        sorted_tier_keys = sorted(tiers.keys(), reverse=True)
+
+        for rep_rank, scr in sorted_tier_keys:
+            candidates = tiers[(rep_rank, scr)]
+
+            # Seeded shuffle of candidates in this tier to break absolute coordination ties uniformly
+            import random
+            random.Random(42).shuffle(candidates)
+
+            # Initialize dynamic 3D dmin for each candidate relative to existing and already committed ligands
+            for c in candidates:
+                pos = c["pos"]
+                dmin_val = float("inf")
+                if len(existing_ligand_pts) > 0:
+                    dmin_val = min(dmin_val, float(np.min(np.linalg.norm(existing_ligand_pts - pos, axis=1))))
+                if committed_positions:
+                    dmin_val = min(dmin_val, float(np.min(np.linalg.norm(np.asarray(committed_positions) - pos, axis=1))))
+                c["dmin_3d"] = dmin_val
+
+            # Greedy Min-Max Farthest Point Selection Loop
+            while candidates:
+                if len(batch_to_place) >= max_to_add:
+                    break
+
+                # Pick candidate: if it is the very first one in the batch, pick a random safe candidate
+                # to avoid absolute center clustering bias, otherwise pick the one with maximum dmin_3d
+                if len(committed_positions) == 0:
+                    best_idx = None
+                    for idx, c in enumerate(candidates):
+                        if c["dmin_3d"] >= d_exclude:
+                            best_idx = idx
+                            break
+                    if best_idx is None:
+                        # No candidate is safe from steric exclusion
+                        break
+                else:
+                    best_idx = max(range(len(candidates)), key=lambda idx: candidates[idx]["dmin_3d"])
+                
+                best_cand = candidates[best_idx]
+
+                # Steric exclusion limit: stop if the best available site is too close to placed ligands
+                if best_cand["dmin_3d"] < d_exclude:
+                    break
+
+                # Commit!
+                new_pos = best_cand["pos"]
+                primary_host = best_cand["primary_host"]
+
+                committed_positions.append(new_pos)
+                committed_hosts.add(primary_host)
+                
+                # Store candidate along with its global batch order rank
+                batch_to_place.append((len(batch_to_place) + 1, best_cand))
+                candidates.pop(best_idx)
+
+                # Dynamically update dmin_3d for all remaining candidates in this tier
+                for c in candidates:
+                    dist_to_new = float(np.linalg.norm(c["pos"] - new_pos))
+                    c["dmin_3d"] = min(c["dmin_3d"], dist_to_new)
+
+        if not batch_to_place:
+            continue
+
+        q_initial = _total_Q(symbols, charges)
+        num_added = len(batch_to_place)
+
+        for rank_num, best_cand in batch_to_place:
+            primary_host = best_cand["primary_host"]
+            new_pos = best_cand["pos"]
+            fid = best_cand["fid"]
+            inc_facets_key = best_cand["inc_facets_key"]
+            role_rank = best_cand["role_rank"]
+            dft_val = best_cand["dft_val"]
+            score = best_cand["score"]
+            offset = best_cand["offset"]
+            dmin_3d = best_cand["dmin_3d"]
+            depth_min = best_cand["depth_min"]
+
+            host_elem = symbols[primary_host]
+            cn_before = int(cn_bi[primary_host])
+
+            symbols.append(ligand)
+            pts = np.vstack([pts, new_pos])
+            if atom_regions is not None:
+                atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
+
+            _record_uv_allfacets(primary_host, pts, frames, surf_tol, uv_taken, edit_count_facet)
+            for add_fid in inc_facets_key:
+                add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
+            if not inc_facets_key:
+                add_count_facet[fid] = add_count_facet.get(fid, 0) + 1
+            host_taken[primary_host] = host_taken.get(primary_host, 0) + 1
+
             if verbose:
-                print(f"[debug:add] veto: deficit_chk={deficit_chk} (cn_before={cn_before}) for host {symbols[i]}#{i}")
-            continue  # try next candidate
-        if verbose:
-            print(
-                f"[debug:add] host score={score}, repair_rank={repair_rank}, host_gain={host_gain}, "
-                f"touched={touched}, role={ROLE_ORDER_VEU[role_rank]}, inc={list(inc_facets_key)}, "
-                f"side_add={add_side_count:.2f}, side_edit={edit_side_count:.2f}, "
-                f"dmin={dmin:.3f}, bulk={placed_via_bulk}"
-            )
+                role_name = ROLE_ORDER_VEU[role_rank]
+                print(
+                    f"  [batch:add] rank #{rank_num}: place {ligand} on {host_elem}#{primary_host} "
+                    f"(CN={cn_before}, role={role_name}, facet={fid}, deficit={dft_val}, score={score:.1f}, dmin_3d={dmin_3d:.2f}) at +{offset:.2f} Å"
+                )
 
-        host_elem = symbols[i]
-        before = _total_Q(symbols, charges)
-        symbols.append(ligand)
-        pts = np.vstack([pts, new_pos])
-        if atom_regions is not None:
-            atom_regions.append(_atom_region_index(i, region_masks, atom_regions))
-        after = _total_Q(symbols, charges)
-
-        _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
-        for add_fid in inc_facets_key:
-            add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
-        if not inc_facets_key:
-            add_count_facet[fid] = add_count_facet.get(fid, 0) + 1
-        host_taken[i] = host_taken.get(i, 0) + 1
-
-        cn_after_arr = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        cn_after = int(cn_after_arr[i])
-        role_name = ROLE_ORDER_VEU[role_rank]
-        shell_label = "sublayer" if depth_min >= 0.35 * surf_tol else "outer"
-        if verbose:
-            print(
-                f"add ligand {ligand} to {host_elem}#{i} "
-                f"(CN_before={cn_before}, CN_after={cn_after}, role={role_name}, facet={fid}, shell={shell_label}, deficit={deficit_chk}) "
-                f"at +{offset:.2f} Å | Q:{before:+d}→{after:+d}"
-            )
-        return True, symbols, pts  # single successful action
+        q_final = _total_Q(symbols, charges)
+        print(f"[batch:add] Added {num_added} '{ligand}' ligand(s) in this pass | Q: {q_initial:+d} → {q_final:+d}")
+        return True, symbols, pts
 
     # If we reach here, we found no acceptable candidate in any tier
     return False, symbols, pts
@@ -1587,9 +1650,17 @@ def charge_balance_iterative(
         symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
     )
     # Update planes to reflect the new shrunk boundary of the nanocrystal after prepass
+    # In rebalancing mode (prepass_mode == "none"), exclude passivating ligand atoms
+    # from determining the boundary because they lie outside the scaffold.
+    if prepass_mode == "none":
+        scaffold_mask = np.array(symbols) != ligand
+        scaffold_pts = pts[scaffold_mask] if np.any(scaffold_mask) else pts
+    else:
+        scaffold_pts = pts
+
     new_planes = []
     for n, d in planes:
-        d_new = float(np.max(pts @ n) + 1e-5)
+        d_new = float(np.max(scaffold_pts @ n) + 1e-5)
         new_planes.append((n, d_new))
     planes = new_planes
 
@@ -1629,6 +1700,7 @@ def charge_balance_iterative(
         frames = _build_facet_frames(planes)
         mem = _facet_memberships(pts, planes, surf_tol)
         cn_bi = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+        pt_tree = cKDTree(np.asarray(pts, float))
         uv_cache: UVCache = {}
 
         Q = _total_Q(symbols, charges)
@@ -1637,7 +1709,8 @@ def charge_balance_iterative(
 
         # Priority 1
         progressed, symbols, pts = _priority1_swap_undercoord_anions_once(
-            symbols, pts, frames, mem, cn_bi, charges, ligand, surf_tol, uv_cache, verbose=verbose
+            symbols, pts, frames, mem, cn_bi, charges, ligand, surf_tol, uv_cache, verbose=verbose,
+            pt_tree=pt_tree
         )
         if progressed:
             continue

@@ -42,6 +42,7 @@ from .stack import (
     size_unit_cells_to_aspect,
     size_unit_cells_to_radius_aspect,
     validate_stack_symmetry,
+    material_cation_anion,
 )
 from .twin_workflow import apply_single_material_twins
 from .facet_reconstruction import reconstruct_polar_facets
@@ -402,23 +403,87 @@ def _native_species_in_cif_order(struct: Structure, charges, ligand_symbol: str 
 
 
 def _center_variants(struct: Structure, cfg: Config, ligand_symbol: str | None):
+    # Determine the materials to search in
+    if getattr(cfg, "mode", "single") == "stack" and getattr(cfg, "materials", None):
+        materials = cfg.materials
+    else:
+        materials = None
+
     if cfg.construction_origin and not _is_all_centers_spec(cfg.construction_origin):
         species_list = _center_species_list(cfg.construction_origin)
         if species_list:
             variants = []
             for species in species_list:
+                # Find which material structure has this species
+                target_struct = struct
+                if materials:
+                    for m in materials:
+                        try:
+                            m_struct = Structure.from_file(m.cif)
+                            if any(site.specie.symbol == species for site in m_struct.sites):
+                                target_struct = m_struct
+                                break
+                        except Exception:
+                            pass
                 variants.append((_safe_label(species), construction_origin_shift(
-                    struct, {"center_on_species": species}
+                    target_struct, {"center_on_species": species}
                 )))
-            return variants
+            
+            # Deduplicate variants by origin_shift
+            unique_variants = []
+            for name, shift in variants:
+                if not any(
+                    (shift is None and u_shift is None) or 
+                    (shift is not None and u_shift is not None and np.allclose(shift, u_shift, atol=1e-5))
+                    for _, u_shift in unique_variants
+                ):
+                    unique_variants.append((name, shift))
+            return unique_variants
+
         return [("custom", construction_origin_shift(struct, cfg.construction_origin))]
 
+    # Fallback / 'all' species
+    # Collect all unique native species across materials
+    native_species = []
+    if materials:
+        for m in materials:
+            try:
+                m_struct = Structure.from_file(m.cif)
+                for sym in _native_species_in_cif_order(m_struct, cfg.charges, ligand_symbol):
+                    if sym not in native_species:
+                        native_species.append(sym)
+            except Exception:
+                pass
+    else:
+        native_species = _native_species_in_cif_order(struct, cfg.charges, ligand_symbol)
+
     variants = []
-    for sym in _native_species_in_cif_order(struct, cfg.charges, ligand_symbol):
+    for sym in native_species:
+        target_struct = struct
+        if materials:
+            for m in materials:
+                try:
+                    m_struct = Structure.from_file(m.cif)
+                    if any(site.specie.symbol == sym for site in m_struct.sites):
+                        target_struct = m_struct
+                        break
+                except Exception:
+                    pass
         variants.append((_safe_label(sym), construction_origin_shift(
-            struct, {"center_on_species": sym}
+            target_struct, {"center_on_species": sym}
         )))
-    return variants or [("origin", None)]
+
+    # Deduplicate variants by origin_shift
+    unique_variants = []
+    for name, shift in variants:
+        if not any(
+            (shift is None and u_shift is None) or 
+            (shift is not None and u_shift is not None and np.allclose(shift, u_shift, atol=1e-5))
+            for _, u_shift in unique_variants
+        ):
+            unique_variants.append((name, shift))
+    return unique_variants or [("origin", None)]
+
 
 
 def _variant_out_path(
@@ -580,6 +645,7 @@ def _run_passivation_and_write_outputs(
         prepass_min_cn_terrace=cfg.passivation.prepass_min_cn_terrace,
         prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
         prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
+        include_sublayer=cfg.passivation.include_sublayer,
     )
 
     surface_reconstruction_spec = getattr(
@@ -610,6 +676,22 @@ def _run_passivation_and_write_outputs(
             verbose=args.verbose,
             write_all=args.write_all,
             prefix=prefix,
+        )
+
+    if output_layer_planes is not None:
+        syms, pts = _perform_core_shell_swapping_and_rebalance(
+            syms,
+            pts,
+            args=args,
+            cfg=cfg,
+            anion_lig=anion_lig,
+            layer_planes=output_layer_planes,
+            resolved_materials=output_materials,
+            charges=cfg.charges,
+            planes=planes,
+            cif_path=cif_path,
+            pair_cuts_override=pair_cuts_override,
+            verbose=args.verbose,
         )
 
     ligand_exchange_charge_ledger = []
@@ -740,6 +822,180 @@ def _run_passivation_and_write_outputs(
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     return syms, pts, ligand_exchange_charge_ledger
+
+
+def _fps_subsample(coords: np.ndarray, num_to_pick: int) -> np.ndarray:
+    """
+    Selects num_to_pick indices from coords using Farthest Point Sampling.
+    To ensure reproducibility (tie-breaking), we use a deterministic seed
+    or fixed initial pick (index with max norm).
+    """
+    n = len(coords)
+    if n == 0 or num_to_pick <= 0:
+        return np.array([], dtype=int)
+    if num_to_pick >= n:
+        return np.arange(n)
+
+    picks = []
+    # Deterministic start: pick the point furthest from the origin (max norm)
+    norms = np.linalg.norm(coords, axis=1)
+    first_pick = int(np.argmax(norms))
+    picks.append(first_pick)
+
+    # Track minimum distance from each point to the selected set
+    min_dists = np.linalg.norm(coords - coords[first_pick], axis=1)
+
+    for _ in range(1, num_to_pick):
+        next_pick = int(np.argmax(min_dists))
+        picks.append(next_pick)
+        dists_to_next = np.linalg.norm(coords - coords[next_pick], axis=1)
+        min_dists = np.minimum(min_dists, dists_to_next)
+
+    return np.array(picks, dtype=int)
+
+
+def _perform_core_shell_swapping_and_rebalance(
+    syms,
+    pts,
+    *,
+    args,
+    cfg,
+    anion_lig,
+    layer_planes,
+    resolved_materials,
+    charges,
+    planes,
+    cif_path,
+    pair_cuts_override,
+    verbose,
+):
+    if not layer_planes or not resolved_materials:
+        return syms, pts
+
+    # Dynamically compute region masks using current post-passivation coordinates
+    region_masks = region_masks_from_layer_planes(pts, layer_planes)
+
+    # 1. Relabel all regions based on the abrupt materials definition
+    # This correctly changes core species and shell species.
+    # Passivating ligands are kept as anion_lig.
+    syms = relabel_regions_by_material(
+        syms,
+        region_masks,
+        resolved_materials,
+        charges,
+        anion_lig,
+        verbose=verbose,
+    )
+
+    # 2. Check if a mixed interface is requested.
+    interface_type = "abrupt"
+    mixing_width = 3.0
+    mixing_ratio = 0.5
+
+    # Check top-level stack config first
+    stack_cfg = getattr(cfg, "stack", None)
+    if stack_cfg is not None:
+        interface_type = getattr(stack_cfg, "interface", "abrupt")
+        mixing_width = getattr(stack_cfg, "mixing_width", 3.0)
+
+    # Check shell material config (resolved_materials[1] interface)
+    if len(resolved_materials) > 1 and resolved_materials[1].interface is not None:
+        shell_int = resolved_materials[1].interface
+        interface_type = str(shell_int.get("type", interface_type)).strip().lower()
+        mixing_width = float(shell_int.get("mixing_width", mixing_width))
+        mixing_ratio = float(shell_int.get("mixing_ratio", mixing_ratio))
+
+    if interface_type == "mixed":
+        if verbose:
+            print(f"\n[Mixed Interface] Blending interface (width: {mixing_width} Å, ratio: {mixing_ratio}) via Farthest Point Sampling...")
+
+        # We assume 2 materials: core (0) and shell (1)
+        core_cat, core_an = material_cation_anion(resolved_materials[0], charges)
+        shell_cat, shell_an = material_cation_anion(resolved_materials[1], charges)
+
+        # Core non-ligand indices
+        core_idx_mask = region_masks[0] & (np.array(syms) != anion_lig)
+        # Shell non-ligand indices
+        shell_idx_mask = region_masks[1] & (np.array(syms) != anion_lig)
+
+        core_indices = np.where(core_idx_mask)[0]
+        shell_indices = np.where(shell_idx_mask)[0]
+
+        if len(core_indices) > 0 and len(shell_indices) > 0:
+            from scipy.spatial import cKDTree
+            shell_tree = cKDTree(pts[shell_indices])
+            dists, _ = shell_tree.query(pts[core_indices], distance_upper_bound=mixing_width)
+            valid_query = dists <= mixing_width
+            mixing_core_global_indices = core_indices[valid_query]
+
+            # Separate mixing core atoms into cations and anions
+            mixing_cations = [idx for idx in mixing_core_global_indices if syms[idx] == core_cat]
+            mixing_anions = [idx for idx in mixing_core_global_indices if syms[idx] == core_an]
+
+            if verbose:
+                print(f"    - Found {len(mixing_core_global_indices)} core atoms in mixing zone (cations: {len(mixing_cations)}, anions: {len(mixing_anions)})")
+
+            num_cat_swap = int(round(mixing_ratio * len(mixing_cations)))
+            if len(mixing_cations) > 0 and num_cat_swap > 0:
+                cat_coords = pts[mixing_cations]
+                fps_cat_local_indices = _fps_subsample(cat_coords, num_cat_swap)
+                for local_idx in fps_cat_local_indices:
+                    global_idx = mixing_cations[local_idx]
+                    syms[global_idx] = shell_cat
+
+            num_an_swap = int(round(mixing_ratio * len(mixing_anions)))
+            if len(mixing_anions) > 0 and num_an_swap > 0:
+                an_coords = pts[mixing_anions]
+                fps_an_local_indices = _fps_subsample(an_coords, num_an_swap)
+                for local_idx in fps_an_local_indices:
+                    global_idx = mixing_anions[local_idx]
+                    syms[global_idx] = shell_an
+
+            if verbose:
+                print(f"    - Swapped {num_cat_swap} cations to {shell_cat} and {num_an_swap} anions to {shell_an}")
+
+    # Output the core_mixed.xyz containing only the core region (region_masks[0])
+    prefix = os.path.splitext(args.out)[0]
+    out_dir = os.path.dirname(args.out)
+    core_mixed_path = os.path.join(out_dir, "core_mixed.xyz") if out_dir else "core_mixed.xyz"
+    core_mixed_prefix_path = f"{prefix}_core_mixed.xyz"
+
+    core_mask = region_masks[0]
+    core_syms = [s for s, keep in zip(syms, core_mask) if keep]
+    core_pts = pts[core_mask]
+
+    if len(core_syms) > 0:
+        if verbose:
+            print(f"    - Writing core-only mixed atomic output to {core_mixed_path} and {core_mixed_prefix_path} ({len(core_syms)} atoms)")
+        core_pts_out = center_coords(core_pts) if args.center else core_pts
+        write_xyz(core_mixed_path, core_syms, core_pts_out)
+        write_xyz(core_mixed_prefix_path, core_syms, core_pts_out)
+
+    # 3. Post-swap charge balancing
+    if verbose:
+        print("\n[Post-Swap Rebalancing] Checking charge and running passivation rebalance if needed...")
+
+    syms, pts = charge_balance_iterative(
+        syms, pts,
+        charges, anion_lig,
+        verbose=verbose,
+        planes=planes,
+        surf_tol=cfg.passivation.surf_tol,
+        cif_path=resolved_materials[-1].cif,
+        positive_q_strategy=args.positive_q_mode,
+        write_all=args.write_all,
+        prefix=prefix,
+        experimental_exhausted_positive_q_fallback=bool(
+            getattr(cfg, "experimental", {}).get("exhausted_positive_q_fallback", False)
+        ),
+        pair_cuts_override=pair_cuts_override,
+        region_masks=region_masks,
+        stack_passivation=False,
+        prepass_mode="none",
+        include_sublayer=cfg.passivation.include_sublayer,
+    )
+
+    return syms, pts
 
 
 def _print_surface_reports(syms, pts, planes, facets, charges, surf_tol: float, *, label: str, verbose: bool):
@@ -1060,7 +1316,6 @@ def main(argv: List[str] | None = None) -> int:
             cfg.materials,
             mode=cfg.stack.geometry_reference,
         )
-        struct_ref = Structure.from_file(reference_cfg.cif)
         resolved_materials = []
         for material in cfg.materials:
             mat_struct = Structure.from_file(material.cif)
@@ -1085,6 +1340,9 @@ def main(argv: List[str] | None = None) -> int:
             if not active_layer_indices:
                 raise SystemExit("At least one material must have nonzero size_unit_cells in stack mode.")
         outer_cfg = resolved_materials[outer_idx]
+
+        # Force unified crystal to be cut as a single Wulff polyhedron using shell lattice
+        struct_ref = Structure.from_file(outer_cfg.cif)
         if cumulative_sizes is None:
             radius_eff = _radius_from_size_args(struct_ref, args)
             aspect_outer = outer_cfg.aspect
@@ -1097,130 +1355,114 @@ def main(argv: List[str] | None = None) -> int:
                 f"policy={cfg.stack.geometry_reference}; core material: {core_cfg.name}"
             )
 
-        if outer_cfg.shape_mode == "sphere":
-            facets_outer = []
-            syms, pts, _ = build_spherical_nanocrystal(
-                struct_ref,
-                radius_eff,
-                n_planes=outer_cfg.sphere_planes,
+        # Get construction center variants
+        variants = _center_variants(struct_ref, cfg, anion_lig)
+        multiple_variants = len(variants) > 1
+        if args.verbose and multiple_variants:
+            print(f"    - Construction center variants: {[label for label, _ in variants]}")
+
+        for variant_label, origin_shift in variants:
+            run_args = copy.copy(args)
+            run_args.out = _variant_out_path(
+                args.out,
+                variant_label,
+                multiple_variants,
+                args=None, # pass args=None so it doesn't add _rep3 to the variant filename
+                material_label=outer_cfg.name,
             )
-        else:
-            facets_outer = expand_facets(struct_ref, outer_cfg.seeds, proper_only=cfg.proper_only)
-            syms, pts, _ = build_nanocrystal(struct_ref, facets_outer, radius_eff, aspect=aspect_outer)
-        syms, pts = dedupe_points(syms, pts)
-        if args.verbose:
-            if cumulative_sizes is not None:
-                print("    - Cumulative size_unit_cells (replica topology on reference lattice):")
-                prev_size = np.zeros(3, dtype=float)
-                for idx, (m, size) in enumerate(zip(resolved_materials, cumulative_sizes)):
-                    if idx > 0 and np.allclose(size, prev_size, atol=1e-12):
+
+            if args.verbose:
+                heading = f" [{variant_label}]" if multiple_variants else ""
+                if outer_cfg.shape_mode == "sphere":
+                    print(f"\n[4] Building nanocrystal from spherical cut{heading}...")
+                else:
+                    print(f"\n[4] Building nanocrystal from Wulff facets{heading}...")
+                if origin_shift is not None:
+                    print(
+                        "    - Construction origin shift "
+                        f"r0 = [{origin_shift[0]:.6f}, {origin_shift[1]:.6f}, {origin_shift[2]:.6f}] Å"
+                    )
+                print(f"    - Output: {run_args.out}")
+
+            if outer_cfg.shape_mode == "sphere":
+                facets_outer = []
+                syms, pts, _ = build_spherical_nanocrystal(
+                    struct_ref,
+                    radius_eff,
+                    n_planes=outer_cfg.sphere_planes,
+                    origin_shift=origin_shift,
+                )
+            else:
+                facets_outer = expand_facets(struct_ref, outer_cfg.seeds, proper_only=cfg.proper_only)
+                syms, pts, _ = build_nanocrystal(
+                    struct_ref,
+                    facets_outer,
+                    radius_eff,
+                    aspect=aspect_outer,
+                    origin_shift=origin_shift,
+                )
+            syms, pts = dedupe_points(syms, pts)
+            if args.verbose:
+                if cumulative_sizes is not None:
+                    print("    - Cumulative size_unit_cells (replica topology on reference lattice):")
+                    prev_size = np.zeros(3, dtype=float)
+                    for idx, (m, size) in enumerate(zip(resolved_materials, cumulative_sizes)):
+                        if idx > 0 and np.allclose(size, prev_size, atol=1e-12):
+                            print(
+                                f"      {m.name}: size={tuple(f'{x:g}' for x in size)} "
+                                "-> zero-thickness layer; reuses previous boundary"
+                            )
+                            prev_size = np.asarray(size, dtype=float)
+                            continue
+                        r_i, aspect_i = reference_radius_from_size(struct_ref, size)
+                        r_phys, _ = size_unit_cells_to_radius_aspect(Structure.from_file(m.cif), size)
                         print(
                             f"      {m.name}: size={tuple(f'{x:g}' for x in size)} "
-                            "-> zero-thickness layer; reuses previous boundary"
+                            f"-> radius={r_i:.6f} Å (ref), aspect={tuple(round(x, 4) for x in aspect_i)}; "
+                            f"physical_if_native={r_phys:.6f} Å"
                         )
                         prev_size = np.asarray(size, dtype=float)
-                        continue
-                    r_i, aspect_i = reference_radius_from_size(struct_ref, size)
-                    r_phys, _ = size_unit_cells_to_radius_aspect(Structure.from_file(m.cif), size)
+                if outer_cfg.shape_mode == "sphere":
                     print(
-                        f"      {m.name}: size={tuple(f'{x:g}' for x in size)} "
-                        f"-> radius={r_i:.6f} Å (ref), aspect={tuple(round(x, 4) for x in aspect_i)}; "
-                        f"physical_if_native={r_phys:.6f} Å"
+                        f"    - Outermost spherical cut atoms: {len(syms)} "
+                        f"(reference={reference_cfg.name}, planes={outer_cfg.sphere_planes})"
                     )
-                    prev_size = np.asarray(size, dtype=float)
-            if outer_cfg.shape_mode == "sphere":
-                print(
-                    f"    - Outermost spherical cut atoms: {len(syms)} "
-                    f"(reference={reference_cfg.name}, planes={outer_cfg.sphere_planes})"
-                )
-            else:
-                print(
-                    f"    - Outermost cut atoms: {len(syms)} "
-                    f"(reference={reference_cfg.name}, outer layer={outer_cfg.name})"
-                )
+                else:
+                    print(
+                        f"    - Outermost cut atoms: {len(syms)} "
+                        f"(reference={reference_cfg.name}, outer layer={outer_cfg.name})"
+                    )
 
-        layer_planes = build_layer_planes(
-            resolved_materials,
-            struct_ref,
-            cfg.proper_only,
-            cumulative_sizes=cumulative_sizes,
-            radius=radius_eff if cumulative_sizes is None else None,
-        )
-        region_masks = region_masks_from_layer_planes(pts, layer_planes)
-        syms = relabel_regions_by_material(
-            syms,
-            region_masks,
-            resolved_materials,
-            cfg.charges,
-            getattr(cfg.passivation, "ligand", None),
-            verbose=args.verbose,
-        )
+            layer_planes = build_layer_planes(
+                resolved_materials,
+                struct_ref,
+                cfg.proper_only,
+                cumulative_sizes=cumulative_sizes,
+                radius=radius_eff if cumulative_sizes is None else None,
+            )
+            region_masks = region_masks_from_layer_planes(pts, layer_planes)
 
-        syms, pts = _prune_before_facet_detection(syms, pts, args=args, cfg=cfg)
-        region_masks = region_masks_from_layer_planes(pts, layer_planes)
+            syms, pts = _prune_before_facet_detection(syms, pts, args=run_args, cfg=cfg)
+            region_masks = region_masks_from_layer_planes(pts, layer_planes)
 
-        stack_pair_cuts = merge_pair_cuts_from_cifs(
-            [resolved_materials[idx].cif for idx in active_layer_indices],
-            cfg.charges,
-            safety=1.00,
-        )
-
-        surface_cfg = resolved_materials[outer_idx]
-        struct = struct_ref
-        if surface_cfg.shape_mode == "sphere":
-            seeds0 = []
-            passivation_planes = sphere_halfspaces(radius_eff, n_planes=surface_cfg.sphere_planes)
-            if args.verbose:
-                print(
-                    "\n[5] Using synthetic spherical surface planes "
-                    f"(composite, {len(passivation_planes)} planes); Miller facet report skipped."
-                )
-        else:
-            seeds0 = expand_facets(struct_ref, surface_cfg.seeds, proper_only=cfg.proper_only)
-            _facets, passivation_planes = _detect_facets_and_report(
-                syms,
-                pts,
-                struct,
+            stack_pair_cuts = merge_pair_cuts_from_cifs(
+                [resolved_materials[idx].cif for idx in active_layer_indices],
                 cfg.charges,
-                seeds0,
-                cfg.passivation.surf_tol,
-                label=" (composite)",
-                verbose=args.verbose,
+                safety=1.00,
             )
 
-        if args.verbose:
-            print(f"\n[4] Composite particle atoms (pre-passivation): {len(syms)}")
-
-        # --- OPTIONAL TWIN BOUNDARIES (stack mode) ---
-        if getattr(cfg, "twins", None):
-            if args.verbose:
-                print("\n[3a] Applying twin boundary transformations (stack mode)...")
-            # Use reference lattice for twins and recut
-            outer_shell = resolved_materials[outer_idx]
-
-            # (1) Apply mirrors
-            pts = apply_twins(
-                pts,
-                struct_ref.lattice.matrix,
-                cfg.twins,
-                default_origin="center",
-                species=syms,
-                charges=cfg.charges,
-            )
-
-            # (2) Recut with outer Wulff planes on reference lattice
-            if outer_shell.shape_mode == "sphere":
-                planes_outer = sphere_halfspaces(radius_eff, n_planes=outer_shell.sphere_planes)
-            else:
-                facets_shell = expand_facets(struct_ref, outer_shell.seeds, proper_only=cfg.proper_only)
-                planes_outer = halfspaces(struct_ref, facets_shell, R=radius_eff, aspect=aspect_outer)
-            syms, pts = recut_with_planes(syms, pts, planes_outer)
-    
-            if args.verbose:
-                print(f"    - After twins+recut: {len(syms)} atoms")
+            surface_cfg = resolved_materials[outer_idx]
+            struct = struct_ref
             if surface_cfg.shape_mode == "sphere":
+                seeds0 = []
                 passivation_planes = sphere_halfspaces(radius_eff, n_planes=surface_cfg.sphere_planes)
+                if args.verbose:
+                    print(
+                        "\n[5] Using synthetic spherical surface planes "
+                        f"(composite, {len(passivation_planes)} planes); Miller facet report skipped."
+                    )
             else:
+                seeds0 = expand_facets(struct_ref, surface_cfg.seeds, proper_only=cfg.proper_only)
                 _facets, passivation_planes = _detect_facets_and_report(
                     syms,
                     pts,
@@ -1228,90 +1470,165 @@ def main(argv: List[str] | None = None) -> int:
                     cfg.charges,
                     seeds0,
                     cfg.passivation.surf_tol,
-                    label=" (composite, post-twin)",
+                    label=" (composite)",
                     verbose=args.verbose,
                 )
 
-        # --- Write core.xyz and shell.xyz (behind --write-all) ---
-        if args.write_all:
-            region_masks = region_masks_from_layer_planes(pts, layer_planes)
-            layer_prefix = os.path.splitext(args.out)[0]
-            for k, mask in enumerate(region_masks):
-                tag = "core" if k == 0 else f"shell{k}"
-                part_syms = [s for s, keep in zip(syms, mask) if keep]
-                part_pts = pts[mask]
-                layer_path = f"{layer_prefix}_{tag}.xyz"
-                if args.verbose:
-                    print(f"    - Writing {layer_path} ({len(part_syms)} atoms)")
-                part_pts_out = center_coords(part_pts) if args.center else part_pts
-                part_syms_out, part_pts_out = _ordered_xyz_view(
-                    part_syms,
-                    part_pts_out,
-                    cfg.charges,
-                    anion_lig,
-                )
-                write_xyz(layer_path, part_syms_out, part_pts_out)
-
-        syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
-            syms,
-            pts,
-            args=args,
-            cfg=cfg,
-            anion_lig=anion_lig,
-            planes=passivation_planes,
-            cif_path=surface_cfg.cif,
-            struct=struct,
-            facet_seeds=seeds0,
-            material_label=surface_cfg.name,
-            construction_radius_override=radius_eff,
-            pair_cuts_override=stack_pair_cuts,
-            output_layer_planes=layer_planes,
-            output_materials=resolved_materials,
-            region_masks=region_masks,
-            stack_passivation=True,
-        )
-
-        use_core_lattice_fit = not args.no_core_lattice_fit
-        if use_core_lattice_fit:
-            region_masks = region_masks_from_layer_planes(pts, layer_planes)
             if args.verbose:
-                print("\n[3b] Applying core lattice fit with smooth interface blend...")
-            try:
-                core_struct = Structure.from_file(core_cfg.cif)
-                pts = apply_core_lattice_fit(
+                print(f"\n[4] Composite particle atoms (pre-passivation): {len(syms)}")
+
+            # --- OPTIONAL TWIN BOUNDARIES (stack mode) ---
+            if getattr(cfg, "twins", None):
+                if args.verbose:
+                    print("\n[3a] Applying twin boundary transformations (stack mode)...")
+                # Use reference lattice for twins and recut
+                outer_shell = resolved_materials[outer_idx]
+
+                # (1) Apply mirrors
+                pts = apply_twins(
                     pts,
-                    region_masks[0],
-                    layer_planes[0],
                     struct_ref.lattice.matrix,
-                    core_struct.lattice.matrix,
-                    strain_width=args.core_strain_width,
-                    center_mode=args.core_center,
+                    cfg.twins,
+                    default_origin="center",
+                    species=syms,
+                    charges=cfg.charges,
                 )
+
+                # (2) Recut with outer Wulff planes on reference lattice
+                if outer_shell.shape_mode == "sphere":
+                    planes_outer = sphere_halfspaces(radius_eff, n_planes=outer_shell.sphere_planes)
+                else:
+                    facets_shell = expand_facets(struct_ref, outer_shell.seeds, proper_only=cfg.proper_only)
+                    planes_outer = halfspaces(struct_ref, facets_shell, R=radius_eff, aspect=aspect_outer)
+                syms, pts = recut_with_planes(syms, pts, planes_outer)
+        
                 if args.verbose:
-                    print(
-                        f"    - Core lattice fit applied "
-                        f"(width={args.core_strain_width:.3f} Å, center={args.core_center})"
+                    print(f"    - After twins+recut: {len(syms)} atoms")
+                if surface_cfg.shape_mode == "sphere":
+                    passivation_planes = sphere_halfspaces(radius_eff, n_planes=surface_cfg.sphere_planes)
+                else:
+                    _facets, passivation_planes = _detect_facets_and_report(
+                        syms,
+                        pts,
+                        struct,
+                        cfg.charges,
+                        seeds0,
+                        cfg.passivation.surf_tol,
+                        label=" (composite, post-twin)",
+                        verbose=args.verbose,
                     )
-            except np.linalg.LinAlgError:
-                print("WARNING: reference lattice not invertible; skipping core lattice fit.")
-            if args.center:
-                pts = center_coords(pts)
-            write_xyz(args.out, syms, pts)
-            if args.verbose:
-                print(f"[12] Rewrote passivated structure after core lattice fit → {args.out}")
-    
-        if args.verbose:
-            print("\n### ELEMENT COUNTS ###")
-            _print_stack_summary(
+
+            # --- Write core.xyz and shell.xyz (behind --write-all) ---
+            if args.write_all:
+                region_masks = region_masks_from_layer_planes(pts, layer_planes)
+                layer_prefix = os.path.splitext(run_args.out)[0]
+                for k, mask in enumerate(region_masks):
+                    tag = "core" if k == 0 else f"shell{k}"
+                    part_syms = [s for s, keep in zip(syms, mask) if keep]
+                    part_pts = pts[mask]
+                    layer_path = f"{layer_prefix}_{tag}.xyz"
+                    if args.verbose:
+                        print(f"    - Writing {layer_path} ({len(part_syms)} atoms)")
+                    part_pts_out = center_coords(part_pts) if args.center else part_pts
+                    part_syms_out, part_pts_out = _ordered_xyz_view(
+                        part_syms,
+                        part_pts_out,
+                        cfg.charges,
+                        anion_lig,
+                    )
+                    write_xyz(layer_path, part_syms_out, part_pts_out)
+
+            syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
                 syms,
-                cfg.charges,
-                resolved_materials,
-                anion_lig,
-                pts=pts,
-                layer_planes=layer_planes,
-                ligand_exchange_charge_ledger=ligand_exchange_charge_ledger,
+                pts,
+                args=run_args,
+                cfg=cfg,
+                anion_lig=anion_lig,
+                planes=passivation_planes,
+                cif_path=surface_cfg.cif,
+                struct=struct,
+                facet_seeds=seeds0,
+                material_label=surface_cfg.name,
+                construction_radius_override=radius_eff,
+                pair_cuts_override=stack_pair_cuts,
+                output_layer_planes=layer_planes,
+                output_materials=resolved_materials,
+                region_masks=region_masks,
+                stack_passivation=False,
             )
-    
+
+            use_core_lattice_fit = not args.no_core_lattice_fit
+            if use_core_lattice_fit:
+                region_masks = region_masks_from_layer_planes(pts, layer_planes)
+                if args.verbose:
+                    print("\n[3b] Applying core lattice fit with smooth interface blend...")
+                try:
+                    core_struct = Structure.from_file(core_cfg.cif)
+                    pts = apply_core_lattice_fit(
+                        pts,
+                        region_masks[0],
+                        layer_planes[0],
+                        struct_ref.lattice.matrix,
+                        core_struct.lattice.matrix,
+                        strain_width=args.core_strain_width,
+                        center_mode=args.core_center,
+                    )
+                    if args.verbose:
+                        print(
+                            f"    - Core lattice fit applied "
+                            f"(width={args.core_strain_width:.3f} Å, center={args.core_center})"
+                        )
+                except np.linalg.LinAlgError:
+                    print("WARNING: reference lattice not invertible; skipping core lattice fit.")
+                if args.center:
+                    pts = center_coords(pts)
+                write_xyz(run_args.out, syms, pts)
+                if args.verbose:
+                    print(f"[12] Rewrote passivated structure after core lattice fit → {run_args.out}")
+
+            # --- ALWAYS write core.xyz by default using finalized coordinates ---
+            final_masks = region_masks_from_layer_planes(pts, layer_planes)
+            core_mask = final_masks[0]
+            core_syms = [s for s, keep in zip(syms, core_mask) if keep]
+            core_pts = pts[core_mask]
+            
+            layer_prefix = os.path.splitext(run_args.out)[0]
+            core_out_path = f"{layer_prefix}_core.xyz"
+            
+            out_dir = os.path.dirname(args.out)
+            default_core_path = os.path.join(out_dir, "core.xyz") if out_dir else "core.xyz"
+            
+            if args.verbose:
+                print(f"    - [Default Output] Writing core region to {core_out_path} and {default_core_path} ({len(core_syms)} atoms)")
+            
+            write_xyz(default_core_path, core_syms, core_pts)
+            write_xyz(core_out_path, core_syms, core_pts)
+
+            if multiple_variants and variant_label == variants[0][0]:
+                import shutil
+                if args.verbose:
+                    print(f"    - [Default Output] Copying first variant '{variant_label}' to default output: {args.out}")
+                shutil.copyfile(run_args.out, args.out)
+                try:
+                    shutil.copyfile(
+                        f"{layer_prefix}.json",
+                        f"{os.path.splitext(args.out)[0]}.json"
+                    )
+                except Exception:
+                    pass
+        
+            if args.verbose:
+                print("\n### ELEMENT COUNTS ###")
+                _print_stack_summary(
+                    syms,
+                    cfg.charges,
+                    resolved_materials,
+                    anion_lig,
+                    pts=pts,
+                    layer_planes=layer_planes,
+                    ligand_exchange_charge_ledger=ligand_exchange_charge_ledger,
+                )
+        
         return 0
     
 
@@ -1481,6 +1798,19 @@ def main(argv: List[str] | None = None) -> int:
             facet_seeds=wulff_facets,
             material_label=material_label,
         )
+
+        if multiple_variants and variant_label == variants[0][0]:
+            import shutil
+            if args.verbose:
+                print(f"    - [Default Output] Copying first variant '{variant_label}' to default output: {args.out}")
+            shutil.copyfile(run_args.out, args.out)
+            try:
+                shutil.copyfile(
+                    f"{os.path.splitext(run_args.out)[0]}.json",
+                    f"{os.path.splitext(args.out)[0]}.json"
+                )
+            except Exception:
+                pass
 
         if args.verbose:
             print("\n### ELEMENT COUNTS ###")

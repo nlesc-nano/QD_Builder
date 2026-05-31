@@ -245,38 +245,32 @@ def coord_numbers_bipartite(
     If pair_cuts is None, falls back to covalent-based thresholds.
     """
     N = len(symbols)
+    if N == 0:
+        return np.zeros(0, dtype=int)
+
     pts = np.asarray(pts, float)
     tree = cKDTree(pts)
-    cn = np.zeros(N, dtype=int)
 
-    uniq = set(symbols)
-    max_rcut = 0.0 if not uniq else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq for b in uniq)
+    uniq_elems = sorted(list(set(symbols)))
+    max_rcut = 0.0 if not uniq_elems else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq_elems for b in uniq_elems)
 
-    for i in range(N):
-        si = symbols[i]
-        qi = charges.get(si, 0)
+    elem_to_idx = {el: idx for idx, el in enumerate(uniq_elems)}
+    sym_indices = np.array([elem_to_idx[s] for s in symbols], dtype=int)
 
-        idxs = tree.query_ball_point(pts[i], r=max_rcut)
-        if qi == 0:
-            # count all neighbors under calibrated cut (rare for cores, but supported)
-            count = 0
-            for j in idxs:
-                if j == i:
-                    continue
-                if np.linalg.norm(pts[j] - pts[i]) <= _pair_cut_calibrated(si, symbols[j], pair_cuts):
-                    count += 1
-            cn[i] = count
-            continue
+    cutoff_matrix = np.zeros((len(uniq_elems), len(uniq_elems)), dtype=float)
+    for u, el_u in enumerate(uniq_elems):
+        for v, el_v in enumerate(uniq_elems):
+            cutoff_matrix[u, v] = _pair_cut_calibrated(el_u, el_v, pair_cuts)
 
-        count = 0
-        for j in idxs:
-            if j == i:
-                continue
-            if charges.get(symbols[j], 0) * qi >= 0:
-                continue
-            if np.linalg.norm(pts[j] - pts[i]) <= _pair_cut_calibrated(si, symbols[j], pair_cuts):
-                count += 1
-        cn[i] = count
+    coo = tree.sparse_distance_matrix(tree, max_rcut, output_type='coo_matrix')
+    row, col, dists = coo.row, coo.col, coo.data
+
+    charge_arr = np.array([charges.get(s, 0) for s in symbols], dtype=float)
+    bipartite_mask = (charge_arr[row] * charge_arr[col] < 0) | (charge_arr[row] == 0)
+    cutoff_mask = dists <= cutoff_matrix[sym_indices[row], sym_indices[col]]
+    valid_mask = (row != col) & bipartite_mask & cutoff_mask
+
+    cn = np.bincount(row[valid_mask], minlength=N)
     return cn
 
 def coord_numbers(
@@ -288,20 +282,31 @@ def coord_numbers(
     Non-bipartite CN: counts all neighbors within calibrated (or covalent) pair cutoffs.
     Signature kept backward-compatible: older code may call coord_numbers(symbols, pts).
     """
+    N = len(symbols)
+    if N == 0:
+        return np.zeros(0, dtype=int)
+
     pts = np.asarray(pts, float)
     tree = cKDTree(pts)
-    uniq = set(symbols)
-    max_rcut = 0.0 if not uniq else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq for b in uniq)
-    cn = np.zeros(len(pts), dtype=int)
-    for i, (sym_i, pi) in enumerate(zip(symbols, pts)):
-        idxs = tree.query_ball_point(pi, r=max_rcut)
-        count = 0
-        for j in idxs:
-            if j == i:
-                continue
-            if np.linalg.norm(pts[j] - pi) <= _pair_cut_calibrated(sym_i, symbols[j], pair_cuts):
-                count += 1
-        cn[i] = count
+
+    uniq_elems = sorted(list(set(symbols)))
+    max_rcut = 0.0 if not uniq_elems else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq_elems for b in uniq_elems)
+
+    elem_to_idx = {el: idx for idx, el in enumerate(uniq_elems)}
+    sym_indices = np.array([elem_to_idx[s] for s in symbols], dtype=int)
+
+    cutoff_matrix = np.zeros((len(uniq_elems), len(uniq_elems)), dtype=float)
+    for u, el_u in enumerate(uniq_elems):
+        for v, el_v in enumerate(uniq_elems):
+            cutoff_matrix[u, v] = _pair_cut_calibrated(el_u, el_v, pair_cuts)
+
+    coo = tree.sparse_distance_matrix(tree, max_rcut, output_type='coo_matrix')
+    row, col, dists = coo.row, coo.col, coo.data
+
+    cutoff_mask = dists <= cutoff_matrix[sym_indices[row], sym_indices[col]]
+    valid_mask = (row != col) & cutoff_mask
+
+    cn = np.bincount(row[valid_mask], minlength=N)
     return cn
 
 def mode(vals: Iterable[int]) -> int:

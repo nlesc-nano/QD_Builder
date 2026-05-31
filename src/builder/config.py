@@ -591,6 +591,7 @@ def parse_yaml_config(path: str) -> Config:
     prepass_min_cn_terrace = int(pass_cfg.get("prepass_min_cn_terrace", 3))
     prepass_min_cn_edge = int(pass_cfg.get("prepass_min_cn_edge", 3))
     prepass_min_cn_vertex = int(pass_cfg.get("prepass_min_cn_vertex", 1 if prepass_mode == "role-aware" else 3))
+    include_sublayer = bool(pass_cfg.get("include_sublayer", False))
 
     legacy_neutral_ligands = _parse_neutral_ligands(pass_cfg.get("neutral_ligands"))
     passiv_spec = PassivationSpec(
@@ -601,6 +602,7 @@ def parse_yaml_config(path: str) -> Config:
         prepass_min_cn_terrace=prepass_min_cn_terrace,
         prepass_min_cn_edge=prepass_min_cn_edge,
         prepass_min_cn_vertex=prepass_min_cn_vertex,
+        include_sublayer=include_sublayer,
         neutral_ligands=legacy_neutral_ligands,
     )
 
@@ -629,7 +631,15 @@ def parse_yaml_config(path: str) -> Config:
     geometry_reference = str(stack_raw.get("geometry_reference", "core")).strip().lower()
     if geometry_reference not in {"core", "shortest", "shell"}:
         raise ValueError("stack.geometry_reference must be 'core', 'shortest', or 'shell'")
-    stack_spec = StackSpec(geometry_reference=geometry_reference)
+    interface = str(stack_raw.get("interface", "abrupt")).strip().lower()
+    if interface not in {"abrupt", "mixed"}:
+        raise ValueError("stack.interface must be 'abrupt' or 'mixed'")
+    mixing_width = float(stack_raw.get("mixing_width", 3.0))
+    stack_spec = StackSpec(
+        geometry_reference=geometry_reference,
+        interface=interface,
+        mixing_width=mixing_width
+    )
 
     # Register cation_ligand charge if provided
     if facet_reconstruction.cation_ligand and facet_reconstruction.cation_ligand not in charges:
@@ -764,6 +774,10 @@ def parse_yaml_config(path: str) -> Config:
                     ),
                 )
 
+            interface = m.get("interface")
+            if interface is not None and not isinstance(interface, dict):
+                raise TypeError(f"Material {name} 'interface' must be a mapping")
+
             mats.append(MaterialSpec(
                 name=name,
                 cif=cif,
@@ -773,6 +787,7 @@ def parse_yaml_config(path: str) -> Config:
                 shape_mode=shape_mode,
                 sphere_planes=sphere_planes,
                 align=align,
+                interface=interface,
             ))
 
         return Config(
