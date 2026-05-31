@@ -82,8 +82,10 @@ def _signed_equivalents(
     *,
     proper_only: bool,
     include_opposites: bool = True,
+    ops: list | None = None,
 ) -> list[tuple[int, int, int]]:
-    ops = SpacegroupAnalyzer(struct, symprec=1e-3).get_symmetry_operations(cartesian=True)
+    if ops is None:
+        ops = SpacegroupAnalyzer(struct, symprec=1e-3).get_symmetry_operations(cartesian=True)
     rec_t = struct.lattice.reciprocal_lattice.matrix.T
     g0 = struct.lattice.reciprocal_lattice.get_cartesian_coords(hkl)
     out: set[tuple[int, int, int]] = set()
@@ -302,6 +304,7 @@ def _analyze(
     if missing:
         print(f"[warn] charges missing for CIF species {missing}; they contribute Q=0", file=sys.stderr)
 
+    ops = SpacegroupAnalyzer(struct, symprec=1e-3).get_symmetry_operations(cartesian=True)
     reps = get_symmetrically_distinct_miller_indices(struct, max_index=max_index)
     rows = []
     for rep in sorted(reps, key=lambda t: (abs(t[0]) + abs(t[1]) + abs(t[2]), t)):
@@ -310,12 +313,14 @@ def _analyze(
             tuple(rep),
             proper_only=proper_only,
             include_opposites=False,
+            ops=ops,
         ))
         signed = _signed_equivalents(
             struct,
             tuple(rep),
             proper_only=proper_only,
             include_opposites=True,
+            ops=ops,
         )
         signed_rows = []
         classifications = []

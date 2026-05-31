@@ -720,21 +720,42 @@ def run_ligand_exchange_posttreatment(
         for i, sc in enumerate(site_configs):
             sc["other_site_positions"] = np.asarray([p for j, p in enumerate(site_dpos) if j != i], float)
 
+        # Partition sites into independent, spatially isolated batches
+        batches = []
+        site_positions = np.asarray(site_dpos, float)
+        for idx in range(len(site_positions)):
+            pos = site_positions[idx]
+            placed_in_batch = False
+            for batch in batches:
+                clash = False
+                for other_idx in batch:
+                    dist = float(np.linalg.norm(pos - site_positions[other_idx]))
+                    if dist < 10.0:
+                        clash = True
+                        break
+                if not clash:
+                    batch.append(idx)
+                    placed_in_batch = True
+                    break
+            if not placed_in_batch:
+                batches.append([idx])
+
         placed = [(np.array([], dtype=int), np.zeros((0, 3), float)) for _ in site_configs]
-        for _ in range(max(1, int(spec.refinement_passes))):
-            next_placed = []
-            for i, sc in enumerate(site_configs):
-                env_pos_parts = [base_pts]
-                env_z_parts = [base_z]
-                for j, (nums_j, coords_j) in enumerate(placed):
-                    if i == j or len(nums_j) == 0:
-                        continue
+        for batch in batches:
+            # Build env_pos containing base nanocrystal plus all ligands placed in previous batches
+            env_pos_parts = [base_pts]
+            env_z_parts = [base_z]
+            for j, (nums_j, coords_j) in enumerate(placed):
+                if len(nums_j) > 0:
                     env_pos_parts.append(np.asarray(coords_j, float))
                     env_z_parts.append(np.asarray(nums_j, int))
-                env_pos = np.vstack(env_pos_parts)
-                env_z = np.concatenate(env_z_parts)
-                next_placed.append(_place_exchange_ligand(sc, env_pos, env_z, _Args))
-            placed = next_placed
+            env_pos = np.vstack(env_pos_parts)
+            env_z = np.concatenate(env_z_parts)
+            
+            # Place and optimize all ligands in the current batch simultaneously
+            for i in batch:
+                sc = site_configs[i]
+                placed[i] = _place_exchange_ligand(sc, env_pos, env_z, _Args)
 
         new_syms = list(base_syms)
         new_pts = base_pts.copy()

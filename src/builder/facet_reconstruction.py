@@ -1425,13 +1425,7 @@ def reconstruct_polar_facets(
         all_planes,
         surf_tol,
     )
-    capacity_slots = _select_compensation_slots(
-        compensation_slots,
-        pts,
-        len(compensation_slots),
-        min_separation,
-        seed + 17,
-    )
+    capacity_slots = compensation_slots
     compensation_capacity = len(capacity_slots) * add_charge_unit
     if compensation_capacity <= 0:
         print("[recon] No positive-facet missing coordination slots available for compensation; skipping.")
@@ -1440,7 +1434,6 @@ def reconstruct_polar_facets(
 
     reports_by_fid = {r.fid: r for r in reports_before}
     selected_anions: List[int] = []
-    selected_charge_delta = 0
     plan_rows: List[Tuple[Tuple[int, int, int], float, int, int, int, int, int]] = []
     neg_reports = sorted(
         [reports_by_fid[fid] for fid in neg_fids],
@@ -1448,70 +1441,168 @@ def reconstruct_polar_facets(
         reverse=True,
     )
 
-    for facet_counter, report in enumerate(neg_reports):
-        if selected_charge_delta >= compensation_capacity:
-            break
+    # 1. Pre-calculate candidates symmetrically for all negative facets
+    facet_data = {}
+    for report in neg_reports:
         local_candidates = [
             i for i in anion_candidates
             if report.fid in memberships[i]
-            and all(float(np.linalg.norm(pts[i] - pts[j])) >= min_separation for j in selected_anions)
         ]
         if not local_candidates:
-            plan_rows.append((report.hkl, report.q_net, 0, 0, 0, 0, 0))
+            facet_data[report.fid] = {
+                "local_candidates": [],
+                "max_nonadjacent": [],
+            }
             continue
-
+        
         max_local_idx = _maximum_independent_indices(pts[local_candidates], min_separation)
         max_nonadjacent = [local_candidates[k] for k in max_local_idx]
-        avg_delta = float(np.mean([replacement_delta[i] for i in max_nonadjacent])) if max_nonadjacent else 0.25
-        requested = int(math.ceil(abs(report.q_net) * target_reduction / max(avg_delta, 1e-9)))
-        requested = max(1, requested)
-        remaining_charge = compensation_capacity - selected_charge_delta
-        requested_pool = max_nonadjacent
-        if requested < len(max_nonadjacent):
-            requested_local = _fps_indices(
-                pts[max_nonadjacent],
-                requested,
-                min_separation,
-                seed + 101 * (facet_counter + 1),
-            )
-            requested_pool = [max_nonadjacent[k] for k in requested_local]
+        
+        facet_data[report.fid] = {
+            "local_candidates": local_candidates,
+            "max_nonadjacent": max_nonadjacent,
+        }
 
-        chosen: List[int] = []
-        chosen_charge = 0
-        for idx in requested_pool:
-            dq = swap_charge_delta[idx]
-            if chosen_charge + dq > remaining_charge:
+    # Group the negative facets by their HKL family
+    from collections import defaultdict
+    family_groups = defaultdict(list)
+    for report in neg_reports:
+        fam = _hkl_family(report.hkl)
+        family_groups[fam].append(report)
+
+    # Define capacity C
+    C = len(compensation_slots)
+
+    # Save target swaps for each facet using the capacity-bounded formula
+    final_target_swaps = {}
+    for fam, group in family_groups.items():
+        n_facets = len(group)
+        # Find the minimum candidate count among the equivalent facets in this family
+        A_min = len(facet_data[group[0].fid]["local_candidates"])
+        for r in group:
+            A_min = min(A_min, len(facet_data[r.fid]["local_candidates"]))
+        
+        # S_max is the absolute capacity-limited maximum swaps per negative polar facet
+        S_max = min(A_min, C // n_facets)
+        
+        # S_target is scaled by the target ratio
+        S_target = int(np.round(S_max * target_reduction))
+        S_target = max(0, min(S_max, S_target))
+        
+        for r in group:
+            final_target_swaps[r.fid] = S_target
+
+    # 2. Dynamic Iterative Batch Passivation & Reconstruction Loop
+    applied_swaps = {report.fid: [] for report in neg_reports}
+    picked_slots = []
+    
+    while True:
+        # Check active facets that still need swaps
+        active_facets = [
+            report for report in neg_reports
+            if len(applied_swaps[report.fid]) < final_target_swaps[report.fid]
+        ]
+        if not active_facets:
+            break
+
+        # Symmetrically select 1 swap candidate per active facet in each family
+        batch_swaps = []
+        batch_selected_anions = set()
+        for report in active_facets:
+            fdata = facet_data[report.fid]
+            target = final_target_swaps[report.fid]
+            max_nonadjacent = fdata["max_nonadjacent"]
+            local_candidates = fdata["local_candidates"]
+            
+            # Pool: if we are within non-adjacent limits, use max_nonadjacent; otherwise, relax to local_candidates
+            if target <= len(max_nonadjacent):
+                pool = max_nonadjacent
+            else:
+                pool = local_candidates
+                
+            remaining_pool = [i for i in pool if i not in selected_anions and i not in batch_selected_anions]
+            if not remaining_pool:
                 continue
-            chosen.append(idx)
-            chosen_charge += dq
+                
+            # Farthest Point Selection relative to already swapped sites on this facet
+            swapped_on_facet = applied_swaps[report.fid]
+            if not swapped_on_facet:
+                # Pick point farthest from centroid of the facet
+                facet_pts = pts[local_candidates]
+                centroid = facet_pts.mean(axis=0) if len(facet_pts) > 0 else pts.mean(axis=0)
+                best_cand = max(remaining_pool, key=lambda idx: float(np.linalg.norm(pts[idx] - centroid)))
+            else:
+                # Farthest point from already swapped points
+                best_cand = max(
+                    remaining_pool,
+                    key=lambda idx: min(float(np.linalg.norm(pts[idx] - pts[s])) for s in swapped_on_facet)
+                )
+            
+            batch_swaps.append((report.fid, best_cand))
+            batch_selected_anions.add(best_cand)
 
-        selected_anions.extend(chosen)
-        selected_charge_delta += chosen_charge
-        max_charge = sum(swap_charge_delta[i] for i in max_nonadjacent)
+        if not batch_swaps:
+            break
+
+        # Calculate compensating ligand additions for this batch
+        n_needed_swaps = len(batch_swaps)
+        needed_added_ligands = n_needed_swaps * add_charge_unit
+        
+        # Select from remaining capacity slots
+        available_slots = [
+            slot for slot in capacity_slots
+            if slot not in picked_slots
+        ]
+        if len(available_slots) < needed_added_ligands:
+            break
+            
+        # Select slots using 3D FPS relative to already picked slots
+        batch_slots = []
+        for _ in range(needed_added_ligands):
+            rem_slots = [s for s in available_slots if s not in batch_slots]
+            if not rem_slots:
+                break
+            if not picked_slots and not batch_slots:
+                # First point: pick one with highest outwards radial distance
+                centroid = pts.mean(axis=0)
+                best_slot = max(rem_slots, key=lambda s: float(np.linalg.norm(pts[s[0]] - centroid)))
+            else:
+                # Pick slot farthest from already selected slots
+                ref_pts = np.asarray([pts[s[0]] for s in (picked_slots + batch_slots)], float)
+                best_slot = max(
+                    rem_slots,
+                    key=lambda s: float(np.min(np.linalg.norm(ref_pts - pts[s[0]], axis=1)))
+                )
+            batch_slots.append(best_slot)
+
+        if len(batch_slots) < needed_added_ligands:
+            break
+
+        # Commit batch!
+        for fid, idx in batch_swaps:
+            applied_swaps[fid].append(idx)
+            selected_anions.append(idx)
+        picked_slots.extend(batch_slots)
+
+    # Populate final plan_rows for reporting
+    for report in neg_reports:
+        fdata = facet_data[report.fid]
+        applied = len(applied_swaps[report.fid])
+        chosen_charge = applied * add_charge_unit
+        max_charge = len(fdata["max_nonadjacent"]) * add_charge_unit
         plan_rows.append((
             report.hkl,
             report.q_net,
-            requested,
-            len(max_nonadjacent),
+            final_target_swaps[report.fid],
+            len(fdata["max_nonadjacent"]),
             max_charge,
             chosen_charge,
-            len(chosen),
+            applied,
         ))
 
-    while selected_anions and selected_charge_delta % add_charge_unit != 0:
-        dropped = selected_anions.pop()
-        selected_charge_delta -= swap_charge_delta[dropped]
-
+    selected_charge_delta = len(selected_anions) * add_charge_unit
     picked_anions = selected_anions
     needed_added_ligands = selected_charge_delta // add_charge_unit
-    picked_slots = capacity_slots[:needed_added_ligands]
-    if len(picked_slots) < needed_added_ligands:
-        print(
-            f"[recon] Compensation slot selection produced only {len(picked_slots)} slots "
-            f"for {needed_added_ligands} required ligands; skipping."
-        )
-        print('='*60)
-        return symbols, pts
 
     if not picked_anions:
         print(

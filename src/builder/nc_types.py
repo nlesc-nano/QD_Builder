@@ -121,6 +121,7 @@ class PassivationSpec:
     prepass_min_cn_terrace: int = 3
     prepass_min_cn_edge: int = 3
     prepass_min_cn_vertex: int = 3
+    include_sublayer: bool = False
     neutral_ligands: NeutralLigandPostTreatSpec = field(
         default_factory=NeutralLigandPostTreatSpec
     )
@@ -176,11 +177,14 @@ class MaterialSpec:
     shape_mode: str = "wulff"
     sphere_planes: int = 192
     align: Optional[AlignSpec] = None
+    interface: Optional[Dict] = None
 
 @dataclass(frozen=True)
 class StackSpec:
     """Stack-mode options (core-shell builds)."""
     geometry_reference: str = "core"  # core | shortest | shell
+    interface: str = "abrupt"          # abrupt | mixed
+    mixing_width: float = 3.0          # in Angstroms
 
 # Unified config returned by parse_yaml_config
 @dataclass(frozen=True)

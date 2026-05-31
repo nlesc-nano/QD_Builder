@@ -995,28 +995,47 @@ def run_neutral_ligand_posttreatment(
                 p for j, p in enumerate(site_dpos) if j != i
             ]
 
+        # Partition sites into independent, spatially isolated batches
+        batches = []
+        site_positions = np.asarray(site_dpos, float)
+        for idx in range(len(site_positions)):
+            pos = site_positions[idx]
+            placed_in_batch = False
+            for batch in batches:
+                clash = False
+                for other_idx in batch:
+                    dist = float(np.linalg.norm(pos - site_positions[other_idx]))
+                    if dist < 10.0:
+                        clash = True
+                        break
+                if not clash:
+                    batch.append(idx)
+                    placed_in_batch = True
+                    break
+            if not placed_in_batch:
+                batches.append([idx])
+
         placed_ligands: List[Tuple[np.ndarray, np.ndarray]] = [
             (np.array([], dtype=int), np.zeros((0, 3), float))
             for _ in site_configs
         ]
-        n_refine = max(1, int(spec.refinement_passes))
-        for _ref_pass in range(n_refine):
-            next_ligands: List[Tuple[np.ndarray, np.ndarray]] = []
-            for i, site_config in enumerate(site_configs):
-                env_pos_parts = [base_pts]
-                env_z_parts = [np.array([_atomic_number(s) for s in base_syms], int)]
-                for j, (nums_j, coords_j) in enumerate(placed_ligands):
-                    if i == j or len(nums_j) == 0:
-                        continue
+        for batch in batches:
+            # Build env_pos containing base nanocrystal plus all ligands placed in previous batches
+            env_pos_parts = [base_pts]
+            env_z_parts = [np.array([_atomic_number(s) for s in base_syms], int)]
+            for j, (nums_j, coords_j) in enumerate(placed_ligands):
+                if len(nums_j) > 0:
                     env_pos_parts.append(np.asarray(coords_j, float))
                     env_z_parts.append(np.asarray(nums_j, int))
-                env_pos = np.vstack(env_pos_parts)
-                env_z = np.concatenate(env_z_parts)
-                placed_numbers, placed_coords = _refine_one_ligand(
+            env_pos = np.vstack(env_pos_parts)
+            env_z = np.concatenate(env_z_parts)
+            
+            # Place and optimize all ligands in the current batch simultaneously
+            for i in batch:
+                site_config = site_configs[i]
+                placed_ligands[i] = _refine_one_ligand(
                     site_config, env_pos, env_z, args_ns
                 )
-                next_ligands.append((placed_numbers, placed_coords))
-            placed_ligands = next_ligands
 
         placed_count = 0
         for placed_numbers, placed_coords in placed_ligands:
