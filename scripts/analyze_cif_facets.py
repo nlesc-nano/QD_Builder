@@ -67,8 +67,7 @@ def _hkl_compact(hkl: tuple[int, int, int]) -> str:
 
 
 def _family_label(hkl: tuple[int, int, int]) -> str:
-    vals = sorted((abs(hkl[0]), abs(hkl[1]), abs(hkl[2])), reverse=True)
-    return "{" + "".join(str(v) for v in vals) + "}"
+    return "{" + "".join(str(x) for x in hkl) + "}"
 
 
 def _unit_normal(struct: Structure, hkl: tuple[int, int, int]) -> np.ndarray:
