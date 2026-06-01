@@ -399,13 +399,13 @@ def _place_exchange_ligand(
 
     base_size = int(site_config.get("base_size", len(env_pos)))
     original_indices = np.arange(len(env_z))
-    from scipy.spatial import KDTree
+    from scipy.spatial import cKDTree
     
     pose_scores = []
     
     tree = None
     if len(env_pos) > 0:
-        tree = KDTree(env_pos)
+        tree = cKDTree(env_pos)
 
     for pose_coords in candidate_poses:
         score = 0.0
