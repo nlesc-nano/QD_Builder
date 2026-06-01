@@ -944,19 +944,49 @@ def run_neutral_ligand_posttreatment(
             print("  → No unoccupied strict virtual sites available. Skipping.")
             continue
 
-        total_slots = sum(site["multiplicity"] for site in merged_cif_sites)
-        k = max(1, int(round(pass_spec.ratio * total_slots)))
-
-        # Prioritize higher multiplicity (already sorted descending)
-        selected_cif_sites = []
-        satisfied_slots = 0
+        # Option 1: Strictly Limit to One Ligand Per Surface Atom (Maximum Steric Protection)
+        # Ensure that each surface host atom is associated with at most one selected virtual site.
+        unique_host_sites = []
+        passivated_hosts = set()
         for site in merged_cif_sites:
-            if satisfied_slots >= k:
-                break
-            selected_cif_sites.append(site)
-            satisfied_slots += site["multiplicity"]
+            if any(h in passivated_hosts for h in site["hosts"]):
+                continue
+            unique_host_sites.append(site)
+            for h in site["hosts"]:
+                passivated_hosts.add(h)
 
-        print(f"  → {len(selected_cif_sites)} sites selected for passivation (satisfying {satisfied_slots}/{total_slots} deficit slots; multiplicity-prioritized)")
+        if not unique_host_sites:
+            print("  → No independent virtual sites available after steric host filtering. Skipping.")
+            continue
+
+        total_unique = len(unique_host_sites)
+        k = max(1, int(round(pass_spec.ratio * total_unique)))
+        k = min(k, total_unique)
+
+        # Subsample/order the unique_host_sites based on the distribution to treat facets on same ground
+        site_positions = np.asarray([s["pos"] for s in unique_host_sites], float)
+        if pass_spec.distribution == "random":
+            rng = random.Random(spec.seed + pass_idx)
+            ordered_indices = list(range(total_unique))
+            rng.shuffle(ordered_indices)
+        elif pass_spec.distribution in ("uniform", "segmented"):
+            maximize_dist = (pass_spec.distribution == "uniform")
+            ordered_indices = _get_spatially_ordered_indices(site_positions, maximize_dist)
+        else:
+            # Fallback: keep the original multiplicity-based order (descending)
+            ordered_indices = list(range(total_unique))
+
+        selected_cif_sites = []
+        for idx in ordered_indices:
+            if len(selected_cif_sites) >= k:
+                break
+            selected_cif_sites.append(unique_host_sites[idx])
+
+        # satisfied_slots is the sum of multiplicities (deficits satisfied)
+        satisfied_slots = sum(site["multiplicity"] for site in selected_cif_sites)
+        total_slots = sum(site["multiplicity"] for site in unique_host_sites)
+
+        print(f"  → {len(selected_cif_sites)} sites selected for passivation (satisfying {satisfied_slots}/{total_slots} deficit slots; distribution={pass_spec.distribution})")
 
         if not selected_cif_sites:
             continue
