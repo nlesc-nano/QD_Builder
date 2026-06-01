@@ -345,7 +345,8 @@ def _place_exchange_ligand(
 
     # Target frame in QD space
     f_y = n0
-    f_x_0 = _unit(v_arb - np.dot(v_arb, f_y) * f_y)
+    f_arb = np.array([1.0, 0.0, 0.0]) if abs(f_y[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    f_x_0 = _unit(f_arb - np.dot(f_arb, f_y) * f_y)
     f_z_0 = np.cross(f_x_0, f_y)
 
     # Search for neighboring cations for bidentate coordination reward
@@ -637,6 +638,14 @@ def run_ligand_exchange_posttreatment(
             print("  → No valid charged ligands prepared. Skipping pass.")
             continue
 
+        # Compute surface mask dynamically on work_pts
+        surf_tol = getattr(cfg.passivation, "surf_tol", 2.0)
+        surf_mask = np.zeros(len(work_syms), bool)
+        if planes:
+            for (normal, d) in planes:
+                normal = np.asarray(normal, float)
+                surf_mask |= ((d - work_pts @ normal) < surf_tol)
+
         candidate_indices = [
             i for i, sym in enumerate(work_syms)
             if sym == pass_spec.replace and int(cfg.charges.get(sym, 0)) == pass_spec.charge
@@ -647,7 +656,9 @@ def run_ligand_exchange_posttreatment(
             if not hosts:
                 continue
             # Exclude in-place swapped core/sublayer anions (which sit in bulk coordination pockets with 3 or more neighbors)
-            if len(hosts) >= 3:
+            # unless they are physically on the surface (within surf_tol).
+            is_on_surface = surf_mask[li] if li < len(surf_mask) else False
+            if len(hosts) >= 3 and not is_on_surface:
                 continue
             primary = hosts[0]
             vec = work_pts[li] - work_pts[primary]

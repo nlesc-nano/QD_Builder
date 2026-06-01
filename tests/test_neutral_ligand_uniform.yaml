@@ -1,0 +1,34 @@
+size_unit_cells: [1.5, 1.5, 1.5]
+
+facets:
+  - hkl: "100"
+    scope: family
+    gamma: 1.0
+  - hkl: "111"
+    scope: family
+    gamma: 1.0
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+  prepass_mode: role-aware
+  prepass_min_cn_terrace: 3
+  prepass_min_cn_edge: 2
+  prepass_min_cn_vertex: 1
+
+  neutral_ligands:
+    enabled: true
+    passes:
+      - target: cation
+        smiles: "CCCN"
+        distribution: uniform
+        ratio: 0.6
+    ff: uff
+    sterics_mode: vdw
+    offset_out: 0.5
+    seed: 1337
