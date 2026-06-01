@@ -98,8 +98,8 @@ def _build_sterics_tree(atoms_pos: np.ndarray, atoms_z: np.ndarray,
     coords = atoms_pos[keep]
     radii = np.array([_get_vdw(int(z)) for z in atoms_z[keep]])
     if len(coords) == 0:
-        return KDTree(np.zeros((1, 3))), np.array([2.0])
-    return KDTree(coords), radii
+        return cKDTree(np.zeros((1, 3))), np.array([2.0])
+    return cKDTree(coords), radii
 
 
 # ──────────────────────────────────────────────────────────────────────────────
