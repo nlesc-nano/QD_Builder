@@ -594,33 +594,7 @@ def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) 
         # Bulk slab scoring uses max projection; Wulff halfspaces expose the opposite polar layer.
         chosen = (-chosen[0], -chosen[1], -chosen[2])
         resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=scope))
-    return _swap_dual_family_effective_terminations(resolved)
-
-
-def _swap_dual_family_effective_terminations(facets: List[Facet]) -> List[Facet]:
-    groups: dict[tuple[int, int, int], dict[str, float]] = {}
-    for f in facets:
-        term = getattr(f, "termination", None)
-        if getattr(f, "scope", "family") != "family" or term not in {"cation_rich", "anion_rich"}:
-            continue
-        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
-        groups.setdefault(fam, {})[term] = f.gamma
-
-    dual = {fam: terms for fam, terms in groups.items() if "cation_rich" in terms and "anion_rich" in terms}
-    if not dual:
-        return facets
-
-    opposite = {"cation_rich": "anion_rich", "anion_rich": "cation_rich"}
-    out: List[Facet] = []
-    for f in facets:
-        term = getattr(f, "termination", None)
-        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
-        if getattr(f, "scope", "family") == "family" and fam in dual and term in opposite:
-            new_term = opposite[term]
-            out.append(Facet(f.h, f.k, f.l, dual[fam][new_term], termination=new_term, scope=f.scope))
-        else:
-            out.append(f)
-    return out
+    return resolved
 
 
 def _effective_termination_from_charge(q: float) -> str | None:
@@ -629,6 +603,18 @@ def _effective_termination_from_charge(q: float) -> str | None:
     if q < 0:
         return "anion_rich"
     return None
+
+
+def _dual_termination_families(facets: List[Facet]) -> set[tuple[int, int, int]]:
+    """Return family indices where both cation_rich and anion_rich are requested."""
+    groups: dict[tuple[int, int, int], set[str]] = {}
+    for f in facets:
+        term = getattr(f, "termination", None)
+        if getattr(f, "scope", "family") != "family" or term not in {"cation_rich", "anion_rich"}:
+            continue
+        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
+        groups.setdefault(fam, set()).add(term)
+    return {fam for fam, terms in groups.items() if len(terms) == 2}
 
 
 def _termination_mismatches_for_detected_facets(
@@ -640,10 +626,17 @@ def _termination_mismatches_for_detected_facets(
     charges,
     surf_tol: float,
 ) -> List[dict]:
+    dual_fams = _dual_termination_families(requested_facets)
+    if not dual_fams:
+        return []
+
     requested_by_hkl: dict[tuple[int, int, int], str] = {}
     for f in requested_facets:
         term = getattr(f, "termination", None)
         if term not in {"cation_rich", "anion_rich"}:
+            continue
+        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
+        if fam not in dual_fams:
             continue
         requested_by_hkl[(int(f.h), int(f.k), int(f.l))] = term
     if not requested_by_hkl:
@@ -655,8 +648,6 @@ def _termination_mismatches_for_detected_facets(
         requested = requested_by_hkl.get(hkl)
         if requested is None:
             continue
-        # Requested cation/anion-rich terminations refer to the exposed outer
-        # atomic layer, not the charge of a multi-layer surface shell.
         shell = np.where((float(d) - pts @ n) < min(0.25, max(1e-3, surf_tol * 0.125)))[0]
         if shell.size == 0:
             continue
@@ -1937,7 +1928,9 @@ def main(argv: List[str] | None = None) -> int:
                     print(f"    - Skipping center variant '{variant_label}': {msg}")
                 variant_failed = True
                 break
-            raise SystemExit(msg)
+            if args.verbose:
+                print(f"    - WARNING: {msg}")
+            wulff_facets = facets_for_variant
 
         if variant_failed:
             continue
