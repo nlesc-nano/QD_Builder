@@ -1473,6 +1473,11 @@ def reconstruct_polar_facets(
     # Define capacity C
     C = len(compensation_slots)
 
+    # Find the slot requirement ratio per swap to adjust S_max
+    first_idx = anion_candidates[0] if anion_candidates else None
+    charge_ratio = (swap_charge_delta[first_idx] // add_charge_unit) if first_idx is not None else 1
+    charge_ratio = max(1, charge_ratio)
+
     # Save target swaps for each facet using the capacity-bounded formula
     final_target_swaps = {}
     for fam, group in family_groups.items():
@@ -1483,7 +1488,7 @@ def reconstruct_polar_facets(
             A_min = min(A_min, len(facet_data[r.fid]["local_candidates"]))
         
         # S_max is the absolute capacity-limited maximum swaps per negative polar facet
-        S_max = min(A_min, C // n_facets)
+        S_max = min(A_min, C // (n_facets * charge_ratio))
         
         # S_target is scaled by the target ratio
         S_target = int(np.round(S_max * target_reduction))
@@ -1545,8 +1550,8 @@ def reconstruct_polar_facets(
             break
 
         # Calculate compensating ligand additions for this batch
-        n_needed_swaps = len(batch_swaps)
-        needed_added_ligands = n_needed_swaps * add_charge_unit
+        total_batch_charge = sum(swap_charge_delta[idx] for _, idx in batch_swaps)
+        needed_added_ligands = total_batch_charge // add_charge_unit
         
         # Select from remaining capacity slots
         available_slots = [
@@ -1600,7 +1605,7 @@ def reconstruct_polar_facets(
             applied,
         ))
 
-    selected_charge_delta = len(selected_anions) * add_charge_unit
+    selected_charge_delta = sum(swap_charge_delta[idx] for idx in selected_anions)
     picked_anions = selected_anions
     needed_added_ligands = selected_charge_delta // add_charge_unit
 
