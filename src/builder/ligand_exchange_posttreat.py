@@ -11,6 +11,7 @@ from .analysis import (
     _pair_cut_calibrated,
     compute_cif_virtual_sites,
     derive_pair_cuts_from_cif,
+    _surface_outward_direction,
 )
 from .nc_types import Config, LigandExchangePostTreatSpec, Plane
 from .neutral_ligand_posttreat import (
@@ -325,6 +326,7 @@ def _place_exchange_ligand(
     c_center = site_config["c_center"]
     v_tail = np.asarray(site_config["v_tail"], float)
     n0 = _unit(np.asarray(site_config["n0"], float))
+    n_surf = _unit(np.asarray(site_config.get("n_surf", n0), float))
     dpos = np.asarray(site_config["dpos"], float) # original displaced Cl position
     r_search = float(site_config.get("r_search", 5.5))
     cfg_charges = site_config.get("cfg_charges", {})
@@ -344,7 +346,7 @@ def _place_exchange_ligand(
     E = np.column_stack([e_x, e_y, e_z])
 
     # Target frame in QD space
-    f_y = n0
+    f_y = n_surf
     f_arb = np.array([1.0, 0.0, 0.0]) if abs(f_y[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     f_x_0 = _unit(f_arb - np.dot(f_arb, f_y) * f_y)
     f_z_0 = np.cross(f_x_0, f_y)
@@ -665,12 +667,14 @@ def run_ligand_exchange_posttreatment(
             norm = float(np.linalg.norm(vec))
             if norm < 1e-8:
                 continue
+            surf_norm = _surface_outward_direction(li, work_pts, planes, surf_tol)
             candidates.append({
                 "ligand_idx": li,
                 "hosts": hosts,
                 "primary_host": primary,
                 "pos": work_pts[li].copy(),
                 "n0": vec / norm,
+                "n_surf": surf_norm,
                 "bond_len": norm,
             })
 
@@ -712,6 +716,7 @@ def run_ligand_exchange_posttreatment(
             site_configs.append({
                 "dpos": anchor_pos,
                 "n0": c["n0"],
+                "n_surf": c["n_surf"],
                 "numbers": lig["numbers"],
                 "coords": lig["coords"],
                 "d1": lig["d1"],
