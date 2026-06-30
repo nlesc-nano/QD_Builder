@@ -594,7 +594,125 @@ def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) 
         # Bulk slab scoring uses max projection; Wulff halfspaces expose the opposite polar layer.
         chosen = (-chosen[0], -chosen[1], -chosen[2])
         resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=scope))
-    return resolved
+    return _swap_dual_family_effective_terminations(resolved)
+
+
+def _swap_dual_family_effective_terminations(facets: List[Facet]) -> List[Facet]:
+    groups: dict[tuple[int, int, int], dict[str, float]] = {}
+    for f in facets:
+        term = getattr(f, "termination", None)
+        if getattr(f, "scope", "family") != "family" or term not in {"cation_rich", "anion_rich"}:
+            continue
+        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
+        groups.setdefault(fam, {})[term] = f.gamma
+
+    dual = {fam: terms for fam, terms in groups.items() if "cation_rich" in terms and "anion_rich" in terms}
+    if not dual:
+        return facets
+
+    opposite = {"cation_rich": "anion_rich", "anion_rich": "cation_rich"}
+    out: List[Facet] = []
+    for f in facets:
+        term = getattr(f, "termination", None)
+        fam = tuple(abs(int(x)) for x in (f.h, f.k, f.l))
+        if getattr(f, "scope", "family") == "family" and fam in dual and term in opposite:
+            new_term = opposite[term]
+            out.append(Facet(f.h, f.k, f.l, dual[fam][new_term], termination=new_term, scope=f.scope))
+        else:
+            out.append(f)
+    return out
+
+
+def _effective_termination_from_charge(q: float) -> str | None:
+    if q > 0:
+        return "cation_rich"
+    if q < 0:
+        return "anion_rich"
+    return None
+
+
+def _termination_mismatches_for_detected_facets(
+    syms: List[str],
+    pts: np.ndarray,
+    requested_facets: List[Facet],
+    detected_facets: List[Facet],
+    detected_planes,
+    charges,
+    surf_tol: float,
+) -> List[dict]:
+    requested_by_hkl: dict[tuple[int, int, int], str] = {}
+    for f in requested_facets:
+        term = getattr(f, "termination", None)
+        if term not in {"cation_rich", "anion_rich"}:
+            continue
+        requested_by_hkl[(int(f.h), int(f.k), int(f.l))] = term
+    if not requested_by_hkl:
+        return []
+
+    mismatches: List[dict] = []
+    for f, (n, d) in zip(detected_facets, detected_planes):
+        hkl = (int(f.h), int(f.k), int(f.l))
+        requested = requested_by_hkl.get(hkl)
+        if requested is None:
+            continue
+        # Requested cation/anion-rich terminations refer to the exposed outer
+        # atomic layer, not the charge of a multi-layer surface shell.
+        shell = np.where((float(d) - pts @ n) < min(0.25, max(1e-3, surf_tol * 0.125)))[0]
+        if shell.size == 0:
+            continue
+        q = float(sum(float(charges.get(syms[i], 0.0)) for i in shell.tolist()))
+        effective = _effective_termination_from_charge(q)
+        if effective != requested:
+            mismatches.append({
+                "hkl": hkl,
+                "requested": requested,
+                "effective": effective or "balanced",
+                "charge": q,
+                "atoms": int(shell.size),
+            })
+    return mismatches
+
+
+def _flip_terminated_facets(facets: List[Facet]) -> List[Facet]:
+    return [
+        Facet(-f.h, -f.k, -f.l, f.gamma, termination=f.termination, scope=f.scope)
+        if getattr(f, "termination", None) in {"cation_rich", "anion_rich"}
+        else f
+        for f in facets
+    ]
+
+
+def _format_termination_mismatches(mismatches: List[dict]) -> str:
+    parts = []
+    for m in mismatches[:8]:
+        h, k, l = m["hkl"]
+        parts.append(
+            f"({h},{k},{l}) requested={m['requested']} effective={m['effective']} "
+            f"Q={m['charge']:+.0f} atoms={m['atoms']}"
+        )
+    extra = len(mismatches) - len(parts)
+    if extra > 0:
+        parts.append(f"... +{extra} more")
+    return "; ".join(parts)
+
+
+def _build_wulff_cut(
+    struct: Structure,
+    wulff_facets: List[Facet],
+    radius_eff: float,
+    *,
+    aspect,
+    origin_shift,
+):
+    syms, pts, planes_geo = build_nanocrystal(
+        struct,
+        wulff_facets,
+        radius_eff,
+        aspect=aspect,
+        origin_shift=origin_shift,
+    )
+    syms, pts = dedupe_points(syms, pts, tol=1e-3)
+    return syms, pts, planes_geo
 
 
 def _run_passivation_and_write_outputs(
@@ -1686,7 +1804,7 @@ def main(argv: List[str] | None = None) -> int:
         seeds = _resolve_facet_terminations(struct, cfg.seeds, cfg.charges)
         if args.verbose:
             resolved = [
-                ((f.h, f.k, f.l), f.termination)
+                ((f.h, f.k, f.l), f.gamma, f.termination)
                 for f in seeds
                 if getattr(f, "termination", None)
             ]
@@ -1700,6 +1818,12 @@ def main(argv: List[str] | None = None) -> int:
         wulff_facets = expand_facets(struct, seeds, proper_only=proper_only)
         if args.verbose:
             print(f"    - Expanded to {len(wulff_facets)} oriented facets")
+            if any(getattr(f, "termination", None) for f in wulff_facets) and len(wulff_facets) <= 16:
+                expanded = [
+                    ((f.h, f.k, f.l), f.gamma, getattr(f, "termination", None))
+                    for f in wulff_facets
+                ]
+                print(f"    - Expanded terminated facets: {expanded}")
 
     variants = _center_variants(struct, cfg, anion_lig)
     multiple_variants = len(variants) > 1
@@ -1730,41 +1854,93 @@ def main(argv: List[str] | None = None) -> int:
                 )
             print(f"    - Output: {run_args.out}")
 
-        if cfg.shape_mode == "sphere":
-            syms, pts, _planes_geo = build_spherical_nanocrystal(
-                struct,
-                radius_eff,
-                n_planes=cfg.sphere_planes,
-                origin_shift=origin_shift,
-            )
-        else:
-            syms, pts, _planes_geo = build_nanocrystal(
-                struct,
-                wulff_facets,
-                radius_eff,
-                aspect=aspect,
-                origin_shift=origin_shift,
-            )
-        syms, pts = dedupe_points(syms, pts, tol=1e-3)
-        if args.verbose:
-            print(f"    - Cut particle: {len(syms)} atoms")
+        facets_for_variant = wulff_facets
+        last_mismatches: List[dict] = []
+        variant_failed = False
+        for termination_attempt in range(2):
             if cfg.shape_mode == "sphere":
-                print(f"    - Spherical cut planes: {cfg.sphere_planes}")
+                syms, pts, _planes_geo = build_spherical_nanocrystal(
+                    struct,
+                    radius_eff,
+                    n_planes=cfg.sphere_planes,
+                    origin_shift=origin_shift,
+                )
+                syms, pts = dedupe_points(syms, pts, tol=1e-3)
             else:
-                ax, ay, az = aspect
-                print(f"    - Aspect multipliers (a,b,c): {ax:.3f}, {ay:.3f}, {az:.3f}")
+                syms, pts, _planes_geo = _build_wulff_cut(
+                    struct,
+                    facets_for_variant,
+                    radius_eff,
+                    aspect=aspect,
+                    origin_shift=origin_shift,
+                )
+            if args.verbose:
+                print(f"    - Cut particle: {len(syms)} atoms")
+                if cfg.shape_mode == "sphere":
+                    print(f"    - Spherical cut planes: {cfg.sphere_planes}")
+                else:
+                    ax, ay, az = aspect
+                    print(f"    - Aspect multipliers (a,b,c): {ax:.3f}, {ay:.3f}, {az:.3f}")
 
-        # --- OPTIONAL TWIN BOUNDARIES (single-material) ---
-        if getattr(cfg, "twins", None):
-            syms, pts = apply_single_material_twins(
+            # --- OPTIONAL TWIN BOUNDARIES (single-material) ---
+            if getattr(cfg, "twins", None):
+                syms, pts = apply_single_material_twins(
+                    syms,
+                    pts,
+                    cfg=cfg,
+                    struct=struct,
+                    planes_geo=_planes_geo,
+                )
+
+            syms, pts = _prune_before_facet_detection(syms, pts, args=args, cfg=cfg)
+            if cfg.shape_mode == "sphere":
+                break
+
+            detected_facets, detected_planes = detect_facets_from_nc(
                 syms,
                 pts,
-                cfg=cfg,
-                struct=struct,
-                planes_geo=_planes_geo,
+                struct.lattice,
+                cfg.charges,
+                facets_for_variant,
+                cfg.passivation.surf_tol,
             )
+            mismatches = _termination_mismatches_for_detected_facets(
+                syms,
+                pts,
+                facets_for_variant,
+                detected_facets,
+                detected_planes,
+                cfg.charges,
+                cfg.passivation.surf_tol,
+            )
+            if not mismatches:
+                if termination_attempt and args.verbose:
+                    print("    - Effective facet termination check passed after flipping terminated Wulff seeds")
+                wulff_facets = facets_for_variant
+                break
+            last_mismatches = mismatches
+            if termination_attempt == 0:
+                if args.verbose:
+                    print(
+                        "    - Effective facet termination mismatch after pruning; "
+                        "retrying with opposite terminated Wulff seeds: "
+                        f"{_format_termination_mismatches(mismatches)}"
+                    )
+                facets_for_variant = _flip_terminated_facets(facets_for_variant)
+                continue
+            msg = (
+                "Requested facet termination could not be realized by the finite Wulff cut after pruning. "
+                f"{_format_termination_mismatches(last_mismatches)}"
+            )
+            if multiple_variants:
+                if args.verbose:
+                    print(f"    - Skipping center variant '{variant_label}': {msg}")
+                variant_failed = True
+                break
+            raise SystemExit(msg)
 
-        syms, pts = _prune_before_facet_detection(syms, pts, args=args, cfg=cfg)
+        if variant_failed:
+            continue
 
         report_label = f" ({variant_label})" if multiple_variants else ""
         if cfg.shape_mode == "sphere":
