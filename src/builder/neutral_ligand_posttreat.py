@@ -960,8 +960,13 @@ def run_neutral_ligand_posttreatment(
             continue
 
         total_unique = len(unique_host_sites)
-        k = max(1, int(round(pass_spec.ratio * total_unique)))
+        if int(getattr(pass_spec, "target_count", 0) or 0) > 0:
+            k = int(pass_spec.target_count)
+        else:
+            k = int(round(pass_spec.ratio * total_unique))
         k = min(k, total_unique)
+        if k <= 0:
+            continue
 
         # Subsample/order the unique_host_sites based on the distribution to treat facets on same ground
         site_positions = np.asarray([s["pos"] for s in unique_host_sites], float)

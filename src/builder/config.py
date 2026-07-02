@@ -16,6 +16,8 @@ from .nc_types import (
     FacetReconstructionSpec, StackSpec,
     NeutralLigandPass, NeutralLigandPostTreatSpec,
     LigandExchangePass, LigandExchangePostTreatSpec,
+    AlloyingPass, AlloyingPostTreatSpec,
+    ZTypeDisplacementPass, ZTypeDisplacementPostTreatSpec,
     SurfaceReconstructionSpec, PostTreatmentSpec,
 )
 
@@ -355,15 +357,21 @@ def _parse_neutral_ligands(raw) -> NeutralLigandPostTreatSpec:
                 f"neutral_ligands.passes[{i}].distribution must be one of {valid_distributions!r}"
             )
         ratio = float(entry.get("ratio", 1.0))
-        if not (0.0 < ratio <= 1.0):
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"neutral_ligands.passes[{i}].target_count must be >= 0")
+        if not (0.0 <= ratio <= 1.0):
             raise ValueError(
-                f"neutral_ligands.passes[{i}].ratio must be in (0, 1], got {ratio}"
+                f"neutral_ligands.passes[{i}].ratio must be in [0, 1], got {ratio}"
             )
+        if target_count <= 0 and ratio <= 0.0:
+            continue
         passes.append(NeutralLigandPass(
             target=target,
             smiles=smiles,
             distribution=distribution,
             ratio=ratio,
+            target_count=target_count,
         ))
 
     # -- Shared placement options --
@@ -429,14 +437,20 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
                 f"ligand_exchange.passes[{i}].distribution must be one of {valid_distributions!r}"
             )
         ratio = float(entry.get("ratio", 1.0))
-        if not (0.0 < ratio <= 1.0):
-            raise ValueError(f"ligand_exchange.passes[{i}].ratio must be in (0, 1], got {ratio}")
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"ligand_exchange.passes[{i}].target_count must be >= 0")
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"ligand_exchange.passes[{i}].ratio must be in [0, 1], got {ratio}")
+        if target_count <= 0 and ratio <= 0.0:
+            continue
         passes.append(LigandExchangePass(
             replace=replace,
             charge=charge,
             smiles=smiles,
             distribution=distribution,
             ratio=ratio,
+            target_count=target_count,
         ))
 
     ff = str(raw.get("ff", "uff")).strip().lower()
@@ -452,6 +466,129 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
         ff=ff,
         refinement_passes=int(raw.get("refinement_passes", 2)),
         sterics_mode=sterics_mode,
+        seed=int(raw.get("seed", 1337)),
+    )
+
+
+def _parse_alloying(raw, charges: Dict[str, int]) -> AlloyingPostTreatSpec:
+    if raw is None:
+        return AlloyingPostTreatSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.alloying must be a mapping")
+    if not bool(raw.get("enabled", False)):
+        return AlloyingPostTreatSpec(enabled=False)
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("post_treatment.alloying.passes must be a list")
+    valid_regions = {"surface", "core", "both"}
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"alloying.passes[{i}] must be a mapping")
+        replace = str(entry.get("replace", "")).strip()
+        replacement = str(entry.get("with", entry.get("replacement", ""))).strip()
+        if not replace or not replacement:
+            raise ValueError(f"alloying.passes[{i}] requires replace and with/replacement")
+        if replace not in charges:
+            raise ValueError(f"alloying.passes[{i}].replace {replace!r} has no known charge")
+        repl_charge_raw = entry.get("with_charge", entry.get("replacement_charge", charges.get(replacement)))
+        if repl_charge_raw is None:
+            raise ValueError(f"alloying.passes[{i}] replacement charge is required for {replacement!r}")
+        region = str(entry.get("region", entry.get("target_region", "both"))).strip().lower()
+        if region not in valid_regions:
+            raise ValueError(f"alloying.passes[{i}].region must be one of {valid_regions!r}")
+        distribution = str(entry.get("distribution", "random")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(f"alloying.passes[{i}].distribution must be one of {valid_distributions!r}")
+        ratio = float(entry.get("ratio", 1.0))
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"alloying.passes[{i}].target_count must be >= 0")
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"alloying.passes[{i}].ratio must be in [0, 1], got {ratio}")
+        if target_count <= 0 and ratio <= 0.0:
+            continue
+        passes.append(AlloyingPass(
+            replace=replace,
+            replacement=replacement,
+            replacement_charge=int(repl_charge_raw),
+            region=region,
+            distribution=distribution,
+            ratio=ratio,
+            target_count=target_count,
+        ))
+    return AlloyingPostTreatSpec(enabled=True, passes=tuple(passes), seed=int(raw.get("seed", 1337)))
+
+
+def _derive_z_type_anion_count(cation: str, anion: str, charges: Dict[str, int]) -> int:
+    q_cat = int(charges.get(cation, 0))
+    q_an = int(charges.get(anion, 0))
+    if q_cat <= 0:
+        raise ValueError(f"z_type_displacement cation {cation!r} must have positive charge")
+    if q_an >= 0:
+        raise ValueError(f"z_type_displacement anion {anion!r} must have negative charge")
+    if q_cat % abs(q_an) != 0:
+        raise ValueError(
+            f"z_type_displacement {cation}/{anion} does not form an integer neutral unit "
+            f"from charges {q_cat:+d}/{q_an:+d}"
+        )
+    return q_cat // abs(q_an)
+
+
+def _parse_z_type_displacement(raw, charges: Dict[str, int]) -> ZTypeDisplacementPostTreatSpec:
+    if raw is None:
+        return ZTypeDisplacementPostTreatSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.z_type_displacement must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return ZTypeDisplacementPostTreatSpec(enabled=False)
+
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("post_treatment.z_type_displacement.passes must be a list")
+
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"z_type_displacement.passes[{i}] must be a mapping")
+        cation = str(entry.get("cation", "")).strip()
+        anion = str(entry.get("anion", entry.get("ligand", ""))).strip()
+        if not cation:
+            raise ValueError(f"z_type_displacement.passes[{i}].cation is required")
+        if not anion:
+            raise ValueError(f"z_type_displacement.passes[{i}].anion is required")
+        anion_count = int(entry.get("anion_count") or 0)
+        if anion_count <= 0:
+            anion_count = _derive_z_type_anion_count(cation, anion, charges)
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"z_type_displacement.passes[{i}].target_count must be >= 0")
+        distribution = str(entry.get("distribution", "random")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(
+                f"z_type_displacement.passes[{i}].distribution must be one of {valid_distributions!r}"
+            )
+        ratio = float(entry.get("ratio", 1.0))
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"z_type_displacement.passes[{i}].ratio must be in [0, 1], got {ratio}")
+        if target_count <= 0 and ratio <= 0.0:
+            continue
+        passes.append(ZTypeDisplacementPass(
+            cation=cation,
+            anion=anion,
+            anion_count=anion_count,
+            target_count=target_count,
+            distribution=distribution,
+            ratio=ratio,
+        ))
+
+    return ZTypeDisplacementPostTreatSpec(
+        enabled=True,
+        passes=tuple(passes),
         seed=int(raw.get("seed", 1337)),
     )
 
@@ -526,7 +663,7 @@ def _surface_reconstruction_from_legacy(raw, *, default_ligand: str) -> SurfaceR
     return _parse_surface_reconstruction(sr_raw, default_ligand=default_ligand)
 
 
-def _parse_post_treatment(raw, *, pass_cfg: dict, default_ligand: str, legacy_recon_raw) -> PostTreatmentSpec:
+def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], default_ligand: str, legacy_recon_raw) -> PostTreatmentSpec:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -540,6 +677,15 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, default_ligand: str, legacy_re
     exchange_raw = raw.get("ligand_exchange", raw.get("ligand-exchange"))
     ligand_exchange = _parse_ligand_exchange(exchange_raw)
 
+    alloying_raw = raw.get("alloying", raw.get("alloy"))
+    alloying = _parse_alloying(alloying_raw, charges)
+
+    z_type_raw = raw.get(
+        "z_type_displacement",
+        raw.get("z-type-displacement", raw.get("z_type", raw.get("z-type"))),
+    )
+    z_type_displacement = _parse_z_type_displacement(z_type_raw, charges)
+
     surface_raw = raw.get("surface_reconstruction", raw.get("surface-reconstruction"))
     surface_reconstruction = _parse_surface_reconstruction(surface_raw, default_ligand=default_ligand)
     if not surface_reconstruction.enabled:
@@ -549,6 +695,8 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, default_ligand: str, legacy_re
 
     return PostTreatmentSpec(
         surface_reconstruction=surface_reconstruction,
+        alloying=alloying,
+        z_type_displacement=z_type_displacement,
         neutral_ligands=neutral_ligands,
         ligand_exchange=ligand_exchange,
     )
@@ -619,6 +767,7 @@ def parse_yaml_config(path: str) -> Config:
     post_treatment = _parse_post_treatment(
         cfg.get("post_treatment", cfg.get("post-treatment")),
         pass_cfg=pass_cfg,
+        charges=charges,
         default_ligand=str(lig_old),
         legacy_recon_raw=cfg.get("facet_reconstruction"),
     )
@@ -646,6 +795,8 @@ def parse_yaml_config(path: str) -> Config:
         charges[facet_reconstruction.cation_ligand] = facet_reconstruction.cation_ligand_charge or +1
     if post_treatment.surface_reconstruction.ligand and post_treatment.surface_reconstruction.ligand not in charges:
         charges[post_treatment.surface_reconstruction.ligand] = -1
+    for alloy_pass in post_treatment.alloying.passes:
+        charges.setdefault(alloy_pass.replacement, alloy_pass.replacement_charge)
 
     # ---- Helper: parse facets list/mapping → List[Facet] ----
     def _parse_facets(raw) -> List[Facet]:

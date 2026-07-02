@@ -22,6 +22,7 @@ class NeutralLigandPass:
     smiles: str
     distribution: str = "random"
     ratio: float = 1.0
+    target_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,26 @@ class LigandExchangePass:
     smiles: Tuple[str, ...]
     distribution: str = "random"
     ratio: float = 1.0
+    target_count: int = 0
+
+
+@dataclass(frozen=True)
+class AlloyingPass:
+    """Replace inorganic core/surface atoms with another ion before ligand treatments."""
+    replace: str
+    replacement: str
+    replacement_charge: int
+    region: str = "both"              # surface | core | both
+    distribution: str = "random"      # random | segmented | uniform
+    ratio: float = 1.0
+    target_count: int = 0
+
+
+@dataclass(frozen=True)
+class AlloyingPostTreatSpec:
+    enabled: bool = False
+    passes: Tuple[AlloyingPass, ...] = ()
+    seed: int = 1337
 
 
 @dataclass(frozen=True)
@@ -70,6 +91,35 @@ class LigandExchangePostTreatSpec:
     ff: str = "uff"
     refinement_passes: int = 2
     sterics_mode: str = "vdw"
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
+class ZTypeDisplacementPass:
+    """
+    Remove neutral Z-type surface units, e.g. CdCl2, CdSe, CsBr, PbBr2.
+
+    cation     : positive surface species used as the group center.
+    anion      : negative ligand/native species removed nearest to the cation.
+    anion_count: number of anions removed per cation; if omitted by YAML/API,
+                 it is derived from formal charges.
+    target_count: exact number of groups to remove; if <= 0, ratio is used.
+    distribution: 'random' | 'segmented' | 'uniform'
+    ratio      : fraction of eligible cation-centered groups to displace.
+    """
+    cation: str
+    anion: str
+    anion_count: int = 0
+    target_count: int = 0
+    distribution: str = "random"
+    ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class ZTypeDisplacementPostTreatSpec:
+    """Optional post-treatment for removing neutral inorganic Z-type units."""
+    enabled: bool = False
+    passes: Tuple[ZTypeDisplacementPass, ...] = ()
     seed: int = 1337
 
 
@@ -96,6 +146,8 @@ class SurfaceReconstructionSpec:
 @dataclass(frozen=True)
 class PostTreatmentSpec:
     surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
+    alloying: AlloyingPostTreatSpec = field(default_factory=AlloyingPostTreatSpec)
+    z_type_displacement: ZTypeDisplacementPostTreatSpec = field(default_factory=ZTypeDisplacementPostTreatSpec)
     neutral_ligands: NeutralLigandPostTreatSpec = field(default_factory=NeutralLigandPostTreatSpec)
     ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
 
