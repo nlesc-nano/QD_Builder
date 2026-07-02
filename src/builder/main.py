@@ -804,6 +804,59 @@ def _run_passivation_and_write_outputs(
         )
 
     ligand_exchange_charge_ledger = []
+    z_type_displacement_ledger = []
+    alloying_ledger = []
+
+    # ── Inorganic alloying (optional; before Z-type/X-type/L-type), then rebalance
+    alloying_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "alloying",
+        None,
+    )
+    if alloying_spec is not None and alloying_spec.enabled:
+        from .alloying_posttreat import run_alloying_posttreatment
+        syms, pts, alloying_ledger = run_alloying_posttreatment(
+            syms, pts, cfg, struct, planes
+        )
+        if alloying_ledger:
+            for entry in alloying_ledger:
+                cfg.charges.setdefault(entry["replacement"], int(entry["replacement_charge"]))
+            if args.verbose:
+                print("\n[alloying] Rebalancing charge after inorganic substitutions...")
+            syms, pts = charge_balance_iterative(
+                syms, pts,
+                cfg.charges, anion_lig,
+                verbose=args.verbose,
+                planes=planes,
+                surf_tol=cfg.passivation.surf_tol,
+                cif_path=cif_path,
+                positive_q_strategy=args.positive_q_mode,
+                write_all=args.write_all,
+                prefix=prefix,
+                experimental_exhausted_positive_q_fallback=bool(
+                    getattr(cfg, "experimental", {}).get("exhausted_positive_q_fallback", False)
+                ),
+                pair_cuts_override=pair_cuts_override,
+                region_masks=region_masks,
+                stack_passivation=stack_passivation,
+                prepass_mode=cfg.passivation.prepass_mode,
+                prepass_min_cn_terrace=cfg.passivation.prepass_min_cn_terrace,
+                prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
+                prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
+                include_sublayer=cfg.passivation.include_sublayer,
+            )
+
+    # ── Z-type displacement (optional; after reconstruction, before X-type exchange)
+    z_type_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "z_type_displacement",
+        None,
+    )
+    if z_type_spec is not None and z_type_spec.enabled:
+        from .z_type_displacement_posttreat import run_z_type_displacement_posttreatment
+        syms, pts, z_type_displacement_ledger = run_z_type_displacement_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path
+        )
 
     # ── Charged ligand exchange (optional; after reconstruction, before neutral ligands)
     ligand_exchange_spec = getattr(
@@ -928,6 +981,10 @@ def _run_passivation_and_write_outputs(
             "total_charge": q_total,
             "ligand_exchange_charge_ledger": ligand_exchange_charge_ledger,
         })
+    if z_type_displacement_ledger:
+        extra["z_type_displacement_ledger"] = z_type_displacement_ledger
+    if alloying_ledger:
+        extra["alloying_ledger"] = alloying_ledger
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     return syms, pts, ligand_exchange_charge_ledger

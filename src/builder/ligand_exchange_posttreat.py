@@ -683,7 +683,13 @@ def run_ligand_exchange_posttreatment(
             continue
 
         site_positions = np.asarray([c["pos"] for c in candidates], float)
-        selected_local = _subsample_sites(site_positions, pass_spec.ratio, pass_spec.distribution, spec.seed + pass_idx)
+        if int(getattr(pass_spec, "target_count", 0) or 0) > 0:
+            ratio_eff = min(1.0, int(pass_spec.target_count) / max(1, len(candidates)))
+        else:
+            ratio_eff = pass_spec.ratio
+        selected_local = _subsample_sites(site_positions, ratio_eff, pass_spec.distribution, spec.seed + pass_idx)
+        if int(getattr(pass_spec, "target_count", 0) or 0) > 0:
+            selected_local = selected_local[:int(pass_spec.target_count)]
         assignments = _smiles_assignments(selected_local, len(ligands))
         selected = [candidates[i] for i in selected_local]
         print(f"  → Selected {len(selected)} / {len(candidates)} native ligands for exchange")
