@@ -1,0 +1,60 @@
+size_unit_cells: [3, 3, 3]
+
+facets:
+  - hkl: "100"
+    scope: family
+    gamma: 0.1
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+
+charges:
+  Cs: 1
+  Pb: 2
+  Br: -1
+  Cl: -1
+  In: 3
+  Zn: 2
+  C: 0
+  O: -1
+  N: 0
+  S: -1
+  H: 0
+
+symmetry:
+  proper_rotations_only: true
+
+construction_origin:
+  center_on_species: Cs
+
+post_treatment:
+  # Native Z-type displacement remains disabled (or empty) to verify it is completely untouched
+  z_type_displacement:
+    enabled: false
+  
+  # The neutral_exchange configuration running MXn, zwitterion, and L-type exchange
+  neutral_exchange:
+    enabled: true
+    passes:
+      # z-type to z-type MXn exchange
+      - cation: Cs
+        anion: Br
+        anion_count: 1
+        ratio: 0.3
+        exchange_type: mxn
+        smiles: "InBr3"
+      # z-type to zwitterion exchange
+      - cation: Cs
+        anion: Br
+        anion_count: 1
+        ratio: 0.3
+        exchange_type: zwitterion
+        smiles: "CCCCC[NH2+]CCC(=O)[O-]"
+      # z-type to l-type exchange
+      - cation: Cs
+        anion: Br
+        anion_count: 1
+        ratio: 0.3
+        exchange_type: l_type
+        smiles: "CCCCC(=O)O"

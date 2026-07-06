@@ -874,6 +874,8 @@ def run_neutral_ligand_posttreatment(
             sym = cur_syms[i]
             if sym not in native_species:
                 continue
+            if getattr(pass_spec, "target_symbol", None) and sym != pass_spec.target_symbol:
+                continue
             q_i = charges.get(sym, 0)
             if q_i == 0:
                 continue

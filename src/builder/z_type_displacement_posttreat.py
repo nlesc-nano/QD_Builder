@@ -82,6 +82,59 @@ def _count_possible_groups(
     return min(len(cation_indices), len(anion_indices) // int(anion_count))
 
 
+def _count_bound_groups(
+    syms: List[str],
+    pts: NDArray[np.float64],
+    cation_indices: List[int],
+    anion_indices: List[int],
+    anion_count: int,
+    cuts: Optional[PairCuts],
+    *,
+    allow_unbound_completion: bool = False,
+) -> int:
+    needed = max(1, int(anion_count))
+    count = 0
+    used_anions = set()
+    for ci in cation_indices:
+        cation = syms[int(ci)]
+        c_pos = pts[int(ci)]
+        bound = []
+        for ai in anion_indices:
+            if ai in used_anions:
+                continue
+            anion = syms[int(ai)]
+            try:
+                cutoff = _pair_cut_calibrated(cation, anion, cuts)
+            except Exception:
+                cutoff = 3.2
+            dist = float(np.linalg.norm(pts[int(ai)] - c_pos))
+            if dist <= max(3.2, 1.15 * cutoff):
+                bound.append((dist, int(ai)))
+        if not bound:
+            continue
+        bound.sort()
+        chosen = [ai for _dist, ai in bound[:needed]]
+        if allow_unbound_completion and len(chosen) < needed:
+            chosen_set = set(chosen)
+            extras = sorted(
+                (
+                    (float(np.linalg.norm(pts[int(ai)] - c_pos)), int(ai))
+                    for ai in anion_indices
+                    if int(ai) not in used_anions and int(ai) not in chosen_set
+                ),
+                key=lambda item: item[0],
+            )
+            for _dist, ai in extras:
+                chosen.append(ai)
+                if len(chosen) == needed:
+                    break
+        if len(chosen) < needed:
+            continue
+        used_anions.update(chosen)
+        count += 1
+    return count
+
+
 def _bound_hosts(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -207,6 +260,26 @@ def _relocate_orphan_ligands(
     }
 
 
+def _filter_passivated_indices(
+    indices: List[int],
+    syms: List[str],
+    pts: NDArray[np.float64],
+    native_species: set[str],
+    cutoff: float = 3.5
+) -> List[int]:
+    non_native_coords = [pts[j] for j, sym in enumerate(syms) if sym not in native_species]
+    if not non_native_coords:
+        return indices
+    non_native_arr = np.asarray(non_native_coords, float)
+    filtered = []
+    for idx in indices:
+        pos = pts[idx]
+        dists = np.linalg.norm(non_native_arr - pos, axis=1)
+        if np.min(dists) >= cutoff:
+            filtered.append(idx)
+    return filtered
+
+
 def detect_z_type_displacement_options(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -228,23 +301,52 @@ def detect_z_type_displacement_options(
     species_present = sorted(set(syms))
     cations = [s for s in species_present if int(charges.get(s, 0)) > 0]
     anions = [s for s in species_present if int(charges.get(s, 0)) < 0]
+    for lig in passivation_ligands:
+        if lig and lig not in anions and int(charges.get(lig, 0)) < 0:
+            anions.append(lig)
 
     options = []
     for cation in cations:
-        cation_indices = _eligible_indices(
-            syms, pts, cation, require_surface=True, surface=surface
-        )
-        if not cation_indices:
-            continue
         for anion in anions:
             anion_count = _derive_anion_count(cation, anion, charges)
             if not anion_count:
                 continue
+
+            is_core_ion_pair = (cation in native) and (anion in native)
+
+            cation_indices = _eligible_indices(
+                syms, pts, cation, require_surface=True, surface=surface
+            )
+            if is_core_ion_pair:
+                cation_indices = _filter_passivated_indices(cation_indices, syms, pts, native)
+            if not cation_indices:
+                continue
+
             require_anion_surface = anion in native and anion not in passivation_ligands
             anion_indices = _eligible_indices(
                 syms, pts, anion, require_surface=require_anion_surface, surface=surface
             )
-            count = _count_possible_groups(cation_indices, anion_indices, anion_count)
+            if is_core_ion_pair:
+                anion_indices = _filter_passivated_indices(anion_indices, syms, pts, native)
+
+            if anion in passivation_ligands and anion_indices:
+                try:
+                    cuts = derive_pair_cuts_from_cif(cif_path, charges, safety=1.00) if cif_path else None
+                except Exception:
+                    cuts = None
+                count = _count_bound_groups(
+                    syms,
+                    pts,
+                    cation_indices,
+                    anion_indices,
+                    anion_count,
+                    cuts,
+                    allow_unbound_completion=True,
+                )
+            elif anion not in species_present and anion in passivation_ligands:
+                count = len(cation_indices)
+            else:
+                count = _count_possible_groups(cation_indices, anion_indices, anion_count)
             if count <= 0:
                 continue
             options.append({
@@ -377,14 +479,20 @@ def run_z_type_displacement_posttreatment(
             f"dist={pass_spec.distribution}"
         )
 
+        is_core_ion_pair = (cation in native) and (anion in native)
+
         surface = _surface_mask(work_pts, planes, getattr(cfg.passivation, "surf_tol", 2.0))
         cation_indices = _eligible_indices(
             work_syms, work_pts, cation, require_surface=True, surface=surface
         )
+        if is_core_ion_pair:
+            cation_indices = _filter_passivated_indices(cation_indices, work_syms, work_pts, native)
         require_anion_surface = anion in native and anion not in passivation_ligands
         anion_indices = _eligible_indices(
             work_syms, work_pts, anion, require_surface=require_anion_surface, surface=surface
         )
+        if is_core_ion_pair:
+            anion_indices = _filter_passivated_indices(anion_indices, work_syms, work_pts, native)
         possible = _count_possible_groups(cation_indices, anion_indices, anion_count)
         print(
             f"  → Candidates: {possible} groups from {len(cation_indices)} surface {cation} "
