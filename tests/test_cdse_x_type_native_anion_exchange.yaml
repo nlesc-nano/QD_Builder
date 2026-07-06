@@ -1,0 +1,43 @@
+size_unit_cells: [3, 3, 3]
+
+facets:
+  - hkl: "100"
+    scope: family
+    gamma: 1.0
+    termination: cation_rich
+  - hkl: "111"
+    scope: family
+    gamma: 1.0
+    termination: anion_rich
+  - hkl: "-1-1-1"
+    scope: family
+    gamma: 1.0
+    termination: cation_rich
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+
+charges:
+  Cd: 2
+  Se: -2
+  Cl: -1
+
+symmetry:
+  proper_rotations_only: true
+
+construction_origin:
+  center_on_species: Cd
+
+post_treatment:
+  ligand_exchange:
+    enabled: true
+    ff: uff
+    sterics_mode: vdw
+    seed: 1337
+    passes:
+      - replace: Se
+        charge: -1
+        smiles: "CCCS"
+        distribution: uniform
+        ratio: 0.4

@@ -19,6 +19,7 @@ from .nc_types import (
     AlloyingPass, AlloyingPostTreatSpec,
     ZTypeDisplacementPass, ZTypeDisplacementPostTreatSpec,
     SurfaceReconstructionSpec, PostTreatmentSpec,
+    NeutralExchangePass, NeutralExchangePostTreatSpec,
 )
 
 # -------------------- CLI --------------------
@@ -351,6 +352,7 @@ def _parse_neutral_ligands(raw) -> NeutralLigandPostTreatSpec:
         smiles = str(entry.get("smiles", "")).strip()
         if not smiles:
             raise ValueError(f"neutral_ligands.passes[{i}].smiles is required")
+        target_symbol = str(entry.get("target_symbol", "")).strip() or None
         distribution = str(entry.get("distribution", "random")).strip().lower()
         if distribution not in valid_distributions:
             raise ValueError(
@@ -372,6 +374,7 @@ def _parse_neutral_ligands(raw) -> NeutralLigandPostTreatSpec:
             distribution=distribution,
             ratio=ratio,
             target_count=target_count,
+            target_symbol=target_symbol,
         ))
 
     # -- Shared placement options --
@@ -418,9 +421,22 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
         replace = str(entry.get("replace", "")).strip()
         if not replace:
             raise ValueError(f"ligand_exchange.passes[{i}].replace is required")
-        charge = int(entry.get("charge", 0))
-        if charge not in {-1, +1}:
-            raise ValueError(f"ligand_exchange.passes[{i}].charge currently supports -1 or +1")
+        charge_raw = entry.get("charge")
+        if charge_raw is not None:
+            charge = int(charge_raw)
+            if charge not in {-1, +1}:
+                raise ValueError(f"ligand_exchange.passes[{i}].charge currently supports -1 or +1")
+        else:
+            charge = None
+
+        replace_charge_raw = entry.get("replace_charge", entry.get("replacement_charge"))
+        if replace_charge_raw is not None:
+            replace_charge = int(replace_charge_raw)
+            if replace_charge == 0:
+                raise ValueError(f"ligand_exchange.passes[{i}].replace_charge must be non-zero")
+        else:
+            replace_charge = None
+
         smiles_raw = entry.get("smiles")
         if isinstance(smiles_raw, str):
             smiles = (smiles_raw.strip(),)
@@ -447,6 +463,7 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
         passes.append(LigandExchangePass(
             replace=replace,
             charge=charge,
+            replace_charge=replace_charge,
             smiles=smiles,
             distribution=distribution,
             ratio=ratio,
@@ -593,6 +610,75 @@ def _parse_z_type_displacement(raw, charges: Dict[str, int]) -> ZTypeDisplacemen
     )
 
 
+def _parse_neutral_exchange(raw, charges: Dict[str, int]) -> NeutralExchangePostTreatSpec:
+    if raw is None:
+        return NeutralExchangePostTreatSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.neutral_exchange must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return NeutralExchangePostTreatSpec(enabled=False)
+
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("post_treatment.neutral_exchange.passes must be a list")
+
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"neutral_exchange.passes[{i}] must be a mapping")
+        cation = str(entry.get("cation", "")).strip()
+        anion = str(entry.get("anion", entry.get("ligand", ""))).strip()
+        if not cation:
+            raise ValueError(f"neutral_exchange.passes[{i}].cation is required")
+        if not anion:
+            raise ValueError(f"neutral_exchange.passes[{i}].anion is required")
+        anion_count = int(entry.get("anion_count") or 0)
+        if anion_count <= 0:
+            anion_count = _derive_z_type_anion_count(cation, anion, charges)
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"neutral_exchange.passes[{i}].target_count must be >= 0")
+        distribution = str(entry.get("distribution", "random")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(
+                f"neutral_exchange.passes[{i}].distribution must be one of {valid_distributions!r}"
+            )
+        ratio = float(entry.get("ratio", 1.0))
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"neutral_exchange.passes[{i}].ratio must be in [0, 1], got {ratio}")
+        exchange_type = str(entry.get("exchange_type", "mxn")).strip().lower()
+        if exchange_type == "salt":
+            exchange_type = "mxn"
+        valid_exchange_types = {"mxn", "zwitterion", "l_type"}
+        if exchange_type not in valid_exchange_types:
+            raise ValueError(f"neutral_exchange.passes[{i}].exchange_type must be one of {valid_exchange_types!r}")
+        smiles = str(entry.get("smiles", "")).strip()
+        if not smiles:
+            raise ValueError(f"neutral_exchange.passes[{i}].smiles is required")
+
+        if target_count <= 0 and ratio <= 0.0:
+            continue
+        passes.append(NeutralExchangePass(
+            cation=cation,
+            anion=anion,
+            anion_count=anion_count,
+            target_count=target_count,
+            distribution=distribution,
+            ratio=ratio,
+            exchange_type=exchange_type,
+            smiles=smiles,
+        ))
+
+    return NeutralExchangePostTreatSpec(
+        enabled=True,
+        passes=tuple(passes),
+        seed=int(raw.get("seed", 1337)),
+    )
+
+
 def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconstructionSpec:
     if raw is None:
         return SurfaceReconstructionSpec()
@@ -686,6 +772,9 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
     )
     z_type_displacement = _parse_z_type_displacement(z_type_raw, charges)
 
+    neutral_exchange_raw = raw.get("neutral_exchange", raw.get("neutral-exchange"))
+    neutral_exchange = _parse_neutral_exchange(neutral_exchange_raw, charges)
+
     surface_raw = raw.get("surface_reconstruction", raw.get("surface-reconstruction"))
     surface_reconstruction = _parse_surface_reconstruction(surface_raw, default_ligand=default_ligand)
     if not surface_reconstruction.enabled:
@@ -699,6 +788,7 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
         z_type_displacement=z_type_displacement,
         neutral_ligands=neutral_ligands,
         ligand_exchange=ligand_exchange,
+        neutral_exchange=neutral_exchange,
     )
 
 

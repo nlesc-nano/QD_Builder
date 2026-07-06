@@ -858,6 +858,18 @@ def _run_passivation_and_write_outputs(
             syms, pts, cfg, struct, planes, cif_path
         )
 
+    # ── Neutral ligand exchange (optional; after displacement, before X-type exchange)
+    neutral_exchange_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "neutral_exchange",
+        None,
+    )
+    if neutral_exchange_spec is not None and neutral_exchange_spec.enabled:
+        from .neutral_exchange_posttreat import run_neutral_exchange_posttreatment
+        syms, pts, neutral_exchange_ledger = run_neutral_exchange_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path
+        )
+
     # ── Charged ligand exchange (optional; after reconstruction, before neutral ligands)
     ligand_exchange_spec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -865,7 +877,10 @@ def _run_passivation_and_write_outputs(
         None,
     )
     if ligand_exchange_spec is not None and ligand_exchange_spec.enabled:
-        from .ligand_exchange_posttreat import run_ligand_exchange_posttreatment
+        from .ligand_exchange_posttreat import (
+            rebalance_ligand_exchange_charge,
+            run_ligand_exchange_posttreatment,
+        )
         syms, pts, ligand_exchange_charge_ledger = run_ligand_exchange_posttreatment(
             syms, pts, cfg, struct, planes, cif_path
         )
@@ -880,6 +895,15 @@ def _run_passivation_and_write_outputs(
                 f"YAML exchanged-ligand Q={q_exchange:+d}, "
                 f"total Q={q_total:+d}"
             )
+            if q_total != 0:
+                print(
+                    f"[ligand-exchange:charge-balance] residual Q={q_total:+d}; "
+                    "running ligand-only exchange compensation"
+                )
+                syms, pts = rebalance_ligand_exchange_charge(
+                    syms, pts, cfg, struct, planes, cif_path, ligand_exchange_charge_ledger,
+                    verbose=args.verbose,
+                )
 
     # ── Neutral-ligand post-treatment (optional; final post-treatment step) ───
     neutral_ligand_spec = getattr(

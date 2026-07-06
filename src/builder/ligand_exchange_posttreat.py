@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,6 +10,8 @@ from numpy.typing import NDArray
 from .analysis import (
     PairCuts,
     _pair_cut_calibrated,
+    bulk_cn_opposite_by_interior,
+    coord_numbers_bipartite,
     compute_cif_virtual_sites,
     derive_pair_cuts_from_cif,
     _surface_outward_direction,
@@ -260,7 +263,43 @@ def _prepare_cation_ligand(smiles: str, seed: int, ff: str):
     return charged, int(anchor_idx), None, None, coords, anchor_name
 
 
-def _prepare_charged_ligand(smiles: str, charge: int, seed: int, ff: str):
+def _detect_ligand_charge(smiles: str) -> int:
+    from rdkit import Chem
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles!r}")
+
+    # Check if matches any anion patterns
+    anion_patterns = [
+        Chem.MolFromSmarts("[CX3](=O)[OX2H1]"),
+        Chem.MolFromSmarts("[PX4](=O)([OX2H1])[OX2H1,O-]"),
+        Chem.MolFromSmarts("[#16X6](=O)(=O)[OX2H1]"),
+        Chem.MolFromSmarts("[SX2H1]"),
+        Chem.MolFromSmarts("[OX2H1][#6]"),
+    ]
+    for patt in anion_patterns:
+        if patt is not None and mol.HasSubstructMatch(patt):
+            return -1
+
+    # Check if matches any cation patterns
+    cation_patterns = [
+        Chem.MolFromSmarts("[#7X4+]"),
+        Chem.MolFromSmarts("[#15X4+]"),
+        Chem.MolFromSmarts("[NX3;!$([NX3](=O))]"),
+        Chem.MolFromSmarts("[PX3]"),
+        Chem.MolFromSmarts("[SX2;H0]"),
+    ]
+    for patt in cation_patterns:
+        if patt is not None and mol.HasSubstructMatch(patt):
+            return 1
+
+    raise ValueError(f"Could not automatically determine charge for SMILES: {smiles!r}")
+
+
+def _prepare_charged_ligand(smiles: str, charge: Optional[int], seed: int, ff: str):
+    if charge is None or charge == 0:
+        charge = _detect_ligand_charge(smiles)
+
     if charge < 0:
         mol, d1, d2, c_center, coords, anchor_name = _prepare_anion_ligand(smiles, seed, ff)
     elif charge > 0:
@@ -550,6 +589,205 @@ def _is_lattice_site(pos: np.ndarray, bulk_struct, syms: List[str], pts: np.ndar
     return False
 
 
+def _native_species(bulk_struct) -> set[str]:
+    if bulk_struct is None or not hasattr(bulk_struct, "sites"):
+        return set()
+    return {str(site.specie.symbol) for site in bulk_struct.sites}
+
+
+def _filter_passivated_indices(
+    indices: List[int],
+    syms: List[str],
+    pts: NDArray[np.float64],
+    native_species: set[str],
+    cutoff: float = 3.5
+) -> List[int]:
+    non_native_coords = [pts[j] for j, sym in enumerate(syms) if sym not in native_species]
+    if not non_native_coords:
+        return indices
+    non_native_arr = np.asarray(non_native_coords, float)
+    filtered = []
+    for idx in indices:
+        pos = pts[idx]
+        dists = np.linalg.norm(non_native_arr - pos, axis=1)
+        if np.min(dists) >= cutoff:
+            filtered.append(idx)
+    return filtered
+
+
+def _effective_charge(symbols: List[str], charges: Dict[str, int], ledger: List[dict]) -> int:
+    q_element = int(sum(int(charges.get(sym, 0)) for sym in symbols))
+    q_ignored = int(sum(int(entry.get("ignored_element_charge", 0)) for entry in ledger))
+    q_exchange = int(sum(int(entry.get("charge", 0)) for entry in ledger))
+    return q_element - q_ignored + q_exchange
+
+
+def _remove_passivation_ligands_for_charge(
+    syms: List[str],
+    pts: NDArray[np.float64],
+    cfg: Config,
+    ledger: List[dict],
+    needed: int,
+    *,
+    distribution: str,
+    seed: int,
+) -> Tuple[List[str], NDArray[np.float64], int]:
+    ligand = cfg.passivation.ligand
+    ligand_idx = [i for i, sym in enumerate(syms) if sym == ligand]
+    if needed <= 0 or not ligand_idx:
+        return syms, pts, 0
+    remove_count = min(int(needed), len(ligand_idx))
+    selected_local = _subsample_sites(
+        np.asarray([pts[i] for i in ligand_idx], float),
+        min(1.0, remove_count / max(1, len(ligand_idx))),
+        distribution,
+        seed,
+    )[:remove_count]
+    remove_set = {ligand_idx[i] for i in selected_local}
+    keep = np.ones(len(syms), dtype=bool)
+    for i in remove_set:
+        keep[i] = False
+    return [s for s, k in zip(syms, keep) if k], pts[keep], len(remove_set)
+
+
+def rebalance_ligand_exchange_charge(
+    syms: List[str],
+    pts: NDArray[np.float64],
+    cfg: Config,
+    bulk_struct,
+    planes: List[Plane],
+    cif_path: str,
+    ledger: List[dict],
+    *,
+    verbose: bool = True,
+) -> Tuple[List[str], NDArray[np.float64]]:
+    """
+    Correct only the formal charge introduced by charged X-type exchange.
+
+    This deliberately does not run the full structural passivation loop: native
+    cations/anions must not be removed or swapped as a side effect of ligand
+    exchange compensation.
+    """
+    if not ledger:
+        return syms, pts
+
+    ligand = cfg.passivation.ligand
+    q_lig = int(cfg.charges.get(ligand, 0))
+    q_total = _effective_charge(syms, cfg.charges, ledger)
+    if q_total == 0:
+        return syms, pts
+
+    work_syms = list(syms)
+    work_pts = np.asarray(pts, float).copy()
+    surf_tol = getattr(cfg.passivation, "surf_tol", 2.0)
+
+    if q_total < 0:
+        if q_lig >= 0:
+            if verbose:
+                print(
+                    f"[ligand-exchange:charge-balance] residual Q={q_total:+d}; "
+                    f"cannot remove non-anionic passivation ligand {ligand!r}"
+                )
+            return work_syms, work_pts
+        needed = int((-q_total + abs(q_lig) - 1) // abs(q_lig))
+        if not any(sym == ligand for sym in work_syms):
+            if verbose:
+                print(
+                    f"[ligand-exchange:charge-balance] residual Q={q_total:+d}; "
+                    f"no {ligand} ligands available to remove"
+                )
+            return work_syms, work_pts
+        distribution = str(ledger[-1].get("distribution", "uniform"))
+        before = q_total
+        work_syms, work_pts, removed = _remove_passivation_ligands_for_charge(
+            work_syms,
+            work_pts,
+            cfg,
+            ledger,
+            needed,
+            distribution=distribution,
+            seed=int(getattr(cfg.post_treatment.ligand_exchange, "seed", 1337)) + 7919,
+        )
+        after = _effective_charge(work_syms, cfg.charges, ledger)
+        if verbose:
+            print(
+                f"[ligand-exchange:charge-balance] removed {removed} {ligand} "
+                f"ligand(s) | Q:{before:+d}->{after:+d}"
+            )
+        return work_syms, work_pts
+
+    if q_lig >= 0:
+        if verbose:
+            print(
+                f"[ligand-exchange:charge-balance] residual Q={q_total:+d}; "
+                f"cannot add non-anionic passivation ligand {ligand!r}"
+            )
+        return work_syms, work_pts
+
+    from .passivation import _build_facet_frames, _facet_memberships
+    from .passivation_iterative import _priority3_balance_positive_q_add
+
+    pair_cuts = derive_pair_cuts_from_cif(cif_path, cfg.charges, safety=1.00)
+    add_count_facet: Dict[int, int] = defaultdict(int)
+    edit_count_facet: Dict[int, int] = defaultdict(int)
+    uv_taken: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+    host_taken: Dict[int, int] = {}
+    target = int((q_total + abs(q_lig) - 1) // abs(q_lig))
+    added = 0
+    before = q_total
+
+    for _ in range(target):
+        frames = _build_facet_frames(planes)
+        mem = _facet_memberships(work_pts, planes, surf_tol)
+        cn_bi = coord_numbers_bipartite(work_syms, work_pts, cfg.charges, pair_cuts=pair_cuts)
+        progressed, work_syms, work_pts = _priority3_balance_positive_q_add(
+            work_syms,
+            work_pts,
+            frames,
+            planes,
+            mem,
+            cn_bi,
+            cfg.charges,
+            ligand,
+            surf_tol,
+            uv_taken,
+            edit_count_facet,
+            add_count_facet,
+            host_taken,
+            {},
+            pair_cuts,
+            verbose=verbose,
+            include_sublayer=False,
+            cif_path=cif_path,
+        )
+        if not progressed:
+            break
+        added += 1
+        if _effective_charge(work_syms, cfg.charges, ledger) <= 0:
+            break
+
+    after = _effective_charge(work_syms, cfg.charges, ledger)
+    trimmed = 0
+    if after < 0:
+        needed_remove = int((-after + abs(q_lig) - 1) // abs(q_lig))
+        work_syms, work_pts, trimmed = _remove_passivation_ligands_for_charge(
+            work_syms,
+            work_pts,
+            cfg,
+            ledger,
+            needed_remove,
+            distribution=str(ledger[-1].get("distribution", "uniform")),
+            seed=int(getattr(cfg.post_treatment.ligand_exchange, "seed", 1337)) + 1543,
+        )
+        after = _effective_charge(work_syms, cfg.charges, ledger)
+    if verbose:
+        print(
+            f"[ligand-exchange:charge-balance] added {added} {ligand} ligand(s) "
+            f"and trimmed {trimmed} excess {ligand} ligand(s) | Q:{before:+d}->{after:+d}"
+        )
+    return work_syms, work_pts
+
+
 def run_ligand_exchange_posttreatment(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -614,9 +852,21 @@ def run_ligand_exchange_posttreatment(
     charge_ledger: List[dict] = []
 
     for pass_idx, pass_spec in enumerate(spec.passes):
+        replace_charge = pass_spec.replace_charge
+        if replace_charge is None:
+            replace_charge = int(cfg.charges.get(pass_spec.replace, 0))
+
+        molecular_charge = pass_spec.charge
+        if molecular_charge is None:
+            try:
+                molecular_charge = _detect_ligand_charge(pass_spec.smiles[0])
+            except Exception as exc:
+                print(f"  [warning] Could not determine ligand charge from {pass_spec.smiles[0]!r}: {exc}")
+                molecular_charge = -1 if replace_charge < 0 else 1
+
         print(
             f"\n[ligand-exchange:pass-{pass_idx + 1}] replace={pass_spec.replace!r} "
-            f"charge={pass_spec.charge:+d} ratio={pass_spec.ratio:.2f} "
+            f"replace_charge={replace_charge:+d} ligand_charge={molecular_charge:+d} ratio={pass_spec.ratio:.2f} "
             f"dist={pass_spec.distribution} smiles={list(pass_spec.smiles)!r}"
         )
 
@@ -625,7 +875,7 @@ def run_ligand_exchange_posttreatment(
             try:
                 prepared = _prepare_charged_ligand(
                     smiles,
-                    pass_spec.charge,
+                    molecular_charge,
                     seed=spec.seed + 101 * (pass_idx + 1) + sidx,
                     ff=spec.ff,
                 )
@@ -648,18 +898,35 @@ def run_ligand_exchange_posttreatment(
                 normal = np.asarray(normal, float)
                 surf_mask |= ((d - work_pts @ normal) < surf_tol)
 
+        native = _native_species(bulk_struct)
+        native_replace = pass_spec.replace in native
+        bulk_cn = {}
+        cn = None
+        if native_replace:
+            cn = coord_numbers_bipartite(work_syms, work_pts, cfg.charges, pair_cuts=cuts)
+            bulk_cn = bulk_cn_opposite_by_interior(
+                work_syms, work_pts, planes, surf_tol, cfg.charges, pair_cuts=cuts
+            )
         candidate_indices = [
             i for i, sym in enumerate(work_syms)
-            if sym == pass_spec.replace and int(cfg.charges.get(sym, 0)) == pass_spec.charge
+            if sym == pass_spec.replace and int(cfg.charges.get(sym, 0)) == replace_charge
         ]
+        if native_replace:
+            candidate_indices = _filter_passivated_indices(candidate_indices, work_syms, work_pts, native)
         candidates = []
         for li in candidate_indices:
+            is_on_surface = surf_mask[li] if li < len(surf_mask) else False
+            if native_replace:
+                if not is_on_surface:
+                    continue
+                target_cn = int(bulk_cn.get(work_syms[li], 0))
+                if cn is not None and target_cn > 0 and int(cn[li]) >= target_cn:
+                    continue
             hosts = _bound_hosts(work_syms, work_pts, li, cfg.charges, cuts)
             if not hosts:
                 continue
             # Exclude in-place swapped core/sublayer anions (which sit in bulk coordination pockets with 3 or more neighbors)
             # unless they are physically on the surface (within surf_tol).
-            is_on_surface = surf_mask[li] if li < len(surf_mask) else False
             if len(hosts) >= 3 and not is_on_surface:
                 continue
             primary = hosts[0]
@@ -734,7 +1001,8 @@ def run_ligand_exchange_posttreatment(
                 "r_search": r_search,
                 "cfg_charges": cfg.charges,
                 "base_size": len(base_syms),
-                "replacement_charge": pass_spec.charge,
+                "replacement_charge": molecular_charge,
+                "removed_charge": replace_charge,
                 "replacement_smiles": lig["smiles"],
                 "replacement_name": lig["name"],
             })
@@ -794,6 +1062,9 @@ def run_ligand_exchange_posttreatment(
                 "smiles": sc["replacement_smiles"],
                 "kind": sc["replacement_name"],
                 "charge": molecular_charge,
+                "removed_charge": int(sc.get("removed_charge", molecular_charge)),
+                "removed_symbol": pass_spec.replace,
+                "distribution": pass_spec.distribution,
                 "ignored_element_charge": int(
                     sum(int(cfg.charges.get(sym, 0)) for sym in atom_syms)
                 ),

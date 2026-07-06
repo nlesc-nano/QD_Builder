@@ -23,6 +23,7 @@ class NeutralLigandPass:
     distribution: str = "random"
     ratio: float = 1.0
     target_count: int = 0
+    target_symbol: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -53,8 +54,9 @@ class LigandExchangePass:
     ratio       : fraction of eligible native ligands to exchange.
     """
     replace: str
-    charge: int
     smiles: Tuple[str, ...]
+    charge: Optional[int] = None
+    replace_charge: Optional[int] = None
     distribution: str = "random"
     ratio: float = 1.0
     target_count: int = 0
@@ -113,6 +115,8 @@ class ZTypeDisplacementPass:
     target_count: int = 0
     distribution: str = "random"
     ratio: float = 1.0
+    exchange_type: str = "displacement"
+    smiles: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -144,12 +148,32 @@ class SurfaceReconstructionSpec:
 
 
 @dataclass(frozen=True)
+class NeutralExchangePass:
+    cation: str
+    anion: str
+    anion_count: int = 0
+    exchange_type: str = "mxn"   # "mxn" | "zwitterion" | "l_type"; "salt" accepted as legacy alias
+    smiles: str = ""
+    distribution: str = "random"
+    ratio: float = 1.0
+    target_count: int = 0
+
+
+@dataclass(frozen=True)
+class NeutralExchangePostTreatSpec:
+    enabled: bool = False
+    passes: Tuple[NeutralExchangePass, ...] = ()
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
 class PostTreatmentSpec:
     surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
     alloying: AlloyingPostTreatSpec = field(default_factory=AlloyingPostTreatSpec)
     z_type_displacement: ZTypeDisplacementPostTreatSpec = field(default_factory=ZTypeDisplacementPostTreatSpec)
     neutral_ligands: NeutralLigandPostTreatSpec = field(default_factory=NeutralLigandPostTreatSpec)
     ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
+    neutral_exchange: NeutralExchangePostTreatSpec = field(default_factory=NeutralExchangePostTreatSpec)
 
 # Basic
 @dataclass(frozen=True)

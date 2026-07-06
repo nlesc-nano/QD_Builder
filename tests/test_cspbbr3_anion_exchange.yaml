@@ -29,7 +29,6 @@ post_treatment:
     seed: 1337
     passes:
       - replace: Br
-        charge: -1
         smiles: "CCC(=O)O"
         distribution: random
         ratio: 0.6
