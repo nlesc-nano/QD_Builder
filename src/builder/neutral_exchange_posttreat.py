@@ -274,20 +274,45 @@ def _hard_clash_count(
     *,
     margin: float = 0.65,
 ) -> int:
+    clashes, _clearance = _steric_metrics(
+        symbols,
+        coords,
+        env_syms,
+        env_pts,
+        margin=margin,
+    )
+    return clashes
+
+
+def _steric_metrics(
+    symbols: List[str],
+    coords: np.ndarray,
+    env_syms: List[str],
+    env_pts: np.ndarray,
+    *,
+    margin: float = 0.65,
+    tree=None,
+) -> Tuple[int, float]:
     if len(coords) == 0 or len(env_pts) == 0:
-        return 0
+        return 0, float("inf")
     from pymatgen.core import Element
     from scipy.spatial import cKDTree
 
-    tree = cKDTree(np.asarray(env_pts, float))
+    env_pts = np.asarray(env_pts, float)
+    if tree is None:
+        tree = cKDTree(env_pts)
     clashes = 0
+    min_clearance = float("inf")
     for sym, pos in zip(symbols, coords):
         try:
             z = Element(sym).Z
         except Exception:
             z = 6
         r_i = _get_vdw(z)
-        hits = tree.query_ball_point(np.asarray(pos, float), r=r_i + 2.2)
+        hits = tree.query_ball_point(np.asarray(pos, float), r=r_i + 3.0)
+        if not hits:
+            _dist, nearest = tree.query(np.asarray(pos, float), k=1)
+            hits = [int(nearest)]
         for h in hits:
             env_sym = env_syms[int(h)]
             try:
@@ -295,9 +320,11 @@ def _hard_clash_count(
             except Exception:
                 z_j = 6
             threshold = max(0.75, r_i + _get_vdw(z_j) - margin)
-            if float(np.linalg.norm(np.asarray(pos, float) - env_pts[int(h)])) < threshold:
+            distance = float(np.linalg.norm(np.asarray(pos, float) - env_pts[int(h)]))
+            min_clearance = min(min_clearance, distance - threshold)
+            if distance < threshold:
                 clashes += 1
-    return clashes
+    return clashes, min_clearance
 
 
 def _rotation_matrix_aligning_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -367,33 +394,104 @@ def _place_single_anion_ligand(lig_prep: dict, host_pos: np.ndarray, ai_pos: np.
     return symbols, coords
 
 
-def _detect_zwitterion_anchors(mol) -> Tuple[int, int]:
-    cat_idx = None
-    for atom in mol.GetAtoms():
-        if atom.GetFormalCharge() > 0 and atom.GetAtomicNum() in {7, 15}:
-            cat_idx = int(atom.GetIdx())
-            break
-    if cat_idx is None:
-        for atom in mol.GetAtoms():
-            if atom.GetAtomicNum() in {7, 15}:
-                cat_idx = int(atom.GetIdx())
-                break
-    if cat_idx is None:
-        raise ValueError("No cationic anchor (N or P) found")
+_PHOSPHONATE_SHORTHAND = "COP(=O)OCC[NH3+]"
+_PHOSPHONATE_ZWITTERION = "COP(=O)([O-])OCC[NH3+]"
 
-    an_idx = None
-    for atom in mol.GetAtoms():
-        if atom.GetFormalCharge() < 0 and atom.GetAtomicNum() in {8, 16}:
-            an_idx = int(atom.GetIdx())
-            break
-    if an_idx is None:
-        for atom in mol.GetAtoms():
-            if atom.GetAtomicNum() in {8, 16}:
-                an_idx = int(atom.GetIdx())
-                break
-    if an_idx is None:
-        raise ValueError("No anionic anchor (O or S) found")
-    return cat_idx, an_idx
+
+def _zwitterion_validation_error(smiles: str, detail: str) -> ValueError:
+    suggestion = ""
+    if "".join(str(smiles).split()) == _PHOSPHONATE_SHORTHAND:
+        suggestion = f" Did you mean {_PHOSPHONATE_ZWITTERION!r}?"
+    return ValueError(f"Invalid zwitterion SMILES {smiles!r}: {detail}.{suggestion}")
+
+
+def _validate_zwitterion_smiles(smiles: str):
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise _zwitterion_validation_error(smiles, "RDKit could not parse the molecule")
+
+    formal_charge = int(Chem.GetFormalCharge(mol))
+    positive = [
+        int(atom.GetIdx())
+        for atom in mol.GetAtoms()
+        if atom.GetFormalCharge() > 0 and atom.GetAtomicNum() in {7, 15}
+    ]
+    negative = [
+        int(atom.GetIdx())
+        for atom in mol.GetAtoms()
+        if atom.GetFormalCharge() < 0 and atom.GetAtomicNum() in {8, 16}
+    ]
+    if formal_charge != 0:
+        raise _zwitterion_validation_error(
+            smiles,
+            f"formal charge is {formal_charge:+d}; zwitterions require net charge 0",
+        )
+    if not positive or not negative:
+        raise _zwitterion_validation_error(
+            smiles,
+            "zwitterions require explicit positive N/P and negative O/S centers",
+        )
+    return mol
+
+
+def _detect_zwitterion_anchors(mol) -> Tuple[int, int]:
+    positive = [
+        int(atom.GetIdx())
+        for atom in mol.GetAtoms()
+        if atom.GetFormalCharge() > 0 and atom.GetAtomicNum() in {7, 15}
+    ]
+    negative = [
+        int(atom.GetIdx())
+        for atom in mol.GetAtoms()
+        if atom.GetFormalCharge() < 0 and atom.GetAtomicNum() in {8, 16}
+    ]
+    if not positive:
+        raise ValueError("No explicit cationic anchor (N+ or P+) found")
+    if not negative:
+        raise ValueError("No explicit anionic anchor (O- or S-) found")
+    return positive[0], negative[0]
+
+
+def _zwitterion_side_branch(mol, cat_idx: int, an_idx: int) -> Tuple[Optional[int], List[int]]:
+    """Find the largest carbon-containing branch off the anchor-to-anchor spacer."""
+    from rdkit import Chem
+
+    path = list(Chem.rdmolops.GetShortestPath(mol, int(cat_idx), int(an_idx)))
+    if len(path) < 2:
+        return None, []
+    path_set = set(path)
+    center_idx = int(path[-2])
+    candidates = []
+    for nb in mol.GetAtomWithIdx(center_idx).GetNeighbors():
+        start = int(nb.GetIdx())
+        if start in path_set:
+            continue
+        seen = {center_idx, *path_set}
+        queue = [start]
+        atoms = []
+        while queue:
+            cur = queue.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            atom = mol.GetAtomWithIdx(cur)
+            if atom.GetAtomicNum() > 1:
+                atoms.append(cur)
+            for next_atom in atom.GetNeighbors():
+                next_idx = int(next_atom.GetIdx())
+                if next_idx not in seen:
+                    queue.append(next_idx)
+        carbon_atoms = [
+            idx for idx in atoms if mol.GetAtomWithIdx(idx).GetAtomicNum() == 6
+        ]
+        if carbon_atoms:
+            candidates.append((len(carbon_atoms), len(atoms), carbon_atoms))
+    if not candidates:
+        return None, []
+    _carbon_count, _size, branch_atoms = max(candidates, key=lambda row: (row[0], row[1]))
+    return center_idx, branch_atoms
 
 
 def _tail_vector_from_cation(mol, coords: np.ndarray, cat_idx: int, an_idx: int) -> np.ndarray:
@@ -454,66 +552,121 @@ def _place_zwitterion(
     from rdkit import Chem
     from rdkit.Chem import AllChem
     from pymatgen.core import Element
+    from scipy.spatial import cKDTree
 
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid zwitterion SMILES: {smiles!r}")
-    mol = Chem.AddHs(mol)
+    mol = Chem.AddHs(_validate_zwitterion_smiles(smiles))
+    cat_idx, an_idx = _detect_zwitterion_anchors(mol)
+    branch_center_idx, branch_atoms = _zwitterion_side_branch(mol, cat_idx, an_idx)
+
     params = AllChem.ETKDGv3()
     params.randomSeed = int(seed)
-    if AllChem.EmbedMolecule(mol, params) < 0:
+    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=8, params=params))
+    if not conf_ids:
         raise RuntimeError(f"3-D embedding failed for zwitterion SMILES: {smiles!r}")
-    try:
-        if AllChem.MMFFHasAllMoleculeParams(mol):
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=300)
-        else:
-            AllChem.UFFOptimizeMolecule(mol, maxIters=300)
-    except Exception:
-        pass
-
-    cat_idx, an_idx = _detect_zwitterion_anchors(mol)
-    conf = mol.GetConformer()
-    coords = np.array([conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())])
     symbols = [Element.from_Z(atom.GetAtomicNum()).symbol for atom in mol.GetAtoms()]
 
-    source_axis = coords[an_idx] - coords[cat_idx]
     target_axis = np.asarray(ai_pos, float) - np.asarray(ci_pos, float)
     if float(np.linalg.norm(target_axis)) < 1e-8:
         target_axis = np.asarray(n_surf, float)
-    R = _rotation_matrix_aligning_vectors(source_axis, target_axis)
-    base = (coords - coords[cat_idx]) @ R.T + np.asarray(ci_pos, float)
-
     axis = target_axis / (float(np.linalg.norm(target_axis)) + 1e-12)
-    tail_vec = _tail_vector_from_cation(mol, coords, cat_idx, an_idx) @ R.T
     n_surf = np.asarray(n_surf, float)
     n_surf = n_surf / (float(np.linalg.norm(n_surf)) + 1e-12)
     target_tail = n_surf - np.dot(n_surf, axis) * axis
-    source_tail = tail_vec - np.dot(tail_vec, axis) * axis
     if float(np.linalg.norm(target_tail)) < 1e-8:
         target_tail = n_surf
-    if float(np.linalg.norm(source_tail)) < 1e-8:
-        source_tail = tail_vec
 
-    best_coords = base
-    best_score = float("inf")
     env_syms = env_syms or []
     env_pts = np.asarray(env_pts, float) if env_pts is not None else np.zeros((0, 3), float)
-    for deg in range(0, 360, 10):
-        R_ax = _rotation_about_axis(axis, np.deg2rad(deg))
-        test = (base - ci_pos) @ R_ax.T + ci_pos
-        test_tail = source_tail @ R_ax.T
-        align_penalty = -float(np.dot(
-            test_tail / (float(np.linalg.norm(test_tail)) + 1e-12),
-            target_tail / (float(np.linalg.norm(target_tail)) + 1e-12),
-        ))
-        clash_penalty = 100.0 * _hard_clash_count(symbols, test, env_syms, env_pts)
-        score = clash_penalty + align_penalty
-        if score < best_score:
-            best_score = score
-            best_coords = test
+    env_tree = cKDTree(env_pts) if len(env_pts) else None
+    candidates = []
 
-    final_coords = best_coords
-    return symbols, final_coords
+    for conf_id in conf_ids:
+        try:
+            if AllChem.MMFFHasAllMoleculeParams(mol):
+                AllChem.MMFFOptimizeMolecule(mol, confId=int(conf_id), maxIters=300)
+            else:
+                AllChem.UFFOptimizeMolecule(mol, confId=int(conf_id), maxIters=300)
+        except Exception:
+            pass
+
+        conf = mol.GetConformer(int(conf_id))
+        coords = np.array([conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())])
+        source_axis = coords[an_idx] - coords[cat_idx]
+        R = _rotation_matrix_aligning_vectors(source_axis, target_axis)
+        base = (coords - coords[cat_idx]) @ R.T + np.asarray(ci_pos, float)
+
+        tail_vec = _tail_vector_from_cation(mol, coords, cat_idx, an_idx) @ R.T
+        source_tail = tail_vec - np.dot(tail_vec, axis) * axis
+        if float(np.linalg.norm(source_tail)) < 1e-8:
+            source_tail = tail_vec
+
+        for deg in range(0, 360, 10):
+            R_ax = _rotation_about_axis(axis, np.deg2rad(deg))
+            test = (base - ci_pos) @ R_ax.T + ci_pos
+            test_tail = source_tail @ R_ax.T
+            tail_alignment = float(np.dot(
+                test_tail / (float(np.linalg.norm(test_tail)) + 1e-12),
+                target_tail / (float(np.linalg.norm(target_tail)) + 1e-12),
+            ))
+            clashes, clearance = _steric_metrics(
+                symbols,
+                test,
+                env_syms,
+                env_pts,
+                tree=env_tree,
+            )
+
+            branch_projection = None
+            if branch_center_idx is not None and branch_atoms:
+                branch_vec = (
+                    test[np.asarray(branch_atoms, int)].mean(axis=0)
+                    - test[int(branch_center_idx)]
+                )
+                branch_projection = float(np.dot(
+                    branch_vec / (float(np.linalg.norm(branch_vec)) + 1e-12),
+                    n_surf,
+                ))
+
+            candidates.append({
+                "coords": test,
+                "clashes": int(clashes),
+                "clearance": float(clearance),
+                "branch_projection": branch_projection,
+                "tail_alignment": tail_alignment,
+            })
+
+    if not candidates:
+        raise RuntimeError(f"No placement poses generated for zwitterion SMILES: {smiles!r}")
+
+    if branch_atoms:
+        outward = [
+            candidate for candidate in candidates
+            if candidate["branch_projection"] is not None
+            and candidate["branch_projection"] > 0.05
+        ]
+        if not outward:
+            raise RuntimeError(
+                "Could not orient the carbon-containing zwitterion side group "
+                "toward the outward surface normal"
+            )
+        candidates = outward
+
+    min_clashes = min(candidate["clashes"] for candidate in candidates)
+    finalists = [
+        candidate for candidate in candidates
+        if candidate["clashes"] == min_clashes
+    ]
+
+    best = max(
+        finalists,
+        key=lambda candidate: (
+            candidate["branch_projection"]
+            if candidate["branch_projection"] is not None else -1.0,
+            candidate["clearance"],
+            candidate["tail_alignment"],
+        ),
+    )
+    return symbols, np.asarray(best["coords"], float)
 
 
 def _surface_outward_direction(pos: np.ndarray, planes: List[Plane]) -> np.ndarray:
@@ -933,10 +1086,13 @@ def run_neutral_exchange_posttreatment(
             anion_count = derived
         formula = _formula(cation, anion, anion_count)
         exchange_type = "mxn" if pass_spec.exchange_type == "salt" else pass_spec.exchange_type
+        smiles = pass_spec.smiles
         print(
             f"\n[neutral-exchange:pass-{pass_idx + 1}] formula={formula} ratio={pass_spec.ratio:.2f} "
-            f"type={exchange_type} smiles={pass_spec.smiles!r}"
+            f"type={exchange_type} smiles={smiles!r}"
         )
+        if exchange_type == "zwitterion":
+            _validate_zwitterion_smiles(smiles)
 
         is_core_ion_pair = (cation in native) and (anion in native)
 
@@ -991,7 +1147,6 @@ def run_neutral_exchange_posttreatment(
         new_syms = [work_syms[i] for i in keep]
         new_pts = list(work_pts[keep])
 
-        smiles = pass_spec.smiles
         branch_success = False
         placed_charge_correction = 0
         preferred_removal_anions: List[str] = []
@@ -1060,12 +1215,22 @@ def run_neutral_exchange_posttreatment(
         elif exchange_type == "zwitterion":
             try:
                 zw_placed = 0
+                center_indices = [
+                    idx for idx, sym in enumerate(work_syms)
+                    if not native or sym in native
+                ]
+                structure_center = (
+                    work_pts[np.asarray(center_indices, int)].mean(axis=0)
+                    if center_indices else work_pts.mean(axis=0)
+                )
                 for ci, ais in groups:
                     if not ais:
                         continue
                     ci_pos = removed_coords[ci]
                     ai_pos = removed_coords[ais[0]]
-                    surf_norm = _surface_outward_direction(ci_pos, planes)
+                    surf_norm = np.asarray(ci_pos, float) - np.asarray(structure_center, float)
+                    if float(np.linalg.norm(surf_norm)) < 1e-8:
+                        surf_norm = _surface_outward_direction(ci_pos, planes)
                     syms_zw, coords_zw = _place_zwitterion(
                         smiles,
                         ci_pos,
@@ -1083,7 +1248,7 @@ def run_neutral_exchange_posttreatment(
                 print(f"  → Zwitterion exchange successful: placed {zw_placed} zwitterion molecules")
                 branch_success = zw_placed > 0
             except Exception as exc:
-                print(f"  [error] Zwitterion exchange failed: {exc}")
+                raise RuntimeError(f"Zwitterion exchange failed: {exc}") from exc
         
         elif exchange_type == "l_type":
             try:
