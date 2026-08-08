@@ -593,6 +593,71 @@ def _unit(v: np.ndarray) -> np.ndarray:
     return v / ln if ln > 1e-12 else np.zeros_like(v)
 
 
+def cif_first_shell_vector_sets(
+    bulk_struct,
+    site_sym: str,
+    neighbor_symbols: Iterable[str],
+) -> List[List[np.ndarray]]:
+    """
+    Return distinct CIF Cartesian first-shell vector sets for one site species.
+
+    The vectors retain their physical bond lengths and crystallographic
+    orientation.  This is the common low-level source for passivation virtual
+    directions and nucleation lattice occupancy.
+    """
+    if bulk_struct is None or not hasattr(bulk_struct, "sites") or not hasattr(bulk_struct, "lattice"):
+        return []
+
+    neighbor_set = set(neighbor_symbols)
+    if not neighbor_set:
+        return []
+    neighbor_sites = [
+        site
+        for site in bulk_struct.sites
+        if str(site.specie.symbol) in neighbor_set
+    ]
+    if not neighbor_sites:
+        return []
+
+    latt = bulk_struct.lattice
+    vector_sets: List[List[np.ndarray]] = []
+    seen: Set[Tuple[Tuple[float, float, float], ...]] = set()
+    for ref_site in bulk_struct.sites:
+        if str(ref_site.specie.symbol) != site_sym:
+            continue
+        ref_cart = np.asarray(ref_site.coords, float)
+        candidates: List[Tuple[float, np.ndarray]] = []
+        for neighbor in neighbor_sites:
+            neighbor_cart = np.asarray(neighbor.coords, float)
+            for ia in range(-1, 2):
+                for ib in range(-1, 2):
+                    for ic in range(-1, 2):
+                        shift = ia * latt.matrix[0] + ib * latt.matrix[1] + ic * latt.matrix[2]
+                        vec = neighbor_cart + shift - ref_cart
+                        dist = float(np.linalg.norm(vec))
+                        if dist > 0.1:
+                            candidates.append((dist, vec))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda rec: rec[0])
+        d_min = candidates[0][0]
+        vectors: List[np.ndarray] = []
+        for dist, vec in candidates:
+            if dist >= 1.2 * d_min:
+                break
+            unit = _unit(vec)
+            if all(float(np.dot(unit, _unit(old))) < 0.99 for old in vectors):
+                vectors.append(np.asarray(vec, float))
+        if not vectors:
+            continue
+        key = tuple(sorted(tuple(np.round(v, 6)) for v in vectors))
+        if key in seen:
+            continue
+        seen.add(key)
+        vector_sets.append(vectors)
+    return vector_sets
+
+
 def _bulk_ideal_direction_sets(
     site_sym: str,
     bulk_struct,
@@ -612,50 +677,22 @@ def _bulk_ideal_direction_sets(
     if site_q == 0:
         return []
 
-    opp_sites = [
-        s for s in bulk_struct.sites
+    opposite_symbols = {
+        str(s.specie.symbol)
+        for s in bulk_struct.sites
         if int(charges.get(str(s.specie.symbol), 0)) * site_q < 0
-    ]
-    if not opp_sites:
+    }
+    if not opposite_symbols:
         return []
 
-    latt = bulk_struct.lattice
-    direction_sets: List[List[np.ndarray]] = []
-    seen: Set[Tuple[Tuple[float, float, float], ...]] = set()
-    for ref_site in bulk_struct.sites:
-        if str(ref_site.specie.symbol) != site_sym:
-            continue
-        ref_cart = np.asarray(ref_site.coords, float)
-        candidates: List[Tuple[float, np.ndarray]] = []
-        for opp in opp_sites:
-            opp_cart = np.asarray(opp.coords, float)
-            for ia in range(-1, 2):
-                for ib in range(-1, 2):
-                    for ic in range(-1, 2):
-                        shift = ia * latt.matrix[0] + ib * latt.matrix[1] + ic * latt.matrix[2]
-                        vec = opp_cart + shift - ref_cart
-                        dist = float(np.linalg.norm(vec))
-                        if dist > 0.1:
-                            candidates.append((dist, vec))
-        if not candidates:
-            continue
-        candidates.sort(key=lambda rec: rec[0])
-        d_min = candidates[0][0]
-        dirs: List[np.ndarray] = []
-        for dist, vec in candidates:
-            if dist >= 1.2 * d_min:
-                break
-            unit = _unit(vec)
-            if all(float(np.dot(unit, old)) < 0.99 for old in dirs):
-                dirs.append(unit)
-        if not dirs:
-            continue
-        key = tuple(sorted(tuple(np.round(v, 6)) for v in dirs))
-        if key in seen:
-            continue
-        seen.add(key)
-        direction_sets.append(dirs)
-    return direction_sets
+    return [
+        [_unit(vector) for vector in vectors]
+        for vectors in cif_first_shell_vector_sets(
+            bulk_struct,
+            site_sym,
+            opposite_symbols,
+        )
+    ]
 
 
 def _actual_opposite_bond_vectors(
@@ -1046,6 +1083,5 @@ def compute_cif_virtual_sites(
     # Sort by multiplicity descending
     merged_sites.sort(key=lambda x: x["multiplicity"], reverse=True)
     return merged_sites
-
 
 

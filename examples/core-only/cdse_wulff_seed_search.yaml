@@ -1,0 +1,52 @@
+# Seed-search scan for continuum Wulff cuts (composition staircase vs size/origin).
+# Drive with:  python scripts/scan_wulff_seeds.py examples/core-only/cdse_wulff_seed_search.yaml
+#
+# This is NOT nucleation (k,p). It maps which discrete magic sizes the standard
+# Wulff half-space cut produces at sub-nm to ~2 unit cells, to document why the
+# "minimum faceted" builder seed sits near k≈13 for Se-centred size≈1.
+
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+facets:
+  - hkl: "100"
+    scope: family
+    termination: cation_rich
+    gamma: 1.0
+  - hkl: "111"
+    scope: family
+    termination: cation_rich
+    gamma: 1.0
+  - hkl: "-1-1-1"
+    scope: family
+    termination: anion_rich
+    gamma: 1.0
+
+symmetry:
+  proper_rotations_only: true
+
+# Origins to scan (in addition to species-centred origins below).
+seed_search:
+  size_start: 0.40
+  size_stop: 1.50
+  size_step: 0.05
+  # Isotropic size_unit_cells = [s, s, s] at each step.
+  origins:
+    - com
+    - species: Se
+    - species: Cd
+  auto_shift:
+    - false
+    - true
+  # Write construction-native XYZ only for rows with k_core >= this (0 = all).
+  write_xyz_min_k: 7
+  # Optional: only keep near-stoichiometric cuts |n_cat - n_an| <= tol
+  max_stoich_imbalance: null
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0

@@ -1,0 +1,61 @@
+# Wurtzite CdSe / CdCl2 smoke (kmax=1) for competitive ZB vs WZ maps.
+# Same chemistry keys as cdse_cdcl2.yaml; different CIF (and thus site vectors).
+# Compare retained (k,p) topologies against examples/nucleation/cdse_cdcl2.yaml.
+# Terminal motifs left off until WZ surfaces are DFT-checked.
+cif: ../cifs/CdSe_wz.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  kmax: 1
+  mode: exact
+  core_growth_policy: all
+  passivation_ring_policy: none
+  discarded_through_k: 1
+
+  lattice_policy:
+    inorganic_ring_length: 6
+    geometry_defaults: zb_tetrahedral
+  surface_geometry:
+    terminal_motifs: none
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

@@ -1,0 +1,407 @@
+{
+  "k1p0:retained": [
+    [
+      "Cd1Se1",
+      "9f212b13a08a82c973b39483b2755796",
+      "Cd[1] Se[1]",
+      "edges=1",
+      "none",
+      "status=retained",
+      "reason=minimum_cn_shortfall"
+    ]
+  ],
+  "k1p1:retained": [
+    [
+      "Cd2Cl2Se1",
+      "e980469023d5d2999e255141dd41d652",
+      "Cd[2, 2] Cl[1, 1] Se[2]",
+      "edges=4",
+      "none",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k1p2:retained": [
+    [
+      "Cd3Cl4Se1",
+      "8944c344bca89d7239795e317d2c296a",
+      "Cd[4, 3, 3] Cl[2, 2, 2, 1] Se[3]",
+      "edges=10",
+      "shared_occupied_neighbor=3",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k1p3:retained": [
+    [
+      "Cd4Cl6Se1",
+      "a0216a5f8801501bf978084eaa7a02d6",
+      "Cd[4, 4, 4, 4] Cl[2, 2, 2, 2, 2, 2] Se[4]",
+      "edges=16",
+      "shared_occupied_neighbor=6",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k2p0:retained": [
+    [
+      "Cd2Se2",
+      "bb365d5773c349a831613c0d21314a61",
+      "Cd[2, 1] Se[2, 1]",
+      "edges=3",
+      "none",
+      "status=retained",
+      "reason=minimum_cn_shortfall"
+    ]
+  ],
+  "k2p1:retained": [
+    [
+      "Cd3Cl2Se2",
+      "9ca9c172791a428a2cd1599283a7e191",
+      "Cd[2, 2, 2] Cl[1, 1] Se[2, 2]",
+      "edges=6",
+      "none",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k2p2:retained": [
+    [
+      "Cd4Cl4Se2",
+      "a1765200b041df1b930f1f21892df6f4",
+      "Cd[4, 3, 3, 3] Cl[2, 2, 2, 2] Se[3, 2]",
+      "edges=13",
+      "shared_occupied_neighbor=3,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k2p3:retained": [
+    [
+      "Cd5Cl6Se2",
+      "17cdfbc4fcd9c6947de82a6bcd62ab65",
+      "Cd[4, 4, 3, 3, 3] Cl[2, 2, 2, 2, 2, 1] Se[3, 3]",
+      "edges=17",
+      "shared_occupied_neighbor=4,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl6Se2",
+      "29dc26de6902e0a1cb6b2de87ef027f0",
+      "Cd[4, 4, 3, 3, 3] Cl[2, 2, 2, 2, 2, 1] Se[3, 3]",
+      "edges=17",
+      "shared_occupied_neighbor=4,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl6Se2",
+      "8ea3ec681be26385079cf0ce67249aa2",
+      "Cd[4, 4, 3, 3, 3] Cl[2, 2, 2, 2, 2, 1] Se[3, 3]",
+      "edges=17",
+      "shared_occupied_neighbor=4,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl6Se2",
+      "d0d883ce839285e0f5cd84cbe37cb71b",
+      "Cd[4, 4, 3, 3, 3] Cl[2, 2, 2, 2, 2, 1] Se[3, 3]",
+      "edges=17",
+      "shared_occupied_neighbor=4,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k2p4:retained": [
+    [
+      "Cd6Cl8Se2",
+      "0da6542e9c4cc5abc3a444e35619c388",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "39422765a72cfbeedadfc649f531c13c",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "42630bfa56dc30aacc3eae302a95bfe0",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "60324c43208cae463e7cb86bd47de506",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "75f1d0cad1ee75ad907001365c06eab3",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "779fab9b7c7ecc18c41cc01120f1292e",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "abf4faf8d0cf59e71e0a99fb8193df04",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "b9816c2ab0e72c6412d123d2862a0afa",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd6Cl8Se2",
+      "c7ea16b2eed7ef4087467b47256c7274",
+      "Cd[4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 1] Se[4, 3]",
+      "edges=22",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k2p5:retained": [
+    [
+      "Cd7Cl10Se2",
+      "e9ec4772c671e0e9a9a7fc456bd7f92a",
+      "Cd[4, 4, 4, 4, 4, 4, 4] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4]",
+      "edges=28",
+      "shared_occupied_neighbor=8,shared_vacant_cif_site=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p0:retained": [
+    [
+      "Cd3Se3",
+      "06640eb4c45bbe343d7bdfb67e69cd21",
+      "Cd[2, 2, 1] Se[2, 2, 1]",
+      "edges=5",
+      "none",
+      "status=retained",
+      "reason=minimum_cn_shortfall"
+    ]
+  ],
+  "k3p1:retained": [
+    [
+      "Cd4Cl2Se3",
+      "fbb62199a33298471ee3bdfee3f1a171",
+      "Cd[3, 3, 3, 2] Cl[2, 2] Se[3, 2, 2]",
+      "edges=11",
+      "shared_occupied_neighbor=2",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p2:retained": [
+    [
+      "Cd5Cl4Se3",
+      "1ac96e8786a8c7c3a0a62ecc47a150dd",
+      "Cd[4, 3, 3, 3, 3] Cl[2, 2, 2, 2] Se[3, 3, 2]",
+      "edges=16",
+      "shared_occupied_neighbor=3,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl4Se3",
+      "588d0d6eba298cf371ba3a50c41e0110",
+      "Cd[4, 3, 3, 3, 3] Cl[2, 2, 2, 2] Se[3, 3, 2]",
+      "edges=16",
+      "shared_occupied_neighbor=3,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl4Se3",
+      "5fb38151285d5f7771221f5c10869c2c",
+      "Cd[4, 3, 3, 3, 3] Cl[2, 2, 2, 2] Se[3, 3, 2]",
+      "edges=16",
+      "shared_occupied_neighbor=3,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd5Cl4Se3",
+      "caf96d4543bf82796d916ed23b43d44a",
+      "Cd[4, 3, 3, 3, 3] Cl[2, 2, 2, 2] Se[3, 3, 2]",
+      "edges=16",
+      "shared_occupied_neighbor=3,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p3:retained": [
+    [
+      "Cd6Cl6Se3",
+      "7ee27715f2e03c6d9193b403257f6dd4",
+      "Cd[4, 4, 4, 3, 3, 3] Cl[2, 2, 2, 2, 2, 2] Se[3, 3, 3]",
+      "edges=21",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p4:retained": [
+    [
+      "Cd7Cl8Se3",
+      "23d84b974cdc4c9d2e4fbc1380c4eb4a",
+      "Cd[4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=26",
+      "shared_occupied_neighbor=7,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd7Cl8Se3",
+      "70ddfc6c444fdbe8f653fc7cb32f0e6a",
+      "Cd[4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=26",
+      "shared_occupied_neighbor=7,shared_vacant_cif_site=1",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p5:retained": [
+    [
+      "Cd8Cl10Se3",
+      "32e0301a510f5b4016b52ee48d564ff1",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd8Cl10Se3",
+      "768d6ee96ca41a41fb7f3e96952d1688",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd8Cl10Se3",
+      "92d9a17dcdc85ff5f45c5d591ab2b4ba",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd8Cl10Se3",
+      "a3108de95d6915d7eff3555c4fdd202b",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd8Cl10Se3",
+      "be696530e6ce04dc44fb539ce10ee51e",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd8Cl10Se3",
+      "d03e9969a1402cc44fd3132b8616b4df",
+      "Cd[4, 4, 4, 4, 4, 4, 3, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 3, 3]",
+      "edges=30",
+      "shared_occupied_neighbor=5,shared_vacant_cif_site=5",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p6:retained": [
+    [
+      "Cd9Cl12Se3",
+      "3caae98b1ae5b9f4610d47acad6a7e41",
+      "Cd[4, 4, 4, 4, 4, 4, 4, 4, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4, 3]",
+      "edges=35",
+      "shared_occupied_neighbor=8,shared_vacant_cif_site=4",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd9Cl12Se3",
+      "bd80aa26a6d52b932d8a121eec43911d",
+      "Cd[4, 4, 4, 4, 4, 4, 4, 4, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4, 3]",
+      "edges=35",
+      "shared_occupied_neighbor=8,shared_vacant_cif_site=4",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd9Cl12Se3",
+      "fcaa670da97b56002da039cd99fd44eb",
+      "Cd[4, 4, 4, 4, 4, 4, 4, 4, 3] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4, 3]",
+      "edges=35",
+      "shared_occupied_neighbor=8,shared_vacant_cif_site=4",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ],
+  "k3p7:retained": [
+    [
+      "Cd10Cl14Se3",
+      "20f21d6360615bdc7c7dd640bff44904",
+      "Cd[4, 4, 4, 4, 4, 4, 4, 4, 4, 4] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4, 4]",
+      "edges=40",
+      "shared_occupied_neighbor=11,shared_vacant_cif_site=3",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ],
+    [
+      "Cd10Cl14Se3",
+      "f271aaf4d6f3c03b02d334e8b911a793",
+      "Cd[4, 4, 4, 4, 4, 4, 4, 4, 4, 4] Cl[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] Se[4, 4, 4]",
+      "edges=40",
+      "shared_occupied_neighbor=10,shared_vacant_cif_site=3",
+      "status=retained",
+      "reason=min_cn_compliant"
+    ]
+  ]
+}

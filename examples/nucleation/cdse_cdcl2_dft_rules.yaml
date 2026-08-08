@@ -1,0 +1,66 @@
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+# The COUNTERFACTUAL to cdse_cdcl2.yaml: same system with the bridging rule
+# switched OFF (min_bridged_host_cn: 1), i.e. the library default before the DFT
+# evidence came in.  Kept runnable so the two answers can be diffed:
+#
+#   nc-builder examples/nucleation/cdse_cdcl2.yaml           -o /tmp/nuc_rule
+#   nc-builder examples/nucleation/cdse_cdcl2_dft_rules.yaml -o /tmp/nuc_norule
+#
+# Raise kmax to 2 in both to see the bin that decides it.  At k=2 p=3 this file
+# retains one 18-edge Cd[2,4,4,4,4] Se[2,4] structure; cdse_cdcl2.yaml retains a
+# four-member Se[3,3] family whose members were relaxed by DFT and fall within
+# 0.87 kcal/mol of each other.  The extra bond here is bought by stranding a Cd
+# and an Se at CN 2.
+nucleation:
+  kmax: 1
+
+  # Rank on the inorganic framework alone, so bridges stop buying rank.  This is
+  # an independent way to reach the same k=2 p=3 family, but it contradicts the
+  # k=1 p=1 relaxation (it keeps the bridged Cd[2,3] there), so "all" stays the
+  # default and min_bridged_host_cn carries the chemistry instead.
+  bond_count_scope: all
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        # 1 = unrestricted, the pre-DFT default.  cdse_cdcl2.yaml sets 3.
+        min_bridged_host_cn: 1

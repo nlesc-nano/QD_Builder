@@ -6,9 +6,15 @@ import numpy as np
 from numpy.typing import NDArray
 from collections import Counter
 
-def write_xyz(path: str, symbols: List[str], pts: NDArray[np.float64]) -> None:
+def write_xyz(
+    path: str,
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    *,
+    comment: str | None = None,
+) -> None:
     with open(path, "w") as fh:
-        fh.write(f"{len(symbols)}\n{os.path.basename(path)}\n")
+        fh.write(f"{len(symbols)}\n{comment or os.path.basename(path)}\n")
         for s, (x, y, z) in zip(symbols, pts):
             fh.write(f"{s} {x:.6f} {y:.6f} {z:.6f}\n")
 

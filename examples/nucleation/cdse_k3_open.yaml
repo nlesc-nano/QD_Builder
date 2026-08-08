@@ -1,0 +1,60 @@
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+# Open-rich map for DFT comparison against cdse_k3_closed.yaml.
+# Same chemistry; core growth does NOT prefer 6-ring closure, so branched
+# lattice animals remain.  Use scripts/export_ring_comparison.py on the two
+# bundles after generation.
+nucleation:
+  kmax: 3
+  mode: guided
+  exact_through_k: 3
+  core_growth_policy: all
+  compact_from_k: 3
+  passivation_ring_policy: none
+  # Keep discarded isomers through k=3: retained winners are almost always
+  # compact (many Cd–Se 6-rings).  Open DFT candidates come from discarded.
+  discarded_through_k: 3
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        # Cl 4-rings come from latent bridges; keep the DFT-backed host floor.
+        min_bridged_host_cn: 3

@@ -1,0 +1,107 @@
+cif: ../../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Broad equilibrium calibration through k=6.
+  #
+  # This is intentionally not a literal exact decorated enumeration: the
+  # exact k=3 calculation already shows that the ligand subset space becomes
+  # combinatorial.  Instead, core growth remains unrestricted and the search
+  # retains a wide score band, a 64-skeleton beam, and several ligand shells
+  # per skeleton.  Chemical potentials are applied only after DFT labeling.
+  kmax: 6
+  mode: guided
+
+  # Explore all skeletons through k=3.  For k=3 -> 4 and later growth, use a
+  # broad set of retained core parents.  The separate exact-k3 run is the
+  # audit of ligand-shell completeness at the small-size boundary.
+  exact_through_k: 3
+  retain_score_layers: 4
+  retain_max_per_bin: 24
+  # In bare/redecorated growth, identical retained shells are collapsed to
+  # their unique inorganic cores; propagate every such retained core.
+  growth_max_parents_per_bin: 0
+
+  # Keep several passivation alternatives for each skeleton whenever the
+  # orbit-enumeration problem is small enough.  For larger assignment spaces,
+  # the guided incumbent prevents the generator from blowing up.
+  shells_per_skeleton: 8
+  shell_score_layers: 4
+  shells_per_score_layer: 2
+  shell_enum_max_assignments: 5000
+
+  # Do not impose compact-ring growth in this calibration run.  Compact and
+  # ring-closed structures are ranked favourably, but open controls remain
+  # available so DFT can tell us when ring closure becomes effectively
+  # universal.  The beam starts only at k=4.
+  core_growth_policy: all
+  compact_from_k: 5
+  p_skeleton_beam: 64
+  p_beam_from_k: 4
+  p_beam_rank: fused_rings
+  fused_chair_from_k: 6
+  fused_chair_mode: rank
+
+  # Rebuild the ligand shell independently at every (k,p): this is the
+  # equilibrium channel.  Walk the full neutral p ladder up to the hard
+  # coordination capacity; do not impose concentration-dependent coverage.
+  core_growth_occupation: bare
+  continuous_decoration: false
+  monomer_p_values: [0]
+  parent_p_mode: all_retained
+  p_ladder_mode: inherited_plus
+  p_surf_beta: 0.0
+  k_growth_max_shed: 0
+  k_growth_max_add: -1
+
+  # Ring preference acts only within the top coordination-score layer.  The
+  # three lower retained layers remain controls rather than being ring-filtered.
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+
+  # Save all rejected structures only through k=3.  At k=4-6 the counts and
+  # audit metadata are kept, but writing every rejected XYZ would be excessive.
+  discarded_through_k: 3
+  bond_count_scope: all
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

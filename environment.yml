@@ -1,14 +1,47 @@
-name: nc-builder
+
+# =============================================================================
+# QD_Builder / nucleation -- single self-contained environment.
+#
+#   micromamba create -f environment.yml -y
+#   micromamba activate qd-builder
+#   pip install -e .
+#
+# Everything the nucleation map needs lives here, including xTB.  With xtb and
+# ase in this environment you can leave `relaxation.python` out of the run pack
+# and the relaxation runs in-process instead of shelling out to a second env.
+#
+# Pins are lower bounds except python, which is pinned to a minor version so a
+# cluster rebuild reproduces the same solve.
+# =============================================================================
+name: qd-builder
+
 channels:
   - conda-forge
+
 dependencies:
-  - python>=3.9
-  - numpy
-  - scipy>=1.11
-  - pyyaml
+  - python=3.11
+
+  # --- core: graph enumeration, embedding, geometry packs -------------------
+  - numpy>=1.24
+  - scipy>=1.11              # least_squares -> motif reconstruction
+  - networkx>=3.0            # graphs, isomorphism, cycle bases
+  - pyyaml>=6.0              # run packs and geometry packs
+
+  # --- crystal / cheminformatics (Wulff + surface passivation paths) --------
   - pymatgen>=2023.7
-  - rdkit
+  - rdkit>=2023.03
+
+  # --- semi-empirical relaxation -------------------------------------------
+  # xtb-python exposes GFN1/GFN2 to ASE; the xtb binary is the CLI fallback.
+  - xtb>=6.6
+  - xtb-python>=22.1
+  - ase>=3.22
+
+  # --- analysis of run outputs (tools/ and scripts/) ------------------------
+  - pandas>=2.0
+  - matplotlib-base>=3.7
+
+  # --- test suite -----------------------------------------------------------
+  - pytest>=7.4
+
   - pip
-  - pip:
-      # editable install of THIS repo (requires you've cloned it first)
-      - -e .

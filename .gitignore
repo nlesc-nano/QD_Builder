@@ -55,3 +55,15 @@ examples/out/*
 /*.zip
 cache/
 size_cell_scan/
+
+# Nucleation run outputs (regenerable; can reach GBs on a cluster)
+runs/
+analysis/
+*.traj
+*.mdrestart
+gfnff_topo
+gfnff_adjacency
+
+# Scheduler artefacts
+slurm-*.out
+*.slurm.log

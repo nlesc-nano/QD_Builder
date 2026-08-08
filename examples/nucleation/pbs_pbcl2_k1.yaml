@@ -1,0 +1,61 @@
+# Rock-salt IV–VI smoke: PbS + PbCl2 packages (kmax=1).
+# CN6 bulk from the CIF; preferred rings length 4; no ZB terminal motif table.
+# Graph rules are starting guesses — not DFT-calibrated for PbS/PbCl2.
+cif: ../cifs/PbS.cif
+
+charges:
+  Pb: +2
+  S: -2
+  Cl: -1
+
+nucleation:
+  kmax: 1
+  mode: exact
+  core_growth_policy: all
+  passivation_ring_policy: none
+  discarded_through_k: 1
+
+  lattice_policy:
+    inorganic_ring_length: 4
+    geometry_defaults: none
+  surface_geometry:
+    terminal_motifs: none
+
+  core_monomer:
+    cation: Pb
+    anion: S
+  precursor:
+    center: Pb
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.25
+
+  geometry_rules:
+    Pb:
+      cn2: linear
+      cn4: tetrahedral
+      cn6: octahedral
+    S:
+      all: octahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Pb: 2
+      S: 2
+      Cl: 1
+    max_cn:
+      Pb: 6
+      S: 6
+      Cl: 2
+    allowed_bonds:
+      - [Pb, S]
+      - [Pb, Cl]
+    bridging:
+      Cl:
+        host: Pb
+        shared_neighbor: S
+        surface_angle_deg: 90.0
+        # Off until DFT: rock-salt bridges need separate calibration.
+        min_bridged_host_cn: 1

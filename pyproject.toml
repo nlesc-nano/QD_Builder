@@ -13,11 +13,21 @@ authors = [
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
-  "numpy",
+  "numpy>=1.24",
+  "networkx>=3.0",
   "scipy>=1.11",
-  "pyyaml",
+  "pyyaml>=6.0",
   "pymatgen>=2023.7"
 ]
+
+[project.optional-dependencies]
+# Semi-empirical relaxation.  Installable from conda-forge (see
+# environment.yml); the pip names exist but xtb-python builds from source,
+# so conda/micromamba is strongly preferred on a cluster.
+xtb = ["ase>=3.22", "xtb>=22.1"]
+# Post-run analysis in tools/ and scripts/.
+analysis = ["pandas>=2.0", "matplotlib>=3.7"]
+test = ["pytest>=7.4"]
 
 [project.scripts]
 nc-builder = "builder.main:main"
@@ -27,4 +37,3 @@ where = ["src"]
 
 [tool.setuptools]
 include-package-data = true
-

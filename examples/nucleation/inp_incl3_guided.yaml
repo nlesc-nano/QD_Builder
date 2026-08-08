@@ -1,0 +1,58 @@
+# InP / InCl3 nucleation smoke test (zinc-blende, same graph machinery as CdSe).
+# Charges +3/-3; precursor InCl3 (ligand_count: 3). Compact chair growth from k=3.
+# Bridging and min_cn are starting guesses — not DFT-calibrated for III-V.
+cif: ../cifs/InP_zb.cif
+
+charges:
+  In: +3
+  P: -3
+  Cl: -1
+
+nucleation:
+  kmax: 2
+  mode: guided
+  exact_through_k: 3
+  core_growth_policy: compact_ring
+  compact_from_k: 3
+  passivation_ring_policy: none
+  discarded_through_k: 2
+  surface_geometry:
+    terminal_motifs: none
+
+  core_monomer:
+    cation: In
+    anion: P
+  precursor:
+    center: In
+    ligand: Cl
+    ligand_count: 3
+  site_tolerance: 0.20
+
+  geometry_rules:
+    In:
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    P:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    # In(III) CN=2 is chemically rare; start stricter than Cd.
+    min_cn:
+      In: 3
+      P: 2
+      Cl: 1
+    max_cn:
+      In: 4
+      P: 4
+      Cl: 2
+    allowed_bonds:
+      - [In, P]
+      - [In, Cl]
+    bridging:
+      Cl:
+        host: In
+        shared_neighbor: P
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

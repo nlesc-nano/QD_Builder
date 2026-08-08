@@ -1,0 +1,22 @@
+{
+  "nucleation.log": "4e86646bab4b360e41b2aa5bb0058819d57654116591fcc2e4340a7c66bd01d3",
+  "registry.json": "2501facaec3457444d9935e8ca21ef5b4c4edbed59e4fa94b1534aeb28296ec7",
+  "structures/k001/p000/retained/k001_p000_retained_iso0001_construction_native.xyz": "5ba0c0cf0e6611f92e1fb7862778f2464838119ce6547854e22c2f1b43e2894c",
+  "structures/k001/p000/retained/k001_p000_retained_iso0001_surface.xyz": "dc14f5cf9ac4ce9813146fc5f8b94c9ed25423eff3ddacdeea5ce2cbf60f7305",
+  "structures/k001/p001/discarded/k001_p001_discarded_iso0001_construction_native.xyz": "2cf98b90d584d9a99759a99d4736db974743d5a3768a2ea64177aebcbd4766db",
+  "structures/k001/p001/retained/k001_p001_retained_iso0001_construction_native.xyz": "3ddfb6b9cf33e6bc34a37aa92d7c7f286aa723d7f9100546e040aa02a4a2ad88",
+  "structures/k001/p001/retained/k001_p001_retained_iso0001_surface.xyz": "53fdf3a8aa46a5cf76069626a1cc83e6e64b93cce071f9e4b91050f9834f839a",
+  "structures/k001/p002/discarded/k001_p002_discarded_iso0001_construction_native.xyz": "100af8e580ce91d9cf0968755d10541a21c97be8b5ebdb83b38a0d96c304ea4a",
+  "structures/k001/p002/discarded/k001_p002_discarded_iso0002_construction_native.xyz": "169a8cc0250252d8ee79f683bcc36b6e3e15d08dde924f845f335f1d1bb37ada",
+  "structures/k001/p002/discarded/k001_p002_discarded_iso0003_construction_native.xyz": "58bed2813ff8659e9e2b7ce9aec2b8646e3648c14eb10a11c110893fc240e370",
+  "structures/k001/p002/retained/k001_p002_retained_iso0001_construction_native.xyz": "a8af4ce39e6ee9b7bd23417ed29aa8b94d7a375f7dbde1b6dd9b426ab66e1e1d",
+  "structures/k001/p002/retained/k001_p002_retained_iso0001_surface.xyz": "c9ea93f4fa62100631fe3e8cd973bb77a133d69d2faa1670459b08956e7934a2",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0001_construction_native.xyz": "4a63fbd55987a4e496758f846a9497bdf7116dcc8541b4f083d0f978ed21f3fa",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0002_construction_native.xyz": "c29a941781b69f33d649f98d6e64136c69c419e8e9ebf67a5102dd2c29ac901b",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0003_construction_native.xyz": "1fd74e4df856456befefb74ada91811c640bce78de70f8adfb421d7f38602470",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0004_construction_native.xyz": "13704029d280afb0be76d44928814e67eb5fe62e0e265c28f43d35e3eda068db",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0005_construction_native.xyz": "6e05aff135d450e1c57104cb76fb6883df8fba5c8370cb72a81adc65f605dcc5",
+  "structures/k001/p003/discarded/k001_p003_discarded_iso0006_construction_native.xyz": "d13067e5951d75c4277b9e54d5827b3ae74e0df9336e4dbbdfa1e75484631963",
+  "structures/k001/p003/retained/k001_p003_retained_iso0001_construction_native.xyz": "c214b18530f7c7aea6442972eb3cd4e6860171beb993febbefd5e065cc0a71e9",
+  "structures/k001/p003/retained/k001_p003_retained_iso0001_surface.xyz": "9d556d64ae4ecf1f53c77ebfc881720765f600bed78001e6e41419f52f635d28"
+}

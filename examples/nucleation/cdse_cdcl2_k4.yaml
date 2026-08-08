@@ -1,0 +1,77 @@
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+# Reaching k=4.  Exact enumeration does not get here -- the p axis within the
+# k=4 row blows up (unique_bases > 100k), so this recipe gives up completeness in
+# two named, independent places.  Both are recorded in registry.json under
+# "completeness" and banner-warned in nucleation.log; nothing here is silent.
+nucleation:
+  kmax: 4
+
+  # KNOB 1 -- skeleton axis.  Grow k=1,2,3 from every unique skeleton, then from
+  # k=3 onward carry forward only the deduplicated cores of *retained* records.
+  # This is the "bring along only the retained structures" rule.  Distinct
+  # skeletons measured 4 / 14 / 243 at k=1/2/3 while retained stayed flat, so
+  # without this the k=4 row is unreachable.
+  exact_through_k: 3
+
+  # KNOB 2 -- ligand axis.  One ligand shell per skeleton, placed in the
+  # passivation module's repair order (a bridging site first, since one Cl there
+  # makes two bonds, then the most undercoordinated Cd).  Symmetry-distinct
+  # ligand arrangements on the same skeleton are NOT enumerated.
+  #
+  # Measured cost at k<=3: 30 retained vs 41 exact.  The loss is concentrated in
+  # k2p4 (9 -> 2) and k3p5 (6 -> 3); the two bins checked by DFT so far, k2p3 and
+  # k3p2, are unaffected (4 -> 4 in both).
+  #
+  # Set to "exact" to keep ligand isomers and narrow only the skeleton axis --
+  # strictly more complete, and worth trying first if it finishes.  DFT at
+  # k=2 p=3 found the low-energy structures to be a near-degenerate set spanning
+  # under 3 kcal/mol, which is exactly the diversity this knob discards.
+  mode: guided
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        # DFT-backed, and the shipped default -- see cdse_cdcl2.yaml.  Known
+        # weakness: at k=2 p=3 it excludes an 18-bond structure that relaxes
+        # 1.1 kcal/mol below anything it keeps (inside DFT error, but excluded
+        # outright, so that branch does not propagate).  Set to 1 to compare.
+        min_bridged_host_cn: 3
