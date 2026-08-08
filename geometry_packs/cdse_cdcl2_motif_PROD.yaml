@@ -1,5 +1,5 @@
 # Compact motif run pack; the detailed bridge-first geometry is imported below.
-cif: CdSe_zb.cif
+cif: ../examples/cifs/CdSe_zb.cif
 charges: {Cd: 2, Se: -2, Cl: -1}
 nucleation:
   kmax: 3
@@ -27,15 +27,18 @@ graph_rules:
   # Soft bridge load.  THIS bounds load, not the hard cap; 3 cuts mean terminal
   # Cl 2.99 -> 1.82 at k3p4 and keeps the k3p3 minimum family intact.
   bridge_first_prefer_bridges_per_cd: 3
-  # Compactness pre-filter, relative to each bin's most compact graph.
-  # Adapts to the bin: keeps ~91% where Wiener barely varies (k=2) and ~41%
-  # where it does (k3p3).  Over nine bins t=0.10 loses the bin energy minimum
-  # once; a top-20% rank cut loses it four times.
+  # Compactness pre-filter: keep graphs within this relative Wiener excess of
+  # the bin's own most compact graph.  Adapts to the bin -- it barely prunes
+  # where the Wiener spread is narrow (and the descriptor is uninformative)
+  # and bites where it is wide.  Measured over nine bins with xTB energies:
+  #   0.20 -> 0/9 bins lose their energy minimum;  k<=4 keeps 3964 of 4545
+  #   0.10 -> 1/9 lose it;                          k<=4 keeps 2209
+  #   a top-20% RANK cut -> 4/9 lose it (do not use a fixed fraction)
+  # k=4 has no energies yet, so its retention is an extrapolation of the rule.
   selection_order: compactness
-  selection_max_wiener_excess: 0.10
+  selection_max_wiener_excess: 0.20
   decoration_mode: motif_bridge_first
   bridge_first_hard_max_bridges_per_cd: 2
-  bridge_first_prefer_bridges_per_cd: 3
   max_shared_ligands_per_host_pair: 1
   min_bridged_host_cn: 3
   forbid_mono_se_dual_terminal: true
