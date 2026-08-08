@@ -252,6 +252,79 @@ def max_bridges_per_host_pair(state: _State, spec: NucleationSpec) -> int:
     return max(counts.values()) if counts else 0
 
 
+def _has_cycle_of_length(graph: "nx.Graph", length: int, want: int) -> bool:
+    """Whether ``graph`` holds at least ``want`` distinct cycles of ``length``.
+
+    Stops as soon as the quota is met, so a gate costs far less than a full
+    census; only a rejected graph pays for the whole search.
+    """
+
+    if want <= 0:
+        return True
+    seen: set = set()
+    for start in graph.nodes():
+        stack = [(start, [start])]
+        while stack:
+            current, path = stack.pop()
+            if len(path) == length:
+                if graph.has_edge(current, start):
+                    seen.add(
+                        frozenset(
+                            frozenset((path[i], path[(i + 1) % length]))
+                            for i in range(length)
+                        )
+                    )
+                    if len(seen) >= want:
+                        return True
+                continue
+            for neighbor in graph.neighbors(current):
+                # ``start`` is the smallest node of any cycle it reports, so
+                # each cycle is discovered from exactly one root.
+                if neighbor in path or neighbor < start:
+                    continue
+                stack.append((neighbor, path + [neighbor]))
+    return False
+
+
+def required_ring_violations(
+    state: _State, spec: NucleationSpec
+) -> List[str]:
+    """Enforce ``graph_rules.required_rings`` -- rings a graph *must* contain.
+
+    ``min_ring_size`` forbids rings that are too small; this is the opposite
+    gate, and it is what bounds the combinatorics at large k.  Eight-rings
+    (Cd4X4 macrocycles) were the most consistent stability correlate measured
+    across k=2 bins, so demanding one from k>=4 removes the open, floppy
+    frameworks before they are ever decorated::
+
+        graph_rules:
+          required_rings:
+            - {size: 8, min_count: 1, from_k: 4}
+
+    ``from_k`` makes the gate apply only at or above that core size, leaving
+    the small bins exhaustive.  Rings are counted on the *whole* graph, so
+    ligand-containing macrocycles count -- that is what was measured.
+    """
+
+    rules = getattr(spec.graph_rules, "required_rings", None) or ()
+    if not rules:
+        return []
+    anion = spec.core.anion
+    k = sum(1 for atom in state.atoms if atom.symbol == anion)
+    violations: List[str] = []
+    for rule in rules:
+        size = int(rule.get("size", 0))
+        if size < 3:
+            continue
+        from_k = int(rule.get("from_k", 0))
+        if k < from_k:
+            continue
+        want = int(rule.get("min_count", 1))
+        if not _has_cycle_of_length(state.graph, size, want):
+            violations.append(f"missing_required_ring:{size}x{want}:k{k}")
+    return violations
+
+
 def molecular_graph_violations(
     state: _State,
     spec: NucleationSpec,
@@ -320,6 +393,7 @@ def molecular_graph_violations(
             violations.append("inorganic_empty")
 
     violations.extend(ring_size_violations(state, spec))
+    violations.extend(required_ring_violations(state, spec))
 
     # H6 bridges per Cd–Cd pair
     if bridge_cap > 0:

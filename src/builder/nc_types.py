@@ -423,6 +423,11 @@ class NucleationGraphRules:
     #: Relaxed structures show 3 bridging Cl on one Cd is common, so raising
     #: this to 3 is the knob for reaching them.
     bridge_first_prefer_bridges_per_cd: int = 2
+    #: Rings a graph MUST contain, e.g.
+    #: ``[{"size": 8, "min_count": 1, "from_k": 4}]``.  The inverse of
+    #: ``min_ring_size``: this gate is what bounds the combinatorics at large
+    #: k, where exhaustive enumeration stops being affordable.
+    required_rings: Tuple[Dict[str, int], ...] = ()
     # When true, a Cd attached to a μ3 Cl cap may not participate in another
     # μ2/μ3 Cl bridge.  Terminal Cl remains allowed on that Cd.
     forbid_mu3_host_bridge_overlap: bool = False
