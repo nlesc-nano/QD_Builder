@@ -423,6 +423,15 @@ class NucleationGraphRules:
     #: Relaxed structures show 3 bridging Cl on one Cd is common, so raising
     #: this to 3 is the knob for reaching them.
     bridge_first_prefer_bridges_per_cd: int = 2
+    #: Above this many core automorphisms the beam keys states by identity
+    #: instead of canonicalizing over the whole group.  |Aut| grows
+    #: factorially in symmetry-equivalent precursor cations (mean 8388 at
+    #: k=4 p=9), and canonicalization is O(|Aut|) per state.  0 disables the
+    #: cap.  Emitted graphs are deduplicated by certificate either way, so the
+    #: cap never admits a duplicate *graph* -- only duplicate beam states,
+    #: which cost diversity.  Measured at k=4: 2048 leaves p6/p7 counts exact
+    #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 but drops ~7% of p7.
+    bridge_first_max_automorphisms: int = 2048
     #: Rings a graph MUST contain, e.g.
     #: ``[{"size": 8, "min_count": 1, "from_k": 4}]``.  The inverse of
     #: ``min_ring_size``: this gate is what bounds the combinatorics at large

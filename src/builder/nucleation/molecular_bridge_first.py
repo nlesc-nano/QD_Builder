@@ -307,6 +307,25 @@ def sequential_passivate(
     # the common case once k grows, and it skips the whole relabelling.
     identity_only = len(slot_maps) == 1 and slot_maps[0] == tuple(range(n_cd))
 
+    # Canonicalizing a state costs O(|Aut| . n log n), and |Aut| grows
+    # factorially in the number of symmetry-equivalent precursor cations: it
+    # reaches a mean of 8388 (max 31104) at k=4 p=9, where a single bin spent
+    # 1541 s in decoration with 92% of that inside state_key.  Above the cap we
+    # key by identity instead.  That admits symmetry-duplicate *beam states* --
+    # it never admits a duplicate graph, because emitted graphs are
+    # deduplicated by isomorphism certificate downstream regardless.  The cost
+    # is beam slots spent on equivalent states, so the cap trades a little
+    # diversity for a large constant factor exactly where the group explodes.
+    aut_cap = int(
+        getattr(spec.graph_rules, "bridge_first_max_automorphisms", 0) or 0
+    )
+    if aut_cap > 0 and len(slot_maps) > aut_cap:
+        if status is not None:
+            status.automorphism_cap_hits = (
+                getattr(status, "automorphism_cap_hits", 0) + 1
+            )
+        identity_only = True
+
     def _identity_key(st: _PlaceState) -> Tuple:
         """Key for an asymmetric skeleton: no relabelling to apply.
 

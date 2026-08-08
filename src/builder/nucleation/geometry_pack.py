@@ -426,6 +426,9 @@ class GeometryPack:
                 self.graph_rules.get("bridge_first_prefer_bridges_per_cd", 2)
             ),
             "required_rings": self.graph_rules.get("required_rings") or [],
+            "bridge_first_max_automorphisms": int(
+                self.graph_rules.get("bridge_first_max_automorphisms", 2048)
+            ),
             "forbid_mu3_host_bridge_overlap": bool(
                 self.graph_rules.get("forbid_mu3_host_bridge_overlap", False)
             ),
