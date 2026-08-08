@@ -6234,7 +6234,13 @@ def enumerate_molecular_bin(
         dump_failures=dump_failures,
         collect_only=bool(
             target_isomers
-            or float(getattr(spec.graph_rules, "selection_top_fraction", 0.0) or 0.0) > 0.0
+            or float(
+                getattr(spec.graph_rules, "selection_top_fraction", 0.0) or 0.0
+            ) > 0.0
+            or float(
+                getattr(spec.graph_rules, "selection_max_wiener_excess", 0.0)
+                or 0.0
+            ) > 0.0
         ) and embed,
     )
 
@@ -6760,11 +6766,9 @@ def enumerate_molecular_bin(
         fraction = float(
             getattr(spec.graph_rules, "selection_top_fraction", 0.0) or 0.0
         )
-        if fraction > 0.0 and pool:
-            budget = max(1, int(-(-len(pool) * min(fraction, 1.0) // 1)))
-            target_isomers = budget if not target_isomers else min(
-                target_isomers, budget
-            )
+        excess_cap = float(
+            getattr(spec.graph_rules, "selection_max_wiener_excess", 0.0) or 0.0
+        )
         if order_mode == "compactness" and pool:
             def _compactness(entry):
                 graph = entry[1].graph
@@ -6772,7 +6776,28 @@ def enumerate_molecular_bin(
                     return float("inf")
                 return float(nx.wiener_index(graph))
 
-            ranked = sorted(range(len(pool)), key=lambda i: _compactness(pool[i]))
+            scores = [_compactness(entry) for entry in pool]
+            finite = [v for v in scores if v < float("inf")]
+            # A relative cut against the bin's own most compact graph.  Unlike
+            # a fixed rank it adapts to the spread: where the Wiener range is
+            # narrow the descriptor carries no information and almost nothing
+            # is dropped, and where it is wide the cut bites.
+            if excess_cap > 0.0 and finite:
+                best = min(finite)
+                allowed = sum(
+                    1 for v in scores if v <= best * (1.0 + excess_cap)
+                )
+                target_isomers = (
+                    allowed if not target_isomers
+                    else min(target_isomers, allowed)
+                )
+            if fraction > 0.0:
+                budget = max(1, -(-len(pool) * 1000 // 1000))
+                budget = max(1, int(len(pool) * min(fraction, 1.0) + 0.999))
+                target_isomers = (
+                    budget if not target_isomers else min(target_isomers, budget)
+                )
+            ranked = sorted(range(len(pool)), key=lambda i: scores[i])
             if progress is not None:
                 progress(
                     f"    selection: compactness rank cut, pool={len(pool)} "

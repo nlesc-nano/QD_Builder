@@ -118,7 +118,9 @@ graph_rules:
 
   # --- selection ----------------------------------------------------------
   selection_order: compactness         # or bond_bands (historical default)
-  selection_top_fraction: 0.25         # keep this fraction of each bin's pool
+  selection_max_wiener_excess: 0.10    # PREFERRED: relative to the bin's own
+                                       # most compact graph
+  # selection_top_fraction: 0.25       # fixed rank cut -- see warning below
 
   # --- optional gates -----------------------------------------------------
   required_rings:                      # rings a graph MUST contain
@@ -134,11 +136,34 @@ the most compact `selection_top_fraction`. Compactness tracks relative energy
 at rho +0.32 to +0.78 across measured bins; keeping the top 70% retains ~89%
 of each bin's best decile, top 50% retains ~80%.
 
-It is a **rank** cut, not an absolute threshold. The raw scores shift between
-bins, so a fixed cut empties some bins while leaving others untouched.
+### Use `selection_max_wiener_excess`, not `selection_top_fraction`
 
-Measured at k3p3: pool 186 -> 47 reconstructions at `selection_top_fraction:
-0.25`.
+A fixed rank cut prunes the same fraction everywhere, which is wrong: the
+Wiener spread within a bin ranges from 10% (k=2, where the descriptor carries
+almost no information) to 39% (k3p3, where it discriminates). Worse, the bin's
+lowest-*energy* structure is often not compact -- it sits at the 95th
+compactness percentile in one bin and the 69th in another.
+
+Measured over nine bins with known energies:
+
+| cut | bins losing the bin energy minimum |
+|---|---|
+| top 20% by rank | **4 / 9** |
+| top 30% | 3 / 9 |
+| top 50% | 3 / 9 |
+| top 70% | 2 / 9 |
+| excess <= 0.05 | 3 / 9 |
+| **excess <= 0.10** | **1 / 9** |
+| excess <= 0.20 | 0 / 9 |
+
+The relative cut adapts: at 0.10 it keeps 91-94% of the k=2 bins (nothing to
+gain there) and 41-53% of the k=3 bins (where it pays). Verified end to end:
+k3p3 186 -> 76 and k3p4 205 -> 108 at 0.10; 186 -> 17 at 0.05; 186 -> 163 at
+0.20.
+
+The one bin that still loses its minimum at 0.10 has its energy minimum at
+excess 0.154 -- genuinely among the least compact graphs in that bin. No
+compactness cut can retain it, so treat ~1-in-9 as the accuracy budget.
 
 ### Gates that did not work
 
