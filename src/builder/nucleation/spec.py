@@ -643,6 +643,10 @@ def load_nucleation_spec(
                 selection_top_fraction=float(
                     graph_rules_raw.get("selection_top_fraction", 0.0) or 0.0
                 ),
+                selection_max_wiener_excess=float(
+                    graph_rules_raw.get("selection_max_wiener_excess", 0.0)
+                    or 0.0
+                ),
                 required_rings=_parse_required_rings(
                     graph_rules_raw.get("required_rings")
                 ),

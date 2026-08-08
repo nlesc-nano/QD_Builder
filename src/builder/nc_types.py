@@ -447,6 +447,16 @@ class NucleationGraphRules:
     #: absolute threshold: the underlying scores shift between bins, so a fixed
     #: cut empties some bins and leaves others untouched.
     selection_top_fraction: float = 0.0
+    #: Keep candidates whose Wiener index is within this *relative excess* of
+    #: the bin's most compact graph: (W - W_min) / W_min <= value.  0 disables.
+    #: Preferred over ``selection_top_fraction``, which is a fixed rank and so
+    #: prunes hardest exactly where compactness carries least information.  A
+    #: relative cut adapts to the bin's own spread: it keeps ~91% of a k=2 bin
+    #: (Wiener spread only 10%, so the descriptor is uninformative there) and
+    #: ~41% of k3p3 (spread 39%, where it discriminates).  Measured over nine
+    #: bins, 0.10 loses the bin energy minimum once; a top-20% rank cut loses
+    #: it four times, and even top-70% still loses it twice.
+    selection_max_wiener_excess: float = 0.0
     #: Rings a graph MUST contain, e.g.
     #: ``[{"size": 8, "min_count": 1, "from_k": 4}]``.  The inverse of
     #: ``min_ring_size``: this gate is what bounds the combinatorics at large

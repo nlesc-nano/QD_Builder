@@ -440,6 +440,9 @@ class GeometryPack:
             "selection_top_fraction": float(
                 self.graph_rules.get("selection_top_fraction", 0.0) or 0.0
             ),
+            "selection_max_wiener_excess": float(
+                self.graph_rules.get("selection_max_wiener_excess", 0.0) or 0.0
+            ),
             "forbid_mu3_host_bridge_overlap": bool(
                 self.graph_rules.get("forbid_mu3_host_bridge_overlap", False)
             ),
