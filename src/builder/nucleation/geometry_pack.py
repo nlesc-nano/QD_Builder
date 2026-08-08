@@ -427,7 +427,18 @@ class GeometryPack:
             ),
             "required_rings": self.graph_rules.get("required_rings") or [],
             "bridge_first_max_automorphisms": int(
-                self.graph_rules.get("bridge_first_max_automorphisms", 2048)
+                self.graph_rules.get("bridge_first_max_automorphisms", 64)
+            ),
+            "bridge_first_maximize_bridged_pairs": bool(
+                self.graph_rules.get(
+                    "bridge_first_maximize_bridged_pairs", False
+                )
+            ),
+            "selection_order": str(
+                self.graph_rules.get("selection_order", "bond_bands")
+            ),
+            "selection_top_fraction": float(
+                self.graph_rules.get("selection_top_fraction", 0.0) or 0.0
             ),
             "forbid_mu3_host_bridge_overlap": bool(
                 self.graph_rules.get("forbid_mu3_host_bridge_overlap", False)
