@@ -1,0 +1,113 @@
+# Compact motif run pack; the detailed bridge-first geometry is imported below.
+cif: ../examples/cifs/CdSe_zb.cif
+charges: {Cd: 2, Se: -2, Cl: -1}
+nucleation:
+  kmax: 3
+  mode: exact
+  core_monomer: {cation: Cd, anion: Se}
+  precursor: {center: Cd, ligand: Cl, ligand_count: 2}
+  site_tolerance: 0.2
+schema_version: 2
+name: cdse_cdcl2_motif_gxtb
+geometry_reference: cdse_cdcl2_bridge_first_xtb.yaml
+graph_rules:
+  require_inorganic_connected: true
+  enforce_min_cn: true
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 4}
+    Cl: {min: 1, max: 3}
+  pair_rules: {Cd-Se: {bond: allowed, bond_max_distance: 3.25}, Cd-Cl: {bond: allowed, bond_max_distance: 2.90}, Cd-Cd: {bond: forbidden, min_distance: 3.00}, Se-Se: {bond: forbidden, min_distance: 3.80}, Cl-Se: {bond: forbidden, min_distance: 2.70}, Cl-Cl: {bond: forbidden, min_distance: 2.70}}
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]
+  min_ring_size: {Cd-Se: 6}
+  # ---- production settings (see INSTALL.md for the measurements) ----
+  # |Aut| cap: k4p9 goes 1541 s -> 4.7 s.  Costs ~7% of graphs at k4p7.
+  bridge_first_max_automorphisms: 64
+  # Soft bridge load.  THIS bounds load, not the hard cap; 3 cuts mean terminal
+  # Cl 2.99 -> 1.82 at k3p4 and keeps the k3p3 minimum family intact.
+  bridge_first_prefer_bridges_per_cd: 3
+  # Compactness pre-filter: keep graphs within this relative Wiener excess of
+  # the bin's own most compact graph.  Adapts to the bin -- it barely prunes
+  # where the Wiener spread is narrow (and the descriptor is uninformative)
+  # and bites where it is wide.  Measured over nine bins with xTB energies:
+  #   0.20 -> 0/9 bins lose their energy minimum;  k<=4 keeps 3964 of 4545
+  #   0.10 -> 1/9 lose it;                          k<=4 keeps 2209
+  #   a top-20% RANK cut -> 4/9 lose it (do not use a fixed fraction)
+  # k=4 has no energies yet, so its retention is an extrapolation of the rule.
+  selection_order: compactness
+  selection_max_wiener_excess: 0.20
+  decoration_mode: motif_bridge_first
+  bridge_first_hard_max_bridges_per_cd: 2
+  max_shared_ligands_per_host_pair: 1
+  min_bridged_host_cn: 3
+  forbid_mono_se_dual_terminal: true
+  forbid_mu3_host_bridge_overlap: true
+motifs:
+  Se-Cd2:
+    center: Se
+    linker: Cd
+    linker_count: 2
+    bond_A_by_linker_cn: {2: 2.5, 3: 2.5, 4: 2.54}
+    bond_tol_A: 0.08
+    angle_deg: 90.0
+    angle_tol_deg: 12.0
+  Se-Cd3:
+    center: Se
+    linker: Cd
+    linker_count: 3
+    bond_A_by_linker_cn: {2: 2.5, 3: 2.6, 4: 2.65}
+    bond_tol_A: 0.08
+    angle_deg: 90.0
+    angle_tol_deg: 12.0
+    improper_deg: 82.0
+    improper_tol_deg: 12.0
+  Se-Cd4:
+    center: Se
+    linker: Cd
+    linker_count: 4
+    bond_A_by_linker_cn: {3: 2.65, 4: 2.72}
+    bond_tol_A: 0.08
+    angle_deg: 109.5
+    angle_tol_deg: 12.0
+  Cl-Cd1:
+    center: Cl
+    linker: Cd
+    linker_count: 1
+    bond_A_by_linker_cn: {2: 2.32, 3: 2.32, 4: 2.32}
+    bond_tol_A: 0.05
+  Cl-Cd2:
+    center: Cl
+    linker: Cd
+    linker_count: 2
+    bond_A_by_linker_cn: {3: 2.54, 4: 2.54}
+    bond_tol_A: 0.08
+    angle_deg: 90.0
+    angle_tol_deg: 12.0
+  Cl-Cd3:
+    center: Cl
+    linker: Cd
+    linker_count: 3
+    bond_A_by_linker_cn: {3: 2.7, 4: 2.7}
+    bond_tol_A: 0.08
+    angle_deg: 88.0
+    angle_tol_deg: 15.0
+junctions:
+  coplanar_shared_pair:
+    - {when: {anion: Se, anion_cn: 2, ligand: Cl, ligand_cn: 2}, tol_deg: 6.0, weight: 2.0}
+reconstruction: {method: motif_factor, audit: clashes_only, factor_starts_per_graph: 1, max_nfev: 8, layout_iterations: 40, xtb_starts_per_graph: 1, overlap_min_A: 0.75, start_max_bond_error_A: 0.5}
+# g-xTB relaxation.  On the cluster the binary is on PATH and XTBPATH is
+# exported, so `binary: gxtb` alone is enough; the explicit xtb_path below is
+# for a local build.  g-xTB has no Python API, so this drives the executable
+# directly as `gxtb in.xyz --gxtb --opt` -- unlike GFN1, which goes through
+# xtb-python/ASE.  Timings measured locally: 5 atoms 1 s, 21 atoms 15 s,
+# 29 atoms 47 s, so timeout_s must be far larger than the GFN1 value of 90.
+relaxation:
+  enabled: true
+  method: g-xTB
+  binary: gxtb
+  # xtb_path: /scratch/iinfante/software/xtb-gxtb-linux-x86_64/share/xtb
+  charge: 0                 # k CdSe + p CdCl2 is neutral by construction
+  timeout_s: 1800
+  check_connectivity: true
+

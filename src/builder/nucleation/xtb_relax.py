@@ -39,6 +39,15 @@ class XtbSettings:
     max_steps: int = 500
     #: interpreter that has xtb-python; ``None`` means "this one"
     python: Optional[str] = None
+    #: path to a standalone xtb/g-xTB executable.  When ``method`` selects
+    #: g-xTB this binary is driven on the command line instead of the
+    #: xtb-python worker, because g-xTB is not exposed through the Python API.
+    binary: Optional[str] = None
+    #: value for XTBPATH (the parameter directory shipped with the build)
+    xtb_path: Optional[str] = None
+    #: total charge handed to the binary; these clusters are neutral by
+    #: construction (k CdSe + p CdCl2), so 0 is right unless a pack says else
+    charge: int = 0
     #: recompute the graph after relaxation and report how it differs
     check_connectivity: bool = True
     #: wall-clock guard for one worker batch; 0 disables the guard
@@ -58,6 +67,15 @@ class XtbSettings:
             fmax=float(raw.get("fmax", 0.02)),
             max_steps=int(raw.get("max_steps", 500)),
             python=None if python is None else str(Path(python).expanduser()),
+            binary=(
+                None if raw.get("binary") is None
+                else str(Path(str(raw["binary"])).expanduser())
+            ),
+            xtb_path=(
+                None if raw.get("xtb_path") is None
+                else str(Path(str(raw["xtb_path"])).expanduser())
+            ),
+            charge=int(raw.get("charge", 0)),
             check_connectivity=bool(raw.get("check_connectivity", True)),
             timeout_s=float(raw.get("timeout_s", 0.0)),
         )
@@ -90,6 +108,124 @@ class XtbResult:
     connectivity_changed: Tuple[Tuple[int, int], ...] = ()
     #: the graph implied by the relaxed coordinates
     relaxed_edges: Tuple[Tuple[int, int], ...] = ()
+
+
+#: Hartree -> eV, so CLI energies match the eV the python worker reports.
+_HARTREE_EV = 27.211386245988
+
+
+def _is_gxtb(method: str) -> bool:
+    """Whether ``method`` selects the g-xTB Hamiltonian."""
+
+    return str(method).strip().lower().replace("_", "-") in {
+        "g-xtb", "gxtb", "g-xtb-cli",
+    }
+
+
+def _run_cli(structures, settings) -> List[Dict[str, Any]]:
+    """Drive a standalone xtb/g-xTB binary, one optimisation per structure.
+
+    g-xTB has no Python binding, so it is run as ``<binary> in.xyz --gxtb
+    --opt`` in a scratch directory per structure.  Energy and geometry come
+    from ``xtbopt.xyz``; Wiberg orders from ``wbo`` when present.
+    """
+
+    import os
+    import re
+    import shutil
+    import tempfile
+
+    binary = settings.binary or "gxtb"
+    env = dict(os.environ)
+    if settings.xtb_path:
+        env["XTBPATH"] = settings.xtb_path
+    env.setdefault("OMP_NUM_THREADS", "1")
+
+    out: List[Dict[str, Any]] = []
+    for entry in structures:
+        work = tempfile.mkdtemp(prefix="gxtb_")
+        try:
+            xyz = Path(work) / "in.xyz"
+            lines = [str(len(entry["symbols"])), entry["id"]]
+            for sym, pos in zip(entry["symbols"], entry["positions"]):
+                lines.append(
+                    f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
+                )
+            xyz.write_text("\n".join(lines) + "\n")
+            cmd = [binary, "in.xyz", "--gxtb", "--opt"]
+            if settings.charge:
+                cmd += ["--chrg", str(int(settings.charge))]
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=work, capture_output=True, text=True, env=env,
+                    check=False,
+                    timeout=(
+                        None if settings.timeout_s <= 0.0 else settings.timeout_s
+                    ),
+                )
+            except subprocess.TimeoutExpired:
+                out.append({
+                    "id": entry["id"], "ok": False,
+                    "error": f"timeout after {settings.timeout_s:g} s",
+                })
+                continue
+            except OSError as exc:
+                out.append({"id": entry["id"], "ok": False, "error": str(exc)})
+                continue
+            log = (proc.stdout or "") + (proc.stderr or "")
+            opt = Path(work) / "xtbopt.xyz"
+            if not opt.exists():
+                tail = [ln for ln in log.splitlines() if ln.strip()]
+                out.append({
+                    "id": entry["id"], "ok": False,
+                    "error": tail[-1][:200] if tail else "no xtbopt.xyz",
+                })
+                continue
+            body = opt.read_text().splitlines()
+            n = int(body[0].split()[0])
+            comment = body[1]
+            positions = []
+            for row in body[2:2 + n]:
+                parts = row.split()
+                positions.append([float(v) for v in parts[1:4]])
+            energy_eh = None
+            m = re.search(r"energy:\s*(-?\d+\.\d+)", comment)
+            if m:
+                energy_eh = float(m.group(1))
+            else:
+                m = re.search(r"TOTAL ENERGY\s+(-?\d+\.\d+)", log)
+                if m:
+                    energy_eh = float(m.group(1))
+            gap = None
+            gaps = re.findall(r"HOMO-LUMO gap\s+(-?\d+\.\d+)\s*eV", log)
+            if gaps:
+                gap = float(gaps[-1])
+            converged = "GEOMETRY OPTIMIZATION CONVERGED" in log
+            steps = 0
+            m = re.search(r"CONVERGED AFTER\s+(\d+)\s+ITERATIONS", log)
+            if m:
+                steps = int(m.group(1))
+            bond_orders = None
+            wbo = Path(work) / "wbo"
+            if wbo.exists():
+                bond_orders = [[0.0] * n for _ in range(n)]
+                for row in wbo.read_text().splitlines():
+                    parts = row.split()
+                    if len(parts) != 3:
+                        continue
+                    i, j, w = int(parts[0]) - 1, int(parts[1]) - 1, float(parts[2])
+                    if 0 <= i < n and 0 <= j < n:
+                        bond_orders[i][j] = bond_orders[j][i] = w
+            out.append({
+                "id": entry["id"], "ok": energy_eh is not None,
+                "energy_eV": None if energy_eh is None else energy_eh * _HARTREE_EV,
+                "gap_eV": gap, "steps": steps, "converged": converged,
+                "positions": positions, "bond_orders": bond_orders,
+                "error": "" if energy_eh is not None else "no energy in output",
+            })
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    return out
 
 
 def _run_in_process(structures, settings) -> Optional[List[Dict[str, Any]]]:
@@ -199,9 +335,12 @@ def relax_structures(
         }
         for entry in structures
     ]
-    raw = _run_in_process(payload, settings)
-    if raw is None:
-        raw = _run_in_subprocess(payload, settings)
+    if _is_gxtb(settings.method):
+        raw = _run_cli(payload, settings)
+    else:
+        raw = _run_in_process(payload, settings)
+        if raw is None:
+            raw = _run_in_subprocess(payload, settings)
     by_id = {str(r.get("id")): r for r in raw}
 
     results: List[XtbResult] = []
