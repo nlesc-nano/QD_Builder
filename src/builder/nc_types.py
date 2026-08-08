@@ -430,8 +430,23 @@ class NucleationGraphRules:
     #: cap.  Emitted graphs are deduplicated by certificate either way, so the
     #: cap never admits a duplicate *graph* -- only duplicate beam states,
     #: which cost diversity.  Measured at k=4: 2048 leaves p6/p7 counts exact
-    #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 but drops ~7% of p7.
-    bridge_first_max_automorphisms: int = 2048
+    #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 and drops ~7% of
+    #: p7, which is the trade chosen here -- speed matters more at large k.
+    bridge_first_max_automorphisms: int = 64
+    #: Steer the beam toward decorations that link more distinct Cd pairs.
+    #: OFF by default: it correlates with compactness post hoc but is a poor
+    #: objective (a mu3 whose hosts already share an anion scores zero), and
+    #: enabling it strips the mu3 family holding the k3p3 energy minimum.
+    bridge_first_maximize_bridged_pairs: bool = False
+    #: Order in which a buffered bin pool is drained: "bond_bands" (the
+    #: historical density-balanced round robin) or "compactness" (lowest
+    #: Wiener index first).  Compactness tracks relative energy at rho +0.32
+    #: to +0.78 across bins and keeps ~89% of the best decile at top-70%.
+    selection_order: str = "bond_bands"
+    #: Keep this fraction of each bin's pool (0 disables).  A rank cut, not an
+    #: absolute threshold: the underlying scores shift between bins, so a fixed
+    #: cut empties some bins and leaves others untouched.
+    selection_top_fraction: float = 0.0
     #: Rings a graph MUST contain, e.g.
     #: ``[{"size": 8, "min_count": 1, "from_k": 4}]``.  The inverse of
     #: ``min_ring_size``: this gate is what bounds the combinatorics at large

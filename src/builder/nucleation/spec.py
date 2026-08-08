@@ -630,7 +630,18 @@ def load_nucleation_spec(
                     graph_rules_raw.get("bridge_first_prefer_bridges_per_cd", 2)
                 ),
                 bridge_first_max_automorphisms=int(
-                    graph_rules_raw.get("bridge_first_max_automorphisms", 2048)
+                    graph_rules_raw.get("bridge_first_max_automorphisms", 64)
+                ),
+                bridge_first_maximize_bridged_pairs=bool(
+                    graph_rules_raw.get(
+                        "bridge_first_maximize_bridged_pairs", False
+                    )
+                ),
+                selection_order=str(
+                    graph_rules_raw.get("selection_order", "bond_bands")
+                ).strip().lower() or "bond_bands",
+                selection_top_fraction=float(
+                    graph_rules_raw.get("selection_top_fraction", 0.0) or 0.0
                 ),
                 required_rings=_parse_required_rings(
                     graph_rules_raw.get("required_rings")

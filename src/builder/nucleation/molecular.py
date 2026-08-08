@@ -5381,14 +5381,18 @@ class _CandidateScreen:
             )
             return None
 
-        if self.embed and self._motif_factor_enabled():
-            return self._offer_motif_factor(state)
-
         if self.collect_only:
             # Graph-level screening is done; hand the survivor to the bin so it
-            # can be banded by total bond count before anything is embedded.
+            # can be ranked (bond-count bands, or compactness) before anything
+            # is embedded.  This has to precede the motif-factor branch: that
+            # path embeds immediately, so with it first the pool stayed empty
+            # and every budget/selection setting was silently inert whenever
+            # reconstruction.method was motif_factor.
             self.pool.append((int(graph.number_of_edges()), state))
             return None
+
+        if self.embed and self._motif_factor_enabled():
+            return self._offer_motif_factor(state)
 
         frames: List[Tuple[FloatArray, List[bool]]] = []
         frame_names: List[str] = []
@@ -6228,7 +6232,10 @@ def enumerate_molecular_bin(
         validate_every_graph=validate_every_graph,
         frame_options=frame_options,
         dump_failures=dump_failures,
-        collect_only=bool(target_isomers) and embed,
+        collect_only=bool(
+            target_isomers
+            or float(getattr(spec.graph_rules, "selection_top_fraction", 0.0) or 0.0) > 0.0
+        ) and embed,
     )
 
     skeletons_truncated = False
@@ -6740,8 +6747,46 @@ def enumerate_molecular_bin(
         # cheap to build.
         pool = screen.pool
         screen.collect_only = False
-        bands = bond_count_bands(pool)
-        keys = sorted(bands)
+        # A rank cut on graph compactness.  Wiener index (sum of shortest-path
+        # lengths, in bonds) is computed on the finished graph before any
+        # coordinates exist and tracks relative energy at rho +0.32 to +0.78
+        # across bins; keeping the most compact 70% retains ~89% of each bin's
+        # best decile.  It is applied as a *rank* because the raw score shifts
+        # between bins -- an absolute cut empties some bins and leaves others
+        # untouched.
+        order_mode = str(
+            getattr(spec.graph_rules, "selection_order", "bond_bands")
+        ).strip().lower()
+        fraction = float(
+            getattr(spec.graph_rules, "selection_top_fraction", 0.0) or 0.0
+        )
+        if fraction > 0.0 and pool:
+            budget = max(1, int(-(-len(pool) * min(fraction, 1.0) // 1)))
+            target_isomers = budget if not target_isomers else min(
+                target_isomers, budget
+            )
+        if order_mode == "compactness" and pool:
+            def _compactness(entry):
+                graph = entry[1].graph
+                if graph.number_of_nodes() < 2 or not nx.is_connected(graph):
+                    return float("inf")
+                return float(nx.wiener_index(graph))
+
+            ranked = sorted(range(len(pool)), key=lambda i: _compactness(pool[i]))
+            if progress is not None:
+                progress(
+                    f"    selection: compactness rank cut, pool={len(pool)} "
+                    f"→ budget={target_isomers}"
+                )
+            for index in ranked:
+                if len(seen) >= target_isomers:
+                    break
+                screen.offer(pool[index][1])
+            bands = {}
+            keys = []
+        else:
+            bands = bond_count_bands(pool)
+            keys = sorted(bands)
         if progress is not None:
             progress(
                 f"    budget: pool={len(pool)} graphs in {len(keys)} bond-count "
