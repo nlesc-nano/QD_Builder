@@ -3272,6 +3272,9 @@ class _DecorationStatus:
     """
 
     truncated: bool = False
+    #: skeletons whose automorphism group exceeded
+    #: ``bridge_first_max_automorphisms`` and were keyed by identity instead
+    automorphism_cap_hits: int = 0
     #: partial assignments skipped because an equivalent one was already
     #: expanded under a symmetry of the skeleton
     symmetry_pruned: int = 0

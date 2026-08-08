@@ -629,6 +629,9 @@ def load_nucleation_spec(
                 bridge_first_prefer_bridges_per_cd=int(
                     graph_rules_raw.get("bridge_first_prefer_bridges_per_cd", 2)
                 ),
+                bridge_first_max_automorphisms=int(
+                    graph_rules_raw.get("bridge_first_max_automorphisms", 2048)
+                ),
                 required_rings=_parse_required_rings(
                     graph_rules_raw.get("required_rings")
                 ),
