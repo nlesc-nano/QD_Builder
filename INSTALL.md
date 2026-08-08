@@ -192,3 +192,62 @@ compactness cut can retain it, so treat ~1-in-9 as the accuracy budget.
 
 At `selection_top_fraction: 0.2` that is ~1000 xTB runs for k <= 4 (about 6
 core-hours at the measured ~21 s/structure) and ~10000 for k <= 5.
+
+## g-xTB relaxation
+
+g-xTB is more accurate than GFN1 but has **no Python API**, so it is driven as
+a command-line binary (`gxtb in.xyz --gxtb --opt`) rather than through
+xtb-python/ASE. Select it with `method: g-xTB` and the backend switches
+automatically:
+
+```yaml
+relaxation:
+  enabled: true
+  method: g-xTB
+  binary: gxtb          # name/path of the executable
+  xtb_path: /scratch/.../xtb-gxtb-linux-x86_64/share/xtb   # or export XTBPATH
+  charge: 0             # k CdSe + p CdCl2 is neutral by construction
+  timeout_s: 1800
+```
+
+On a cluster where PATH and XTBPATH are already exported, `binary: gxtb` alone
+is enough. Use `geometry_packs/cdse_cdcl2_motif_GXTB.yaml`.
+
+Energy, geometry and Wiberg orders are read from `xtbopt.xyz`, `wbo` and the
+log; energies are converted Hartree -> eV so they are directly comparable with
+the GFN1 path.
+
+**Timing** (measured): 5 atoms 1 s, 21 atoms 15 s, 29 atoms 47 s — roughly
+2-3x GFN1. The GFN1 default `timeout_s: 90` kills most k=4 structures; use
+1800.
+
+**Energies are not comparable between methods** — g-xTB reports a different
+reference (a 5-atom cluster is -99522 eV under g-xTB, -371.8 eV under GFN1).
+Only compare within one method and one composition.
+
+## Audit thresholds for relaxed structures
+
+These are *audit* thresholds for judging a relaxed geometry. They are not the
+`pair_rules` `min_distance` values, which are construction epsilons for the
+embedding (79% of *embedded* structures sit below the Cd-Cd construction floor,
+so applying it post-relaxation would delete most of a run).
+
+| pair | audit threshold | basis |
+|---|---|---|
+| Cd-Cd | **2.80** | see below |
+| Se-Se | 2.80 | real Se-Se bonds form at 2.34 |
+| Cl-Se | 2.80 | real Cl-Se bonds form at 2.19 |
+| Cl-Cl | 3.00 | never violated in practice |
+
+The Cd-Cd value is set from 42829 relaxed Cd-Cd distances. Nothing exists below
+2.64 A, and the population splits by bridging context:
+
+    bridging atoms   n       min    p1
+    0 (bare)         7279    2.64   2.72
+    1                25547   2.82   3.20
+    2                9907    2.90   3.04
+
+Doubly-bridged Cd pairs bottom out at exactly 2.90, so a 2.90 cutoff clips
+legitimate Cd(mu-X)2Cd rhombi. At 2.80, 219 genuinely bare Cd...Cd contacts are
+flagged and **zero** bridged pairs are misflagged; at 2.90 ten are lost and at
+3.00, fifty-eight.
