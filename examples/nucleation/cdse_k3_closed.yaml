@@ -1,0 +1,57 @@
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+# Closed-rich map for DFT comparison against cdse_k3_open.yaml.
+# Compact core growth prefers new zb 6-rings; passivation prefers Cl 4/6 rings
+# among winners.  Bridge chemistry still uses min_bridged_host_cn: 3.
+nucleation:
+  kmax: 3
+  mode: guided
+  exact_through_k: 3
+  core_growth_policy: compact_ring
+  compact_from_k: 3
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+  discarded_through_k: 3
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

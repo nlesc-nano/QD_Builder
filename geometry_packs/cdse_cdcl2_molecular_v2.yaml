@@ -1,0 +1,195 @@
+# Directly runnable current-builder configuration.
+cif: ../examples/cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  kmax: 3
+  mode: exact
+  core_monomer: {cation: Cd, anion: Se}
+  precursor: {center: Cd, ligand: Cl, ligand_count: 2}
+  site_tolerance: 0.20
+
+schema_version: 2
+name: cdse_cdcl2_molecular
+
+graph_rules:
+  require_inorganic_connected: true
+  enforce_min_cn: true
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 4}
+    Cl: {min: 1, max: 3}
+  pair_rules:
+    Cd-Se: allowed
+    Cd-Cl: allowed
+    Cd-Cd: forbidden
+    Se-Se: forbidden
+    Cl-Se: forbidden
+    Cl-Cl: forbidden
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]
+  min_ring_size: {Cd-Se: 6}
+  max_shared_ligands_per_host_pair: 1
+  decoration_mode: skeleton_bridge_first
+  bridge_first_p1_terminal_policy: unrestricted
+  bridge_cd_cd_max_distance: 4.75
+  min_bridged_host_cn: 3
+  forbid_mono_se_dual_terminal: true
+  ring_first_when_pattern_possible: true
+  ring_first_fallback_to_open: true
+  multi_ring_ladder: true
+  ring_min_pattern_cd: [3, 3, 4]
+  ring_min_pattern_se: [3, 3, 3]
+
+motifs:
+  ring6:
+    edges: [[0,0],[0,2],[1,0],[1,1],[2,1],[2,2]]
+  fusions:
+    - name: path_Cd1Se2
+      edges: [[0,0],[0,2],[1,0],[1,1],[2,1],[2,2],[3,0],[3,3],[4,1],[4,3]]
+    - name: edge_CdSe
+      edges: [[0,0],[0,2],[0,4],[1,0],[1,1],[2,1],[2,2],[3,0],[3,3],[4,3],[4,4]]
+
+bonds:
+  - {pair: CdCl_terminal, cn_cd: 2, cn_other: 1, r_A: 2.32, tol_A: 0.05}
+  - {pair: CdCl_terminal, cn_cd: 3, cn_other: 1, r_A: 2.32, tol_A: 0.05}
+  - {pair: CdCl_terminal, cn_cd: 4, cn_other: 1, r_A: 2.32, tol_A: 0.05}
+  - {pair: CdCl_bridge,   cn_cd: 3, cn_other: 2, r_A: 2.54, tol_A: 0.08}
+  - {pair: CdCl_bridge,   cn_cd: 4, cn_other: 2, r_A: 2.54, tol_A: 0.08}
+  - {pair: CdCl_bridge,   cn_cd: 5, cn_other: 2, r_A: 2.61, tol_A: 0.08}
+  - {pair: CdCl_bridge,   cn_cd: 3, cn_other: 3, r_A: 2.70, tol_A: 0.08}
+  - {pair: CdCl_bridge,   cn_cd: 4, cn_other: 3, r_A: 2.70, tol_A: 0.08}
+  - {pair: CdCl_bridge,   cn_cd: 5, cn_other: 3, r_A: 2.70, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 2, cn_other: 2, r_A: 2.50, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 2, cn_other: 3, r_A: 2.50, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 3, cn_other: 2, r_A: 2.50, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 4, cn_other: 2, r_A: 2.54, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 3, cn_other: 3, r_A: 2.60, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 3, cn_other: 4, r_A: 2.65, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 4, cn_other: 3, r_A: 2.65, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 3, cn_other: 5, r_A: 2.65, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 4, cn_other: 4, r_A: 2.72, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 4, cn_other: 5, r_A: 2.80, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 4, cn_other: 6, r_A: 2.80, tol_A: 0.08}
+  - {pair: CdSe, cn_cd: 5, cn_other: 5, r_A: 2.90, tol_A: 0.10}
+
+angles:
+  Se:
+    cn2: {default: {deg: 90,    tol_deg: 12}}
+    cn3: {default: {deg: 90,    tol_deg: 12}}
+    cn4: {default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}}
+    cn5:
+      default: {deg: 90, tol_deg: 15, hard_min_deg: 75, hard_max_deg: 135}
+  Cl:
+    cn2: {default: {deg: 90, tol_deg: 12}}
+    cn3: {default: {deg: 88, tol_deg: 15}}
+  Cd:
+    cn2:
+      default: {deg: 175, tol_deg: 10}
+      by_pair:
+        Cl_t-Se:   {deg: 175, tol_deg: 10}
+        Cl_b2s-Se: {deg: 173, tol_deg: 12}
+        Cl_b2n-Se: {deg: 173, tol_deg: 12}
+        Se-Se:     {deg: 175, tol_deg: 12}
+    cn3:
+      by_role_signature:
+        Cl_t+Cl_t+Se:
+          {Cl_t-Cl_t: {deg: 120, tol_deg: 15}, Cl_t-Se: {deg: 120, tol_deg: 15}}
+        Cl_b2s+Cl_t+Se:
+          {Cl_b2s-Cl_t: {deg: 122, tol_deg: 12}, Cl_b2s-Se: {deg: 94, tol_deg: 12},
+           Cl_t-Se: {deg: 144, tol_deg: 12}}
+        Cl_b2n+Cl_t+Se:
+          {Cl_b2n-Cl_t: {deg: 110, tol_deg: 15}, Cl_b2n-Se: {deg: 105, tol_deg: 15},
+           Cl_t-Se: {deg: 145, tol_deg: 15}}
+        Cl_b3+Cl_t+Se:
+          {Cl_b3-Cl_t: {deg: 112, tol_deg: 15}, Cl_b3-Se: {deg: 94, tol_deg: 12},
+           Cl_t-Se: {deg: 154, tol_deg: 15}}
+        Cl_b2s+Cl_b2s+Se:
+          {Cl_b2s-Cl_b2s: {deg: 138, tol_deg: 12}, Cl_b2s-Se: {deg: 111, tol_deg: 15}}
+        Cl_b2n+Cl_b2s+Se:
+          {Cl_b2n-Cl_b2s: {deg: 121, tol_deg: 12}, Cl_b2n-Se: {deg: 139, tol_deg: 15},
+           Cl_b2s-Se: {deg: 100, tol_deg: 12}}
+        Cl_b2n+Cl_b2n+Se:
+          {Cl_b2n-Cl_b2n: {deg: 104, tol_deg: 15}, Cl_b2n-Se: {deg: 128, tol_deg: 15}}
+        Cl_b2n+Cl_b3+Se:
+          {Cl_b2n-Cl_b3: {deg: 92, tol_deg: 15}, Cl_b2n-Se: {deg: 155, tol_deg: 15},
+           Cl_b3-Se: {deg: 113, tol_deg: 15}}
+        Cl_t+Se+Se:
+          {Cl_t-Se: {deg: 112, tol_deg: 12}, Se-Se: {deg: 136, tol_deg: 12}}
+        Cl_b2s+Se+Se:
+          {Cl_b2s-Se: {deg: 105, tol_deg: 15}, Se-Se: {deg: 150, tol_deg: 15}}
+        Cl_b2n+Se+Se:
+          {Cl_b2n-Se: {deg: 108, tol_deg: 15}, Se-Se: {deg: 144, tol_deg: 15}}
+        Cl_b3+Se+Se:
+          {Cl_b3-Se: {deg: 104, tol_deg: 15}, Se-Se: {deg: 152, tol_deg: 15}}
+      by_signature:
+        Se3: {Se-Se: {deg: 120, tol_deg: 12}}
+        Cl3: {Cl-Cl: {deg: 120, tol_deg: 15}}
+      default: {deg: 120, tol_deg: 15}
+    cn4:
+      default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}
+      by_pair:
+        Cl_b2s-Se:     {deg:  95,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_b2n-Se:     {deg: 100,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 125}
+        Cl_b3-Se:      {deg:  95,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_t-Se:       {deg: 120,   tol_deg: 12}
+        Cl_b2s-Cl_t:   {deg: 120,   tol_deg: 12}
+        Cl_b2n-Cl_t:   {deg: 118,   tol_deg: 12}
+        Cl_b3-Cl_t:    {deg: 115,   tol_deg: 15}
+        Cl_b2s-Cl_b2s: {deg: 112,   tol_deg: 12}
+        Cl_b2n-Cl_b2n: {deg: 112,   tol_deg: 15}
+        Cl_b2n-Cl_b2s: {deg: 112,   tol_deg: 15}
+        Se-Se:         {deg: 109.5, tol_deg: 12}
+
+angle_sum_cn3:
+  Cd: {target_deg: 360, tol_deg: 8}
+  Se: {target_deg: 270, tol_deg: 15}
+  Cl: {target_deg: 270, tol_deg: 20}
+
+dihedrals:
+  improper:
+    Cd: {cn3: {default: {deg: 0.0,  tol_deg: 12}}}
+    Se: {cn3: {Cd3:     {deg: 82.0, tol_deg: 12}}}
+  proper:
+    - {path: [Cd, Cl_b, Cd, Se],  when: {se_cn_min: 3}, phi_deg: 0,   tol_deg: 25}
+    - {path: [Cd, Cl_b, Cd, Se],  when: {se_cn_max: 2}, phi_deg: 180, tol_deg: 30}
+    - {path: [Cd, Cl_b, Cd, Cl_t],                      phi_deg: 180, tol_deg: 25}
+
+nonbonded_1_4:
+  Cd-Cl: {min_A: 3.55, tol_A: 0.40}
+  Cd-Se: {min_A: 3.60, tol_A: 0.35}
+nonbonded:
+  Cd-Se: {min_A: 3.60, tol_A: 0.20}
+  Cd-Cl: {min_A: 3.50, tol_A: 0.20}
+  Cd-Cd: {min_A: 3.20, tol_A: 0.05}
+  Se-Se: {min_A: 3.80, tol_A: 0.10}
+  Cl-Se: {min_A: 3.30, tol_A: 0.10}
+  Cl-Cl: {min_A: 2.80, tol_A: 0.10}
+
+rings:
+  cdse_6:
+    conformations: [chair]
+    patterns:
+      default:
+        cd_cn: [3, 3, 4]
+        se_cn: [3, 3, 3]
+        bond_cdse_A: 2.60
+        angle_at_cd_deg: 136
+        angle_at_se_deg: 90
+    dihedrals:
+      chair: [55, -55, 55, -55, 55, -55]
+
+relaxation:
+  enabled: true
+  method: GFN1-xTB
+  accuracy: 1.0
+  electronic_temperature: 300.0
+  max_iterations: 500
+  fmax: 0.02
+  max_steps: 500
+  python: ~/miniconda3/envs/xtb/bin/python
+  check_connectivity: true

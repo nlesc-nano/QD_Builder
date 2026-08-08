@@ -18,6 +18,7 @@ setup(
     include_package_data=True,
     install_requires=[
         "numpy",
+        "networkx>=3.0",
         "scipy>=1.11",
         "pyyaml",
         "pymatgen>=2023.7",

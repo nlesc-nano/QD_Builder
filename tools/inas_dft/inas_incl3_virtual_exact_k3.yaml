@@ -1,0 +1,81 @@
+# InAs/InCl3 virtual-site placement calibration.
+# Exact graph and ligand placement through k=3, restricted to p=0..3 so the
+# combinations of InCl3 centres on As virtual sites can be inspected directly.
+cif: InAs.cif
+
+charges:
+  In: +3
+  As: -3
+  Cl: -1
+
+nucleation:
+  kmax: 3
+  mode: exact
+  exact_through_k: 3
+
+  # Keep several coordination layers, while retaining a manageable DFT-facing
+  # set.  All lower-ranked structures remain in discarded_through_k output.
+  retain_score_layers: 8
+  retain_max_per_bin: 32
+  discarded_through_k: 3
+
+  core_growth_policy: all
+  fused_chair_mode: "off"
+  core_growth_occupation: bare
+  continuous_decoration: false
+
+  monomer_p_values: [0, 1, 2, 3]
+  parent_p_mode: all_retained
+  p_ladder_mode: product_window
+
+  # Full shedding remains enabled.  This is deliberately not a one-shed test.
+  k_growth_max_shed: 0
+
+  # Calibration cap: keep p <= 3 at every k, rather than opening the full
+  # As-capacity range p <= 3*k used by the production map.
+  k_growth_max_add: 0
+  p_surf_beta: 0.0
+  shed_alpha: 1.0
+
+  passivation_ring_policy: none
+  ring_lengths: [4, 6]
+  bond_count_scope: skeleton
+
+  core_monomer:
+    cation: In
+    anion: As
+
+  precursor:
+    center: In
+    ligand: Cl
+    ligand_count: 3
+
+  site_tolerance: 0.20
+
+  geometry_rules:
+    In:
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    As:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      In: 3
+      As: 2
+      Cl: 1
+    max_cn:
+      In: 4
+      As: 4
+      Cl: 2
+    allowed_bonds:
+      - [In, As]
+      - [In, Cl]
+    bridging:
+      Cl:
+        host: In
+        shared_neighbor: As
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

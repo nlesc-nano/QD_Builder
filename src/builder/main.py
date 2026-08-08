@@ -7,6 +7,7 @@ import copy
 import re
 import dataclasses
 from collections import Counter
+from pathlib import Path
 from typing import List
 import numpy as np 
 
@@ -1421,6 +1422,63 @@ def main(argv: List[str] | None = None) -> int:
         args.cif, args.yaml = args.inputs[0], args.inputs[1]
     else:
         p.error("expected one argument (YAML for stack mode) or two arguments (CIF YAML for single-material mode)")
+
+    if args.cif is None:
+        from .nucleation import (
+            generate_nucleation_result,
+            is_nucleation_yaml,
+            load_nucleation_spec,
+            write_nucleation_bundle,
+        )
+
+        if is_nucleation_yaml(args.yaml):
+            spec = load_nucleation_spec(args.yaml)
+            if args.out == "nanocrystal.xyz":
+                output_path = Path(f"{Path(args.yaml).stem}_nucleation")
+            else:
+                output_path = Path(args.out)
+            restart = bool(getattr(args, "restart", False))
+            force_restart = bool(getattr(args, "force_restart", False))
+            if restart:
+                print(
+                    f"[nucleation] restart from checkpoint under {output_path}",
+                    flush=True,
+                )
+            result = generate_nucleation_result(
+                spec,
+                progress=lambda message: print(message, flush=True),
+                verbose=args.verbose,
+                checkpoint_dir=output_path,
+                restart=restart,
+                force_restart=force_restart,
+            )
+            print(
+                f"[nucleation] writing retained/native and surface bundle "
+                f"to {output_path}",
+                flush=True,
+            )
+            write_nucleation_bundle(result, output_path)
+
+            physical_bins = sum(
+                len(p_bins) for p_bins in result.registry.values()
+            )
+            structures = sum(
+                len(records)
+                for p_bins in result.registry.values()
+                for records in p_bins.values()
+            )
+            discarded = sum(
+                count
+                for p_bins in result.discarded_counts.values()
+                for count in p_bins.values()
+            )
+            print(
+                f"[nucleation] generated k=1..{spec.kmax}: "
+                f"{physical_bins} physical k/p bins, "
+                f"{structures} retained and {discarded} discarded structures"
+            )
+            print(f"[nucleation] wrote bundle {output_path}")
+            return 0
 
     cfg: Config = parse_yaml_config(args.yaml)
     # Merge CLI options into PassivationSpec

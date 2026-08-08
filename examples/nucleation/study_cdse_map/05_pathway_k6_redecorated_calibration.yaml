@@ -1,0 +1,95 @@
+cif: ../../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Growth-path calibration through k=6.
+  #
+  # A decorated retained parent determines which sites are accessible for
+  # monomer attachment.  The pathway considers shedding any number of complete
+  # CdCl2 packages currently present, then uses the child skeleton's Se
+  # coordination capacity to reject over-decorated channels.  The added
+  # monomer may carry 0, 1, 2, or 3 CdCl2 packages.  After attachment, the
+  # ligand shell is rebuilt, avoiding the present continuous-shell shortcut
+  # that greedily maximizes the number of Cl bridges.
+  kmax: 6
+  mode: guided
+
+  exact_through_k: 3
+  retain_score_layers: 4
+  retain_max_per_bin: 16
+  growth_max_parents_per_bin: 8
+
+  shells_per_skeleton: 6
+  shell_score_layers: 3
+  shells_per_score_layer: 2
+  shell_enum_max_assignments: 5000
+
+  # Keep open and compact growth channels during calibration.  Ring closure is
+  # ranked, not made a hard gate.
+  core_growth_policy: all
+  compact_from_k: 5
+  p_skeleton_beam: 64
+  p_beam_from_k: 4
+  p_beam_rank: fused_rings
+  fused_chair_mode: "off"
+
+  # Decorated-site accessibility plus shedding/adding.  continuous_decoration
+  # is false on purpose: the parent shell blocks attachment sites, but the
+  # product is re-passivated so multiple bridge patterns can be generated.
+  core_growth_occupation: decorated
+  continuous_decoration: false
+  monomer_p_values: [0, 1, 2, 3]
+  parent_p_mode: all_retained
+  p_ladder_mode: product_window
+  # No fixed shedding cap: enumerate all complete CdCl2 shedding counts and
+  # let the child skeleton's Se capacity decide which channels are feasible.
+  k_growth_max_shed: 0
+  k_growth_max_add: 0
+  p_surf_beta: 0.0
+
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+  discarded_through_k: 3
+  bond_count_scope: skeleton
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

@@ -1,0 +1,214 @@
+schema_version: 2
+name: "cdse_cdcl2_molecular"
+description: "DFT-mined fixed-geometry defaults for lattice-free CdSe/CdCl2 molecular builds: bonds and angles are hard construction tables, ring chair/boat owns endocyclic torsions, peaked open torsions are preferred, and flat torsions use soft clearance."
+source: "tools/mine_cdse_dft_geometry.py on dft_all + dft_k5_partial + dft_k6_additional"
+graph_rules:
+  require_inorganic_connected: true
+  enforce_min_cn: true
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 5}
+    Cl: {min: 1, max: 3}
+  pair_rules:
+    Cd-Se: {bond: allowed, bond_max_distance: 3.25}
+    Cd-Cl: {bond: allowed, bond_max_distance: 3.10}
+    Cd-Cd: {bond: forbidden, min_distance: 3.20}
+    Se-Se: {bond: forbidden, min_distance: 3.80}
+    Cl-Cl: {bond: forbidden, min_distance: 2.70}
+    Cl-Se: {bond: forbidden, min_distance: 2.70}
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]
+  # Fixed-geometry construction (not DFT relaxation): at most one Cl may bridge
+  # any Cd–Cd host pair.  Empirically every accepted embed on the (k,p) baseline
+  # ladder through (2,3) has max_shared ≤ 1; dual bridges form Cd–Cl–Cd–Cl
+  # four-rings that the fixed bond/angle tables almost never realise (dominant
+  # late rejections at k=2,p=3).  Clean DFT *does* show max_shared=2 after
+  # relaxation (~1/3 of p>0 structures) — those motifs are out of scope for
+  # exact construction without moving atoms.
+  max_shared_ligands_per_host_pair: 1
+  # Hard Cd--Cd host span for a μ2 bridge candidate.  Omit or set null to
+  # use the historical conservative radius-derived span instead.
+  bridge_cd_cd_max_distance: 4.75
+  # Shortest ring allowed in the alternating Cd-Se subgraph.  Cd2Se2 four-rings
+  # are not present in the reference DFT set; the six-membered Cd3Se3 ring is
+  # (it is the zinc-blende motif).  Every other rule here -- coordination,
+  # allowed pairs, contact floors -- is satisfied by a four-ring, so this is
+  # the only place it can be excluded.
+  min_ring_size:
+    Cd-Se: 6
+  # --- Construction defaults (on) ----------------------------------------
+  # Cl decoration strategy:
+  #   graph_multiset         — abstract μ1/μ2/μ3 host multisets (default)
+  #   skeleton_bridge_first  — 3D skeleton → Cd–Cd distance bridges → terminals
+  #   tet_sites / pack_sites — experimental
+  decoration_mode: graph_multiset
+  # High-p passivation (skeleton_bridge_first only): require every Cd final
+  # CN >= passivate_min_cd_cn when k>=k_ge and p>=p_ge.
+  # HARD passivation at p>=4 currently yields 0 embeds (fixed-geometry tables
+  # still need some Cd2 at construction).  Leave disabled (p_ge=100); enable
+  # only as a soft ranking goal until embed tables improve.
+  passivate_min_cd_cn_k_ge: 2
+  passivate_min_cd_cn_p_ge: 100
+  passivate_min_cd_cn: 3
+  # Finished-graph rule (same idea as nucleation bridging.min_bridged_host_cn):
+  # every host of a μ2/μ3 Cl must have final CN ≥ 3.  Clean DFT: only ~4 Cd
+  # at CN2 host a bridge; construction otherwise emits many final-CN2 bridges.
+  min_bridged_host_cn: 3
+  # Mono-Se Cd (exactly one Se) with two Cl: forbid both Cl terminal.
+  # Clean DFT Cl2Se1 is only (1μ+1t) or (2μ), never (2t).  Leaves (1,1) and
+  # (2,0) bridge patterns available.
+  forbid_mono_se_dual_terminal: true
+  # Note: Se CN on Se bonded to a bridging Cd spans 2–6 in clean DFT; no
+  # hard cut on neighbour Se CN is applied (higher Se CN co-occurs with
+  # more bridges in dense clusters, not less).
+  # --- Optional DFT-collapse filters (default OFF) -------------------------
+  # Enable only after start→final graph statistics from a DFT round support
+  # them.  Annotations always record the same features regardless of these
+  # flags (see annotations.csv from write_molecular_map).
+  #
+  # Reject fixed-geometry embeds where a terminal Cl sits within
+  # closable_terminal_cd2_distance of a nonbonded Cd CN2 (DFT often bridges).
+  reject_closable_terminal_cd2: false
+  closable_terminal_cd2_distance: 3.50
+  # Reject graphs that still admit a sphere-feasible terminal→μ2 upgrade onto
+  # an undercoordinated Cd (not bridge-maximal under construction radii).
+  require_bridge_maximal: false
+  # Forbidden final Cd–Se coordination pairs as [cn_cd, cn_se], e.g. [[2, 5]].
+  # Empty until DFT shows a pair never retained.
+  forbid_cdse_cn_pairs: []
+  # Closed Cd3Se3 seed when min pattern possible; fall back to open if needed.
+  ring_first_when_pattern_possible: true
+  ring_first_fallback_to_open: true
+  multi_ring_ladder: true
+  ring_min_pattern_cd: [3, 3, 4]
+  ring_min_pattern_se: [3, 3, 3]
+# Cd–Se 6-ring DFT-derived construction targets (not a DFT relaxation).
+rings:
+  cdse_6:
+    conformations: [chair, boat]
+    default_pattern: default
+    patterns:
+      default:
+        cd_cn: [3, 3, 4]
+        se_cn: [3, 3, 3]
+        bond_cdse_A: 2.69
+        angle_at_cd_deg: 116.5
+        angle_at_se_deg: 89.5
+    dihedrals:
+      chair: [60.8, -66.6, 61.7, -64.5, 70.8, -65.6]
+      boat: [-6.5, 79.8, -82.3, 16.3, 18.7, -32.1]
+bonds:
+  - {pair: CdCl_bridge, cn_cd: 3, cn_other: 2, r_A: 2.536}
+  - {pair: CdCl_bridge, cn_cd: 3, cn_other: 3, r_A: 2.711}
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 2, r_A: 2.541}
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 3, r_A: 2.721}
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 4, r_A: 2.899}
+  - {pair: CdCl_bridge, cn_cd: 5, cn_other: 2, r_A: 2.615}
+  - {pair: CdCl_bridge, cn_cd: 5, cn_other: 3, r_A: 2.797}
+  - {pair: CdCl_terminal, cn_cd: 2, cn_other: 1, r_A: 2.307}
+  - {pair: CdCl_terminal, cn_cd: 3, cn_other: 1, r_A: 2.325}
+  - {pair: CdCl_terminal, cn_cd: 4, cn_other: 1, r_A: 2.34}
+  - {pair: CdSe, cn_cd: 2, cn_other: 2, r_A: 2.482}
+  - {pair: CdSe, cn_cd: 2, cn_other: 3, r_A: 2.529}
+  - {pair: CdSe, cn_cd: 3, cn_other: 2, r_A: 2.506}
+  - {pair: CdSe, cn_cd: 3, cn_other: 3, r_A: 2.602}
+  - {pair: CdSe, cn_cd: 3, cn_other: 4, r_A: 2.654}
+  - {pair: CdSe, cn_cd: 3, cn_other: 5, r_A: 2.776}
+  - {pair: CdSe, cn_cd: 4, cn_other: 2, r_A: 2.542}
+  - {pair: CdSe, cn_cd: 4, cn_other: 3, r_A: 2.649}
+  - {pair: CdSe, cn_cd: 4, cn_other: 4, r_A: 2.717}
+  - {pair: CdSe, cn_cd: 4, cn_other: 5, r_A: 2.781}
+  - {pair: CdSe, cn_cd: 4, cn_other: 6, r_A: 2.789}
+  - {pair: CdSe, cn_cd: 5, cn_other: 3, r_A: 2.675}
+  - {pair: CdSe, cn_cd: 5, cn_other: 5, r_A: 2.896}
+angles:
+  Cd:
+    cn2:
+      default_deg: 175.603
+    cn3:
+      by_signature:
+        Cl1Se2:
+          Se-Se: 140.764
+          Cl-Se: 103.785
+        Cl2Se1:
+          Cl-Se: 103.351
+          Cl-Cl: 121.857
+          # Role-resolved clean-DFT medians. A shared mu2 bridge connects this
+          # Cd to another Cd that is also bonded to this center's Se; a
+          # non-shared bridge does not. These are local graph environments and
+          # never depend on k or p. p10/p90 record the observed spread but do
+          # not create additional hard constraints.
+          by_role_signature:
+            Cl_t+Cl_t+Se:
+              status: insufficient_clean_dft_samples
+            Cl_b2s+Cl_t+Se:
+              Cl_b2s-Cl_t: {angle_deg: 122.366, p10_deg: 117.197, p90_deg: 132.446}
+              Cl_b2s-Se: {angle_deg: 93.910, p10_deg: 89.829, p90_deg: 98.028}
+              Cl_t-Se: {angle_deg: 143.621, p10_deg: 135.425, p90_deg: 148.378}
+            Cl_b2n+Cl_t+Se:
+              Cl_b2n-Cl_t: {angle_deg: 110.125, p10_deg: 102.622, p90_deg: 120.936}
+              Cl_b2n-Se: {angle_deg: 103.396, p10_deg: 92.952, p90_deg: 116.898}
+              Cl_t-Se: {angle_deg: 143.493, p10_deg: 130.327, p90_deg: 153.617}
+            Cl_b2s+Cl_b2s+Se:
+              Cl_b2s-Cl_b2s: {angle_deg: 138.068, p10_deg: 133.960, p90_deg: 144.772}
+              Cl_b2s-Se: {angle_deg: 101.651, p10_deg: 99.929, p90_deg: 102.909}
+            Cl_b2n+Cl_b2s+Se:
+              Cl_b2n-Cl_b2s: {angle_deg: 121.443, p10_deg: 114.182, p90_deg: 131.473}
+              Cl_b2n-Se: {angle_deg: 137.911, p10_deg: 130.540, p90_deg: 146.405}
+              Cl_b2s-Se: {angle_deg: 97.781, p10_deg: 93.350, p90_deg: 98.733}
+            Cl_b2n+Cl_b2n+Se:
+              Cl_b2n-Cl_b2n: {angle_deg: 102.761, p10_deg: 94.683, p90_deg: 109.418}
+              Cl_b2n-Se: {angle_deg: 126.384, p10_deg: 116.129, p90_deg: 139.869}
+            Cl_b3+Cl_t+Se:
+              Cl_b3-Cl_t: {angle_deg: 111.797, p10_deg: 102.671, p90_deg: 125.469}
+              Cl_b3-Se: {angle_deg: 93.432, p10_deg: 88.139, p90_deg: 94.770}
+              Cl_t-Se: {angle_deg: 154.098, p10_deg: 139.959, p90_deg: 163.044}
+            Cl_b2n+Cl_b3+Se:
+              Cl_b2n-Cl_b3: {angle_deg: 90.428, p10_deg: 86.595, p90_deg: 115.141}
+              Cl_b2n-Se: {angle_deg: 154.365, p10_deg: 138.395, p90_deg: 163.048}
+              Cl_b3-Se: {angle_deg: 104.833, p10_deg: 99.444, p90_deg: 117.343}
+        Cl3:
+          Cl-Cl: 122.678
+        Se3:
+          Se-Se: 117.831
+    cn4:
+      default_deg: 109.5
+  Se:
+    cn2:
+      default_deg: 90.119
+    cn3:
+      default_deg: 89.245
+    cn4:
+      default_deg: 97.446
+    cn5:
+      default_deg: 83.324
+  Cl:
+    cn2:
+      default_deg: 88.143
+    cn3:
+      default_deg: 85.293
+dihedrals:
+  improper:
+    Cd:
+      cn3:
+        Cl1Se2: 0.0
+        Cl2Se1: 0.0
+        Cl3: 0.0
+        Se3: 0.0
+  proper:
+    - path: [Cd, Cl, Cd, Se]
+      target_deg: 0.0
+      weight: preferred
+      tolerance_deg: 30.0
+    - path: [Cd, Se, Cd, Cl]
+      target_deg: null
+      weight: clearance
+    - path: [Cd, Se, Cd, Se]
+      target_deg: null
+      weight: clearance
+      exclude_if: endocyclic_ring_edge
+  one_four:
+    Cl-Se: {soft_min_A: 3.50, hard_min_A: 3.30}
+    Cl-Cl: {soft_min_A: 3.40, hard_min_A: 2.80}
+    Se-Se: {soft_min_A: 3.90, hard_min_A: 3.80}
+    Cd-Cd: {soft_min_A: 3.30, hard_min_A: 3.20}

@@ -1,0 +1,92 @@
+cif: ../../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Production nucleation pathway through k=6.
+  # Decorated parents control monomer accessibility.  Every complete shedding
+  # count from zero through the current p is considered; the child skeleton's
+  # available Se coordination capacity rejects over-decorated products.
+  kmax: 6
+  mode: guided
+
+  exact_through_k: 3
+  retain_score_layers: 4
+  retain_max_per_bin: 16
+  growth_max_parents_per_bin: 8
+
+  shells_per_skeleton: 6
+  shell_score_layers: 3
+  shells_per_score_layer: 2
+  shell_enum_max_assignments: 5000
+
+  core_growth_policy: all
+  compact_from_k: 5
+  p_skeleton_beam: 64
+  p_beam_from_k: 4
+  p_beam_rank: fused_rings
+  fused_chair_mode: "off"
+
+  core_growth_occupation: decorated
+  continuous_decoration: false
+
+  monomer_p_values: [0, 1, 2, 3]
+  parent_p_mode: all_retained
+  p_ladder_mode: product_window
+  # Se-capacity-only shedding.  Zero means no artificial shedding cap.
+  k_growth_max_shed: 0
+  # Continue the destination p-ladder up to the Se-capacity limit.  The p_m
+  # values inject growth channels; they do not replace the full p-map.
+  k_growth_max_add: -1
+  p_surf_beta: 0.0
+
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+  discarded_through_k: 3
+  bond_count_scope: skeleton
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

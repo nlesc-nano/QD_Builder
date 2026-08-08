@@ -1,0 +1,68 @@
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Keep this audit example at k=1 while the rigid graph rules are validated.
+  kmax: 1
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+  # These templates are applied only after graph/CN screening. Native
+  # tetrahedral-site coordinates remain the source for growth to the next k.
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+  graph_rules:
+    # Minimum CN is feasible-first: unavoidable seed deficits remain available.
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    # Pairs are unordered. Geometry always comes from the core Cd-Se CIF.
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    # A terminal Cl may form a latent second Cd-Cl edge when both Cd atoms
+    # share Se and the complete bridge set keeps final Cd CN at or below four.
+    # Construction-native coordinates stay tetrahedral until surface projection.
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        # A bridge may not leave either of its Cd below CN 3.  Four DFT points
+        # back this: at k=1 p=1 the only available bridge would leave one Cd at
+        # CN 2, and the relaxed structure instead keeps both Cd at CN 2 with
+        # terminal Cl and a linear Se-Cd-Cl; at k=1 p=2 three bridges between
+        # CN-3 and CN-4 Cd all hold; k=2 p=0 stays pseudo-linear; and at
+        # k=2 p=3 the four structures this rule retains include the three that
+        # were relaxed, which land within 0.87 kcal/mol of each other.  Without
+        # it that bin keeps a single 18-edge Cd[2,4,4,4,4] Se[2,4] structure
+        # that DFT never visits -- one extra bond bought by stranding a Cd and
+        # an Se at CN 2, because `edges` outranks the evenness term in the
+        # score.  Run examples/nucleation/cdse_cdcl2_dft_rules.yaml to compare.
+        #
+        # Stated on the finished structure on purpose.  The same rule phrased as
+        # a minimum CN for the bridge *donor* does nothing: the identical
+        # structure is reachable from a ligand arrangement whose donor is
+        # three-coordinate, and the route-merging DAG rebuilds it there.
+        min_bridged_host_cn: 3

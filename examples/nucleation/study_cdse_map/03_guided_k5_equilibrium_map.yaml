@@ -1,0 +1,92 @@
+cif: ../../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Production equilibrium map. The neutral p ladder has no imposed coverage
+  # cutoff: it continues until growth closes or reaches the hard CN capacity.
+  # Chemical potentials are applied only after labeling.
+  kmax: 5
+  mode: guided
+  shells_per_skeleton: 3
+  shell_score_layers: 3
+  shells_per_score_layer: 1
+  # Above 1000 raw site subsets, fall back to the DFT-derived guided shell.
+  # This avoids spending most of the run enumerating thousands of equivalent
+  # high-p ligand assignments on every core.
+  shell_enum_max_assignments: 1000
+
+  # k=1..2 provide the complete propagation region. From k=2 onward, only
+  # retained core families propagate; the separate exact-k3 recipe audits this
+  # main controlled approximation without making every production run pay for
+  # the full k=3 skeleton explosion.
+  exact_through_k: 2
+  retain_score_layers: 2
+  retain_max_per_bin: 8
+  growth_max_parents_per_bin: 4
+
+  # DFT-backed ring closure begins at k=5, leaving smaller open exceptions.
+  core_growth_policy: compact_ring
+  compact_from_k: 5
+  p_skeleton_beam: 16
+  p_beam_from_k: 3
+  p_beam_rank: fused_rings
+  fused_chair_from_k: 6
+  fused_chair_mode: rank
+
+  # Equilibrium coverage: strip/rebuild the shell in every p bin. This avoids
+  # imposing a kinetic precursor inventory or a p_surf law on the map.
+  core_growth_occupation: bare
+  continuous_decoration: false
+  monomer_p_values: [0]
+  parent_p_mode: all_retained
+  p_ladder_mode: inherited_plus
+  p_surf_beta: 0.0
+  k_growth_max_shed: 0
+  k_growth_max_add: -1
+
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+  discarded_through_k: 3
+  bond_count_scope: all
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3

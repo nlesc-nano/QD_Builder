@@ -1,0 +1,22 @@
+# Run and composition settings only. Molecular graph and geometry rules live in
+# the referenced geometry pack.
+cif: ../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  geometry_pack: ../../geometry_packs/cdse_cdcl2_molecular.yaml
+  kmax: 1
+  mode: exact
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20

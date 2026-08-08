@@ -27,23 +27,44 @@ from .nc_types import (
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="nc-builder",
-        description="Coordination-aware Wulff-cut nanocrystal builder with surface passivation."
+        description="Nanocrystal builder and discrete nucleation-map generator."
     )
     p.add_argument(
         "inputs",
         nargs="+",
         metavar="INPUT",
-        help="Stack mode: YAML recipe only. Single-material: CIF file then YAML recipe.",
+        help="Nucleation/stack mode: YAML recipe only. Single-material: CIF file then YAML recipe.",
     )
     p.add_argument("-r", "--radius", type=float, default=None,
                    help="Target outer Wulff radius (Å)")
     p.add_argument("-size-unit-cells", "--size-unit-cells", type=float, default=None,
                    help="Material-scaled size: set Wulff radius to this many shortest lattice vectors; floats like 1.5 are allowed.")
 
-    p.add_argument("-o", "--out", default="nanocrystal.xyz", help="Output XYZ path (final)")
+    p.add_argument(
+        "-o",
+        "--out",
+        default="nanocrystal.xyz",
+        help="Builder: final XYZ path. Nucleation: output bundle directory.",
+    )
     p.add_argument("--write-all", action="store_true", help="Also write *_cut.xyz")
     p.add_argument("--center", action="store_true", help="Center the particle at the COM before writing")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument(
+        "--restart",
+        action="store_true",
+        help=(
+            "Nucleation only: resume from the last complete k-row under the "
+            "output bundle checkpoint/ directory instead of starting at k=1."
+        ),
+    )
+    p.add_argument(
+        "--force-restart",
+        action="store_true",
+        help=(
+            "Nucleation only: with --restart, ignore checkpoint fingerprint "
+            "mismatches (YAML/CIF/rules). Use with care."
+        ),
+    )
 
     p.add_argument(
         "--positive-q-mode",

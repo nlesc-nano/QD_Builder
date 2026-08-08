@@ -1,0 +1,61 @@
+cif: ../../cifs/CdSe_zb.cif
+
+charges:
+  Cd: +2
+  Se: -2
+  Cl: -1
+
+nucleation:
+  # Complete small-size reference. Every charge-balanced p bin is explored up
+  # to the coordination capacity; no surface-coverage or chemical-potential
+  # window is imposed here.
+  kmax: 2
+  mode: exact
+  exact_through_k: 2
+  bond_count_scope: all
+  core_growth_policy: all
+  compact_from_k: 5
+  passivation_ring_policy: prefer_cl_rings
+  ring_lengths: [4, 6]
+  discarded_through_k: 2
+  p_surf_beta: 0.0
+  k_growth_max_shed: 0
+  k_growth_max_add: -1
+
+  core_monomer:
+    cation: Cd
+    anion: Se
+  precursor:
+    center: Cd
+    ligand: Cl
+    ligand_count: 2
+  site_tolerance: 0.20
+
+  geometry_rules:
+    Cd:
+      cn2: linear
+      cn3: trigonal_planar
+      cn4: tetrahedral
+    Se:
+      all: tetrahedral
+    Cl:
+      all: tetrahedral
+
+  graph_rules:
+    min_cn:
+      Cd: 2
+      Se: 2
+      Cl: 1
+    max_cn:
+      Cd: 4
+      Se: 4
+      Cl: 2
+    allowed_bonds:
+      - [Cd, Se]
+      - [Cd, Cl]
+    bridging:
+      Cl:
+        host: Cd
+        shared_neighbor: Se
+        surface_angle_deg: 90.0
+        min_bridged_host_cn: 3
