@@ -10217,6 +10217,8 @@ def molecular_decoration_rule_violations(
 ) -> List[str]:
     """Pack construction defaults checked on the finished decorated graph."""
 
+    from .molecular_rules import required_ring_violations
+
     return (
         mu3_host_bridge_overlap_violations(state, spec)
         or
@@ -10224,6 +10226,10 @@ def molecular_decoration_rule_violations(
         or mono_se_dual_terminal_violations(state, spec)
         or _forbidden_cdse_cn_pair_violations(state, spec)
         or shared_cd_pair_violations(state, spec)
+        # Rings a graph must contain are a whole-graph property, so unlike
+        # ``min_ring_size`` (a skeleton invariant) this cannot be hoisted to
+        # the skeleton stage -- ligand-containing macrocycles count.
+        or required_ring_violations(state, spec)
     )
 
 

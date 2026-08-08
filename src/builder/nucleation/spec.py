@@ -118,6 +118,32 @@ def _split_pair_rule_key(raw: object) -> Tuple[str, str]:
     return _bond_key(parts[0].strip(), parts[1].strip())
 
 
+def _parse_required_rings(raw: object) -> Tuple[Dict[str, int], ...]:
+    """Parse ``graph_rules.required_rings`` -- rings a graph must contain."""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise TypeError(
+            "nucleation.graph_rules.required_rings must be a list of mappings"
+        )
+    out: List[Dict[str, int]] = []
+    for row in raw:
+        if not isinstance(row, Mapping):
+            raise TypeError("required_rings entries must be mappings")
+        size = int(row.get("size", 0))
+        if size < 3:
+            raise ValueError(f"required_rings size must be >= 3, got {size}")
+        out.append(
+            {
+                "size": size,
+                "min_count": max(1, int(row.get("min_count", 1))),
+                "from_k": max(0, int(row.get("from_k", 0))),
+            }
+        )
+    return tuple(out)
+
+
 def _parse_min_ring_size(raw: object) -> Dict[str, int]:
     """Parse ``graph_rules.min_ring_size`` -- ``{"Cd-Se": 6}``."""
 
@@ -602,6 +628,9 @@ def load_nucleation_spec(
                 ),
                 bridge_first_prefer_bridges_per_cd=int(
                     graph_rules_raw.get("bridge_first_prefer_bridges_per_cd", 2)
+                ),
+                required_rings=_parse_required_rings(
+                    graph_rules_raw.get("required_rings")
                 ),
                 forbid_mu3_host_bridge_overlap=bool(
                     graph_rules_raw.get("forbid_mu3_host_bridge_overlap", False)
