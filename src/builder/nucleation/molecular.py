@@ -6478,7 +6478,8 @@ def enumerate_molecular_bin(
             embed
             and pack is not None
             and decoration_mode not in {
-                "skeleton_bridge_first", "motif_graph", "motif_bridge_first"
+                "skeleton_bridge_first", "motif_graph",
+                "motif_bridge_first", "motif_bridge_target",
             }
         ):
             survey = survey_skeleton_frames(
@@ -6561,7 +6562,10 @@ def enumerate_molecular_bin(
             continue
 
         decoration_status = _DecorationStatus()
-        if decoration_mode in {"skeleton_bridge_first", "motif_bridge_first"} or (
+        if decoration_mode in {
+            "skeleton_bridge_first", "motif_bridge_first",
+            "motif_bridge_target",
+        } or (
             decoration_mode in {"pack_sites", "tet_sites"}
             and embed and pack is not None
         ):
@@ -6625,7 +6629,49 @@ def enumerate_molecular_bin(
                                 )
                 except Exception:  # noqa: BLE001 — advisory filter only
                     allowed_bridge_pairs = None
-            if decoration_mode in {"skeleton_bridge_first", "motif_bridge_first"}:
+            if decoration_mode == "motif_bridge_target":
+                # Bridge set chosen first, terminals only with what is left.
+                # The tier search cannot reach the measured optimum
+                # (n_bridges(best) = 0.96*2p - 0.21, r=0.994 over 24 bins);
+                # it strands itself interleaving terminals to satisfy
+                # min_bridged_host_cn.
+                from .molecular_bridge_first import (
+                    iter_cl_attachments_bridge_target,
+                )
+
+                decorations = iter_cl_attachments_bridge_target(
+                    k,
+                    p,
+                    skel,
+                    check_spec,
+                    pack,
+                    max_assignments=max_decoration_assignments,
+                    status=decoration_status,
+                    state=state_skel,
+                    cation_ids=cation_ids,
+                    hard_max_bridge_per_cd=int(
+                        check_spec.graph_rules.bridge_first_hard_max_bridges_per_cd
+                    ),
+                    ring_closing_only=bool(
+                        check_spec.graph_rules.bridge_target_ring_closing_only
+                    ),
+                    min_host_cn_cap=int(
+                        check_spec.graph_rules.bridge_target_min_host_cn_cap
+                    ),
+                    max_shared_per_pair=int(
+                        check_spec.graph_rules.bridge_target_max_shared_per_pair
+                    ),
+                    avoid_triangles=bool(
+                        check_spec.graph_rules.bridge_target_avoid_triangles
+                    ),
+                )
+                label = (
+                    "motif bridge-target enumeration (saturate μ2 bridges "
+                    "toward 2p, then terminal fill)"
+                )
+            elif decoration_mode in {
+                "skeleton_bridge_first", "motif_bridge_first"
+            }:
                 from .molecular_bridge_first import (
                     iter_cl_attachments_bridge_first,
                 )
@@ -6822,6 +6868,17 @@ def enumerate_molecular_bin(
         # cheap to build.
         pool = screen.pool
         screen.collect_only = False
+        if progress is not None:
+            # The size of the job, known before a single embedding is attempted:
+            # every candidate here has already cleared the graph-level rules, so
+            # this is what selection and 3D will be asked to chew through.
+            per_skeleton = len(pool) / max(1, len(skeletons))
+            progress(
+                f"    GRAPHS: {len(pool)} graphs passed the graph rules "
+                f"from {len(skeletons)} skeletons "
+                f"({per_skeleton:.1f} graphs/skeleton); "
+                f"{bin_result.raw_graphs} decorations were streamed"
+            )
         # A rank cut on graph compactness.  Wiener index (sum of shortest-path
         # lengths, in bonds) is computed on the finished graph before any
         # coordinates exist and tracks relative energy at rho +0.32 to +0.78

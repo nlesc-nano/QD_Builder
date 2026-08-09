@@ -1081,7 +1081,10 @@ def iter_cl_attachments_bridge_target(
     max_shared = int(
         getattr(spec.graph_rules, "max_shared_ligands_per_host_pair", 1) or 1
     )
+    if max_shared_per_pair > 0:
+        max_shared = min(max_shared, max_shared_per_pair)
     skel = _skel_degrees(cd_list, inorganic_edges)
+
     # Room for chloride on each host, and the cap on how much of it may be
     # bridging.  A hard cap of 0 means "no cap".
     cap = hard_max_bridge_per_cd if hard_max_bridge_per_cd > 0 else n_cl
@@ -1135,8 +1138,6 @@ def iter_cl_attachments_bridge_target(
         sum(bridge_room) // 2,
         len(pair_list) * max(1, max_shared),
     )
-    if ceiling <= 0:
-        return
 
     emitted = 0
     seen_keys: Set[Tuple] = set()
@@ -1239,7 +1240,7 @@ def iter_cl_attachments_bridge_target(
     # exhausted, a second chloride on a pair.  Measured: 92.0% of bridged pairs
     # carry exactly one Cl and doubles only appear as p rises and pairs run out
     # (0.3% of pairs at k5p1, 8.9% at k5p11); 3+ never occurs.
-    tiers = [(1, True), (1, False)]
+    tiers = [(1, True), (1, False)] if avoid_triangles else [(1, False)]
     if max_shared_per_pair > 1:
         tiers.append((max_shared_per_pair, False))
     for target in range(ceiling, -1, -1):

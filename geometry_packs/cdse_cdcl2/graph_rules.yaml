@@ -1,0 +1,63 @@
+# Graph stage: which (k,p) graphs exist at all.
+#
+# Nothing in this file knows about coordinates.  It decides what a legal
+# CdSe/CdCl2 connectivity is, how decorations are enumerated, and which of
+# them are handed to the 3D embedder.
+#
+# An unknown key here is an error, not a silent default -- see
+# NUCLEATION_GRAPH_RULE_KEYS in geometry_pack.py for the full vocabulary.
+
+graph_rules:
+
+  # ---- what counts as a legal graph ------------------------------------
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 4}
+    Cl: {min: 1, max: 3}
+
+  # `bond_max_distance` is the bond-formation cutoff; `min_distance` is a
+  # construction epsilon for the embedder, NOT an audit threshold for a
+  # relaxed structure (79% of embedded structures sit below the Cd-Cd value).
+  # Audit thresholds live in INSTALL.md.
+  pair_rules:
+    Cd-Se: {bond: allowed,   bond_max_distance: 3.25}
+    Cd-Cl: {bond: allowed,   bond_max_distance: 2.90}
+    Cd-Cd: {bond: forbidden, min_distance: 3.00}
+    Se-Se: {bond: forbidden, min_distance: 3.80}
+    Cl-Se: {bond: forbidden, min_distance: 2.70}
+    Cl-Cl: {bond: forbidden, min_distance: 2.70}
+
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]        # terminal, mu2 bridge, mu3 cap
+
+  min_ring_size: {Cd-Se: 6}    # no Cd2Se2 4-rings in the seed
+  require_inorganic_connected: true
+  enforce_min_cn: true
+
+  min_bridged_host_cn: 3                # a bridge needs hosts of CN >= 3
+  max_shared_ligands_per_host_pair: 1   # one Cl per Cd-Cd pair
+  forbid_mono_se_dual_terminal: true
+  forbid_mu3_host_bridge_overlap: true
+
+  # ---- how decorations are generated -----------------------------------
+  decoration_mode: motif_bridge_first
+
+  # Soft bridge load: THIS is what bounds bridges per Cd, not the hard cap.
+  # 3 cuts mean terminal Cl from 2.99 to 1.82 at k3p4 and keeps the k3p3
+  # energy-minimum family intact.
+  bridge_first_prefer_bridges_per_cd: 3
+  bridge_first_hard_max_bridges_per_cd: 2
+
+  # |Aut| grows factorially in equivalent precursor cations (mean 8388 at
+  # k4p9).  Capping it takes that bin from 1541 s to 4.7 s and costs ~7% of
+  # graphs at k4p7 -- without it k=5 is not enumerable.
+  bridge_first_max_automorphisms: 64
+
+  # ---- which graphs reach 3D -------------------------------------------
+  # Relative Wiener-index cut against the bin's own most compact graph.  A
+  # fixed rank cut is wrong here: it prunes the same fraction everywhere,
+  # and the lowest-energy graph is often not the most compact.  Measured
+  # over nine bins with known energies, 0.20 loses no bin minimum, 0.10
+  # loses one, and a top-20% rank cut loses four.
+  selection_order: compactness
+  selection_max_wiener_excess: 0.20

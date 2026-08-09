@@ -90,16 +90,72 @@ micromamba env export --explicit > environment.lock.txt
 - `xtb-python` from PyPI builds from source and needs a Fortran toolchain.
   Install it from conda-forge instead.
 
-## Production run pack (graph_rules)
+## Pack layout
 
-Every knob below is read from `graph_rules` in the run pack. A key absent from
-`nucleation_graph_rules_mapping()` in `geometry_pack.py` silently falls back to
-its dataclass default, so check a new key round-trips before trusting it:
+A run pack is composed from one file per pipeline stage, listed by the driver:
+
+```
+geometry_packs/cdse_cdcl2/
+  run_gxtb.yaml      driver: composition, k/p range, relaxation, include list
+  graph_rules.yaml   graph stage  -- which (k,p) graphs exist (no coordinates)
+  motifs.yaml        vocabulary   -- which local environments are allowed
+  embed.yaml         3D stage     -- bonds/angles/dihedrals, reconstruction
+```
+
+Run it with `--yaml geometry_packs/cdse_cdcl2/run_gxtb.yaml`; the driver is
+both the run spec and the pack, so no wrapper file is needed.
+
+Two rules make the split trustworthy, and both are enforced at load:
+
+- **A setting lives in exactly one file.** Defining the same leaf twice raises,
+  naming both files. There is no precedence to remember, and include order is
+  irrelevant.
+- **An unknown `graph_rules` key raises**, with a spelling suggestion. This
+  used to fail silently: `required_rings` and
+  `bridge_first_maximize_bridged_pairs` were both "enabled" in a pack for days
+  while the enumeration ran on the default, because nothing checked the name.
+  The vocabulary is `NUCLEATION_GRAPH_RULE_KEYS` in `geometry_pack.py`, and
+  `tests/test_geometry_pack_include.py` asserts every name in it is actually
+  consumed.
+
+To see what was parsed:
 
 ```python
 from builder.nucleation.spec import load_nucleation_spec
-print(load_nucleation_spec("pack.yaml").graph_rules)
+print(load_nucleation_spec("geometry_packs/cdse_cdcl2/run_gxtb.yaml").graph_rules)
 ```
+
+### Where a setting goes
+
+| you want to change | file |
+|---|---|
+| allowed coordination, forbidden pairs, ring floor | `graph_rules.yaml` |
+| how decorations are enumerated, `|Aut|` cap | `graph_rules.yaml` |
+| which graphs reach 3D (compactness cut) | `graph_rules.yaml` |
+| which local environments exist at all | `motifs.yaml` |
+| a bond length, angle, improper, clash distance | `embed.yaml` |
+| k/p range, CIF, charges | driver |
+| xTB vs g-xTB, binary, timeout | driver |
+
+`motifs.yaml` is read for `center` + `linker_count` only. A motif may carry
+its own geometry, but **only** in a pack with no `bonds:` table — with
+`embed.yaml` present those numbers are silently dead, which is how the old
+single-file pack ended up carrying a full set of motif bond lengths that
+contradicted the tables actually in use. Note also that adding a `Cd` motif
+would pin Cd to exactly the listed coordination numbers, so census entries
+like `Cd4:Se1Cl3` belong in the `embed.yaml` angle table, not there.
+
+The legacy `geometry_reference:` mechanism still loads, but it overrides whole
+top-level sections rather than merging leaves — so a driver defining
+`graph_rules` silently discarded *all* of the reference's graph rules and
+relaxation settings. Prefer `include:`.
+
+### Legacy single-file packs
+
+`geometry_packs/cdse_cdcl2_motif_GXTB.yaml` and friends still work and are
+kept for reproducing earlier runs. `cdse_cdcl2/` is verified to produce
+identical graph rules, geometry tables and bin results
+(`test_composed_pack_matches_legacy_single_file`).
 
 ```yaml
 graph_rules:
@@ -211,7 +267,37 @@ relaxation:
 ```
 
 On a cluster where PATH and XTBPATH are already exported, `binary: gxtb` alone
-is enough. Use `geometry_packs/cdse_cdcl2_motif_GXTB.yaml`.
+is enough. Use `geometry_packs/cdse_cdcl2/run_gxtb.yaml`. For a local build:
+
+```bash
+export GXTB_PATH=/path/to/xtb-gxtb-<platform>
+export PATH="$GXTB_PATH/bin:$PATH"
+export XTBPATH="$GXTB_PATH/share/xtb"
+```
+
+**Startup banner.** Before the first structure the run prints the backend it
+resolved — binary, absolute path, `--version`, `XTBPATH`, `PATH`,
+`OMP_NUM_THREADS` and the exact command line — and warns if the binary is not
+on `PATH`. A run whose energies look wrong is nearly always a wrong binary or
+a stale `XTBPATH`, and neither is visible from the results:
+
+```
+[relax] binary    : gxtb
+[relax] resolved  : /path/to/xtb-bleed-macos-x86_64/bin/gxtb
+[relax] version   : xtb version 6.7.1 (30c6303) compiled by ... on 2026-05-14
+[relax] XTBPATH   : /path/to/xtb-bleed-macos-x86_64/share/xtb
+[relax] command   : gxtb in.xyz --gxtb --opt
+[relax] timeout_s : 1800    charge: 0
+```
+
+**Job size before 3D.** Once decoration finishes, each bin reports how many
+graphs cleared the graph rules — the real size of the job, known before a
+single embedding is attempted:
+
+```
+    GRAPHS: 10 graphs passed the graph rules from 1 skeletons
+            (10.0 graphs/skeleton); 10 decorations were streamed
+```
 
 Energy, geometry and Wiberg orders are read from `xtbopt.xyz`, `wbo` and the
 log; energies are converted Hartree -> eV so they are directly comparable with

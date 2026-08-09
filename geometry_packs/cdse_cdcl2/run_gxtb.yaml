@@ -1,0 +1,57 @@
+# CdSe / CdCl2 nucleation driver -- g-xTB relaxation.
+#
+# The pipeline runs in three stages and this file names one input per stage:
+#
+#     graph_rules.yaml  ->  which (k,p) graphs exist        [no coordinates]
+#     motifs.yaml       ->  which local environments exist  [vocabulary]
+#     embed.yaml        ->  how a graph becomes coordinates [g-xTB tables]
+#
+# A setting may appear in exactly ONE of these files.  Defining the same key
+# twice is a load error naming both files, so there is no precedence to
+# remember and no way to be unsure which value is in force.
+#
+# Check what the loader actually parsed before trusting a new key:
+#     python -c "from builder.nucleation.spec import load_nucleation_spec; \
+#                print(load_nucleation_spec('<this file>').graph_rules)"
+
+schema_version: 2
+name: cdse_cdcl2_gxtb
+
+include:
+  - graph_rules.yaml
+  - motifs.yaml
+  - embed.yaml
+
+# ---- composition -------------------------------------------------------
+cif: ../../examples/cifs/CdSe_zb.cif
+charges: {Cd: 2, Se: -2, Cl: -1}
+
+nucleation:
+  kmax: 3
+  mode: exact
+  core_monomer: {cation: Cd, anion: Se}
+  precursor: {center: Cd, ligand: Cl, ligand_count: 2}
+  site_tolerance: 0.2
+
+# ---- relaxation --------------------------------------------------------
+# g-xTB has no Python API, so it is driven as a command-line binary:
+#     gxtb in.xyz --gxtb --opt [--chrg N]
+# The exact binary, resolved path, version, XTBPATH and command line are
+# printed once before the first structure -- check that banner if energies
+# look wrong.
+#
+# On a cluster where the module already exports PATH and XTBPATH, `binary:
+# gxtb` alone is enough; set `xtb_path` for a local build:
+#     export GXTB_PATH=/path/to/xtb-gxtb-<platform>
+#     export PATH="$GXTB_PATH/bin:$PATH"
+#     export XTBPATH="$GXTB_PATH/share/xtb"
+#
+# Timings: 5 atoms 1 s, 21 atoms 15 s, 29 atoms 47 s -- roughly 2-3x GFN1,
+# so the GFN1 default timeout of 90 s would kill most k=4 structures.
+relaxation:
+  enabled: true
+  method: g-xTB
+  binary: gxtb
+  charge: 0                  # k CdSe + p CdCl2 is neutral by construction
+  timeout_s: 1800
+  check_connectivity: true

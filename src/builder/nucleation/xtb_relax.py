@@ -122,6 +122,82 @@ def _is_gxtb(method: str) -> bool:
     }
 
 
+#: the banner is per-process state, so a batch prints it once, not per bin
+_BACKEND_BANNER_DONE = False
+
+
+def _binary_version(binary: str, env: Mapping[str, str]) -> str:
+    """The backend's own version string, or why it could not be obtained."""
+
+    try:
+        proc = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True,
+            env=dict(env), check=False, timeout=60.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"<unavailable: {exc}>"
+    for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
+        if "version" in line.lower():
+            return line.strip().lstrip("*").strip()
+    return "<unknown>"
+
+
+def describe_backend(settings: "XtbSettings") -> List[str]:
+    """Exactly what will be executed: binary, version, env, command line.
+
+    Printed once before the first relaxation.  A run whose energies later look
+    wrong is nearly always a wrong binary or a stale ``XTBPATH``, and neither
+    is visible from the results alone.
+    """
+
+    import os
+    import shutil
+
+    binary = settings.binary or "gxtb"
+    env = _cli_env(settings)
+    resolved = shutil.which(binary, path=env.get("PATH", os.defpath))
+    cmd = _cli_command(binary, settings)
+    lines = [
+        "[relax] backend   : command-line binary (no python API)",
+        f"[relax] method    : {settings.method}",
+        f"[relax] binary    : {binary}",
+        f"[relax] resolved  : {resolved or '<NOT FOUND ON PATH>'}",
+        f"[relax] version   : {_binary_version(binary, env)}",
+        f"[relax] XTBPATH   : {env.get('XTBPATH', '<unset>')}",
+        f"[relax] PATH      : {env.get('PATH', '<unset>')}",
+        f"[relax] OMP_NUM_THREADS : {env.get('OMP_NUM_THREADS', '<unset>')}",
+        f"[relax] command   : {' '.join(cmd)}",
+        f"[relax] timeout_s : {settings.timeout_s:g}"
+        f"    charge: {int(settings.charge)}",
+    ]
+    if resolved is None:
+        lines.append(
+            "[relax] WARNING: binary not on PATH -- every relaxation will fail."
+        )
+    return lines
+
+
+def _cli_env(settings: "XtbSettings") -> Dict[str, str]:
+    """Environment handed to the backend, with XTBPATH from the pack."""
+
+    import os
+
+    env = dict(os.environ)
+    if settings.xtb_path:
+        env["XTBPATH"] = settings.xtb_path
+    env.setdefault("OMP_NUM_THREADS", "1")
+    return env
+
+
+def _cli_command(binary: str, settings: "XtbSettings") -> List[str]:
+    """The argv used for every structure (input file is always ``in.xyz``)."""
+
+    cmd = [binary, "in.xyz", "--gxtb", "--opt"]
+    if settings.charge:
+        cmd += ["--chrg", str(int(settings.charge))]
+    return cmd
+
+
 def _run_cli(structures, settings) -> List[Dict[str, Any]]:
     """Drive a standalone xtb/g-xTB binary, one optimisation per structure.
 
@@ -130,16 +206,17 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
     from ``xtbopt.xyz``; Wiberg orders from ``wbo`` when present.
     """
 
-    import os
     import re
     import shutil
     import tempfile
 
+    global _BACKEND_BANNER_DONE
+
     binary = settings.binary or "gxtb"
-    env = dict(os.environ)
-    if settings.xtb_path:
-        env["XTBPATH"] = settings.xtb_path
-    env.setdefault("OMP_NUM_THREADS", "1")
+    env = _cli_env(settings)
+    if not _BACKEND_BANNER_DONE:
+        _BACKEND_BANNER_DONE = True
+        print("\n".join(describe_backend(settings)), flush=True)
 
     out: List[Dict[str, Any]] = []
     for entry in structures:
@@ -152,9 +229,7 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
                     f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
                 )
             xyz.write_text("\n".join(lines) + "\n")
-            cmd = [binary, "in.xyz", "--gxtb", "--opt"]
-            if settings.charge:
-                cmd += ["--chrg", str(int(settings.charge))]
+            cmd = _cli_command(binary, settings)
             try:
                 proc = subprocess.run(
                     cmd, cwd=work, capture_output=True, text=True, env=env,

@@ -433,6 +433,21 @@ class NucleationGraphRules:
     #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 and drops ~7% of
     #: p7, which is the trade chosen here -- speed matters more at large k.
     bridge_first_max_automorphisms: int = 64
+    #: --- motif_bridge_target knobs -------------------------------------
+    #: Restrict bridges to Cd pairs at core distance 2 or 4 (4-ring / 6-ring
+    #: closure).  Measured: 54.2% of bridges close a 4-ring, 44.6% a 6-ring,
+    #: nothing else reaches 1.5%.
+    bridge_target_ring_closing_only: bool = True
+    #: Max chloride on one Cd-Cd pair.  92.0% of bridged pairs carry exactly
+    #: one; 3+ never occurs.  1 removes the doubles tier entirely.
+    bridge_target_max_shared_per_pair: int = 2
+    #: A pair is only bridgeable when its *lower*-CN host is at or below this
+    #: skeleton CN.  79.6% of bridges have a host at CN <= 1; pairs with both
+    #: hosts at CN >= 3 account for 0.1%.
+    bridge_target_min_host_cn_cap: int = 2
+    #: Skip bridge sets making three Cd mutually bridged (rho +0.19 with
+    #: energy in all 21 measured bins) on the first tier.
+    bridge_target_avoid_triangles: bool = True
     #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
     #: In the most stable structure of every measured (k,p) bin essentially
     #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over
