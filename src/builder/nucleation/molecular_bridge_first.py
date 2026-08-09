@@ -1083,7 +1083,72 @@ def iter_cl_attachments_bridge_target(
     )
     if max_shared_per_pair > 0:
         max_shared = min(max_shared, max_shared_per_pair)
+    min_bridge_cn = int(getattr(spec.graph_rules, "min_bridged_host_cn", 0) or 0)
     skel = _skel_degrees(cd_list, inorganic_edges)
+
+    # Skeleton automorphisms, in Cd-slot coordinates, for orderly generation.
+    # Without them the walk explores one branch per automorphic image of the
+    # same bridge set: measured 44845 emissions for 1867 distinct graphs over
+    # k1p2..k3p4 (24x), and 56x at k3p5.  Deduplicating the finished graphs
+    # cannot recover that -- the cost is in the tree, so the pruning has to
+    # happen at every node (see ``walk_bridges``).
+    inorganic = nx.Graph()
+    inorganic.add_nodes_from(
+        (node, {"element": spec.core.anion}) for node in se_ids
+    )
+    inorganic.add_nodes_from(
+        (node, {"element": spec.core.cation}) for node in cd_list
+    )
+    inorganic.add_edges_from(inorganic_edges)
+    aut_cap = int(
+        getattr(spec.graph_rules, "bridge_target_max_automorphisms", 4096) or 0
+    )
+    slot_maps: List[Tuple[int, ...]] = []
+    matcher = nx.algorithms.isomorphism.GraphMatcher(
+        inorganic,
+        inorganic,
+        node_match=nx.algorithms.isomorphism.categorical_node_match(
+            "element", ""
+        ),
+    )
+    for host_map in matcher.isomorphisms_iter():
+        try:
+            slot_maps.append(tuple(position[host_map[host]] for host in cd_list))
+        except KeyError:
+            continue
+        # |Aut| grows factorially in equivalent precursor cations; past the cap
+        # the orbit computation costs more than the branches it removes.
+        if aut_cap > 0 and len(slot_maps) > aut_cap:
+            slot_maps = [tuple(range(n_cd))]
+            break
+    if not slot_maps:
+        slot_maps = [tuple(range(n_cd))]
+    identity = tuple(range(n_cd))
+    trivial_group = len(slot_maps) == 1 and slot_maps[0] == identity
+
+    def _slot_pairs(chosen: Sequence[Tuple[int, int]]) -> Tuple[Tuple[int, int], ...]:
+        return tuple(sorted(
+            (min(position[a], position[b]), max(position[a], position[b]))
+            for a, b in chosen
+        ))
+
+    def _apply(mapping: Tuple[int, ...],
+               pairs: Sequence[Tuple[int, int]]) -> Tuple[Tuple[int, int], ...]:
+        return tuple(sorted(
+            (min(mapping[x], mapping[y]), max(mapping[x], mapping[y]))
+            for x, y in pairs
+        ))
+
+    def _stabiliser(group: Sequence[Tuple[int, ...]],
+                    chosen: Sequence[Tuple[int, int]]) -> List[Tuple[int, ...]]:
+        """The subgroup fixing the bridge set chosen so far.
+
+        Shrinks fast as bridges are committed, so the orbit test at deeper
+        nodes is nearly free.
+        """
+
+        target = _slot_pairs(chosen)
+        return [m for m in group if _apply(m, target) == target]
 
     # Room for chloride on each host, and the cap on how much of it may be
     # bridging.  A hard cap of 0 means "no cap".
@@ -1165,7 +1230,8 @@ def iter_cl_attachments_bridge_target(
 
         yield from walk(0, budget, [])
 
-    def finish(chosen: List[Tuple[int, int]], load: List[int]):
+    def finish(chosen: List[Tuple[int, int]], load: List[int],
+               group: Sequence[Tuple[int, ...]] = ()):
         nonlocal emitted
         budget = n_cl - len(chosen)
         for terms in terminal_fills(load, budget):
@@ -1173,6 +1239,15 @@ def iter_cl_attachments_bridge_target(
             for slot in terms:
                 cn[slot] += 1
             if min_cd_final > 0 and any(c < min_cd_final for c in cn):
+                continue
+            # A bridged host must finish at min_bridged_host_cn.  Without this
+            # the generator emits decorations the downstream screen rejects,
+            # and because the target loop stops descending as soon as a target
+            # *emits*, the terminal-only tier below was never reached -- which
+            # is why k1p1 and k2p1 produced nothing at all.
+            if min_bridge_cn > 0 and any(
+                load[i] > 0 and cn[i] < min_bridge_cn for i in range(n_cd)
+            ):
                 continue
             st = _PlaceState(
                 cn=cn,
@@ -1183,7 +1258,19 @@ def iter_cl_attachments_bridge_target(
                 mu3=[],
                 terminals_on=list(terms),
             )
-            key = (tuple(sorted(chosen)), tuple(sorted(terms)))
+            # Terminals are canonicalised under whatever symmetry survives the
+            # bridge set, so equivalent terminal placements collapse too.
+            if len(group) > 1:
+                bridge_slots = _slot_pairs(chosen)
+                key = min(
+                    (
+                        _apply(mapping, bridge_slots),
+                        tuple(sorted(mapping[slot] for slot in terms)),
+                    )
+                    for mapping in group
+                )
+            else:
+                key = (tuple(sorted(chosen)), tuple(sorted(terms)))
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -1204,10 +1291,17 @@ def iter_cl_attachments_bridge_target(
     def walk_bridges(start: int, load: List[int],
                      chosen: List[Tuple[int, int]], target: int,
                      used: Dict[Tuple[int, int], int], share_cap: int,
-                     no_triangles: bool):
+                     no_triangles: bool,
+                     group: Sequence[Tuple[int, ...]]):
         if len(chosen) == target:
-            yield from finish(chosen, load)
+            yield from finish(chosen, load, group)
             return
+        # Orderly generation: two candidate pairs in the same orbit under the
+        # stabiliser of ``chosen`` produce isomorphic children, because the
+        # automorphism carrying one to the other fixes everything already
+        # placed.  Exploring one representative per orbit prunes the tree
+        # rather than the leaves, which is where the duplication lives.
+        orbit_seen: Set[Tuple[Tuple[int, int], ...]] = set()
         for idx in range(start, len(pair_list)):
             a, b = pair_list[idx]
             s1, s2 = position[a], position[b]
@@ -1217,6 +1311,19 @@ def iter_cl_attachments_bridge_target(
                 continue
             if no_triangles and _closes_triangle(chosen, a, b):
                 continue
+            if len(group) > 1:
+                extended = _slot_pairs(chosen) + (
+                    (min(s1, s2), max(s1, s2)),
+                )
+                canon = min(
+                    _apply(mapping, extended) for mapping in group
+                )
+                if canon in orbit_seen:
+                    continue
+                orbit_seen.add(canon)
+                child_group = _stabiliser(group, chosen + [(a, b)])
+            else:
+                child_group = group
             load[s1] += 1
             load[s2] += 1
             used[(a, b)] = used.get((a, b), 0) + 1
@@ -1225,7 +1332,7 @@ def iter_cl_attachments_bridge_target(
             # restarts at idx rather than idx+1 in that case.
             nxt = idx if share_cap > 1 else idx + 1
             yield from walk_bridges(nxt, load, chosen, target, used,
-                                    share_cap, no_triangles)
+                                    share_cap, no_triangles, child_group)
             chosen.pop()
             used[(a, b)] -= 1
             load[s1] -= 1
@@ -1247,7 +1354,7 @@ def iter_cl_attachments_bridge_target(
         produced = False
         for share_cap, no_tri in tiers:
             for edges in walk_bridges(0, [0] * n_cd, [], target, {},
-                                      share_cap, no_tri):
+                                      share_cap, no_tri, slot_maps):
                 produced = True
                 yield edges
                 if max_assignments > 0 and emitted >= max_assignments:
