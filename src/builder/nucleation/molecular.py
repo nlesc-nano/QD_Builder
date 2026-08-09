@@ -772,6 +772,8 @@ def _skeleton_graph_violations(
     # decided by the skeleton alone -- no decoration can create or remove one.
     violations.extend(ring_size_violations(state, spec))
 
+    violations.extend(_core_density_violations(state, spec))
+
     if spec.require_inorganic_connected:
         components = inorganic_component_count(state, spec)
         if components > 1:
@@ -784,6 +786,59 @@ def _skeleton_graph_violations(
             violations.append("inorganic_empty")
 
     return violations
+
+
+def _core_density_violations(
+    state: _State,
+    spec: NucleationSpec,
+) -> List[str]:
+    """Skeleton-level density rules: edge floor, cut edges, dangling cations.
+
+    All three are properties of the cation-anion core alone, so they are
+    decided once per skeleton rather than once per decoration -- and dropping a
+    core removes every decoration it would have carried.  Measured against the
+    best child each skeleton produces: edge count rho -0.40 (18/19 bins), cut
+    edges +0.39 (18/19), cations at CN1 +0.25 (17/20).
+    """
+
+    cation, anion = spec.core.cation, spec.core.anion
+    frac = float(getattr(spec.graph_rules, "min_core_edge_fraction", 0.0) or 0.0)
+    max_cut = int(getattr(spec.graph_rules, "max_core_cut_edges", -1))
+    max_excess = int(getattr(spec.graph_rules, "max_excess_cn1_cations", -1))
+    if frac <= 0.0 and max_cut < 0 and max_excess < 0:
+        return []
+
+    cations = [a.atom_id for a in state.atoms if a.symbol == cation]
+    anions = [a.atom_id for a in state.atoms if a.symbol == anion]
+    if not cations or not anions:
+        return []
+    core = state.graph.subgraph(cations + anions)
+    n_edges = core.number_of_edges()
+    out: List[str] = []
+
+    if frac > 0.0:
+        max_anion_cn = int(spec.graph_rules.max_cn.get(anion, 4) or 4)
+        e_min = len(cations) + len(anions) - 1
+        e_max = min(len(anions) * max_anion_cn, len(cations) * max_anion_cn)
+        if e_max > e_min:
+            need = e_min + int(-(-(e_max - e_min) * frac // 1))
+            if n_edges < need:
+                out.append(f"core_too_sparse:{n_edges}<{need}")
+
+    if max_cut >= 0 and n_edges:
+        cuts = len(list(nx.bridges(core))) if nx.is_connected(core) else n_edges
+        if cuts > max_cut:
+            out.append(f"core_cut_edges:{cuts}>{max_cut}")
+
+    if max_excess >= 0:
+        n_cn1 = sum(1 for c in cations if core.degree(c) == 1)
+        # Stoichiometric floor: with every cation needing an anion bond, the
+        # anion valence budget forces this many CN1 cations at minimum.
+        max_anion_cn = int(spec.graph_rules.max_cn.get(anion, 4) or 4)
+        floor = max(0, 2 * len(cations) - max_anion_cn * len(anions))
+        if n_cn1 > floor + max_excess:
+            out.append(f"core_dangling_cations:{n_cn1}>{floor}+{max_excess}")
+    return out
 
 
 def _graph_certificate(state: _State) -> Tuple[object, ...]:

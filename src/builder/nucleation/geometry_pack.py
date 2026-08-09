@@ -426,6 +426,15 @@ class GeometryPack:
                 self.graph_rules.get("bridge_first_prefer_bridges_per_cd", 2)
             ),
             "required_rings": self.graph_rules.get("required_rings") or [],
+            "min_core_edge_fraction": float(
+                self.graph_rules.get("min_core_edge_fraction", 0.0) or 0.0
+            ),
+            "max_core_cut_edges": int(
+                self.graph_rules.get("max_core_cut_edges", -1)
+            ),
+            "max_excess_cn1_cations": int(
+                self.graph_rules.get("max_excess_cn1_cations", -1)
+            ),
             "bridge_first_max_automorphisms": int(
                 self.graph_rules.get("bridge_first_max_automorphisms", 64)
             ),

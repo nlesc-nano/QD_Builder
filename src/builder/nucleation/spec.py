@@ -655,6 +655,15 @@ def load_nucleation_spec(
                 required_rings=_parse_required_rings(
                     graph_rules_raw.get("required_rings")
                 ),
+                min_core_edge_fraction=float(
+                    graph_rules_raw.get("min_core_edge_fraction", 0.0) or 0.0
+                ),
+                max_core_cut_edges=int(
+                    graph_rules_raw.get("max_core_cut_edges", -1)
+                ),
+                max_excess_cn1_cations=int(
+                    graph_rules_raw.get("max_excess_cn1_cations", -1)
+                ),
                 forbid_mu3_host_bridge_overlap=bool(
                     graph_rules_raw.get("forbid_mu3_host_bridge_overlap", False)
                 ),
