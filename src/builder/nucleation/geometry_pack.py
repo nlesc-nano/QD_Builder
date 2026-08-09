@@ -46,6 +46,7 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "bridge_target_min_host_cn_cap",
     "bridge_target_avoid_triangles",
     "bridge_target_max_automorphisms",
+    "bridge_target_count_window",
     "bridge_first_target_bridge_fraction",
     "bridge_first_maximize_bridged_pairs",
     "passivate_min_cd_cn",
@@ -653,6 +654,9 @@ class GeometryPack:
             ),
             "bridge_target_max_automorphisms": int(
                 self.graph_rules.get("bridge_target_max_automorphisms", 4096)
+            ),
+            "bridge_target_count_window": int(
+                self.graph_rules.get("bridge_target_count_window", 0)
             ),
             "bridge_first_target_bridge_fraction": float(
                 self.graph_rules.get(

@@ -454,6 +454,11 @@ class NucleationGraphRules:
     #: falls back to no pruning (72x over-emission); at 512 it prunes fully
     #: (9.4x, 3.3s -> 0.57s) and k3p4/k2p4 are unaffected.
     bridge_target_max_automorphisms: int = 4096
+    #: How many productive bridge counts to emit below the ceiling.  0 emits
+    #: only the maximum the skeleton supports.  The bin optimum tracks
+    #: n_bridges = 0.964*(2p) - 0.36 (r=0.993, 29 bins), but the population is
+    #: broad: 5.7% of relaxed structures sit at exactly 2p, 51% within 2.
+    bridge_target_count_window: int = 0
     #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
     #: In the most stable structure of every measured (k,p) bin essentially
     #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over
