@@ -651,6 +651,11 @@ def load_nucleation_spec(
                 bridge_target_avoid_triangles=bool(
                     graph_rules_raw.get("bridge_target_avoid_triangles", True)
                 ),
+                bridge_target_max_automorphisms=int(
+                    graph_rules_raw.get(
+                        "bridge_target_max_automorphisms", 4096
+                    )
+                ),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
                 ),

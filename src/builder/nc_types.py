@@ -448,6 +448,12 @@ class NucleationGraphRules:
     #: Skip bridge sets making three Cd mutually bridged (rho +0.19 with
     #: energy in all 21 measured bins) on the first tier.
     bridge_target_avoid_triangles: bool = True
+    #: Orbit pruning walks a group that shrinks as bridges are committed, so
+    #: it tolerates a far larger |Aut| than the bridge_first beam, which
+    #: canonicalises every state at O(|Aut|.n log n).  At 64 the k2p5 skeleton
+    #: falls back to no pruning (72x over-emission); at 512 it prunes fully
+    #: (9.4x, 3.3s -> 0.57s) and k3p4/k2p4 are unaffected.
+    bridge_target_max_automorphisms: int = 4096
     #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
     #: In the most stable structure of every measured (k,p) bin essentially
     #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over
