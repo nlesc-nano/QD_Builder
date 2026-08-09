@@ -1,0 +1,292 @@
+# =============================================================================
+# CdSe / CdCl2 molecular pack.  Every target carries its own tolerance.
+# Cd CN3 planar (angles sum 360); Se CN3 pyramidal (3x90).
+# Cl roles: Cl_t terminal, Cl_b bridge (code refines to Cl_b2s/Cl_b2n/Cl_b3).
+# Non-bonded restraints act on the SHORT side only; long side is free.
+# =============================================================================
+schema_version: 2
+name: cdse_cdcl2_molecular_gxtb
+
+# ----------------------------------------------------------------- GRAPH ----
+# Only what decides which graphs exist.  Distances here are geometric gates
+# used after embedding, not graph filters.
+graph_rules:
+  require_inorganic_connected: true
+  enforce_min_cn: true
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 4}
+    Cl: {min: 1, max: 3}
+
+  # bond: allowed -> the only edges the generator may create.
+  # bond: forbidden + min_distance -> 3D contact floor (hard = min_distance).
+  pair_rules:                     # topology only; distances live below
+    Cd-Se: allowed
+    Cd-Cl: allowed
+    Cd-Cd: forbidden
+    Se-Se: forbidden
+    Cl-Se: forbidden
+    Cl-Cl: forbidden
+
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]          # Cl binds Cd only; mu1/mu2/mu3
+  min_ring_size: {Cd-Se: 6}      # no Cd-Se-Cd-Se 4-rings
+  max_shared_ligands_per_host_pair: 1
+
+  # bridge-first decoration
+  decoration_mode: skeleton_bridge_first
+  bridge_first_p1_terminal_policy: unrestricted
+  bridge_cd_cd_max_distance: 4.75   # upper gate for a mu2 host pair
+  min_bridged_host_cn: 3            # both hosts of a bridge finish CN>=3
+  forbid_mono_se_dual_terminal: true
+
+  # ring seeding ladder
+  ring_first_when_pattern_possible: true
+  ring_first_fallback_to_open: true
+  multi_ring_ladder: true
+  ring_min_pattern_cd: [3, 3, 4]
+  ring_min_pattern_se: [3, 3, 3]
+
+# ------------------------------------------------------------------ MOTIFS --
+# Seed fragments the skeleton enumerator grows from.  Local indices only:
+# Cd0.. and Se0.. within the motif; edges are [cd_index, se_index].
+# Omit this section to fall back to the built-in ring6 + path/edge fusions.
+motifs:
+  ring6:                      # Cd3Se3 six-ring: Cd0-Se0-Cd1-Se1-Cd2-Se2-Cd0
+    edges: [[0,0],[0,2],[1,0],[1,1],[2,1],[2,2]]
+
+  fusions:                    # two six-rings sharing atoms
+    - name: path_Cd1Se2       # share Se0-Cd1-Se1 (3 atoms, 2 bonds)
+      edges: [[0,0],[0,2],[1,0],[1,1],[2,1],[2,2],
+              [3,0],[3,3],[4,1],[4,3]]
+    - name: edge_CdSe         # share Cd0-Se0 (2 atoms, 1 bond)
+      edges: [[0,0],[0,2],[0,4],[1,0],[1,1],[2,1],[2,2],
+              [3,0],[3,3],[4,3],[4,4]]
+    # face-share (4 atoms, 3 bonds) is deliberately absent: measured zero
+    # times in bulk zinc-blende (it is a bicyclo[2.2.2] cage needing boats).
+
+# ------------------------------------------------------------- BONDS (1-2) --
+# L = r_A - tol_A, U = r_A + tol_A
+bonds:
+  # ---------------------------------------------------------------------
+  # Retuned to g-xTB from 644438 bonds over 8935 clean relaxed structures
+  # (k=1..5, run gxtb_k1k5).  r_A = median, tol_A = half the p16-p84 spread.
+  # g-xTB sits BETWEEN the old GFN1 table and the original DFT one: Cd-Se is
+  # +0.02..+0.11 A longer than GFN1 and -0.06..-0.09 shorter than DFT, while
+  # Cd-Cl terminal lands back on the DFT value (2.32).
+  # Rows with cn_other 5-6 exist only when Se max_cn is raised to 5.
+  # ---------------------------------------------------------------------
+  - {pair: CdCl_terminal, cn_cd: 3, cn_other: 1, r_A: 2.31, tol_A: 0.05}   # n=8770
+  - {pair: CdCl_terminal, cn_cd: 4, cn_other: 1, r_A: 2.32, tol_A: 0.05}   # n=14017
+  - {pair: CdCl_terminal, cn_cd: 5, cn_other: 1, r_A: 2.33, tol_A: 0.05}   # n=42
+  - {pair: CdCl_bridge, cn_cd: 3, cn_other: 2, r_A: 2.47, tol_A: 0.06}   # n=33741
+  - {pair: CdCl_bridge, cn_cd: 3, cn_other: 3, r_A: 2.58, tol_A: 0.09}   # n=5796
+  - {pair: CdCl_bridge, cn_cd: 3, cn_other: 4, r_A: 2.68, tol_A: 0.09}   # n=83
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 2, r_A: 2.50, tol_A: 0.06}   # n=80396
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 3, r_A: 2.64, tol_A: 0.10}   # n=28688
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 4, r_A: 2.73, tol_A: 0.09}   # n=1960
+  - {pair: CdCl_bridge, cn_cd: 4, cn_other: 5, r_A: 2.76, tol_A: 0.09}   # n=84
+  - {pair: CdCl_bridge, cn_cd: 5, cn_other: 2, r_A: 2.58, tol_A: 0.07}   # n=4176
+  - {pair: CdCl_bridge, cn_cd: 5, cn_other: 3, r_A: 2.70, tol_A: 0.10}   # n=1266
+  - {pair: CdCl_bridge, cn_cd: 5, cn_other: 4, r_A: 2.74, tol_A: 0.08}   # n=167
+  - {pair: CdSe, cn_cd: 2, cn_other: 2, r_A: 2.41, tol_A: 0.05}   # n=934
+  - {pair: CdSe, cn_cd: 2, cn_other: 3, r_A: 2.47, tol_A: 0.05}   # n=1029
+  - {pair: CdSe, cn_cd: 2, cn_other: 4, r_A: 2.50, tol_A: 0.05}   # n=101
+  - {pair: CdSe, cn_cd: 3, cn_other: 2, r_A: 2.44, tol_A: 0.05}   # n=5251
+  - {pair: CdSe, cn_cd: 3, cn_other: 3, r_A: 2.52, tol_A: 0.05}   # n=39267
+  - {pair: CdSe, cn_cd: 3, cn_other: 4, r_A: 2.57, tol_A: 0.06}   # n=13852
+  - {pair: CdSe, cn_cd: 3, cn_other: 5, r_A: 2.60, tol_A: 0.07}   # n=863
+  - {pair: CdSe, cn_cd: 4, cn_other: 2, r_A: 2.46, tol_A: 0.05}   # n=697
+  - {pair: CdSe, cn_cd: 4, cn_other: 3, r_A: 2.56, tol_A: 0.05}   # n=27251
+  - {pair: CdSe, cn_cd: 4, cn_other: 4, r_A: 2.64, tol_A: 0.09}   # n=39617
+  - {pair: CdSe, cn_cd: 4, cn_other: 5, r_A: 2.71, tol_A: 0.11}   # n=10390
+  - {pair: CdSe, cn_cd: 4, cn_other: 6, r_A: 2.78, tol_A: 0.14}   # n=1228
+  - {pair: CdSe, cn_cd: 5, cn_other: 3, r_A: 2.60, tol_A: 0.06}   # n=369
+  - {pair: CdSe, cn_cd: 5, cn_other: 4, r_A: 2.68, tol_A: 0.09}   # n=1084
+  - {pair: CdSe, cn_cd: 5, cn_other: 5, r_A: 2.78, tol_A: 0.12}   # n=710
+  - {pair: CdSe, cn_cd: 5, cn_other: 6, r_A: 2.82, tol_A: 0.13}   # n=140
+
+# ------------------------------------------------------------ ANGLES (1-3) --
+# tol_deg is the acceptance band. hard_* is an optional wider backstop.
+# Pair keys resolve: exact role (Cl_b2s) -> generic role (Cl_b) -> element (Cl).
+angles:
+  Se:
+    cn2: {default: {deg: 88, tol_deg: 8}}    # g-xTB median 88, p16-p84 85-92 (n=3441)
+    cn3: {default: {deg: 92, tol_deg: 12}}   # g-xTB median 92, single peak (n=67917)
+    cn4:
+      # g-xTB confirms the bimodality: peaks at 78 / 108 / 152, cis:trans =
+      # 4.1:1 over 82008 angles.  cis median 91 (p16-p84 79-112), trans
+      # median 145 (130-162).  The old 109.5 target sat in the valley.
+      default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}
+      modes:
+        - {deg: 91,  tol_deg: 16}    # cis   (4 of the 6 pairs)
+        - {deg: 145, tol_deg: 16}    # trans (2 of the 6 pairs)
+    cn5:
+      # Se5:Cd5 is 8.4% of relaxed Se centres.  Inert unless coordination
+      # Se.max is raised to 5; harmless otherwise.  cis:trans = 3.2:1,
+      # cis median 83 (77-112), trans median 145 (130-157).
+      default: {deg: 90, tol_deg: 15, hard_min_deg: 75, hard_max_deg: 160}
+      modes:
+        - {deg: 83,  tol_deg: 16}    # cis
+        - {deg: 145, tol_deg: 16}    # trans
+  Cl:
+    # Cl2:Cd2 is 66.0% of all Cl centres -- the dominant ligand motif.
+    cn2: {default: {deg: 92, tol_deg: 11}}   # g-xTB median 92, single peak (n=59182)
+    cn3:
+      # Cl3:Cd3 is 19.9%.  Bimodal at 82 / 122, which one target cannot cover.
+      default: {deg: 92, tol_deg: 15}
+      modes:
+        - {deg: 85,  tol_deg: 12}
+        - {deg: 122, tol_deg: 15}
+  Cd:
+    cn2:
+      default: {deg: 175, tol_deg: 10}
+      by_pair:
+        Cl_t-Se:   {deg: 175, tol_deg: 10}
+        Cl_b2s-Se: {deg: 173, tol_deg: 12}
+        Cl_b2n-Se: {deg: 173, tol_deg: 12}
+        Se-Se:     {deg: 175, tol_deg: 12}
+
+
+    cn4:
+      # CN4 Cd is 63% of all Cd centres and had NO entry before.  Rows are
+      # g-xTB medians per neighbour-role pair; bimodal pairs carry modes.
+      # Cd4:Se1Cl3 alone is 31.9% of Cd centres, Cd4:Se2Cl2 21.9%.
+      default: {deg: 109.5, tol_deg: 14}
+      by_role_signature:
+        Cl_b2+Cl_b2+Cl_b3+Se:               # within Cd4:Se1Cl3 (n=154320)
+          {Cl_b2-Cl_b2: {deg: 106, tol_deg: 16},
+           Cl_b2-Cl_b3: {deg:  95, tol_deg: 12},
+           Cl_b2-Se:    {deg: 100, tol_deg: 13},
+           Cl_b3-Se:    {deg:  95, tol_deg: 10}}
+        Cl_b2+Cl_b2+Cl_t+Se:
+          {Cl_b2-Cl_b2: {deg: 106, tol_deg: 16},
+           Cl_b2-Cl_t:  {deg: 119, tol_deg: 10},
+           Cl_b2-Se:    {deg: 100, tol_deg: 13},
+           Cl_t-Se:     {deg: 116, tol_deg: 12}}
+        Cl_b2+Cl_b2+Se+Se:                  # within Cd4:Se2Cl2 (n=105666)
+          {Cl_b2-Cl_b2: {deg: 108, tol_deg: 16},
+           Cl_b2-Se:    {deg: 104, tol_deg: 16},
+           Se-Se:       {deg: 109, tol_deg: 14}}
+        Cl_b2+Se+Se+Se:                     # within Cd4:Se3Cl1 (n=31842)
+          {Cl_b2-Se:    {deg: 102, tol_deg: 14},
+           Se-Se:       {deg: 106, tol_deg: 14}}
+    cn3:
+      # Every row sums to 360.  DFT-backed rows note the median they round.
+      by_role_signature:
+        Cl_t+Cl_t+Se:                             # derived
+          {Cl_t-Cl_t: {deg: 120, tol_deg: 15},
+           Cl_t-Se:   {deg: 120, tol_deg: 15}}
+        Cl_b2s+Cl_t+Se:                           # DFT 122.4/93.9/143.6
+          {Cl_b2s-Cl_t: {deg: 122, tol_deg: 12},
+           Cl_b2s-Se:   {deg:  94, tol_deg: 12},
+           Cl_t-Se:     {deg: 144, tol_deg: 12}}
+        Cl_b2n+Cl_t+Se:                           # DFT 110.1/103.4/143.5
+          {Cl_b2n-Cl_t: {deg: 110, tol_deg: 15},
+           Cl_b2n-Se:   {deg: 105, tol_deg: 15},
+           Cl_t-Se:     {deg: 145, tol_deg: 15}}
+        Cl_b3+Cl_t+Se:                            # DFT 111.8/93.4/154.1
+          {Cl_b3-Cl_t: {deg: 112, tol_deg: 15},
+           Cl_b3-Se:   {deg:  94, tol_deg: 12},
+           Cl_t-Se:    {deg: 154, tol_deg: 15}}
+        Cl_b2s+Cl_b2s+Se:                         # DFT sum 341; Se angles +9
+          {Cl_b2s-Cl_b2s: {deg: 138, tol_deg: 12},
+           Cl_b2s-Se:     {deg: 111, tol_deg: 15}}
+        Cl_b2n+Cl_b2s+Se:                         # DFT 121.4/137.9/97.8
+          {Cl_b2n-Cl_b2s: {deg: 121, tol_deg: 12},
+           Cl_b2n-Se:     {deg: 139, tol_deg: 15},
+           Cl_b2s-Se:     {deg: 100, tol_deg: 12}}
+        Cl_b2n+Cl_b2n+Se:                         # DFT 102.8/126.4
+          {Cl_b2n-Cl_b2n: {deg: 104, tol_deg: 15},
+           Cl_b2n-Se:     {deg: 128, tol_deg: 15}}
+        Cl_b2n+Cl_b3+Se:                          # DFT sum 350; b3-Se +8
+          {Cl_b2n-Cl_b3: {deg:  92, tol_deg: 15},
+           Cl_b2n-Se:    {deg: 155, tol_deg: 15},
+           Cl_b3-Se:     {deg: 113, tol_deg: 15}}
+        Cl_t+Se+Se:                               # derived
+          {Cl_t-Se: {deg: 112, tol_deg: 12}, Se-Se: {deg: 136, tol_deg: 12}}
+        Cl_b2s+Se+Se:                             # derived
+          {Cl_b2s-Se: {deg: 105, tol_deg: 15}, Se-Se: {deg: 150, tol_deg: 15}}
+        Cl_b2n+Se+Se:                             # derived
+          {Cl_b2n-Se: {deg: 108, tol_deg: 15}, Se-Se: {deg: 144, tol_deg: 15}}
+        Cl_b3+Se+Se:                              # derived
+          {Cl_b3-Se: {deg: 104, tol_deg: 15}, Se-Se: {deg: 152, tol_deg: 15}}
+      by_signature:                               # fallback
+        Se3: {Se-Se: {deg: 120, tol_deg: 12}}
+        Cl3: {Cl-Cl: {deg: 120, tol_deg: 15}}
+      default: {deg: 120, tol_deg: 15}
+
+    cn4:
+      default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}
+      by_pair:
+        Cl_b2s-Se:     {deg:  95,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_b2n-Se:     {deg: 100,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 125}
+        Cl_b3-Se:      {deg:  95,   tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_t-Se:       {deg: 120,   tol_deg: 12}
+        Cl_b2s-Cl_t:   {deg: 120,   tol_deg: 12}
+        Cl_b2n-Cl_t:   {deg: 118,   tol_deg: 12}
+        Cl_b3-Cl_t:    {deg: 115,   tol_deg: 15}
+        Cl_b2s-Cl_b2s: {deg: 112,   tol_deg: 12}
+        Cl_b2n-Cl_b2n: {deg: 112,   tol_deg: 15}
+        Cl_b2n-Cl_b2s: {deg: 112,   tol_deg: 15}
+        Se-Se:         {deg: 109.5, tol_deg: 12}
+
+# Sum rule per CN3 centre. Validate at load: the listed angles must satisfy it.
+angle_sum_cn3:
+  Cd: {target_deg: 360, tol_deg: 8}     # planar
+  Se: {target_deg: 270, tol_deg: 15}    # 3x90 pyramid
+  Cl: {target_deg: 270, tol_deg: 20}    # mu3
+
+# --------------------------------------------------------------- DIHEDRALS --
+dihedrals:
+  improper:
+    Cd: {cn3: {default: {deg: 0.0,  tol_deg: 12}}}   # planar, all signatures
+    Se: {cn3: {Cd3:     {deg: 82.0, tol_deg: 12}}}   # 3x90 implies 90
+  proper:                        # 1-4 torsions not fixed by the ring
+    - {path: [Cd, Cl_b, Cd, Se],  when: {se_cn_min: 3}, phi_deg: 0,   tol_deg: 25}
+    - {path: [Cd, Cl_b, Cd, Se],  when: {se_cn_max: 2}, phi_deg: 180, tol_deg: 30}
+    - {path: [Cd, Cl_b, Cd, Cl_t],                      phi_deg: 180, tol_deg: 25}
+
+# ------------------------------------------------------------- NON-BONDED ---
+# Applies ONLY to pairs with no graph edge.  Short side only:
+#   r >= min_A                : free
+#   min_A - tol_A < r < min_A : soft repulsion
+#   r <= min_A - tol_A        : hard reject   (this is the overlap wall)
+nonbonded_1_4:                   # graph path length exactly 3
+  Cd-Cl: {min_A: 3.55, tol_A: 0.40}     # hard 3.15 (cis DFT min ~3.11)
+  Cd-Se: {min_A: 3.60, tol_A: 0.35}     # hard 3.25 (cis DFT min ~3.27)
+nonbonded:                       # path length >= 4, or disconnected
+  Cd-Se: {min_A: 3.60, tol_A: 0.20}     # hard 3.40; also blocks a phantom bond
+  Cd-Cl: {min_A: 3.50, tol_A: 0.20}     # hard 3.30; also blocks a phantom bond
+  Cd-Cd: {min_A: 3.20, tol_A: 0.05}     # hard 3.15
+  Se-Se: {min_A: 3.80, tol_A: 0.10}     # hard 3.70
+  Cl-Se: {min_A: 3.30, tol_A: 0.10}     # hard 3.20
+  Cl-Cl: {min_A: 2.80, tol_A: 0.10}     # hard 2.70
+
+# ------------------------------------------------------------------ RINGS ---
+rings:
+  cdse_6:
+    conformations: [chair]       # zinc-blende is all-chair
+    derive_from:                 # per ring atom, by its own CN and signature
+      bond:        {pair: CdSe, by_cn: true}
+      angle_at_cd: {element: Cd, by_cn_and_role_signature: true}
+      angle_at_se: {element: Se, by_cn: true}
+    dihedrals:                   # phi follows from r+alpha+beta; seeds only
+      chair:                     # alpha 136 -> |phi| 55; 120 -> 72; 109.5 -> 79
+        mode: derive_from_angles
+        phi_deg: [55, -55, 55, -55, 55, -55]
+        tol_deg: [15, 15, 15, 15, 15, 15]
+
+# ----------------------------------------------------------OPTIMIZER--------
+relaxation:
+  enabled: true
+  method: GFN1-xTB
+  accuracy: 1.0
+  electronic_temperature: 300.0
+  max_iterations: 500
+  fmax: 0.02
+  max_steps: 500
+  python: ~/miniconda3/envs/xtb/bin/python
+  check_connectivity: true
+  bond_order_threshold: 0.5
+

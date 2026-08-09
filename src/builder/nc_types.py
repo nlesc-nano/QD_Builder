@@ -433,6 +433,13 @@ class NucleationGraphRules:
     #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 and drops ~7% of
     #: p7, which is the trade chosen here -- speed matters more at large k.
     bridge_first_max_automorphisms: int = 64
+    #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
+    #: In the most stable structure of every measured (k,p) bin essentially
+    #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over
+    #: 24 bins, and 11 of 24 winners have zero terminal Cl.  Seeds currently
+    #: start at 3.7 bridges at k=5 where the best structures hold 8.4, so the
+    #: optimiser has to build the rest.  0 disables the term.
+    bridge_first_target_bridge_fraction: float = 0.0
     #: Steer the beam toward decorations that link more distinct Cd pairs.
     #: OFF by default: it correlates with compactness post hoc but is a poor
     #: objective (a mu3 whose hosts already share an anion scores zero), and

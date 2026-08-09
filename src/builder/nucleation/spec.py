@@ -632,6 +632,11 @@ def load_nucleation_spec(
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
                 ),
+                bridge_first_target_bridge_fraction=float(
+                    graph_rules_raw.get(
+                        "bridge_first_target_bridge_fraction", 0.0
+                    ) or 0.0
+                ),
                 bridge_first_maximize_bridged_pairs=bool(
                     graph_rules_raw.get(
                         "bridge_first_maximize_bridged_pairs", False

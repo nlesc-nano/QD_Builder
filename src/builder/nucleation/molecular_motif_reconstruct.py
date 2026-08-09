@@ -305,11 +305,19 @@ def reconstruct_motif_state(
         values: List[float] = []
         for left, right, target in bonds:
             values.append((float(np.linalg.norm(xyz[left] - xyz[right])) - target) / 0.025)
-        for left, center, right, target, band in audited_angles:
-            values.append(
+        # Rows sharing a group id are alternative modes of one angle (cis /
+        # trans at a CN4 centre), so the group contributes its smallest
+        # deviation rather than one residual per mode.
+        by_group: dict = {}
+        for left, center, right, target, band, group in audited_angles:
+            dev = (
                 _periodic_delta(_angle_deg(xyz, left, center, right), target)
                 / max(2.0, float(band) / 3.0)
             )
+            prev = by_group.get(group)
+            if prev is None or dev < prev:
+                by_group[group] = dev
+        values.extend(by_group[g] for g in sorted(by_group))
         for center, first, second, third, target in audited_impropers:
             values.append(
                 _periodic_delta(
