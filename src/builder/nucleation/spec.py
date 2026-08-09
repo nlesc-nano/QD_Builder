@@ -433,10 +433,16 @@ def load_nucleation_spec(
     # geometry pack.  This keeps the chemistry, construction policy and
     # relaxation settings in one directly-runnable YAML instead of requiring
     # a small wrapper YAML whose only purpose is to point back here.
+    # A driver that composes its stages with ``include:`` carries no
+    # ``graph_rules`` of its own -- they arrive from an included file -- so it
+    # must be recognised as an inline pack by the include list as well.
     inline_pack = (
         pack_ref is None
         and raw.get("schema_version") is not None
-        and isinstance(raw.get("graph_rules"), Mapping)
+        and (
+            isinstance(raw.get("graph_rules"), Mapping)
+            or bool(raw.get("include"))
+        )
     )
     if inline_pack:
         pack_ref = yaml_path
@@ -628,6 +634,22 @@ def load_nucleation_spec(
                 ),
                 bridge_first_prefer_bridges_per_cd=int(
                     graph_rules_raw.get("bridge_first_prefer_bridges_per_cd", 2)
+                ),
+                bridge_target_ring_closing_only=bool(
+                    graph_rules_raw.get(
+                        "bridge_target_ring_closing_only", True
+                    )
+                ),
+                bridge_target_max_shared_per_pair=int(
+                    graph_rules_raw.get(
+                        "bridge_target_max_shared_per_pair", 2
+                    )
+                ),
+                bridge_target_min_host_cn_cap=int(
+                    graph_rules_raw.get("bridge_target_min_host_cn_cap", 2)
+                ),
+                bridge_target_avoid_triangles=bool(
+                    graph_rules_raw.get("bridge_target_avoid_triangles", True)
                 ),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)

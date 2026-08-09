@@ -11,6 +11,204 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import yaml
 
 
+#: Every ``graph_rules`` key the loader acts on.  A key outside this set is a
+#: typo or a leftover, and the loader raises rather than silently falling back
+#: to a default -- several rules were once "enabled" in a pack for days while
+#: the enumeration ran on the default, because nothing checked the name.
+#: Keep this in sync with ``nucleation_graph_rules_mapping`` and the accessor
+#: properties; ``tests/test_geometry_pack_include.py`` enforces that.
+NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
+    # --- chemistry: what a legal graph is -------------------------------
+    "coordination",
+    "pair_rules",
+    "allowed_neighbor_signatures",
+    "min_ring_size",
+    "require_inorganic_connected",
+    "enforce_min_cn",
+    "forbid_cdse_cn_pairs",
+    "forbid_shared_cd_pair",
+    "max_shared_ligands_per_host_pair",
+    "min_bridged_host_cn",
+    "forbid_mono_se_dual_terminal",
+    "forbid_mu3_host_bridge_overlap",
+    "bridge_cd_cd_max_distance",
+    "reject_closable_terminal_cd2",
+    "closable_terminal_cd2_distance",
+    "require_bridge_maximal",
+    # --- how decorations are generated -----------------------------------
+    "decoration_mode",
+    "bridge_first_p1_terminal_policy",
+    "bridge_first_hard_max_bridges_per_cd",
+    "bridge_first_prefer_bridges_per_cd",
+    "bridge_first_max_automorphisms",
+    "bridge_target_ring_closing_only",
+    "bridge_target_max_shared_per_pair",
+    "bridge_target_min_host_cn_cap",
+    "bridge_target_avoid_triangles",
+    "bridge_first_target_bridge_fraction",
+    "bridge_first_maximize_bridged_pairs",
+    "passivate_min_cd_cn",
+    "passivate_min_cd_cn_k_ge",
+    "passivate_min_cd_cn_p_ge",
+    # --- skeleton-level gates --------------------------------------------
+    "required_rings",
+    "min_core_edge_fraction",
+    "max_core_cut_edges",
+    "max_excess_cn1_cations",
+    "ring_first_when_pattern_possible",
+    "ring_first_fallback_to_open",
+    "multi_ring_ladder",
+    "ring_min_pattern_cd",
+    "ring_min_pattern_se",
+    # --- which graphs get handed to 3D ------------------------------------
+    "selection_order",
+    "selection_top_fraction",
+    "selection_max_wiener_excess",
+})
+
+
+#: Top-level sections a pack may declare, and the stage each one drives.
+PACK_SECTION_STAGE: Dict[str, str] = {
+    "schema_version": "meta",
+    "name": "meta",
+    "include": "meta",
+    "geometry_reference": "meta",
+    "cif": "meta",
+    "charges": "meta",
+    "nucleation": "meta",
+    "graph_rules": "graph",
+    "motifs": "graph+embed",
+    "junctions": "embed",
+    "linker_geometry": "embed",
+    "bonds": "embed",
+    "angles": "embed",
+    "angle_sum_cn3": "embed",
+    "dihedrals": "embed",
+    "nonbonded": "embed",
+    "nonbonded_1_4": "embed",
+    "rings": "embed",
+    "tolerances": "embed",
+    "reconstruction": "embed",
+    "relaxation": "relax",
+}
+
+
+def _leaf_paths(value: object, prefix: str = "") -> List[str]:
+    """Dotted paths of every scalar/list leaf, for collision detection."""
+
+    if isinstance(value, Mapping) and value:
+        out: List[str] = []
+        for key, child in value.items():
+            child_path = f"{prefix}.{key}" if prefix else str(key)
+            out.extend(_leaf_paths(child, child_path))
+        return out
+    return [prefix] if prefix else []
+
+
+def _merge_strict(
+    target: Dict[str, Any],
+    incoming: Mapping[str, Any],
+    origin: Dict[str, str],
+    source: str,
+    prefix: str = "",
+) -> None:
+    """Deep-merge ``incoming`` into ``target``, refusing to redefine a leaf.
+
+    Splitting a pack across files is only an improvement if a reader can tell
+    where a setting comes from.  Two files defining the same leaf is exactly
+    the state that made the single-file packs untrustworthy, so it is an
+    error, reported with both filenames rather than resolved by precedence.
+
+    ``prefix`` must be threaded through the recursion: without it a nested
+    key registers under its bare name and collides with nothing.
+    """
+
+    import copy
+
+    for key, value in incoming.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, Mapping) and isinstance(target.get(key), dict):
+            _merge_strict(target[key], value, origin, source, path)
+            continue
+        for leaf in _leaf_paths(value, path) or [path]:
+            previous = origin.get(leaf)
+            if previous is not None and previous != source:
+                raise ValueError(
+                    f"'{leaf}' is defined in two files: {previous} and "
+                    f"{source}. Each setting must live in exactly one file -- "
+                    f"delete the duplicate."
+                )
+            origin[leaf] = source
+        target[key] = copy.deepcopy(value) if isinstance(value, Mapping) else value
+
+
+def _load_includes(path: Path, raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve ``include:`` into one mapping, or return ``raw`` unchanged.
+
+    Include order does not matter: a leaf may only be set once across the
+    whole set, so there is no precedence to remember.
+    """
+
+    includes = raw.get("include")
+    if not includes:
+        return dict(raw)
+    if isinstance(includes, (str, Path)):
+        includes = [includes]
+    if not isinstance(includes, Sequence):
+        raise TypeError(f"{path}: 'include' must be a list of file paths")
+
+    merged: Dict[str, Any] = {}
+    origin: Dict[str, str] = {}
+    for item in includes:
+        child = Path(str(item)).expanduser()
+        if not child.is_absolute():
+            child = (path.parent / child).resolve()
+        if not child.exists():
+            raise FileNotFoundError(
+                f"{path}: include '{item}' not found at {child}"
+            )
+        sub = yaml.safe_load(child.read_text()) or {}
+        if not isinstance(sub, Mapping):
+            raise TypeError(f"included pack must be a mapping: {child}")
+        if "include" in sub:
+            raise ValueError(
+                f"{child}: nested 'include' is not supported -- list every "
+                f"file in the driver instead, so one file names the whole set."
+            )
+        sub = {
+            key: value
+            for key, value in sub.items()
+            if key not in {"schema_version", "name"}
+        }
+        _merge_strict(merged, sub, origin, child.name)
+    own = {key: value for key, value in raw.items() if key != "include"}
+    _merge_strict(merged, own, origin, path.name)
+    return merged
+
+
+def _validate_graph_rule_keys(path: Path, graph_rules: Mapping[str, Any]) -> None:
+    """Reject unknown ``graph_rules`` keys instead of ignoring them."""
+
+    unknown = sorted(set(graph_rules) - NUCLEATION_GRAPH_RULE_KEYS)
+    if not unknown:
+        return
+    import difflib
+
+    hints = []
+    for key in unknown:
+        close = difflib.get_close_matches(
+            key, sorted(NUCLEATION_GRAPH_RULE_KEYS), n=1
+        )
+        hints.append(f"{key}" + (f" (did you mean '{close[0]}'?)" if close else ""))
+    raise ValueError(
+        f"unknown graph_rules key(s) in {path}: "
+        + ", ".join(hints)
+        + ". A key the loader does not know is ignored silently, so it is "
+        "rejected here. Valid keys: "
+        + ", ".join(sorted(NUCLEATION_GRAPH_RULE_KEYS))
+    )
+
+
 @dataclass(frozen=True)
 class BondLengthEntry:
     pair: str
@@ -351,7 +549,9 @@ class GeometryPack:
                 tuple(item)
                 for item in (self.graph_rules.get("forbid_shared_cd_pair") or [])
             ]
-        elif decoration_mode in {"motif_graph", "motif_bridge_first"}:
+        elif decoration_mode in {
+            "motif_graph", "motif_bridge_first", "motif_bridge_target",
+        }:
             # Motif assembly deliberately keeps the incidence graph and lets
             # the motif/junction reconstruction resolve shared-host geometry.
             # The span heuristic is too aggressive here (notably Se-Cd4 with
@@ -437,6 +637,18 @@ class GeometryPack:
             ),
             "bridge_first_max_automorphisms": int(
                 self.graph_rules.get("bridge_first_max_automorphisms", 64)
+            ),
+            "bridge_target_ring_closing_only": bool(
+                self.graph_rules.get("bridge_target_ring_closing_only", True)
+            ),
+            "bridge_target_max_shared_per_pair": int(
+                self.graph_rules.get("bridge_target_max_shared_per_pair", 2)
+            ),
+            "bridge_target_min_host_cn_cap": int(
+                self.graph_rules.get("bridge_target_min_host_cn_cap", 2)
+            ),
+            "bridge_target_avoid_triangles": bool(
+                self.graph_rules.get("bridge_target_avoid_triangles", True)
             ),
             "bridge_first_target_bridge_fraction": float(
                 self.graph_rules.get(
@@ -1045,9 +1257,13 @@ def load_geometry_pack(path: str | Path) -> GeometryPack:
     raw = yaml.safe_load(path.read_text()) or {}
     if not isinstance(raw, Mapping):
         raise TypeError(f"geometry pack must be a mapping: {path}")
-    # A compact motif pack may borrow the detailed executable geometry tables
-    # from the current-builder pack while keeping its own graph rules,
-    # motifs, reconstruction policy, and xTB settings.
+    # Preferred layout: a driver lists the stage files it is composed of, and
+    # a setting may appear in exactly one of them (see ``_merge_strict``).
+    raw = _load_includes(path, raw)
+    # Legacy layout: a compact motif pack borrows the executable geometry
+    # tables from another pack.  Unlike ``include`` this overrides whole
+    # top-level sections, which is what made it hard to tell which
+    # ``graph_rules`` were in force; prefer ``include`` for new packs.
     reference = raw.get("geometry_reference")
     if reference:
         reference_path = Path(str(reference))
@@ -1084,6 +1300,7 @@ def load_geometry_pack(path: str | Path) -> GeometryPack:
         raise ValueError(
             f"obsolete graph_rules keys in {path}: {', '.join(obsolete_graph)}"
         )
+    _validate_graph_rule_keys(path, graph_rules)
 
     def metadata_paths(value: object, prefix: str = "") -> List[str]:
         found: List[str] = []
