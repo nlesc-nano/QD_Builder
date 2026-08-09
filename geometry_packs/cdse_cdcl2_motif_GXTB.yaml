@@ -9,7 +9,7 @@ nucleation:
   site_tolerance: 0.2
 schema_version: 2
 name: cdse_cdcl2_motif_gxtb
-geometry_reference: cdse_cdcl2_bridge_first_xtb.yaml
+geometry_reference: cdse_cdcl2_bridge_first_gxtb.yaml
 graph_rules:
   require_inorganic_connected: true
   enforce_min_cn: true

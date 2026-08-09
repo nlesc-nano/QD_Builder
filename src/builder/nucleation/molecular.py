@@ -1764,18 +1764,31 @@ def _refine_completed_ring_graph(
     ).reshape(-1, 4)
     improper_target = np.array([t for *_, t in improper_terms], dtype=float)
     hard_index = np.array(
-        [[l, c, r] for l, c, r, _t, _b in hard_angle_terms], dtype=int
+        [[l, c, r] for l, c, r, _t, _b, _g in hard_angle_terms], dtype=int
     ).reshape(-1, 3)
-    hard_target = np.array([t for _l, _c, _r, t, _b in hard_angle_terms], dtype=float)
-    hard_band = np.array(
-        [b for _l, _c, _r, _t, b in hard_angle_terms], dtype=float
+    hard_target = np.array(
+        [t for _l, _c, _r, t, _b, _g in hard_angle_terms], dtype=float
     )
+    hard_band = np.array(
+        [b for _l, _c, _r, _t, b, _g in hard_angle_terms], dtype=float
+    )
+    # Alternative modes of one angle share a group id; the residual reduces
+    # each group to its smallest excess, so the row count and the residual
+    # length differ whenever a multi-modal centre is present.
+    hard_group = np.array(
+        [g for _l, _c, _r, _t, _b, g in hard_angle_terms], dtype=int
+    )
+    _grp = {}
+    hard_group = np.array(
+        [_grp.setdefault(g, len(_grp)) for g in hard_group], dtype=int
+    )
+    n_hard_rows = int(hard_group.max()) + 1 if hard_group.size else 0
     n_ring_terms = len(angle_i)
     stop_bond = len(bond_list)
     stop_floor = stop_bond + len(nonbond_floors)
     stop_ring = stop_floor + 2 * n_ring_terms
     stop_improper = stop_ring + len(improper_terms)
-    stop_hard = stop_improper + len(hard_angle_terms)
+    stop_hard = stop_improper + n_hard_rows
     stop_seed = stop_hard + 3 * len(seed_index)
     out = np.empty(stop_seed + 3 + 3 * len(variable_index), dtype=float)
     work = initial.copy()
@@ -1849,6 +1862,7 @@ def _refine_completed_ring_graph(
             hard_target,
             improper_scale=WELL_BAND_FRACTION * AUDIT_IMPROPER_TOLERANCE_DEG,
             hard_scale=WELL_BAND_FRACTION * hard_band,
+            hard_group=hard_group,
         )
         out[stop_ring:stop_improper] = improper_out
         out[stop_improper:stop_hard] = hard_out
@@ -8146,11 +8160,34 @@ def _audited_local_terms(
                 role_pair=role_pair,
                 role_signature=role_signature,
             )
-            hard_angles.append(
-                (int(left), center, int(right), float(desired), float(
-                    band if band is not None else AUDIT_ANGLE_TOLERANCE_DEG
-                ))
+            modes = pack.center_angle_modes(
+                atom.symbol,
+                len(neighbors),
+                neighbor_pair=pair,
+                signature=signature,
+                role_pair=role_pair,
+                role_signature=role_signature,
             )
+            width = float(
+                band if band is not None else AUDIT_ANGLE_TOLERANCE_DEG
+            )
+            if modes:
+                # A multi-modal centre is satisfied by the NEAREST mode, so one
+                # row per mode sharing a group id; the residual takes the
+                # minimum over the group.  A CN4 anion is cis (~85 deg) for four
+                # of its six pairs and trans (~145 deg) for the other two, and a
+                # single target sits in the empty valley between them.
+                group = len(hard_angles)
+                for deg_target, tol in modes:
+                    hard_angles.append(
+                        (int(left), center, int(right), float(deg_target),
+                         float(tol), group)
+                    )
+            else:
+                hard_angles.append(
+                    (int(left), center, int(right), float(desired), width,
+                     len(hard_angles))
+                )
     return impropers, hard_angles
 
 
@@ -8163,6 +8200,7 @@ def _local_term_residuals(
     *,
     improper_scale: float,
     hard_scale: float,
+    hard_group: Optional[FloatArray] = None,
 ) -> Tuple[FloatArray, FloatArray]:
     """Batched improper / hard-angle residuals shared by both optimizers."""
 
@@ -8192,9 +8230,16 @@ def _local_term_residuals(
         actual = np.where(
             degenerate, 0.0, np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
         )
-        hard_out = (
-            _band_excess(actual, hard_target, hard_scale) / ANGLE_WELL_SCALE_DEG
-        )
+        raw = _band_excess(actual, hard_target, hard_scale) / ANGLE_WELL_SCALE_DEG
+        if hard_group is None:
+            hard_out = raw
+        else:
+            # Rows sharing a group are alternative modes of ONE angle: the
+            # angle is satisfied when it sits in any of them, so the group's
+            # contribution is the smallest excess, not the sum.
+            hard_out = np.full(int(hard_group.max()) + 1, np.inf, dtype=float)
+            np.minimum.at(hard_out, hard_group, raw)
+            hard_out = hard_out[np.isfinite(hard_out)]
     else:
         hard_out = np.empty(0, dtype=float)
     return improper_out, hard_out
@@ -9670,18 +9715,31 @@ def _steric_relax_ligands(
     ).reshape(-1, 4)
     improper_target = np.array([t for *_, t in improper_terms], dtype=float)
     hard_index = np.array(
-        [[l, c, r] for l, c, r, _t, _b in hard_angle_terms], dtype=int
+        [[l, c, r] for l, c, r, _t, _b, _g in hard_angle_terms], dtype=int
     ).reshape(-1, 3)
-    hard_target = np.array([t for _l, _c, _r, t, _b in hard_angle_terms], dtype=float)
-    hard_band = np.array(
-        [b for _l, _c, _r, _t, b in hard_angle_terms], dtype=float
+    hard_target = np.array(
+        [t for _l, _c, _r, t, _b, _g in hard_angle_terms], dtype=float
     )
+    hard_band = np.array(
+        [b for _l, _c, _r, _t, b, _g in hard_angle_terms], dtype=float
+    )
+    # Alternative modes of one angle share a group id; the residual reduces
+    # each group to its smallest excess, so the row count and the residual
+    # length differ whenever a multi-modal centre is present.
+    hard_group = np.array(
+        [g for _l, _c, _r, _t, _b, g in hard_angle_terms], dtype=int
+    )
+    _grp = {}
+    hard_group = np.array(
+        [_grp.setdefault(g, len(_grp)) for g in hard_group], dtype=int
+    )
+    n_hard_rows = int(hard_group.max()) + 1 if hard_group.size else 0
     n_tether = len(variable_flat)
     stop_bond = n_tether + len(bond_constraints)
     stop_rep = stop_bond + len(repulsive_pairs)
     stop_angle = stop_rep + len(angle_terms)
     stop_improper = stop_angle + len(improper_terms)
-    row_count = stop_improper + len(hard_angle_terms)
+    row_count = stop_improper + n_hard_rows
     values_buf = np.empty(row_count, dtype=float)
     work_full = initial.copy()
 
@@ -9722,6 +9780,7 @@ def _steric_relax_ligands(
             hard_target,
             improper_scale=WELL_BAND_FRACTION * AUDIT_IMPROPER_TOLERANCE_DEG,
             hard_scale=WELL_BAND_FRACTION * hard_band,
+            hard_group=hard_group,
         )
         values_buf[stop_angle:stop_improper] = improper_out
         values_buf[stop_improper:] = hard_out
