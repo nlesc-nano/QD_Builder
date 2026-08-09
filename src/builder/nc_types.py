@@ -469,6 +469,22 @@ class NucleationGraphRules:
     #: ``min_ring_size``: this gate is what bounds the combinatorics at large
     #: k, where exhaustive enumeration stops being affordable.
     required_rings: Tuple[Dict[str, int], ...] = ()
+    #: Core-density floor as a fraction of the cation-anion edge window.  The
+    #: window is fixed by composition: e_min = (k+p) + k - 1 (spanning tree),
+    #: e_max = k * max_cn(anion).  Denser cores give better children -- the
+    #: edge count is the strongest skeleton descriptor measured (rho -0.40
+    #: against the skeleton's best child, consistent in 18 of 19 bins).
+    #: 0 disables.
+    min_core_edge_fraction: float = 0.0
+    #: Cap on cut edges (graph bridges) in the cation-anion core.  Tree-like
+    #: cores fall apart: rho +0.39, 18/19 bins.  A negative value disables.
+    max_core_cut_edges: int = -1
+    #: Cap on cations at core CN 1 *beyond* what stoichiometry forces.
+    #: Every cation needs an anion, so all-CN>=2 requires 2(k+p) <= k*max_cn,
+    #: i.e. p <= k for max_cn 4; above that the floor max(0, 2p - 2k) dangling
+    #: cations is unavoidable.  This caps the excess over that floor, so the
+    #: rule stays enforceable at every (k, p).  Negative disables.
+    max_excess_cn1_cations: int = -1
     # When true, a Cd attached to a μ3 Cl cap may not participate in another
     # μ2/μ3 Cl bridge.  Terminal Cl remains allowed on that Cd.
     forbid_mu3_host_bridge_overlap: bool = False
