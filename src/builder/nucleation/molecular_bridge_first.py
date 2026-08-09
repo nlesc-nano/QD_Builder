@@ -1045,6 +1045,7 @@ def iter_cl_attachments_bridge_target(
     min_host_cn_cap: int = 2,
     max_shared_per_pair: int = 2,
     avoid_triangles: bool = True,
+    count_window: int = 0,
 ) -> Iterable[Tuple[Tuple[int, int], ...]]:
     """Enumerate decorations that bridge as much chloride as the core allows.
 
@@ -1350,6 +1351,12 @@ def iter_cl_attachments_bridge_target(
     tiers = [(1, True), (1, False)] if avoid_triangles else [(1, False)]
     if max_shared_per_pair > 1:
         tiers.append((max_shared_per_pair, False))
+    # ``count_window`` is how many *productive* bridge counts to emit, not how
+    # many to try: 0 keeps the historical behaviour of stopping at the first
+    # one that yields anything.  Widening it covers the observed spread --
+    # only 5.7% of relaxed structures sit at exactly 2p bridges but 51% are
+    # within 2 of it -- which is what turns a single shell into a map.
+    windows = 0
     for target in range(ceiling, -1, -1):
         produced = False
         for share_cap, no_tri in tiers:
@@ -1363,4 +1370,6 @@ def iter_cl_attachments_bridge_target(
             if produced:
                 break
         if produced:
-            return
+            windows += 1
+            if windows > count_window:
+                return

@@ -6664,6 +6664,9 @@ def enumerate_molecular_bin(
                     avoid_triangles=bool(
                         check_spec.graph_rules.bridge_target_avoid_triangles
                     ),
+                    count_window=int(
+                        check_spec.graph_rules.bridge_target_count_window
+                    ),
                 )
                 label = (
                     "motif bridge-target enumeration (saturate μ2 bridges "

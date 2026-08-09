@@ -656,6 +656,9 @@ def load_nucleation_spec(
                         "bridge_target_max_automorphisms", 4096
                     )
                 ),
+                bridge_target_count_window=int(
+                    graph_rules_raw.get("bridge_target_count_window", 0)
+                ),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
                 ),
