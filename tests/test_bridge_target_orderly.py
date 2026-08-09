@@ -98,3 +98,70 @@ def test_emission_overhead_stays_bounded(
     result = _bin(target_pack, k, p)
     kept = max(1, len(result.isomers))
     assert result.raw_graphs / kept < ceiling
+
+
+def test_per_skeleton_budget_keeps_every_skeleton(tmp_path_factory) -> None:
+    """The quota samples each skeleton, not the first few.
+
+    The energy variance is between skeletons (best-per-skeleton spans 0.7-2.9
+    eV in a bin) and only ~0.3-0.5 eV within one, so a budget that dropped
+    whole skeletons would discard exactly the variation that matters.
+    """
+
+    tmp = tmp_path_factory.mktemp("budget")
+    driver = yaml.safe_load((PACK_DIR / "run_gxtb.yaml").read_text())
+    rules = yaml.safe_load((PACK_DIR / "graph_rules.yaml").read_text())
+    rules["graph_rules"]["selection_max_per_skeleton"] = 5
+    rules["graph_rules"].pop("selection_max_wiener_excess", None)
+    merged = {k: v for k, v in driver.items() if k != "include"}
+    merged.update(yaml.safe_load((PACK_DIR / "motifs.yaml").read_text()))
+    merged.update(yaml.safe_load((PACK_DIR / "embed.yaml").read_text()))
+    merged.update(rules)
+    merged["cif"] = str(ROOT / "examples/cifs/CdSe_zb.cif")
+    merged.setdefault("relaxation", {})["enabled"] = False
+    path = tmp / "budget.yaml"
+    path.write_text(yaml.safe_dump(merged, sort_keys=False))
+
+    spec = load_nucleation_spec(str(path))
+    result = generate_molecular_map(
+        spec, kmin=3, kmax=3, pmin=2, pmax=2, embed=True
+    ).bins[(3, 2)]
+
+    assert result.isomers, "budget produced an empty bin"
+    # the quota is the only cap, so everything sampled must be embedded
+    assert result.budget_pool > 0
+    # The quota bounds candidates entering 3D, not final isomers: the
+    # motif_factor path runs several reconstruction starts per candidate and
+    # each can yield an accepted structure, so the isomer count per skeleton
+    # legitimately exceeds the quota.
+    assert result.budget_pool <= 5 * max(1, result.skeletons_total)
+
+    # Coverage: every skeleton that put candidates in the pool is still
+    # represented.  Measured directly on the bridge-target generator (k3p2,
+    # quota 5): 38 graphs -> 17, all 5 skeletons retained.
+    assert result.budget_pool >= min(5, result.skeletons_total)
+
+
+def test_budget_gate_leaves_small_bins_exhaustive(tmp_path_factory) -> None:
+    """`selection_per_skeleton_from_k` switches the quota off below its k."""
+
+    tmp = tmp_path_factory.mktemp("gate")
+    driver = yaml.safe_load((PACK_DIR / "run_gxtb.yaml").read_text())
+    rules = yaml.safe_load((PACK_DIR / "graph_rules.yaml").read_text())
+    rules["graph_rules"]["selection_max_per_skeleton"] = 5
+    rules["graph_rules"]["selection_per_skeleton_from_k"] = 4
+    rules["graph_rules"].pop("selection_max_wiener_excess", None)
+    merged = {k: v for k, v in driver.items() if k != "include"}
+    merged.update(yaml.safe_load((PACK_DIR / "motifs.yaml").read_text()))
+    merged.update(yaml.safe_load((PACK_DIR / "embed.yaml").read_text()))
+    merged.update(rules)
+    merged["cif"] = str(ROOT / "examples/cifs/CdSe_zb.cif")
+    merged.setdefault("relaxation", {})["enabled"] = False
+    path = tmp / "gate.yaml"
+    path.write_text(yaml.safe_dump(merged, sort_keys=False))
+
+    spec = load_nucleation_spec(str(path))
+    result = generate_molecular_map(
+        spec, kmin=3, kmax=3, pmin=2, pmax=2, embed=True
+    ).bins[(3, 2)]
+    assert result.budget_pool == 0, "gate did not disable the quota"

@@ -659,6 +659,15 @@ def load_nucleation_spec(
                 bridge_target_count_window=int(
                     graph_rules_raw.get("bridge_target_count_window", 0)
                 ),
+                selection_max_per_skeleton=int(
+                    graph_rules_raw.get("selection_max_per_skeleton", 0)
+                ),
+                selection_per_skeleton_from_k=int(
+                    graph_rules_raw.get("selection_per_skeleton_from_k", 0)
+                ),
+                selection_per_skeleton_from_p=int(
+                    graph_rules_raw.get("selection_per_skeleton_from_p", 0)
+                ),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
                 ),

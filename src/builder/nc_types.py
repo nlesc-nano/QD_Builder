@@ -459,6 +459,17 @@ class NucleationGraphRules:
     #: n_bridges = 0.964*(2p) - 0.36 (r=0.993, 29 bins), but the population is
     #: broad: 5.7% of relaxed structures sit at exactly 2p, 51% within 2.
     bridge_target_count_window: int = 0
+    #: --- per-skeleton decoration budget --------------------------------
+    #: Keep at most this many decorations per skeleton (reservoir-sampled
+    #: over the skeleton's full enumeration, not the first N).  0 disables.
+    #: Measured: 20 lands within 0.003 eV of a skeleton's best (43 skeletons
+    #: with >=12 relaxed decorations); at 2p alone 5-8 already suffices.
+    selection_max_per_skeleton: int = 0
+    #: Apply the budget only from this k and this p onward, so small bins stay
+    #: exhaustive.  k3p3 has 43 decorations/skeleton where a quota of 20 is
+    #: 47% and pointless; k4p4 has 3040 where it is 0.66% and essential.
+    selection_per_skeleton_from_k: int = 0
+    selection_per_skeleton_from_p: int = 0
     #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
     #: In the most stable structure of every measured (k,p) bin essentially
     #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over

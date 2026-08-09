@@ -279,6 +279,10 @@ class MolecularIsomer:
     reconstruction_start: int = -1
     xtb_bond_orders: Optional[Tuple[Tuple[float, ...], ...]] = None
     source_edges: Tuple[Tuple[int, int], ...] = ()
+    #: Fingerprint of the Cd-Se skeleton this isomer was decorated from.  The
+    #: stored ``graph`` is replaced by the relaxed topology when a structure
+    #: changes connectivity, so it cannot be used to recover the seed.
+    seed_skeleton: str = ""
 
     @property
     def symbols(self) -> List[str]:
@@ -721,6 +725,27 @@ def _state_from_parts(
     graph.add_nodes_from(range(len(atoms)))
     graph.add_edges_from((int(a), int(b)) for a, b in edges)
     return _State(atoms=atoms, graph=graph)
+
+
+
+def _per_skeleton_budget(k: int, p: int, spec: NucleationSpec) -> int:
+    """The per-skeleton decoration quota in force for this bin, or 0.
+
+    Gated on (k, p) because the quota is only meaningful once a skeleton has
+    many more decorations than the quota: at k3p3 a skeleton carries ~43 and a
+    quota of 20 samples 47% of them, which is not worth the loss; at k4p4 it
+    carries ~3040 and the same quota is 0.66%, which is what makes the bin
+    tractable at all.
+    """
+
+    budget = int(getattr(spec.graph_rules, "selection_max_per_skeleton", 0) or 0)
+    if budget <= 0:
+        return 0
+    if k < int(getattr(spec.graph_rules, "selection_per_skeleton_from_k", 0) or 0):
+        return 0
+    if p < int(getattr(spec.graph_rules, "selection_per_skeleton_from_p", 0) or 0):
+        return 0
+    return budget
 
 
 def _skeleton_graph_violations(
@@ -4809,6 +4834,8 @@ class _CandidateScreen:
     graph_checkpoint: Optional[Callable[[MolecularBinResult], None]] = None
     validate_every_graph: bool = False
     skeleton_index: int = 0
+    #: fingerprint of the skeleton currently being decorated
+    skeleton_fp: str = ""
     ring_mode: str = "free"
     #: retain per-failure coordinate snapshots for the failures/*.xyz dump
     dump_failures: bool = False
@@ -4818,6 +4845,16 @@ class _CandidateScreen:
     #: candidate in whatever order the decorator happened to emit them.
     collect_only: bool = False
     pool: List[Tuple[int, _State]] = field(default_factory=list)
+    #: Per-skeleton reservoir cap.  0 keeps every candidate.  The energy
+    #: variance is between skeletons (best-per-skeleton spans 0.7-2.9 eV in a
+    #: bin) rather than within one (0.3-0.5 eV at 2p), so a quota spent evenly
+    #: over skeletons buys far more than a deep sample of the first few.
+    max_per_skeleton: int = 0
+    #: reservoir per skeleton index: (kept items, how many were offered)
+    _reservoir: Dict[int, Tuple[List[Tuple[int, _State]], int]] = field(
+        default_factory=dict
+    )
+    _reservoir_rng: Any = None
     #: how many sound frames to keep per coordination vector before calling a
     #: molecule unrealisable; 0 keeps every one of them
     frame_options: int = 0
@@ -5148,6 +5185,7 @@ class _CandidateScreen:
                     ),
                 )
             iso = MolecularIsomer(
+                seed_skeleton=self.skeleton_fp,
                 k=self.k,
                 p=self.p,
                 structure_id=structure_id,
@@ -5457,7 +5495,31 @@ class _CandidateScreen:
             # path embeds immediately, so with it first the pool stayed empty
             # and every budget/selection setting was silently inert whenever
             # reconstruction.method was motif_factor.
-            self.pool.append((int(graph.number_of_edges()), state))
+            entry = (int(graph.number_of_edges()), state)
+            if self.max_per_skeleton <= 0:
+                self.pool.append(entry)
+                return None
+            # Reservoir sampling over this skeleton's stream.  Truncating the
+            # walk instead would return a systematic corner of it: candidates
+            # are emitted hungriest-host-first, so the first N are all the
+            # low-CN-saturating variants.  At k4p4 a quota of 20 is 0.66% of a
+            # skeleton's 3040 decorations, so *which* 20 decides whether the
+            # best-of-N convergence (3 meV at N=20) applies at all.
+            kept, seen_n = self._reservoir.setdefault(
+                self.skeleton_index, ([], 0)
+            )
+            seen_n += 1
+            if len(kept) < self.max_per_skeleton:
+                kept.append(entry)
+            else:
+                if self._reservoir_rng is None:
+                    import random as _random
+
+                    self._reservoir_rng = _random.Random(20260810)
+                j = self._reservoir_rng.randrange(seen_n)
+                if j < self.max_per_skeleton:
+                    kept[j] = entry
+            self._reservoir[self.skeleton_index] = (kept, seen_n)
             return None
 
         if self.embed and self._motif_factor_enabled():
@@ -5980,6 +6042,7 @@ class _CandidateScreen:
             return None
         self.processed.add(certificate)
         isomer = MolecularIsomer(
+            seed_skeleton=self.skeleton_fp,
             k=self.k,
             p=self.p,
             structure_id=(
@@ -6119,34 +6182,103 @@ def _relax_bin_with_xtb(
         )
 
 
+#: ANSI colours cycled over skeleton fingerprints in the ranking.  A bin can
+#: hold hundreds of skeletons, so colour groups the eye and the fingerprint
+#: text disambiguates; colour alone is never the identifier.
+_SKELETON_COLOURS = ("36", "33", "35", "32", "34", "31")
+
+
+def skeleton_fingerprint(
+    atoms: Sequence[AtomRecord],
+    graph: nx.Graph,
+    spec_cation: str = "Cd",
+    spec_anion: str = "Se",
+) -> str:
+    """Short canonical id of the cation-anion core, ignoring ligands.
+
+    Two decorations of one skeleton share this; it is what the per-skeleton
+    budget is defined over, so the ranking has to show it.
+    """
+
+    keep = [
+        atom.atom_id
+        for atom in atoms
+        if atom.symbol in (spec_cation, spec_anion)
+    ]
+    core = nx.Graph()
+    core.add_nodes_from(
+        (i, {"el": atoms[i].symbol}) for i in keep
+    )
+    core.add_edges_from(
+        (a, b) for a, b in graph.edges() if a in set(keep) and b in set(keep)
+    )
+    if core.number_of_nodes() == 0:
+        return "------"
+    return nx.weisfeiler_lehman_graph_hash(
+        core, node_attr="el", iterations=4
+    )[:6]
+
+
 def _log_xtb_energy_ranking(
     bin_result: MolecularBinResult,
     progress: Optional[ProgressCallback],
+    use_colour: Optional[bool] = None,
 ) -> None:
-    """Print xTB energies ranked relative to the lowest-energy isomer."""
+    """Print xTB energies ranked relative to the lowest-energy isomer.
+
+    Rows carry the skeleton fingerprint and are coloured by it, so the
+    decorations of one skeleton read as a group.  Since 73-99% of a bin's
+    energy variance is between skeletons and only ~0.3-0.5 eV within one,
+    seeing which skeleton a structure belongs to is what makes the ranking
+    interpretable at all.  ``seed`` is the enumerated core; ``relaxed`` is the
+    core implied by the relaxed coordinates -- they differ whenever the
+    structure changed topology, which is worth seeing next to the energy.
+    """
 
     if progress is None:
         return
-    energies = [
-        (iso.xtb_energy_eV, iso.structure_id)
-        for iso in bin_result.isomers
-        if iso.xtb_energy_eV is not None
+    rows = [
+        iso for iso in bin_result.isomers if iso.xtb_energy_eV is not None
     ]
-    if not energies:
+    if not rows:
         return
-    energies.sort(key=lambda item: float(item[0]))
-    reference = float(energies[0][0])
+    rows.sort(key=lambda iso: float(iso.xtb_energy_eV))
+    reference = float(rows[0].xtb_energy_eV)
+    if use_colour is None:
+        import os
+        import sys
+
+        use_colour = (
+            sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        )
+    colour_of: Dict[str, str] = {}
     progress(
         f"    xTB energy ranking k={bin_result.k} p={bin_result.p} "
-        "(relative kcal/mol; rank 1 = 0.000)"
+        "(relative kcal/mol; rank 1 = 0.000; skel = seed skeleton "
+        "fingerprint, * = topology changed)"
     )
-    for rank, (energy_eV, structure_id) in enumerate(energies, start=1):
-        delta_kcal = (float(energy_eV) - reference) * 23.060548
-        progress(
-            f"      {rank:3d} {structure_id} "
-            f"ΔE={delta_kcal: .3f} kcal/mol "
-            f"E={float(energy_eV): .6f} eV"
+    for rank, iso in enumerate(rows, start=1):
+        fingerprint = iso.seed_skeleton or skeleton_fingerprint(
+            iso.atoms, iso.graph
         )
+        if fingerprint not in colour_of:
+            colour_of[fingerprint] = _SKELETON_COLOURS[
+                len(colour_of) % len(_SKELETON_COLOURS)
+            ]
+        delta_kcal = (float(iso.xtb_energy_eV) - reference) * 23.060548
+        changed = "" if iso.xtb_same_topology else "*"
+        line = (
+            f"      {rank:3d} [{fingerprint}{changed:1s}] {iso.structure_id} "
+            f"ΔE={delta_kcal: .3f} kcal/mol "
+            f"E={float(iso.xtb_energy_eV): .6f} eV"
+        )
+        if use_colour:
+            line = f"\033[{colour_of[fingerprint]}m{line}\033[0m"
+        progress(line)
+    progress(
+        f"      ({len(colour_of)} distinct skeletons over {len(rows)} "
+        f"structures)"
+    )
 
 
 def enumerate_molecular_bin(
@@ -6310,7 +6442,11 @@ def enumerate_molecular_bin(
                 getattr(spec.graph_rules, "selection_max_wiener_excess", 0.0)
                 or 0.0
             ) > 0.0
+            or _per_skeleton_budget(k, p, spec) > 0
         ) and embed,
+        max_per_skeleton=(
+            _per_skeleton_budget(k, p, spec) if embed else 0
+        ),
     )
 
     skeletons_truncated = False
@@ -6402,6 +6538,9 @@ def enumerate_molecular_bin(
         skeleton_graph = nx.Graph()
         skeleton_graph.add_nodes_from(range(len(atoms)))
         skeleton_graph.add_edges_from((int(a), int(b)) for a, b in skel)
+        screen.skeleton_fp = skeleton_fingerprint(
+            atoms, skeleton_graph, check_spec.core.cation, check_spec.core.anion
+        )
         skel_state = _State(atoms=atoms, graph=skeleton_graph)
         cd_cn = tuple(
             sorted(int(skeleton_graph.degree[i]) for i in cation_ids)
@@ -6869,8 +7008,34 @@ def enumerate_molecular_bin(
         # whole pool in decoration order.  3D costs ~0.55 s per candidate and
         # is flat in k, so this is what bounds a sweep -- the pool itself is
         # cheap to build.
+        if screen.max_per_skeleton > 0 and screen._reservoir:
+            # Round-robin so a bin truncated by any later budget still holds
+            # every skeleton, rather than all of the first few.
+            buckets = [
+                kept for _idx, (kept, _n) in sorted(screen._reservoir.items())
+            ]
+            offered = sum(n for _kept, n in screen._reservoir.values())
+            screen.pool = [
+                bucket[i]
+                for i in range(max((len(b) for b in buckets), default=0))
+                for bucket in buckets
+                if i < len(bucket)
+            ]
+            if progress is not None:
+                progress(
+                    f"    per-skeleton budget: {offered} candidates -> "
+                    f"{len(screen.pool)} sampled "
+                    f"({screen.max_per_skeleton}/skeleton over "
+                    f"{len(buckets)} skeletons)"
+                )
         pool = screen.pool
         screen.collect_only = False
+        if not target_isomers and pool:
+            # The reservoir *is* the budget: everything it sampled is meant to
+            # be embedded.  Without this the bin silently accepted nothing
+            # whenever the per-skeleton quota was the only cap in force, since
+            # both embed loops are bounded by ``target_isomers``.
+            target_isomers = len(pool)
         if progress is not None:
             # The size of the job, known before a single embedding is attempted:
             # every candidate here has already cleared the graph-level rules, so
