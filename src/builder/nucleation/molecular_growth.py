@@ -41,7 +41,12 @@ import numpy as np
 import yaml
 
 from ..nc_types import NucleationSpec
-from .formation import MonomerReferences, load_monomer_references
+from .formation import (
+    MonomerReferences,
+    format_bin_ranking,
+    format_package_growth_profile,
+    load_monomer_references,
+)
 from .geometry_pack import GeometryPack, load_geometry_pack
 from .molecular import (
     _index_blocks,
@@ -253,6 +258,159 @@ def core_edges_from_full(
         if pair == {cation, anion}:
             out.append((min(a, b), max(a, b)))
     return tuple(sorted(out))
+
+
+@dataclass
+class EnergyRecord:
+    """Lightweight isomer energy for ranking / profile (no coordinates)."""
+
+    structure_id: str
+    xtb_energy_eV: float
+    k: int
+    p: int
+    xtb_converged: bool = True
+
+
+def load_energy_index(
+    run_dir: Path,
+    *,
+    k_values: Optional[Sequence[int]] = None,
+    require_converged: bool = True,
+) -> List[EnergyRecord]:
+    """Load g-xTB energies from a map/growth ``index.csv`` (all or selected k)."""
+
+    run_dir = Path(run_dir)
+    index_path = run_dir / "index.csv"
+    if not index_path.is_file():
+        return []
+    k_set = None if k_values is None else {int(x) for x in k_values}
+    out: List[EnergyRecord] = []
+    with index_path.open() as handle:
+        for row in csv.DictReader(handle):
+            try:
+                rk, rp = int(row["k"]), int(row["p"])
+            except (KeyError, ValueError):
+                continue
+            if k_set is not None and rk not in k_set:
+                continue
+            conv = str(row.get("xtb_converged", "")).lower().strip()
+            if require_converged and conv in ("false", "0", "no"):
+                continue
+            try:
+                energy = float(row["xtb_energy_eV"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not math.isfinite(energy):
+                continue
+            sid = str(row.get("structure_id") or f"k{rk:03d}_p{rp:03d}")
+            out.append(
+                EnergyRecord(
+                    structure_id=sid,
+                    xtb_energy_eV=energy,
+                    k=rk,
+                    p=rp,
+                    xtb_converged=conv not in ("false", "0", "no"),
+                )
+            )
+    return out
+
+
+def bin_minima_from_records(
+    records: Sequence[EnergyRecord],
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Map (k, p) → {energy_eV, structure_id} for the lowest-E isomer."""
+
+    best: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for rec in records:
+        key = (int(rec.k), int(rec.p))
+        e = float(rec.xtb_energy_eV)
+        cur = best.get(key)
+        if cur is None or e < float(cur["energy_eV"]):
+            best[key] = {
+                "energy_eV": e,
+                "structure_id": rec.structure_id,
+            }
+    return best
+
+
+def merge_bin_minima(
+    *maps: Mapping[Tuple[int, int], Mapping[str, Any]],
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Merge several (k,p)→min maps; keep the lower energy when both present.
+
+    Near-degenerate energies prefer a real structure id over ``ref:…``.
+    """
+
+    out: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for m in maps:
+        for key, row in m.items():
+            e = row.get("energy_eV")
+            if e is None:
+                continue
+            e = float(e)
+            sid = str(row.get("structure_id") or "")
+            cur = out.get(key)
+            if cur is None:
+                out[key] = {"energy_eV": e, "structure_id": sid}
+                continue
+            cur_e = float(cur["energy_eV"])
+            if e < cur_e - 1.0e-9:
+                out[key] = {"energy_eV": e, "structure_id": sid}
+            elif abs(e - cur_e) <= 1.0e-9:
+                cur_sid = str(cur.get("structure_id") or "")
+                if cur_sid.startswith("ref:") and not sid.startswith("ref:"):
+                    out[key] = {"energy_eV": e, "structure_id": sid}
+    return out
+
+
+def seed_package_minima_from_refs(
+    refs: Optional[MonomerReferences],
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """k=1 package energies from growth.yaml ``package_cluster_eV``."""
+
+    if refs is None:
+        return {}
+    out: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for pm, e in refs.package_cluster_eV.items():
+        out[(1, int(pm))] = {
+            "energy_eV": float(e),
+            "structure_id": f"ref:E(1,{int(pm)})",
+        }
+    return out
+
+
+def format_prior_map_rankings(
+    run_dir: Path,
+    *,
+    growth: GrowthConfig,
+    k_max: int,
+) -> str:
+    """Full bin rankings for parent map sizes k=1 … k_max (same log format)."""
+
+    records = load_energy_index(run_dir, k_values=range(1, int(k_max) + 1))
+    if not records:
+        return f"  (no index energies in {run_dir} for k≤{k_max})"
+    by_bin: Dict[Tuple[int, int], List[EnergyRecord]] = {}
+    for rec in records:
+        by_bin.setdefault((rec.k, rec.p), []).append(rec)
+    pms = tuple(growth.monomer_p_values) or (1, 2, 3)
+    dmu = tuple(growth.delta_mu_cdcl2_eV) or (-1.0, 0.0, 1.0)
+    chunks = [
+        f"  ══ prior map rankings from {run_dir.name}  "
+        f"(k=1…{k_max}; g-xTB already relaxed) ══"
+    ]
+    for (k, p) in sorted(by_bin):
+        chunks.append(
+            format_bin_ranking(
+                by_bin[(k, p)],
+                k=k,
+                p=p,
+                refs=growth.references,
+                package_p_m=pms,
+                delta_mu=dmu,
+            )
+        )
+    return "\n\n".join(chunks)
 
 
 def load_parents_from_run(
@@ -1001,6 +1159,14 @@ def run_growth_step(
             f"bins={sorted(result.skeleton_catalog)}"
         )
 
+    # Report-only: print parent-map rankings (k=1 … k_from) before child opts
+    if log:
+        prior = format_prior_map_rankings(
+            run_dir, growth=growth, k_max=k_from
+        )
+        print(prior, flush=True)
+
+    child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
     if decorate and result.skeleton_catalog:
         if pack is None and map_spec.geometry_pack:
             pack = load_geometry_pack(map_spec.geometry_pack)
@@ -1036,13 +1202,21 @@ def run_growth_step(
                 progress=progress,
             )
             done_cores += len(cores)
+            # track bin minimum for package profile
+            with_e = [
+                iso
+                for iso in bin_res.isomers
+                if iso.xtb_energy_eV is not None
+            ]
+            if with_e:
+                best = min(with_e, key=lambda iso: float(iso.xtb_energy_eV))
+                child_minima[(k, p)] = {
+                    "energy_eV": float(best.xtb_energy_eV),
+                    "structure_id": best.structure_id,
+                }
             if log:
                 n_iso = len(bin_res.isomers)
-                n_ok = sum(
-                    1
-                    for iso in bin_res.isomers
-                    if iso.xtb_energy_eV is not None
-                )
+                n_ok = len(with_e)
                 n_merged = sum(
                     1
                     for rec in getattr(bin_res, "graph_merge_records", []) or []
@@ -1053,8 +1227,6 @@ def run_growth_step(
                     f"with_E={n_ok}  no_E={n_fail}  "
                     f"graph_merges={n_merged}"
                 )
-                from .formation import format_bin_ranking
-
                 ranking = format_bin_ranking(
                     bin_res.isomers,
                     k=k,
@@ -1062,11 +1234,40 @@ def run_growth_step(
                     refs=growth.references,
                     package_p_m=tuple(growth.monomer_p_values) or (1, 2, 3),
                     delta_mu=tuple(growth.delta_mu_cdcl2_eV)
-                    or (-0.5, 0.0, 0.5),
+                    or (-1.0, 0.0, 1.0),
                 )
                 print(ranking, flush=True)
             if out is not None:
                 _write_growth_bin(out, bin_res, growth)
+
+    # Package growth profile: k=1…k_child along p = k·p_m for each package
+    if log:
+        parent_minima = bin_minima_from_records(
+            load_energy_index(run_dir, k_values=range(1, k_from + 1))
+        )
+        out_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        if output_dir is not None:
+            out_minima = bin_minima_from_records(
+                load_energy_index(
+                    Path(output_dir),
+                    k_values=range(1, k_from + 2),
+                    require_converged=False,
+                )
+            )
+        minima = merge_bin_minima(
+            seed_package_minima_from_refs(growth.references),
+            parent_minima,
+            out_minima,
+            child_minima,
+        )
+        profile = format_package_growth_profile(
+            minima,
+            refs=growth.references,
+            package_p_m=tuple(growth.monomer_p_values) or (1, 2, 3),
+            k_values=tuple(range(1, k_from + 2)),
+            delta_mu=tuple(growth.delta_mu_cdcl2_eV) or (-1.0, 0.0, 1.0),
+        )
+        print(profile, flush=True)
 
     if log:
         log.stage(
@@ -1177,9 +1378,15 @@ __all__ = [
     "GrowthConfig",
     "GrowthLog",
     "ParentStructure",
+    "EnergyRecord",
     "GrowthChannelResult",
     "GrowthStepResult",
     "bond_cutoffs_from_spec",
+    "load_energy_index",
+    "bin_minima_from_records",
+    "merge_bin_minima",
+    "seed_package_minima_from_refs",
+    "format_prior_map_rankings",
     "load_parents_from_run",
     "select_parents",
     "identify_packages",

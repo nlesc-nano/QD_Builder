@@ -79,5 +79,9 @@ child:
 # Report-only condition scan (does NOT steer growth)
 chemical_potential:
   enabled: true
-  # Ω = ΔE_f - p * Δμ_CdCl2   with  ΔE_f = E - k E(CdSe) - p E(CdCl2)
+  # g-xTB grand potential (same algebra as nucleation GP reconstruction):
+  #   Ω = E − k μ_CdSe⁰ − p (E(CdCl2) + Δμ)
+  # free:    μ_CdSe⁰ = E(CdSe)
+  # ligated: μ_CdSe⁰(p_m) = E(1,p_m) − p_m E(CdCl2)  from package_cluster_eV
+  # Log shows lean / 0 / rich subset; full grid is available for CSV/index.
   delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
