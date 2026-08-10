@@ -194,7 +194,11 @@ def test_format_bin_ranking_readable() -> None:
     assert "O@-1.0" in text
     assert "O@+0.0" in text
     assert "O@+1.0" in text
-    assert all(ord(ch) < 128 for ch in text)
+    # strip ANSI colour if present before ASCII check
+    import re as _re
+
+    plain = _re.sub(r"\033\[[0-9;]*m", "", text)
+    assert all(ord(ch) < 128 for ch in plain)
     # winner first
     pos2 = text.index("k002_p003_mol0002")
     pos1 = text.index("k002_p003_mol0001")
