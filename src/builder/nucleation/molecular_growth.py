@@ -1076,7 +1076,12 @@ def local_cleanup_structure(
     pack: Optional[GeometryPack],
     structure_id: str,
 ) -> Tuple[FloatArray, float, bool, str]:
-    """Short g-xTB / GFN cleanup.  Returns (coords, time_s, ok, note)."""
+    """Short g-xTB / GFN cleanup.  Returns (coords, time_s, ok, note).
+
+    Important: the pack full-opt ``timeout_s`` (often 1800 s) must **not** be
+    inherited here — otherwise a bad placed seed hangs the whole growth step.
+    ``max_steps`` is written to an xtb ``xcontrol`` for the CLI path.
+    """
 
     if not growth.local_cleanup_enabled or growth.local_cleanup_cycles <= 0:
         return np.asarray(coords, dtype=float), 0.0, False, "cleanup_disabled"
@@ -1084,28 +1089,41 @@ def local_cleanup_structure(
     from .xtb_relax import XtbSettings, relax_structures
 
     method = growth.local_cleanup_method
-    # Prefer pack relaxation binary/env when method is g-xTB
-    base = {}
+    # Prefer pack relaxation binary/env when method is g-xTB, but cap wall time
+    base: Dict[str, Any] = {}
     if pack is not None and isinstance(pack.raw, dict):
         base = dict(pack.raw.get("relaxation") or {})
     base["enabled"] = True
     base["method"] = method
     base["max_steps"] = int(growth.local_cleanup_cycles)
-    # short wall for cleanup so it cannot dominate
-    base.setdefault("timeout_s", 120.0)
+    # Always override pack full-opt timeout (setdefault is wrong here)
+    base["timeout_s"] = float(
+        min(float(base.get("timeout_s") or 60.0), 60.0)
+    )
+    # do not re-check connectivity during a short prelax
+    base["check_connectivity"] = False
     settings = XtbSettings.from_pack(base)
     t0 = time.perf_counter()
-    results = relax_structures(
-        [
-            {
-                "id": f"cleanup-{structure_id}",
-                "symbols": list(symbols),
-                "positions": np.asarray(coords, dtype=float).tolist(),
-            }
-        ],
-        settings,
-        None,
-    )
+    try:
+        results = relax_structures(
+            [
+                {
+                    "id": f"cleanup-{structure_id}",
+                    "symbols": list(symbols),
+                    "positions": np.asarray(coords, dtype=float).tolist(),
+                }
+            ],
+            settings,
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        dt = time.perf_counter() - t0
+        return (
+            np.asarray(coords, dtype=float),
+            dt,
+            False,
+            f"cleanup_exc:{exc}",
+        )
     dt = time.perf_counter() - t0
     xr = results[0]
     if not xr.ok or xr.coordinates is None:
@@ -1119,7 +1137,7 @@ def local_cleanup_structure(
         np.asarray(xr.coordinates, dtype=float),
         dt,
         True,
-        f"cleanup_ok steps≤{growth.local_cleanup_cycles}",
+        f"cleanup_ok maxcycle={growth.local_cleanup_cycles} t={dt:.1f}s",
     )
 
 
@@ -1307,6 +1325,15 @@ def grow_cores_from_parents(
                 # ---- Move B: coordinate carry-over ----
                 if growth.use_coord_carry:
                     seed_serial += 1
+                    if seed_serial == 1 or seed_serial % 5 == 0:
+                        # visible progress: cleanup can take tens of seconds each
+                        print(
+                            f"[growth] move B seed {seed_serial}: "
+                            f"parent={parent.structure_id} s={s} p_m={p_m} "
+                            f"(WBO shed + place"
+                            f"{'+cleanup' if growth.local_cleanup_enabled else ''})",
+                            flush=True,
+                        )
                     seed = build_coord_seed(
                         parent,
                         s=s,
@@ -1340,6 +1367,13 @@ def grow_cores_from_parents(
                                 move="coord",
                             )
                         )
+                        if seed_serial == 1 or seed_serial % 5 == 0:
+                            print(
+                                f"[growth]   -> {seed.structure_id}  "
+                                f"cleanup={seed.cleanup_ok} "
+                                f"t={seed.cleanup_s:.1f}s  {seed.notes}",
+                                flush=True,
+                            )
 
     skeleton_catalog = {
         key: list(edges_map.keys()) for key, edges_map in catalog.items()
@@ -1770,6 +1804,24 @@ class GrowthLog:
         )
         self._tick()
 
+    @staticmethod
+    def _formula_kp(k: object, p: object) -> str:
+        """ASCII formula [CdSe]_k(CdCl2)_p for log lines."""
+
+        try:
+            return f"[CdSe]_{int(k)}(CdCl2)_{int(p)}"
+        except (TypeError, ValueError):
+            return f"[CdSe]_{k}(CdCl2)_{p}"
+
+    @staticmethod
+    def _parent_kp_from_id(parent_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """Parse k###_p### from a structure id like k002_p003_mol0010."""
+
+        m = re.search(r"k(\d+)_p(\d+)", str(parent_id), flags=re.IGNORECASE)
+        if not m:
+            return None, None
+        return int(m.group(1)), int(m.group(2))
+
     def __call__(self, msg: str) -> None:
         """ProgressCallback-compatible."""
 
@@ -1795,6 +1847,12 @@ class GrowthLog:
             err = kv.get("err", "")
             into = kv.get("into", "")
             move = kv.get("move", "A")
+            shed = kv.get("s", kv.get("shed", "-"))
+            p_m = kv.get("p_m", kv.get("pm", "-"))
+            parent = kv.get("parent", kv.get("parent_id", ""))
+            # explicit parent k,p if provided
+            k_par = kv.get("k_parent", kv.get("k_par", ""))
+            p_par = kv.get("p_parent", kv.get("p_par", ""))
             try:
                 opt_s = float(t)
             except ValueError:
@@ -1808,11 +1866,12 @@ class GrowthLog:
                 self.n_merge += 1
                 self._bin_merge += 1
                 target = into or "?"
+                # compact merge line (stage already says move A / decorate)
                 print(
-                    f"  merge {self.n_merge:4d}  k={k} p={p}  {sid:22s}  "
-                    f"-> {target:22s}  "
+                    f"  {self.n_merge:4d}  merge  k={k} p={p}  "
+                    f"{self._formula_kp(k, p)}  "
                     f"+dt={dt:5.1f}s  "
-                    f"[bin m{self._bin_merge} | g{self.n_gxtb} m{self.n_merge}]",
+                    f"{sid} -> {target}",
                     flush=True,
                 )
                 return
@@ -1827,16 +1886,30 @@ class GrowthLog:
                 self.n_fail += 1
                 self._bin_fail += 1
             extra = f" ({err})" if err and rel == "fail" else ""
-            # recon column: motif_factor (A) or cleanup prelax (B)
             recon_lab = "clean" if move in ("B", "coord", "b") else "recon"
-            print(
-                f"  gxtb {self.n_gxtb:4d}  k={k} p={p}  move={move}  "
-                f"{sid:22s}  E={e:>14s}  "
-                f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s +dt={dt:5.1f}s  "
-                f"relax={rel}{extra}  "
-                f"[bin g{self._bin_gxtb} | g{self.n_gxtb} m{self.n_merge}]",
-                flush=True,
-            )
+            child_f = self._formula_kp(k, p)
+
+            if move in ("B", "coord", "b"):
+                # N  k=.. p=.. -s=.. +p_m=.. -> [CdSe]_k(CdCl2)_p  E ... parent=
+                parent_bit = f"  parent={parent}" if parent else ""
+                print(
+                    f"  {self.n_gxtb:4d}  k={k} p={p}  "
+                    f"-s={shed} +p_m={p_m} -> {child_f}  "
+                    f"E={e:>14s}  "
+                    f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
+                    f"+dt={dt:5.1f}s  {rel}{extra}"
+                    f"{parent_bit}",
+                    flush=True,
+                )
+            else:
+                # move A redecorate
+                print(
+                    f"  {self.n_gxtb:4d}  k={k} p={p}  {child_f}  redecorate  "
+                    f"E={e:>14s}  "
+                    f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
+                    f"+dt={dt:5.1f}s  {rel}{extra}",
+                    flush=True,
+                )
             return
         if text.startswith("[growth]"):
             print(text, flush=True)
@@ -2174,7 +2247,14 @@ def _opt_coord_seeds(
     for key in sorted(coord_seeds):
         flat.extend(coord_seeds[key])
     if log:
-        log.line(f"move B: optimizing {len(flat)} coord-carried children")
+        log.line(f"move B: full g-xTB opt of {len(flat)} coord-carried children")
+        log.line(
+            "child p = p_parent - s + p_m;  formula = [CdSe]_k(CdCl2)_p"
+        )
+        log.line(
+            "row: N  k=.. p=.. -s=.. +p_m=.. -> [CdSe]_k(CdCl2)_p  "
+            "E  opt clean +dt  status  parent=.."
+        )
     elif progress:
         progress(f"[growth] move B: opt {len(flat)} coord seeds")
 
@@ -2192,21 +2272,30 @@ def _opt_coord_seeds(
         xr = results[0]
         opt_s = time.perf_counter() - t0
         recon_s = float(seed.cleanup_s)  # report cleanup time under recon slot
+        # parent k,p from id (k002_p003_...) for the stoich line
+        pk, pp = GrowthLog._parent_kp_from_id(seed.parent_id)
+        k_par = "" if pk is None else str(pk)
+        p_par = "" if pp is None else str(pp)
         if progress is not None:
+            base = (
+                f"[growth-job] k={seed.k} p={seed.p} move=B "
+                f"s={seed.shed} p_m={seed.p_m} "
+                f"k_parent={k_par} p_parent={p_par} "
+                f"parent={seed.parent_id} "
+                f"id={seed.structure_id} "
+                f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
+            )
             if xr.ok and xr.energy_eV is not None:
                 progress(
-                    f"[growth-job] k={seed.k} p={seed.p} move=B "
-                    f"id={seed.structure_id} "
-                    f"E_eV={float(xr.energy_eV):.6f} "
-                    f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
-                    f"relax={'ok' if xr.converged else 'fail'}"
+                    base
+                    + f"E_eV={float(xr.energy_eV):.6f} "
+                    + f"relax={'ok' if xr.converged else 'fail'}"
                 )
             else:
                 progress(
-                    f"[growth-job] k={seed.k} p={seed.p} move=B "
-                    f"id={seed.structure_id} "
-                    f"E_eV=n/a t_s={opt_s:.1f} recon_s={recon_s:.1f} "
-                    f"relax=fail err={xr.error or 'coord_opt'}"
+                    base
+                    + "E_eV=n/a "
+                    + f"relax=fail err={xr.error or 'coord_opt'}"
                 )
         if not xr.ok or xr.energy_eV is None:
             continue

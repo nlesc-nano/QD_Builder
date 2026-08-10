@@ -195,7 +195,25 @@ def _cli_command(binary: str, settings: "XtbSettings") -> List[str]:
     cmd = [binary, "in.xyz", "--gxtb", "--opt"]
     if settings.charge:
         cmd += ["--chrg", str(int(settings.charge))]
+    # Optional xcontrol (e.g. maxcycle for short cleanup) written beside in.xyz
+    if int(settings.max_steps) > 0 and int(settings.max_steps) < 500:
+        cmd += ["--input", "xcontrol"]
     return cmd
+
+
+def _write_cli_xcontrol(work: Path, settings: "XtbSettings") -> None:
+    """Limit geometry steps for short cleanups (gxtb CLI ignores max_steps alone)."""
+
+    max_steps = int(settings.max_steps)
+    if max_steps <= 0 or max_steps >= 500:
+        return
+    # xtb/tblite reads $opt maxcycle from the input file
+    (work / "xcontrol").write_text(
+        "$opt\n"
+        f"  maxcycle={max_steps}\n"
+        "$end\n",
+        encoding="utf-8",
+    )
 
 
 def _run_cli(structures, settings) -> List[Dict[str, Any]]:
@@ -229,6 +247,7 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
                     f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
                 )
             xyz.write_text("\n".join(lines) + "\n")
+            _write_cli_xcontrol(Path(work), settings)
             cmd = _cli_command(binary, settings)
             try:
                 proc = subprocess.run(
