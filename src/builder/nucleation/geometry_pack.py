@@ -47,6 +47,8 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "bridge_target_avoid_triangles",
     "bridge_target_max_automorphisms",
     "bridge_target_count_window",
+    "bridge_target_max_emissions_per_skeleton",
+    "bridge_target_max_nodes_per_skeleton",
     "selection_max_per_skeleton",
     "selection_per_skeleton_from_k",
     "selection_per_skeleton_from_p",
@@ -662,6 +664,16 @@ class GeometryPack:
             ),
             "bridge_target_count_window": int(
                 self.graph_rules.get("bridge_target_count_window", 0)
+            ),
+            "bridge_target_max_emissions_per_skeleton": int(
+                self.graph_rules.get(
+                    "bridge_target_max_emissions_per_skeleton", 2000
+                )
+            ),
+            "bridge_target_max_nodes_per_skeleton": int(
+                self.graph_rules.get(
+                    "bridge_target_max_nodes_per_skeleton", 50000
+                )
             ),
             "selection_max_per_skeleton": int(
                 self.graph_rules.get("selection_max_per_skeleton", 0)

@@ -1046,6 +1046,8 @@ def iter_cl_attachments_bridge_target(
     max_shared_per_pair: int = 2,
     avoid_triangles: bool = True,
     count_window: int = 0,
+    max_emissions: int = 0,
+    max_walk_nodes: int = 0,
 ) -> Iterable[Tuple[Tuple[int, int], ...]]:
     """Enumerate decorations that bridge as much chloride as the core allows.
 
@@ -1065,6 +1067,11 @@ def iter_cl_attachments_bridge_target(
 
     Pairs are chosen in strictly increasing index order, so each bridge *set*
     is visited once rather than once per ordering.
+
+    ``max_emissions`` / ``max_walk_nodes`` (or the pack knobs
+    ``bridge_target_max_emissions_per_skeleton`` /
+    ``bridge_target_max_nodes_per_skeleton``) hard-stop the walk so high-p
+    bins cannot stream millions of graphs before the reservoir.  0 = unlimited.
     """
 
     if status is None:
@@ -1085,7 +1092,35 @@ def iter_cl_attachments_bridge_target(
     if max_shared_per_pair > 0:
         max_shared = min(max_shared, max_shared_per_pair)
     min_bridge_cn = int(getattr(spec.graph_rules, "min_bridged_host_cn", 0) or 0)
+    forbid_dual = bool(
+        getattr(spec.graph_rules, "forbid_mono_se_dual_terminal", False)
+    )
     skel = _skel_degrees(cd_list, inorganic_edges)
+    mono_se = {i for i, s in enumerate(skel) if s == 1}
+    # Per-skeleton early stops: pack knobs, overridable by explicit args.
+    # These are *deliberate* sample limits (not incomplete enumeration): they
+    # must not set status.truncated, or the bin aborts as if max_assignments
+    # were hit.
+    if max_emissions <= 0:
+        max_emissions = int(
+            getattr(
+                spec.graph_rules,
+                "bridge_target_max_emissions_per_skeleton",
+                0,
+            )
+            or 0
+        )
+    if max_walk_nodes <= 0:
+        max_walk_nodes = int(
+            getattr(
+                spec.graph_rules,
+                "bridge_target_max_nodes_per_skeleton",
+                0,
+            )
+            or 0
+        )
+    # Global assignment cap (bin-level safety guard) is separate.
+    assignment_cap = int(max_assignments) if max_assignments > 0 else 0
 
     # Skeleton automorphisms, in Cd-slot coordinates, for orderly generation.
     # Without them the walk explores one branch per automorphic image of the
@@ -1199,14 +1234,41 @@ def iter_cl_attachments_bridge_target(
     # Ceiling on bridges: every bridge consumes two host slots, and there are
     # only ``sum(bridge_room)`` of them; it also cannot exceed the Cl budget or
     # the number of distinct pairs available at max_shared per pair.
-    ceiling = min(
-        n_cl,
-        sum(bridge_room) // 2,
-        len(pair_list) * max(1, max_shared),
-    )
+    slot_ceiling = sum(bridge_room) // 2
+    pair_ceiling = len(pair_list) * max(1, max_shared)
+    ceiling = min(n_cl, slot_ceiling, pair_ceiling)
+
+    # Cheap pre-walk feasibility: total free Cd valence must hold every Cl
+    # (each Cl needs at least one host slot; a μ2 uses two).
+    total_room = sum(room)
+    if total_room < n_cl:
+        return
+    # No bridge pairs and no way to place pure terminals under min_cn is rare;
+    # ceiling 0 with n_cl > 0 still allows the target=0 terminal-only tier.
+    if ceiling == 0 and n_cl > 0 and total_room < n_cl:
+        return
 
     emitted = 0
+    walk_nodes = 0
     seen_keys: Set[Tuple] = set()
+
+    def _hit_skel_emission_cap() -> bool:
+        return max_emissions > 0 and emitted >= max_emissions
+
+    def _hit_assignment_cap() -> bool:
+        return assignment_cap > 0 and emitted >= assignment_cap
+
+    def _hit_any_emission_cap() -> bool:
+        return _hit_skel_emission_cap() or _hit_assignment_cap()
+
+    def _hit_node_cap() -> bool:
+        return max_walk_nodes > 0 and walk_nodes >= max_walk_nodes
+
+    def _stop_walk(*, as_incomplete: bool = False) -> None:
+        """End the walk; only assignment-cap hits mark the bin incomplete."""
+
+        if as_incomplete or _hit_assignment_cap():
+            status.truncated = True
 
     def terminal_fills(load: List[int], budget: int) -> Iterable[Tuple[int, ...]]:
         """Multisets of terminal hosts using exactly ``budget`` chloride."""
@@ -1236,6 +1298,8 @@ def iter_cl_attachments_bridge_target(
         nonlocal emitted
         budget = n_cl - len(chosen)
         for terms in terminal_fills(load, budget):
+            if _hit_any_emission_cap():
+                return
             cn = [skel[i] + load[i] for i in range(n_cd)]
             for slot in terms:
                 cn[slot] += 1
@@ -1250,6 +1314,17 @@ def iter_cl_attachments_bridge_target(
                 load[i] > 0 and cn[i] < min_bridge_cn for i in range(n_cd)
             ):
                 continue
+            # Same rule as mono_se_dual_terminal_violations: a mono-Se Cd with
+            # two terminal Cl and no bridge is illegal.  Enforce here so the
+            # productive-target loop never stops on a shell the screen dumps.
+            if forbid_dual and terms:
+                term_on = [0] * n_cd
+                for slot in terms:
+                    term_on[slot] += 1
+                if any(
+                    load[i] == 0 and term_on[i] >= 2 for i in mono_se
+                ):
+                    continue
             st = _PlaceState(
                 cn=cn,
                 n_bridge=list(load),
@@ -1294,6 +1369,14 @@ def iter_cl_attachments_bridge_target(
                      used: Dict[Tuple[int, int], int], share_cap: int,
                      no_triangles: bool,
                      group: Sequence[Tuple[int, ...]]):
+        nonlocal walk_nodes
+        if _hit_any_emission_cap() or _hit_node_cap():
+            _stop_walk()
+            return
+        walk_nodes += 1
+        if _hit_node_cap():
+            _stop_walk()
+            return
         if len(chosen) == target:
             yield from finish(chosen, load, group)
             return
@@ -1304,6 +1387,9 @@ def iter_cl_attachments_bridge_target(
         # rather than the leaves, which is where the duplication lives.
         orbit_seen: Set[Tuple[Tuple[int, int], ...]] = set()
         for idx in range(start, len(pair_list)):
+            if _hit_any_emission_cap() or _hit_node_cap():
+                _stop_walk()
+                return
             a, b = pair_list[idx]
             s1, s2 = position[a], position[b]
             if used.get((a, b), 0) >= share_cap:
@@ -1338,8 +1424,6 @@ def iter_cl_attachments_bridge_target(
             used[(a, b)] -= 1
             load[s1] -= 1
             load[s2] -= 1
-            if max_assignments > 0 and emitted >= max_assignments:
-                return
 
     # Aim at full saturation and step down only if a target yields nothing:
     # the stable structures sit at the top of this range.
@@ -1362,16 +1446,23 @@ def iter_cl_attachments_bridge_target(
     # one that yields anything.  Widening it covers the observed spread --
     # only 5.7% of relaxed structures sit at exactly 2p bridges but 51% are
     # within 2 of it -- which is what turns a single shell into a map.
+    # Productive means finish() actually yielded: every decoration rule that
+    # used to live only in the screen (min_bridged, min_cn, mono-Se dual
+    # terminal) is enforced there, so a shell of pure rejects cannot stop
+    # the descent.
     windows = 0
     for target in range(ceiling, -1, -1):
+        if _hit_any_emission_cap() or _hit_node_cap():
+            _stop_walk()
+            return
         produced = False
         for share_cap, no_tri in tiers:
             for edges in walk_bridges(0, [0] * n_cd, [], target, {},
                                       share_cap, no_tri, slot_maps):
                 produced = True
                 yield edges
-                if max_assignments > 0 and emitted >= max_assignments:
-                    status.truncated = True
+                if _hit_any_emission_cap() or _hit_node_cap():
+                    _stop_walk()
                     return
             if produced:
                 break

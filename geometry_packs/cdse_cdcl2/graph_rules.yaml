@@ -67,6 +67,13 @@ graph_rules:
   selection_max_per_skeleton: 20
   selection_per_skeleton_from_k: 3
 
+  # Early stops so high-p bins cannot stream millions of max-bridge sets
+  # before the reservoir (k4p7 without caps: ~4e6 raw, 0 isomers).  k<=3 bins
+  # finish well under these limits; raise only if a large bin is truncated
+  # and you need more diversity.
+  bridge_target_max_emissions_per_skeleton: 2000
+  bridge_target_max_nodes_per_skeleton: 50000
+
   # Everything else is left at its default on purpose.  Notably:
   #   bridge_first_prefer_bridges_per_cd    2  (beam-only; does not bind k<=2)
   #   bridge_first_max_automorphisms       64  (beam cost cap; irrelevant k<=2)
