@@ -5015,8 +5015,8 @@ class _CandidateScreen:
                 if self.progress is not None:
                     # Compact growth log: this is a merge, not a relax failure.
                     self.progress(
-                        f"[growth-job] k={self.k} p={self.p} "
-                        f"id={source_id} E_eV=merged t_s=0.0 "
+                        f"[growth-job] k={self.k} p={self.p} move=A "
+                        f"id={source_id} E_eV=merged t_s=0.0 recon_s=0.0 "
                         f"relax=merged into={existing.structure_id}"
                     )
                     self.progress(f"[molecular] {detail}")
@@ -5286,9 +5286,11 @@ class _CandidateScreen:
                 if not xr.ok or xr.coordinates is None:
                     if self.progress is not None:
                         self.progress(
-                            f"[growth-job] k={self.k} p={self.p} "
+                            f"[growth-job] k={self.k} p={self.p} move=A "
                             f"id=graph{graph_number:04d}_s{candidate.start_index:02d} "
-                            f"E_eV=n/a t_s={xtb_elapsed:.1f} relax=fail "
+                            f"E_eV=n/a t_s={xtb_elapsed:.1f} "
+                            f"recon_s={reconstruction_elapsed:.1f} "
+                            f"relax=fail "
                             f"err={xr.error or 'no_coordinates'}"
                         )
                         self.progress(
@@ -5437,10 +5439,11 @@ class _CandidateScreen:
                             else f"{float(xr.energy_eV):.6f}"
                         )
                         self.progress(
-                            f"[growth-job] k={self.k} p={self.p} "
+                            f"[growth-job] k={self.k} p={self.p} move=A "
                             f"id={iso.structure_id} "
                             f"E_eV={e_s} "
                             f"t_s={xtb_elapsed:.1f} "
+                            f"recon_s={reconstruction_elapsed:.1f} "
                             f"relax={'ok' if xr.converged else 'fail'}"
                         )
                         self.progress(

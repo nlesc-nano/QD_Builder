@@ -1,20 +1,18 @@
 """Package growth for the lattice-free molecular map.
 
-Mirrors lattice nucleation building blocks:
+Two complementary moves (both when ``geometry.start_from: relaxed_coords``)::
 
-    parent (k, p)
-      -> shed s complete CdCl2 packages (WBO: least-bound first)
-      -> add CdSe + p_m CdCl2  (monomer_p_values)
-      -> p_child = p - s + p_m
-      -> redecorate + full g-xTB (via existing map pipeline)
+  **A graph** — combinatorial precursor-Cd shed on the core graph → monomer
+  attach + p_m inflate → Cl redecorate → motif_factor 3D rebuild → full g-xTB.
 
-Parents use **relaxed** coordinates and distance-inferred bonds (pack
-``bond_max_distance``).  Chemical-potential / grand-potential numbers are
-report-only (see ``formation.py``); they never filter parents or channels.
+  **B coord** — parent XYZ → WBO package shed (least-bound CdCl2 first) →
+  place CdSe + p_m CdCl2 (embed distances) → optional short cleanup → full
+  g-xTB of the carried geometry.
 
-Coordinate carry-over: child core starts from stripped parent XYZ + placed
-CdSe; decoration still uses the map embedder unless a future path injects
-the frame.
+  p_child = p_parent − s + p_m
+
+Chemical-potential / grand-potential numbers are report-only
+(see ``formation.py``); they never filter parents or channels.
 """
 
 from __future__ import annotations
@@ -22,6 +20,8 @@ from __future__ import annotations
 import csv
 import math
 import re
+import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
@@ -88,8 +88,29 @@ class GrowthConfig:
     max_shed: int = 2
     prefer_low_shed: bool = True
     max_children_per_channel: int = 500
+    # geometry / move B (coordinate carry-over)
+    start_from: str = "relaxed_coords"  # relaxed_coords | graph_only
+    place_monomer: str = "embed_tables"
+    clash_policy: str = "soft"
+    local_cleanup_enabled: bool = True
+    local_cleanup_method: str = "g-xTB"
     local_cleanup_cycles: int = 20
+    require_charge_neutral_for_cleanup: bool = True
+    child_redecorate: bool = True
+    child_full_opt: str = "g-xTB"
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
+
+    @property
+    def use_coord_carry(self) -> bool:
+        """True when move B (3D carry-over) should run."""
+
+        return str(self.start_from).lower() in {
+            "relaxed_coords",
+            "relaxed",
+            "coords",
+            "coordinate",
+            "coordinates",
+        }
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "GrowthConfig":
@@ -100,7 +121,14 @@ class GrowthConfig:
         parents = raw.get("parents") or {}
         shed = raw.get("shed") or {}
         geom = raw.get("geometry") or {}
-        cleanup = (geom.get("local_cleanup") or {}) if isinstance(geom, dict) else {}
+        if not isinstance(geom, dict):
+            geom = {}
+        cleanup = geom.get("local_cleanup") or {}
+        if not isinstance(cleanup, dict):
+            cleanup = {}
+        child = raw.get("child") or {}
+        if not isinstance(child, dict):
+            child = {}
         mu = raw.get("chemical_potential") or {}
         refs = None
         if raw.get("references"):
@@ -129,7 +157,17 @@ class GrowthConfig:
             max_children_per_channel=int(
                 raw.get("max_children_per_channel", 500)
             ),
+            start_from=str(geom.get("start_from", "relaxed_coords")),
+            place_monomer=str(geom.get("place_monomer", "embed_tables")),
+            clash_policy=str(geom.get("clash_policy", "soft")),
+            local_cleanup_enabled=bool(cleanup.get("enabled", True)),
+            local_cleanup_method=str(cleanup.get("method", "g-xTB")),
             local_cleanup_cycles=int(cleanup.get("max_cycles", 20)),
+            require_charge_neutral_for_cleanup=bool(
+                geom.get("require_charge_neutral_for_cleanup", True)
+            ),
+            child_redecorate=bool(child.get("redecorate", True)),
+            child_full_opt=str(child.get("full_opt", "g-xTB")),
             delta_mu_cdcl2_eV=dmu,
         )
 
@@ -172,6 +210,26 @@ class GrowthChannelResult:
     p_child: int
     n_cores: int
     core_edges: List[EdgeList] = field(default_factory=list)
+    move: str = "graph"  # graph | coord
+
+
+@dataclass
+class CoordSeed:
+    """One coordinate-carried child ready for cleanup / full opt (move B)."""
+
+    k: int
+    p: int
+    structure_id: str
+    parent_id: str
+    shed: int
+    p_m: int
+    symbols: Tuple[str, ...]
+    coordinates: FloatArray
+    core_edges: EdgeList
+    wbo_scores: Tuple[float, ...] = ()  # scores of packages shed (ascending)
+    cleanup_s: float = 0.0
+    cleanup_ok: bool = False
+    notes: str = ""
 
 
 @dataclass
@@ -184,6 +242,10 @@ class GrowthStepResult:
     channels: List[GrowthChannelResult]
     skeleton_catalog: Dict[Tuple[int, int], List[EdgeList]]
     parent_records: List[Dict[str, Any]] = field(default_factory=list)
+    #: move-B coordinate seeds keyed by (k_child, p_child)
+    coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = field(
+        default_factory=dict
+    )
 
 
 def bond_cutoffs_from_spec(spec: NucleationSpec) -> Dict[Tuple[str, str], float]:
@@ -754,6 +816,399 @@ def parent_core_in_blocks(
 
 
 # ---------------------------------------------------------------------------
+# Move B: coordinate carry-over (WBO shed + place monomer + cleanup)
+# ---------------------------------------------------------------------------
+
+# Default zb-like distances when pack tables are unavailable
+_DEFAULT_CDSE_A = 2.62
+_DEFAULT_CDCL_A = 2.45
+
+
+def _cdse_bond_A(pack: Optional[GeometryPack]) -> float:
+    if pack is None:
+        return _DEFAULT_CDSE_A
+    raw = pack.raw or {}
+    embed = raw.get("embed") or raw
+    # common keys in production packs
+    for key in ("cd_se", "Cd-Se", "cdse"):
+        block = embed.get(key) if isinstance(embed, dict) else None
+        if isinstance(block, dict):
+            for kk in ("r0_A", "r_A", "length_A", "median_A"):
+                if kk in block:
+                    return float(block[kk])
+    return _DEFAULT_CDSE_A
+
+
+def _cdcl_bond_A(pack: Optional[GeometryPack]) -> float:
+    if pack is None:
+        return _DEFAULT_CDCL_A
+    raw = pack.raw or {}
+    embed = raw.get("embed") or raw
+    for key in ("cd_cl", "Cd-Cl", "cdcl"):
+        block = embed.get(key) if isinstance(embed, dict) else None
+        if isinstance(block, dict):
+            for kk in ("r0_A", "r_A", "length_A", "median_A"):
+                if kk in block:
+                    return float(block[kk])
+    return _DEFAULT_CDCL_A
+
+
+def _formal_charge(symbols: Sequence[str], spec: NucleationSpec) -> int:
+    """Formal charge from pack oxidation states (CdSe/CdCl2 → 0 when complete)."""
+
+    ch = {
+        spec.core.cation: 2,
+        spec.core.anion: -2,
+        spec.precursor.ligand: -1,
+    }
+    # precursor center is same element as core cation usually
+    ch.setdefault(spec.precursor.center, 2)
+    return int(sum(ch.get(s, 0) for s in symbols))
+
+
+def shed_packages_coords(
+    parent: ParentStructure,
+    *,
+    s: int,
+    packages: Sequence[CdCl2Package],
+) -> Tuple[Tuple[str, ...], FloatArray, EdgeList, Tuple[float, ...]]:
+    """Remove the ``s`` least-bound packages (already sorted ascending score).
+
+    Returns (symbols, coords, remaining_edges, shed_scores).
+    """
+
+    if s <= 0:
+        return (
+            parent.symbols,
+            np.asarray(parent.coordinates, dtype=float).copy(),
+            parent.edges,
+            (),
+        )
+    drop: set = set()
+    scores: List[float] = []
+    for pkg in list(packages)[:s]:
+        drop.add(pkg.cd)
+        drop.add(pkg.cl[0])
+        drop.add(pkg.cl[1])
+        scores.append(float(pkg.score))
+    keep = [i for i in range(len(parent.symbols)) if i not in drop]
+    if not keep:
+        raise ValueError("shed removed all atoms")
+    old_to_new = {old: new for new, old in enumerate(keep)}
+    symbols = tuple(parent.symbols[i] for i in keep)
+    coords = np.asarray(parent.coordinates, dtype=float)[keep].copy()
+    edges = tuple(
+        sorted(
+            (old_to_new[a], old_to_new[b])
+            for a, b in parent.edges
+            if a in old_to_new and b in old_to_new
+        )
+    )
+    return symbols, coords, edges, tuple(scores)
+
+
+def _outward_direction(
+    coords: FloatArray,
+    anchor: int,
+    neigh: Sequence[int],
+) -> np.ndarray:
+    """Unit vector pointing away from neighbours / COM."""
+
+    com = coords.mean(axis=0)
+    if neigh:
+        mean_n = coords[list(neigh)].mean(axis=0)
+        d = coords[anchor] - mean_n
+    else:
+        d = coords[anchor] - com
+    n = float(np.linalg.norm(d))
+    if n < 1e-6:
+        # arbitrary
+        d = np.array([1.0, 0.0, 0.0])
+        n = 1.0
+    return d / n
+
+
+def _orthonormal_pair(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    a = axis / (float(np.linalg.norm(axis)) + 1e-15)
+    tmp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(a, tmp)
+    e1 = e1 / (float(np.linalg.norm(e1)) + 1e-15)
+    e2 = np.cross(a, e1)
+    e2 = e2 / (float(np.linalg.norm(e2)) + 1e-15)
+    return e1, e2
+
+
+def place_monomer_and_packages(
+    symbols: Sequence[str],
+    coords: FloatArray,
+    edges: EdgeList,
+    *,
+    k_parent: int,
+    p_after_shed: int,
+    p_m: int,
+    spec: NucleationSpec,
+    pack: Optional[GeometryPack] = None,
+) -> Tuple[Tuple[str, ...], FloatArray, EdgeList]:
+    """Add CdSe monomer + ``p_m`` CdCl2 packages in 3D (embed-table distances).
+
+    Keeps all remaining parent atoms (including un-shed Cl).  Places:
+      * new Se outward from a low-CN core Cd
+      * new core Cd bonded to that Se
+      * ``p_m`` precursor Cd each with two Cl (package)
+    """
+
+    cation = spec.core.cation
+    anion = spec.core.anion
+    ligand = spec.precursor.ligand
+    r_cdse = _cdse_bond_A(pack)
+    r_cdcl = _cdcl_bond_A(pack)
+
+    sym = list(symbols)
+    xyz = np.asarray(coords, dtype=float).copy()
+    edge_list = list(edges)
+    neigh: Dict[int, List[int]] = {i: [] for i in range(len(sym))}
+    for a, b in edge_list:
+        neigh[a].append(b)
+        neigh[b].append(a)
+
+    # Prefer a core Cd (bonded to Se) with free valence as monomer attach site
+    se_ids = [i for i, s in enumerate(sym) if s == anion]
+    cd_ids = [i for i, s in enumerate(sym) if s == cation]
+    max_cd = int(spec.graph_rules.max_cn.get(cation, 4))
+    max_se = int(spec.graph_rules.max_cn.get(anion, 4))
+    core_cd = [
+        i
+        for i in cd_ids
+        if any(sym[j] == anion for j in neigh[i]) and len(neigh[i]) < max_cd
+    ]
+    if not core_cd:
+        core_cd = [i for i in cd_ids if len(neigh[i]) < max_cd] or cd_ids
+    if not core_cd:
+        raise ValueError("no Cd to attach monomer")
+    host = min(core_cd, key=lambda i: len(neigh[i]))
+
+    # new Se along outward direction from host
+    d = _outward_direction(xyz, host, neigh[host])
+    new_se = len(sym)
+    sym.append(anion)
+    xyz = np.vstack([xyz, xyz[host] + d * r_cdse])
+    edge_list.append((host, new_se))
+    neigh[host].append(new_se)
+    neigh[new_se] = [host]
+
+    # new core Cd opposite to host relative to new Se
+    d2 = _outward_direction(xyz, new_se, neigh[new_se])
+    new_cd = len(sym)
+    sym.append(cation)
+    xyz = np.vstack([xyz, xyz[new_se] + d2 * r_cdse])
+    edge_list.append((new_se, new_cd))
+    neigh[new_se].append(new_cd)
+    neigh[new_cd] = [new_se]
+
+    # p_m precursor packages: attach to open Se (prefer original Se)
+    open_se = [
+        i
+        for i in se_ids + [new_se]
+        if len(neigh.get(i, [])) < max_se
+    ]
+    e1, e2 = _orthonormal_pair(d2)
+    for m in range(int(p_m)):
+        if not open_se:
+            # fall back: attach to new_se even if overloaded (clash soft)
+            attach_se = new_se
+        else:
+            attach_se = open_se[m % len(open_se)]
+        dse = _outward_direction(xyz, attach_se, neigh.get(attach_se, []))
+        # slight azimuthal offset per package
+        ang = (2.0 * math.pi * m) / max(1, p_m)
+        direction = dse * 0.7 + (math.cos(ang) * e1 + math.sin(ang) * e2) * 0.3
+        direction = direction / (float(np.linalg.norm(direction)) + 1e-15)
+        pre_cd = len(sym)
+        sym.append(cation)
+        xyz = np.vstack([xyz, xyz[attach_se] + direction * r_cdse])
+        edge_list.append((attach_se, pre_cd))
+        neigh.setdefault(attach_se, []).append(pre_cd)
+        neigh[pre_cd] = [attach_se]
+        # two Cl tetrahedral-ish around precursor Cd
+        axis = xyz[pre_cd] - xyz[attach_se]
+        axis = axis / (float(np.linalg.norm(axis)) + 1e-15)
+        u, v = _orthonormal_pair(axis)
+        for sign in (+1.0, -1.0):
+            cl_dir = (axis * 0.3 + sign * u * 0.95)
+            cl_dir = cl_dir / (float(np.linalg.norm(cl_dir)) + 1e-15)
+            cl_i = len(sym)
+            sym.append(ligand)
+            xyz = np.vstack([xyz, xyz[pre_cd] + cl_dir * r_cdcl])
+            edge_list.append((pre_cd, cl_i))
+            neigh[pre_cd].append(cl_i)
+            neigh[cl_i] = [pre_cd]
+
+    edges_out = tuple(
+        sorted((min(a, b), max(a, b)) for a, b in edge_list)
+    )
+    return tuple(sym), xyz, edges_out
+
+
+def core_edges_from_coords(
+    symbols: Sequence[str],
+    coords: FloatArray,
+    *,
+    spec: NucleationSpec,
+    cutoffs: Mapping[Tuple[str, str], float],
+) -> EdgeList:
+    """Cd–Se edges only from distance graph."""
+
+    edges = relaxed_edges(list(symbols), coords, cutoffs)
+    cation, anion = spec.core.cation, spec.core.anion
+    core = []
+    for a, b in edges:
+        pair = {symbols[a], symbols[b]}
+        if pair == {cation, anion}:
+            core.append((min(a, b), max(a, b)))
+    return tuple(sorted(core))
+
+
+def local_cleanup_structure(
+    symbols: Sequence[str],
+    coords: FloatArray,
+    *,
+    growth: GrowthConfig,
+    pack: Optional[GeometryPack],
+    structure_id: str,
+) -> Tuple[FloatArray, float, bool, str]:
+    """Short g-xTB / GFN cleanup.  Returns (coords, time_s, ok, note)."""
+
+    if not growth.local_cleanup_enabled or growth.local_cleanup_cycles <= 0:
+        return np.asarray(coords, dtype=float), 0.0, False, "cleanup_disabled"
+
+    from .xtb_relax import XtbSettings, relax_structures
+
+    method = growth.local_cleanup_method
+    # Prefer pack relaxation binary/env when method is g-xTB
+    base = {}
+    if pack is not None and isinstance(pack.raw, dict):
+        base = dict(pack.raw.get("relaxation") or {})
+    base["enabled"] = True
+    base["method"] = method
+    base["max_steps"] = int(growth.local_cleanup_cycles)
+    # short wall for cleanup so it cannot dominate
+    base.setdefault("timeout_s", 120.0)
+    settings = XtbSettings.from_pack(base)
+    t0 = time.perf_counter()
+    results = relax_structures(
+        [
+            {
+                "id": f"cleanup-{structure_id}",
+                "symbols": list(symbols),
+                "positions": np.asarray(coords, dtype=float).tolist(),
+            }
+        ],
+        settings,
+        None,
+    )
+    dt = time.perf_counter() - t0
+    xr = results[0]
+    if not xr.ok or xr.coordinates is None:
+        return (
+            np.asarray(coords, dtype=float),
+            dt,
+            False,
+            f"cleanup_fail:{xr.error or 'no_coords'}",
+        )
+    return (
+        np.asarray(xr.coordinates, dtype=float),
+        dt,
+        True,
+        f"cleanup_ok steps≤{growth.local_cleanup_cycles}",
+    )
+
+
+def build_coord_seed(
+    parent: ParentStructure,
+    *,
+    s: int,
+    p_m: int,
+    growth: GrowthConfig,
+    spec: NucleationSpec,
+    pack: Optional[GeometryPack],
+    cutoffs: Mapping[Tuple[str, str], float],
+    serial: int,
+) -> Optional[CoordSeed]:
+    """Move B for one (parent, s, p_m): WBO shed → place monomer → cleanup."""
+
+    packages = identify_packages(parent, spec)
+    if s > len(packages):
+        return None
+    try:
+        symbols, coords, edges, shed_scores = shed_packages_coords(
+            parent, s=s, packages=packages
+        )
+        symbols, coords, edges = place_monomer_and_packages(
+            symbols,
+            coords,
+            edges,
+            k_parent=parent.k,
+            p_after_shed=parent.p - s,
+            p_m=p_m,
+            spec=spec,
+            pack=pack,
+        )
+    except (ValueError, IndexError) as exc:
+        return None
+
+    k_child = parent.k + 1
+    p_child = parent.p - s + p_m
+    sid = (
+        f"coord_k{k_child:03d}_p{p_child:03d}_"
+        f"from_{parent.structure_id}_s{s}_pm{p_m}_{serial:04d}"
+    )
+
+    q = _formal_charge(symbols, spec)
+    cleanup_s = 0.0
+    cleanup_ok = False
+    notes = f"shed={s} p_m={p_m} charge={q}"
+    if growth.local_cleanup_enabled:
+        if growth.require_charge_neutral_for_cleanup and q != 0:
+            notes += " cleanup=skipped(non-neutral)"
+        else:
+            coords, cleanup_s, cleanup_ok, cnote = local_cleanup_structure(
+                symbols,
+                coords,
+                growth=growth,
+                pack=pack,
+                structure_id=sid,
+            )
+            notes += f" {cnote}"
+
+    core = core_edges_from_coords(symbols, coords, spec=spec, cutoffs=cutoffs)
+    if not core:
+        # fall back: edges from placement that are Cd–Se
+        cation, anion = spec.core.cation, spec.core.anion
+        core = tuple(
+            sorted(
+                (min(a, b), max(a, b))
+                for a, b in edges
+                if {symbols[a], symbols[b]} == {cation, anion}
+            )
+        )
+    return CoordSeed(
+        k=k_child,
+        p=p_child,
+        structure_id=sid,
+        parent_id=parent.structure_id,
+        shed=s,
+        p_m=p_m,
+        symbols=symbols,
+        coordinates=coords,
+        core_edges=core,
+        wbo_scores=shed_scores,
+        cleanup_s=cleanup_s,
+        cleanup_ok=cleanup_ok,
+        notes=notes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Growth step
 # ---------------------------------------------------------------------------
 
@@ -763,18 +1218,16 @@ def grow_cores_from_parents(
     *,
     growth: GrowthConfig,
     spec: NucleationSpec,
+    pack: Optional[GeometryPack] = None,
 ) -> GrowthStepResult:
-    """Build child Cd–Se core catalogs for k+1 from selected parents.
+    """Build child catalogs from parents using both growth moves.
 
-    For each parent, shed ``s`` packages (0…max_shed) then add a monomer
-    package with ``p_m`` CdCl2 units::
+    **Move A (graph):** combinatorial precursor-Cd shed on the core graph +
+    monomer attach + p_m inflation → unique cores for redecorate/motif_factor.
 
-        p_child = p_parent - s + p_m
-
-    Core graphs come from ``shed_and_grow`` at ``p_out = p - s``, then
-    precursor slots are inflated when ``p_m > 0``.  Package WBO scores are
-    recorded on parents for reporting; combinatorial shed in
-    ``shed_and_grow`` enumerates legal cores.
+    **Move B (coord):** when ``geometry.start_from: relaxed_coords``, WBO
+    package shed on parent 3D → place CdSe + p_m CdCl2 → optional short
+    cleanup → seed frames for full opt (and core added to catalog).
     """
 
     if not parents:
@@ -789,13 +1242,14 @@ def grow_cores_from_parents(
     catalog: Dict[Tuple[int, int], Dict[EdgeList, None]] = {}
     channels: List[GrowthChannelResult] = []
     parent_records: List[Dict[str, Any]] = []
+    coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = defaultdict(list)
+    cutoffs = bond_cutoffs_from_spec(spec)
+    seed_serial = 0
 
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
-        if core is None:
-            continue
         packages = identify_packages(parent, spec)
-        max_s = min(growth.max_shed, parent.p)
+        max_s = min(growth.max_shed, parent.p, len(packages) if packages else parent.p)
         if growth.prefer_low_shed:
             s_order = list(range(0, max_s + 1))
         else:
@@ -808,6 +1262,7 @@ def grow_cores_from_parents(
                 "p": parent.p,
                 "energy_eV": parent.energy_eV,
                 "n_packages": len(packages),
+                "has_wbo": parent.wbo is not None,
                 "source": parent.source_path,
             }
         )
@@ -816,14 +1271,18 @@ def grow_cores_from_parents(
             p_out = parent.p - s
             if p_out < 0:
                 continue
-            children_base = shed_and_grow(
-                core,
-                k=parent.k,
-                p=parent.p,
-                p_out=p_out,
-                spec=spec,
-                max_children=growth.max_children_per_channel,
-            )
+
+            # ---- Move A: graph catalog ----
+            children_base: List[EdgeList] = []
+            if core is not None:
+                children_base = shed_and_grow(
+                    core,
+                    k=parent.k,
+                    p=parent.p,
+                    p_out=p_out,
+                    spec=spec,
+                    max_children=growth.max_children_per_channel,
+                )
             for p_m in growth.monomer_p_values:
                 p_child = p_out + p_m
                 children_pm = _inflate_cores_with_precursor(
@@ -842,7 +1301,45 @@ def grow_cores_from_parents(
                     parent.k + 1,
                     p_child,
                     children_pm,
+                    move="graph",
                 )
+
+                # ---- Move B: coordinate carry-over ----
+                if growth.use_coord_carry:
+                    seed_serial += 1
+                    seed = build_coord_seed(
+                        parent,
+                        s=s,
+                        p_m=p_m,
+                        growth=growth,
+                        spec=spec,
+                        pack=pack,
+                        cutoffs=cutoffs,
+                        serial=seed_serial,
+                    )
+                    if seed is not None:
+                        coord_seeds[(seed.k, seed.p)].append(seed)
+                        # also register core for redecorate diversity
+                        if seed.core_edges:
+                            bucket = catalog.setdefault((seed.k, seed.p), {})
+                            if seed.core_edges not in bucket:
+                                bucket[seed.core_edges] = None
+                        channels.append(
+                            GrowthChannelResult(
+                                parent_id=parent.structure_id,
+                                k_parent=parent.k,
+                                p_parent=parent.p,
+                                shed=s,
+                                p_m=p_m,
+                                k_child=seed.k,
+                                p_child=seed.p,
+                                n_cores=1 if seed.core_edges else 0,
+                                core_edges=(
+                                    [seed.core_edges] if seed.core_edges else []
+                                ),
+                                move="coord",
+                            )
+                        )
 
     skeleton_catalog = {
         key: list(edges_map.keys()) for key, edges_map in catalog.items()
@@ -854,6 +1351,7 @@ def grow_cores_from_parents(
         channels=channels,
         skeleton_catalog=skeleton_catalog,
         parent_records=parent_records,
+        coord_seeds=dict(coord_seeds),
     )
 
 
@@ -966,6 +1464,8 @@ def _store_channel(
     k_child: int,
     p_child: int,
     children: Sequence[EdgeList],
+    *,
+    move: str = "graph",
 ) -> None:
     if not children:
         channels.append(
@@ -979,6 +1479,7 @@ def _store_channel(
                 p_child=p_child,
                 n_cores=0,
                 core_edges=[],
+                move=move,
             )
         )
         return
@@ -999,6 +1500,7 @@ def _store_channel(
             p_child=p_child,
             n_cores=len(kept),
             core_edges=kept,
+            move=move,
         )
     )
 
@@ -1008,16 +1510,58 @@ class GrowthLog:
 
     Always prints lines starting with ``[growth]`` or ``[growth-job]``.
     With ``verbose=True``, also prints the rest (motif details, etc.).
+
+    Distinguishes:
+      * **cores** — unique child Cd–Se skeletons (known up front)
+      * **gxtb** — real g-xTB opt calculations (known only as graphs appear)
+      * **merge** — duplicate graphs that skip g-xTB (free)
+
+    Timing on job lines:
+      * ``opt=``   wall time of the g-xTB binary (or 0 for merges)
+      * ``recon=`` motif_factor 3D rebuild for that unique graph (0 if merge)
+      * ``+Δ=``    wall clock since the previous job/bin event — this is what
+                   you actually wait, including Cl decoration between graphs
     """
 
     def __init__(self, *, verbose: bool = False, quiet: bool = False) -> None:
         self.verbose = bool(verbose)
         self.quiet = bool(quiet)
         self._job_i = 0
+        # global tallies (all bins in this growth step)
+        self.n_gxtb = 0
+        self.n_merge = 0
+        self.n_fail = 0
+        # current bin context
+        self._bin_k: Optional[int] = None
+        self._bin_p: Optional[int] = None
+        self._bin_cores: int = 0
+        self._bin_gxtb: int = 0
+        self._bin_merge: int = 0
+        self._bin_fail: int = 0
+        self._cores_done: int = 0
+        self._cores_total: int = 0
+        self._xtb_starts: int = 1
+        # wall clock
+        self._t_mark: float = time.perf_counter()
+        self._t_bin0: float = self._t_mark
+        self._t_step0: float = self._t_mark
+        self._sum_opt_s: float = 0.0
+        self._sum_recon_s: float = 0.0
+        self._bin_opt_s: float = 0.0
+        self._bin_recon_s: float = 0.0
+
+    def _tick(self) -> float:
+        """Seconds since last mark; advances the mark."""
+
+        now = time.perf_counter()
+        dt = now - self._t_mark
+        self._t_mark = now
+        return dt
 
     def stage(self, n: int, total: int, title: str, **fields: Any) -> None:
         if self.quiet:
             return
+        self._tick()
         print(f"\n=== STAGE {n}/{total}: {title} ===", flush=True)
         for key, value in fields.items():
             print(f"  {key}: {value}", flush=True)
@@ -1027,6 +1571,205 @@ class GrowthLog:
             return
         print(f"[growth] {msg}", flush=True)
 
+    def pipeline_blurb(self, growth: "GrowthConfig") -> None:
+        """One-time note: both growth moves and timing keys."""
+
+        if self.quiet:
+            return
+        print("[growth] two growth moves (both when start_from=relaxed_coords):", flush=True)
+        print(
+            "[growth]   A graph: combinatorial precursor-Cd shed on core graph → "
+            f"p_m={list(growth.monomer_p_values)} inflate → Cl redecorate → "
+            "motif_factor rebuild → full g-xTB",
+            flush=True,
+        )
+        if growth.use_coord_carry:
+            print(
+                "[growth]   B coord: parent XYZ → WBO package shed (s least-bound "
+                f"CdCl2) → place CdSe+p_m CdCl2 (embed distances) → "
+                f"cleanup {'ON' if growth.local_cleanup_enabled else 'OFF'}"
+                f"({growth.local_cleanup_method}, ≤{growth.local_cleanup_cycles} steps"
+                f"{', neutral-only' if growth.require_charge_neutral_for_cleanup else ''}"
+                f") → full g-xTB",
+                flush=True,
+            )
+        else:
+            print(
+                "[growth]   B coord: OFF (geometry.start_from != relaxed_coords)",
+                flush=True,
+            )
+        print(
+            f"[growth]   shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
+            f"prefer_low_shed={growth.prefer_low_shed}",
+            flush=True,
+        )
+        print(
+            "[growth]   timing keys: opt= full g-xTB; recon= motif_factor (A only); "
+            "cleanup= short prelax (B); +dt= wall since previous line",
+            flush=True,
+        )
+
+    def set_work_plan(
+        self,
+        *,
+        cores_total: int,
+        bin_plan: Mapping[str, int],
+        xtb_starts_per_graph: int = 1,
+    ) -> None:
+        """Print decorate/opt plan (cores known; g-xTB count not yet)."""
+
+        self._cores_total = int(cores_total)
+        self._xtb_starts = max(1, int(xtb_starts_per_graph))
+        if self.quiet:
+            return
+        print(
+            f"[growth] work plan: {self._cores_total} unique child cores "
+            f"across {len(bin_plan)} bins",
+            flush=True,
+        )
+        print(f"[growth]   by bin: {dict(bin_plan)}", flush=True)
+        print(
+            "[growth]   note: #g-xTB calcs ≠ #cores — each core yields 0+ Cl "
+            "decorations; each *unique* graph runs "
+            f"≤{self._xtb_starts} g-xTB opt(s); merges skip g-xTB",
+            flush=True,
+        )
+
+    def log_channel_summary(
+        self,
+        channels: Sequence["GrowthChannelResult"],
+        parent_records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Compact shed / package accounting after core growth."""
+
+        if self.quiet:
+            return
+        by_s: Counter = Counter()
+        by_pm: Counter = Counter()
+        by_s_cores: Counter = Counter()
+        by_pm_cores: Counter = Counter()
+        by_move: Counter = Counter()
+        n_ch = 0
+        for ch in channels:
+            n_ch += 1
+            by_s[ch.shed] += 1
+            by_pm[ch.p_m] += 1
+            by_s_cores[ch.shed] += ch.n_cores
+            by_pm_cores[ch.p_m] += ch.n_cores
+            by_move[getattr(ch, "move", "graph")] += 1
+        print(
+            f"[growth] channels: {n_ch}  "
+            f"(graph={by_move.get('graph', 0)}  coord={by_move.get('coord', 0)})",
+            flush=True,
+        )
+        s_bits = [
+            f"s={s}: ch={by_s[s]} cores+={by_s_cores[s]}"
+            for s in sorted(by_s)
+        ]
+        pm_bits = [
+            f"p_m={pm}: ch={by_pm[pm]} cores+={by_pm_cores[pm]}"
+            for pm in sorted(by_pm)
+        ]
+        print(f"[growth]   by shed s:  {',  '.join(s_bits) or '(none)'}", flush=True)
+        print(f"[growth]   by p_m:     {',  '.join(pm_bits) or '(none)'}", flush=True)
+        n_pkg = sum(int(r.get("n_packages") or 0) for r in parent_records)
+        n_wbo = sum(1 for r in parent_records if r.get("has_wbo"))
+        print(
+            f"[growth]   parent packages: {n_pkg} total; "
+            f"{n_wbo}/{len(parent_records)} parents have WBO "
+            f"(coord shed uses WBO/distance rank; graph shed is combinatorial)",
+            flush=True,
+        )
+
+    def begin_bin(
+        self,
+        *,
+        k: int,
+        p: int,
+        cores: int,
+        cores_done: int,
+        cores_total: int,
+    ) -> None:
+        """Open a bin header with core accounting."""
+
+        self._bin_k = int(k)
+        self._bin_p = int(p)
+        self._bin_cores = int(cores)
+        self._bin_gxtb = 0
+        self._bin_merge = 0
+        self._bin_fail = 0
+        self._bin_opt_s = 0.0
+        self._bin_recon_s = 0.0
+        self._cores_done = int(cores_done)
+        self._cores_total = int(cores_total)
+        self._t_bin0 = time.perf_counter()
+        self._tick()
+        if self.quiet:
+            return
+        after = cores_done + cores
+        print(
+            f"[growth] --- bin k={k} p={p} ---",
+            flush=True,
+        )
+        print(
+            f"[growth]   cores in this bin: {cores}   "
+            f"(overall cores {cores_done} done → {after}/{cores_total} after bin)",
+            flush=True,
+        )
+        print(
+            f"[growth]   path: core graph → Cl decorate → motif_factor → g-xTB "
+            f"(≤{self._xtb_starts} opt/unique graph); merges free",
+            flush=True,
+        )
+        if self.n_gxtb or self.n_merge:
+            print(
+                f"[growth]   so far (all bins): gxtb={self.n_gxtb}  "
+                f"merge={self.n_merge}  fail={self.n_fail}  "
+                f"optΣ={self._sum_opt_s:.0f}s reconΣ={self._sum_recon_s:.0f}s",
+                flush=True,
+            )
+
+    def end_bin(
+        self,
+        *,
+        k: int,
+        p: int,
+        n_iso: int,
+        n_ok: int,
+        n_fail: int,
+        n_merged: int,
+        raw_graphs: Optional[int] = None,
+    ) -> None:
+        """Close a bin with final job accounting."""
+
+        if self.quiet:
+            return
+        wall = time.perf_counter() - self._t_bin0
+        extra = ""
+        if raw_graphs is not None:
+            extra = f"  raw_graphs={raw_graphs}"
+        print(
+            f"[growth] bin k={k} p={p} done: isomers={n_iso}  "
+            f"with_E={n_ok}  no_E={n_fail}  graph_merges={n_merged}"
+            f"{extra}",
+            flush=True,
+        )
+        print(
+            f"[growth]   this bin: gxtb={self._bin_gxtb}  "
+            f"merge={self._bin_merge}  fail={self._bin_fail}  "
+            f"wall={wall:.1f}s  optΣ={self._bin_opt_s:.1f}s  "
+            f"reconΣ={self._bin_recon_s:.1f}s  "
+            f"(other≈{max(0.0, wall - self._bin_opt_s - self._bin_recon_s):.1f}s "
+            f"decorate/merge/overhead)",
+            flush=True,
+        )
+        print(
+            f"[growth]   global: gxtb={self.n_gxtb}  merge={self.n_merge}  "
+            f"fail={self.n_fail}",
+            flush=True,
+        )
+        self._tick()
+
     def __call__(self, msg: str) -> None:
         """ProgressCallback-compatible."""
 
@@ -1035,32 +1778,63 @@ class GrowthLog:
         text = str(msg)
         if text.startswith("[growth-job]"):
             self._job_i += 1
+            dt = self._tick()
             parts = text.replace("[growth-job]", "").strip().split()
-            kv = {}
+            kv: Dict[str, str] = {}
             for part in parts:
                 if "=" in part:
                     key, val = part.split("=", 1)
                     kv[key] = val
             sid = kv.get("id", "?")
             e = kv.get("E_eV", "n/a")
-            t = kv.get("t_s", "?")
+            t = kv.get("t_s", "0")
+            recon = kv.get("recon_s", "0")
             rel = kv.get("relax", "?")
             k = kv.get("k", "?")
             p = kv.get("p", "?")
             err = kv.get("err", "")
             into = kv.get("into", "")
+            move = kv.get("move", "A")
+            try:
+                opt_s = float(t)
+            except ValueError:
+                opt_s = 0.0
+            try:
+                recon_s = float(recon)
+            except ValueError:
+                recon_s = 0.0
+
             if rel == "merged" or e == "merged":
+                self.n_merge += 1
+                self._bin_merge += 1
                 target = into or "?"
                 print(
-                    f"  job {self._job_i:4d}  k={k} p={p}  {sid:28s}  "
-                    f"E={'merged':>16s}      t={t:>6s}s  status=merged→{target}",
+                    f"  merge {self.n_merge:4d}  k={k} p={p}  {sid:22s}  "
+                    f"-> {target:22s}  "
+                    f"+dt={dt:5.1f}s  "
+                    f"[bin m{self._bin_merge} | g{self.n_gxtb} m{self.n_merge}]",
                     flush=True,
                 )
                 return
-            extra = f"  ({err})" if err and rel == "fail" else ""
+
+            self.n_gxtb += 1
+            self._bin_gxtb += 1
+            self._sum_opt_s += opt_s
+            self._sum_recon_s += recon_s
+            self._bin_opt_s += opt_s
+            self._bin_recon_s += recon_s
+            if rel == "fail":
+                self.n_fail += 1
+                self._bin_fail += 1
+            extra = f" ({err})" if err and rel == "fail" else ""
+            # recon column: motif_factor (A) or cleanup prelax (B)
+            recon_lab = "clean" if move in ("B", "coord", "b") else "recon"
             print(
-                f"  job {self._job_i:4d}  k={k} p={p}  {sid:28s}  "
-                f"E={e:>16s} eV  t={t:>6s}s  relax={rel}{extra}",
+                f"  gxtb {self.n_gxtb:4d}  k={k} p={p}  move={move}  "
+                f"{sid:22s}  E={e:>14s}  "
+                f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s +dt={dt:5.1f}s  "
+                f"relax={rel}{extra}  "
+                f"[bin g{self._bin_gxtb} | g{self.n_gxtb} m{self.n_merge}]",
                 flush=True,
             )
             return
@@ -1133,25 +1907,64 @@ def run_growth_step(
         )
 
     if log:
+        log.pipeline_blurb(growth)
         log.stage(
             2,
             n_stages,
             f"grow cores  k={k_from} → k={k_from + 1}",
             packages=list(growth.monomer_p_values),
             max_shed=growth.max_shed,
+            move_A="graph combinatorial shed",
+            move_B=(
+                "coord WBO shed + place + cleanup"
+                if growth.use_coord_carry
+                else "off"
+            ),
         )
-    result = grow_cores_from_parents(parents, growth=growth, spec=map_spec)
+    # load pack early so move B can use embed distances / cleanup settings
+    if pack is None and map_spec.geometry_pack:
+        try:
+            pack = load_geometry_pack(map_spec.geometry_pack)
+        except Exception:
+            pack = None
+    result = grow_cores_from_parents(
+        parents, growth=growth, spec=map_spec, pack=pack
+    )
     n_cores = sum(len(v) for v in result.skeleton_catalog.values())
     bin_plan = {
         f"k{k}p{p}": len(cores)
         for (k, p), cores in sorted(result.skeleton_catalog.items())
     }
     if log:
+        log.log_channel_summary(result.channels, result.parent_records)
+    # xtb_starts_per_graph from pack embed/reconstruction (default 1)
+    xtb_starts = 1
+    if pack is not None:
+        recon = (pack.raw or {}).get("reconstruction") or {}
+        try:
+            xtb_starts = int(recon.get("xtb_starts_per_graph", 1))
+        except (TypeError, ValueError):
+            xtb_starts = 1
+    elif map_spec is not None and getattr(map_spec, "geometry_pack", None):
+        try:
+            _tmp_pack = load_geometry_pack(map_spec.geometry_pack)
+            recon = (_tmp_pack.raw or {}).get("reconstruction") or {}
+            xtb_starts = int(recon.get("xtb_starts_per_graph", 1))
+        except Exception:
+            xtb_starts = 1
+
+    n_seeds = sum(len(v) for v in result.coord_seeds.values())
+    if log:
         log.line(
             f"channels={len(result.channels)}  unique_cores={n_cores}  "
-            f"(these cores will be decorated)"
+            f"coord_seeds={n_seeds}  "
+            f"(A→redecorate; B→full opt of carried geometry)"
         )
-        log.line(f"plan by bin: {bin_plan}")
+        log.set_work_plan(
+            cores_total=n_cores,
+            bin_plan=bin_plan,
+            xtb_starts_per_graph=xtb_starts,
+        )
     elif progress:
         progress(
             f"[growth] k={k_from}→{k_from + 1}: "
@@ -1167,26 +1980,68 @@ def run_growth_step(
         print(prior, flush=True)
 
     child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    if decorate and result.skeleton_catalog:
+    if decorate and (result.skeleton_catalog or result.coord_seeds):
         if pack is None and map_spec.geometry_pack:
-            pack = load_geometry_pack(map_spec.geometry_pack)
+            try:
+                pack = load_geometry_pack(map_spec.geometry_pack)
+            except Exception:
+                pack = None
+        if pack is not None and log is not None:
+            recon = (pack.raw or {}).get("reconstruction") or {}
+            try:
+                xtb_starts = int(recon.get("xtb_starts_per_graph", xtb_starts))
+            except (TypeError, ValueError):
+                pass
+            log._xtb_starts = max(1, int(xtb_starts))
         out = Path(output_dir) if output_dir else None
         if out:
             out.mkdir(parents=True, exist_ok=True)
-        if log:
+
+        # ---- Move B first: full opt of coordinate-carried seeds ----
+        if result.coord_seeds and embed:
+            if log:
+                log.stage(
+                    3,
+                    n_stages,
+                    "move B: full opt of coord-carried seeds",
+                    n_seeds=n_seeds,
+                    note="WBO shed + placed monomer; already cleaned if enabled",
+                )
+            _opt_coord_seeds(
+                result.coord_seeds,
+                growth=growth,
+                map_spec=map_spec,
+                pack=pack,
+                output_dir=out,
+                progress=log if log else progress,
+                child_minima=child_minima,
+            )
+
+        if log and result.skeleton_catalog:
             log.stage(
-                3,
+                3 if not result.coord_seeds else 3,
                 n_stages,
-                "decorate + embed + opt",
+                "move A: decorate cores + motif_factor + opt",
                 total_cores=n_cores,
-                note="one relax job per accepted decorated graph",
+                note=(
+                    "graph cores → Cl redecorate → motif_factor → g-xTB; "
+                    "merges free"
+                ),
             )
         done_cores = 0
         for (k, p), cores in sorted(result.skeleton_catalog.items()):
+            n_coord = len(result.coord_seeds.get((k, p), ()))
             if log:
+                log.begin_bin(
+                    k=k,
+                    p=p,
+                    cores=len(cores),
+                    cores_done=done_cores,
+                    cores_total=n_cores,
+                )
                 log.line(
-                    f"--- bin k={k} p={p}  cores={len(cores)}  "
-                    f"(running total cores {done_cores}/{n_cores}) ---"
+                    f"  bin moves: A_graph_cores={len(cores)}  "
+                    f"B_coord_seeds={n_coord} (B already opted if present)"
                 )
             elif progress:
                 progress(
@@ -1210,10 +2065,14 @@ def run_growth_step(
             ]
             if with_e:
                 best = min(with_e, key=lambda iso: float(iso.xtb_energy_eV))
-                child_minima[(k, p)] = {
-                    "energy_eV": float(best.xtb_energy_eV),
-                    "structure_id": best.structure_id,
-                }
+                prev = child_minima.get((k, p))
+                if prev is None or float(best.xtb_energy_eV) < float(
+                    prev["energy_eV"]
+                ):
+                    child_minima[(k, p)] = {
+                        "energy_eV": float(best.xtb_energy_eV),
+                        "structure_id": best.structure_id,
+                    }
             if log:
                 n_iso = len(bin_res.isomers)
                 n_ok = len(with_e)
@@ -1222,10 +2081,14 @@ def run_growth_step(
                     for rec in getattr(bin_res, "graph_merge_records", []) or []
                 )
                 n_fail = max(0, n_iso - n_ok)
-                log.line(
-                    f"bin k={k} p={p} done: isomers={n_iso}  "
-                    f"with_E={n_ok}  no_E={n_fail}  "
-                    f"graph_merges={n_merged}"
+                log.end_bin(
+                    k=k,
+                    p=p,
+                    n_iso=n_iso,
+                    n_ok=n_ok,
+                    n_fail=n_fail,
+                    n_merged=n_merged,
+                    raw_graphs=getattr(bin_res, "raw_graphs", None),
                 )
                 ranking = format_bin_ranking(
                     bin_res.isomers,
@@ -1279,6 +2142,141 @@ def run_growth_step(
             child_cores=n_cores,
         )
     return result
+
+
+def _opt_coord_seeds(
+    coord_seeds: Mapping[Tuple[int, int], Sequence[CoordSeed]],
+    *,
+    growth: GrowthConfig,
+    map_spec: NucleationSpec,
+    pack: Optional[GeometryPack],
+    output_dir: Optional[Path],
+    progress: Optional[Any],
+    child_minima: Dict[Tuple[int, int], Dict[str, Any]],
+) -> None:
+    """Full g-xTB opt for move-B coordinate seeds; write XYZ + index rows."""
+
+    from .xtb_relax import XtbSettings, relax_structures
+
+    if not coord_seeds:
+        return
+    base: Dict[str, Any] = {}
+    if pack is not None and isinstance(pack.raw, dict):
+        base = dict(pack.raw.get("relaxation") or {})
+    base["enabled"] = True
+    if growth.child_full_opt:
+        base["method"] = growth.child_full_opt
+    settings = XtbSettings.from_pack(base)
+    cutoffs = bond_cutoffs_from_spec(map_spec)
+    log = progress if isinstance(progress, GrowthLog) else None
+
+    flat: List[CoordSeed] = []
+    for key in sorted(coord_seeds):
+        flat.extend(coord_seeds[key])
+    if log:
+        log.line(f"move B: optimizing {len(flat)} coord-carried children")
+    elif progress:
+        progress(f"[growth] move B: opt {len(flat)} coord seeds")
+
+    for seed in flat:
+        t0 = time.perf_counter()
+        batch = [
+            {
+                "id": seed.structure_id,
+                "symbols": list(seed.symbols),
+                "positions": np.asarray(seed.coordinates, dtype=float).tolist(),
+                "edges": list(seed.core_edges),
+            }
+        ]
+        results = relax_structures(batch, settings, cutoffs)
+        xr = results[0]
+        opt_s = time.perf_counter() - t0
+        recon_s = float(seed.cleanup_s)  # report cleanup time under recon slot
+        if progress is not None:
+            if xr.ok and xr.energy_eV is not None:
+                progress(
+                    f"[growth-job] k={seed.k} p={seed.p} move=B "
+                    f"id={seed.structure_id} "
+                    f"E_eV={float(xr.energy_eV):.6f} "
+                    f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
+                    f"relax={'ok' if xr.converged else 'fail'}"
+                )
+            else:
+                progress(
+                    f"[growth-job] k={seed.k} p={seed.p} move=B "
+                    f"id={seed.structure_id} "
+                    f"E_eV=n/a t_s={opt_s:.1f} recon_s={recon_s:.1f} "
+                    f"relax=fail err={xr.error or 'coord_opt'}"
+                )
+        if not xr.ok or xr.energy_eV is None:
+            continue
+        e = float(xr.energy_eV)
+        prev = child_minima.get((seed.k, seed.p))
+        if prev is None or e < float(prev["energy_eV"]):
+            child_minima[(seed.k, seed.p)] = {
+                "energy_eV": e,
+                "structure_id": seed.structure_id,
+            }
+        if output_dir is None:
+            continue
+        bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+        bdir.mkdir(parents=True, exist_ok=True)
+        coords = xr.coordinates or tuple(
+            map(tuple, np.asarray(seed.coordinates))
+        )
+        xyz = bdir / f"{seed.structure_id}_xtb.xyz"
+        lines = [
+            str(len(seed.symbols)),
+            f"{seed.structure_id} energy_eV={e} move=coord "
+            f"shed={seed.shed} p_m={seed.p_m} parent={seed.parent_id} "
+            f"{seed.notes}",
+        ]
+        for sym, pos in zip(seed.symbols, coords):
+            lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
+        xyz.write_text("\n".join(lines) + "\n")
+        # append index.csv
+        index_path = Path(output_dir) / "index.csv"
+        write_header = not index_path.is_file()
+        refs = growth.references
+        fields = [
+            "k",
+            "p",
+            "structure_id",
+            "xtb_energy_eV",
+            "xtb_converged",
+            "dE_f_eV",
+            "growth",
+            "move",
+            "shed",
+            "p_m",
+            "parent_id",
+        ]
+        for dmu in growth.delta_mu_cdcl2_eV:
+            fields.append(f"Omega_dmu_{dmu:+.2f}")
+        with index_path.open("a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            row = {
+                "k": seed.k,
+                "p": seed.p,
+                "structure_id": seed.structure_id,
+                "xtb_energy_eV": f"{e:.8f}",
+                "xtb_converged": bool(xr.converged),
+                "dE_f_eV": "",
+                "growth": "1",
+                "move": "coord",
+                "shed": seed.shed,
+                "p_m": seed.p_m,
+                "parent_id": seed.parent_id,
+            }
+            if refs is not None:
+                de_f = refs.formation_eV(e, seed.k, seed.p)
+                row["dE_f_eV"] = f"{de_f:.8f}"
+                for dmu in growth.delta_mu_cdcl2_eV:
+                    key = f"Omega_dmu_{dmu:+.2f}"
+                    row[key] = f"{refs.grand_potential_eV(e, seed.k, seed.p, dmu):.8f}"
+            writer.writerow(row)
 
 
 def _write_growth_bin(
@@ -1380,6 +2378,7 @@ __all__ = [
     "ParentStructure",
     "EnergyRecord",
     "GrowthChannelResult",
+    "CoordSeed",
     "GrowthStepResult",
     "bond_cutoffs_from_spec",
     "load_energy_index",
@@ -1390,6 +2389,9 @@ __all__ = [
     "load_parents_from_run",
     "select_parents",
     "identify_packages",
+    "shed_packages_coords",
+    "place_monomer_and_packages",
+    "build_coord_seed",
     "grow_cores_from_parents",
     "run_growth_step",
     "write_growth_summary",

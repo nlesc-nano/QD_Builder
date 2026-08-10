@@ -55,26 +55,29 @@ parents:
   bond_cutoffs: from_graph_rules
 
 # Shedding complete CdCl2 packages (kinetic + chemical)
+# Move B (coord) uses WBO/distance rank; move A (graph) still enumerates
+# combinatorial precursor-Cd subsets for core diversity.
 shed:
   mode: wbo                    # wbo | enumerate
   max_shed: 2
   prefer_low_shed: true        # early k: shed often before continuous s=0
   wbo_source: parent_opt       # least-bound precursor Cd + its two Cl first
 
-# Growth geometry (coordinate carry-over)
+# Growth geometry — move B (coordinate carry-over)
+# start_from: relaxed_coords enables B; graph_only disables B (A only).
 geometry:
   start_from: relaxed_coords
   place_monomer: embed_tables
   clash_policy: soft
   local_cleanup:
     enabled: true
-    method: GFN1-xTB           # short clean-up only when charge-neutral
+    method: g-xTB              # short clean-up only when charge-neutral
     max_cycles: 20
   require_charge_neutral_for_cleanup: true
 
 child:
-  redecorate: true
-  full_opt: g-xTB
+  redecorate: true             # move A: redecorate graph cores
+  full_opt: g-xTB              # full opt for both moves
 
 # Report-only condition scan (does NOT steer growth)
 chemical_potential:

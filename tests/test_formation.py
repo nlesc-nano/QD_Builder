@@ -146,11 +146,13 @@ def test_package_growth_profile_matrix() -> None:
     assert "0.000" in text
     assert "1.000" in text  # dE_f* at k=2, p_m=1
     assert "3.000" in text  # dE_f* at k=3, p_m=1
-    assert "—" in text  # missing p_m=2 path
+    assert "n/a" in text  # missing p_m=2 path (ASCII, HPC-safe)
     assert "(1,1)" in text
     assert "(2,2)" in text
     # no structure-id clutter in the matrix view
     assert "k1p1" not in text
+    # no non-ASCII glyphs (em dash / Greek) that break Latin-1 HPC logs
+    assert all(ord(ch) < 128 for ch in text)
 
 
 def test_format_bin_ranking_readable() -> None:
@@ -185,13 +187,14 @@ def test_format_bin_ranking_readable() -> None:
     assert "grand potential" in text
     assert "free CdSe baseline" in text
     assert "ligated baselines" in text
-    assert "Ω_free" in text
+    assert "Omega_free" in text
     assert "p_m" in text
-    # lean / 0 / rich only — not the intermediate ±0.5 grid points
-    assert "Ω@-0.5" not in text
-    assert "Ω@-1.0" in text
-    assert "Ω@+0.0" in text
-    assert "Ω@+1.0" in text
+    # lean / 0 / rich only - not the intermediate +/-0.5 grid points
+    assert "O@-0.5" not in text
+    assert "O@-1.0" in text
+    assert "O@+0.0" in text
+    assert "O@+1.0" in text
+    assert all(ord(ch) < 128 for ch in text)
     # winner first
     pos2 = text.index("k002_p003_mol0002")
     pos1 = text.index("k002_p003_mol0001")
