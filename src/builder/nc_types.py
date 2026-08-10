@@ -459,6 +459,13 @@ class NucleationGraphRules:
     #: n_bridges = 0.964*(2p) - 0.36 (r=0.993, 29 bins), but the population is
     #: broad: 5.7% of relaxed structures sit at exactly 2p, 51% within 2.
     bridge_target_count_window: int = 0
+    #: Hard stop on legal decorations yielded for one skeleton.  Without this
+    #: high-p bins can stream millions of max-bridge sets before the reservoir
+    #: samples (k4p7: ~4e6 raw, 0 isomers).  0 = unlimited.
+    bridge_target_max_emissions_per_skeleton: int = 2000
+    #: Hard stop on walk nodes (partial bridge sets visited) per skeleton.
+    #: Guards thrashing when few yields but a huge tree.  0 = unlimited.
+    bridge_target_max_nodes_per_skeleton: int = 50000
     #: --- per-skeleton decoration budget --------------------------------
     #: Keep at most this many decorations per skeleton (reservoir-sampled
     #: over the skeleton's full enumeration, not the first N).  0 disables.

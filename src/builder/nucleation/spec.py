@@ -659,6 +659,16 @@ def load_nucleation_spec(
                 bridge_target_count_window=int(
                     graph_rules_raw.get("bridge_target_count_window", 0)
                 ),
+                bridge_target_max_emissions_per_skeleton=int(
+                    graph_rules_raw.get(
+                        "bridge_target_max_emissions_per_skeleton", 2000
+                    )
+                ),
+                bridge_target_max_nodes_per_skeleton=int(
+                    graph_rules_raw.get(
+                        "bridge_target_max_nodes_per_skeleton", 50000
+                    )
+                ),
                 selection_max_per_skeleton=int(
                     graph_rules_raw.get("selection_max_per_skeleton", 0)
                 ),

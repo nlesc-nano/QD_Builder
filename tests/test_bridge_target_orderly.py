@@ -36,6 +36,9 @@ def target_pack(tmp_path_factory) -> Path:
     # this stays a test of orbit pruning rather than of pack policy.
     rules["graph_rules"]["bridge_first_hard_max_bridges_per_cd"] = 2
     rules["graph_rules"]["bridge_target_count_window"] = 0
+    # Unlimited emissions for exact-count regression (production caps at 2000).
+    rules["graph_rules"]["bridge_target_max_emissions_per_skeleton"] = 0
+    rules["graph_rules"]["bridge_target_max_nodes_per_skeleton"] = 0
     rules["graph_rules"].pop("decoration_mode_from_k", None)
     rules["graph_rules"].pop("decoration_mode_at_or_above", None)
     rules["graph_rules"].pop("selection_max_per_skeleton", None)
@@ -173,3 +176,65 @@ def test_budget_gate_leaves_small_bins_exhaustive(tmp_path_factory) -> None:
         spec, kmin=3, kmax=3, pmin=2, pmax=2, embed=True
     ).bins[(3, 2)]
     assert result.budget_pool == 0, "gate did not disable the quota"
+
+
+def test_emission_cap_stops_before_millions(tmp_path_factory) -> None:
+    """Per-skeleton emission cap must hard-stop the bridge-target stream.
+
+    Without this, high-p bins walk the full max-bridge tree (millions of
+    graphs) before any reservoir or embed runs.
+    """
+
+    tmp = tmp_path_factory.mktemp("cap")
+    driver = yaml.safe_load((PACK_DIR / "run_gxtb.yaml").read_text())
+    rules = yaml.safe_load((PACK_DIR / "graph_rules.yaml").read_text())
+    rules["graph_rules"]["decoration_mode"] = "motif_bridge_target"
+    rules["graph_rules"]["bridge_first_hard_max_bridges_per_cd"] = 3
+    rules["graph_rules"]["bridge_target_count_window"] = 0
+    rules["graph_rules"]["bridge_target_max_emissions_per_skeleton"] = 5
+    rules["graph_rules"]["bridge_target_max_nodes_per_skeleton"] = 10000
+    rules["graph_rules"].pop("decoration_mode_from_k", None)
+    rules["graph_rules"].pop("decoration_mode_at_or_above", None)
+    rules["graph_rules"].pop("selection_max_per_skeleton", None)
+    rules["graph_rules"].pop("selection_per_skeleton_from_k", None)
+    rules["graph_rules"].pop("selection_max_wiener_excess", None)
+    merged = {k: v for k, v in driver.items() if k != "include"}
+    merged.update(yaml.safe_load((PACK_DIR / "motifs.yaml").read_text()))
+    merged.update(yaml.safe_load((PACK_DIR / "embed.yaml").read_text()))
+    merged.update(rules)
+    merged["cif"] = str(ROOT / "examples/cifs/CdSe_zb.cif")
+    merged.setdefault("relaxation", {})["enabled"] = False
+    path = tmp / "cap.yaml"
+    path.write_text(yaml.safe_dump(merged, sort_keys=False))
+
+    spec = load_nucleation_spec(str(path))
+    # k=3 p=4 is combinatorially large without a cap; with cap=5/skel it must
+    # finish quickly and stay near the bound.
+    result = generate_molecular_map(
+        spec, kmin=3, kmax=3, pmin=4, pmax=4, embed=False
+    ).bins[(3, 4)]
+    # 5 emissions × skeletons (order 10) << historical uncapped thousands.
+    assert result.raw_graphs <= 5 * max(1, result.skeletons_total) + 5
+    assert result.raw_graphs > 0
+
+
+def test_mono_se_dual_terminal_not_emitted(target_pack: Path) -> None:
+    """Bridge-target must not yield mono-Se dual-terminal decorations.
+
+    Those used to be emitted and then rejected by the screen, which could
+    mark a bridge-count shell productive while keeping nothing.
+    """
+
+    from builder.nucleation.molecular import mono_se_dual_terminal_violations
+    from builder.nucleation.types import _State
+
+    spec = load_nucleation_spec(str(target_pack))
+    # Small bins where leftover terminals are common.
+    for k, p in [(1, 2), (2, 2), (2, 3)]:
+        result = generate_molecular_map(
+            spec, kmin=k, kmax=k, pmin=p, pmax=p, embed=False
+        ).bins[(k, p)]
+        for iso in result.isomers:
+            state = _State(atoms=iso.atoms, graph=iso.graph)
+            viol = mono_se_dual_terminal_violations(state, spec)
+            assert not viol, f"k{k}p{p} {iso.structure_id}: {viol}"
