@@ -5280,6 +5280,12 @@ class _CandidateScreen:
                 if not xr.ok or xr.coordinates is None:
                     if self.progress is not None:
                         self.progress(
+                            f"[growth-job] k={self.k} p={self.p} "
+                            f"id=graph{graph_number:04d}_s{candidate.start_index:02d} "
+                            f"E_eV=n/a t_s={xtb_elapsed:.1f} relax=fail "
+                            f"err={xr.error or 'no_coordinates'}"
+                        )
+                        self.progress(
                             f"[molecular] motif graph graph{graph_number:04d} "
                             f"start{candidate.start_index:02d} | "
                             f"xtb=FAIL | converged={str(xr.converged).lower()} | "
@@ -5418,6 +5424,19 @@ class _CandidateScreen:
                 if iso is not None:
                     produced.append(iso)
                     if self.progress is not None:
+                        # Compact one-liner for growth CLI (filtered by GrowthLog).
+                        e_s = (
+                            "n/a"
+                            if xr.energy_eV is None
+                            else f"{float(xr.energy_eV):.6f}"
+                        )
+                        self.progress(
+                            f"[growth-job] k={self.k} p={self.p} "
+                            f"id={iso.structure_id} "
+                            f"E_eV={e_s} "
+                            f"t_s={xtb_elapsed:.1f} "
+                            f"relax={'ok' if xr.converged else 'fail'}"
+                        )
                         self.progress(
                             f"[molecular] motif graph graph{graph_number:04d} "
                             f"start{candidate.start_index:02d} | files="
