@@ -135,8 +135,74 @@ def test_identify_packages_two_cl(map_spec) -> None:
     pkgs = identify_packages(parent, map_spec)
     assert len(pkgs) >= 1
     assert pkgs[0].cd == 2
-    # weaker sum WBO sheds first when sorted ascending
-    assert pkgs[0].score == pytest.approx(0.9)
+    # weaker sum WBO sheds first when sorted ascending (plus tiny Se bias)
+    assert pkgs[0].score == pytest.approx(0.9, abs=0.05)
+
+
+def test_identify_packages_nonoverlapping() -> None:
+    """Shared Cl must not make two packages claim the same ligand."""
+    from builder.nucleation.molecular_growth import identify_packages
+    from builder.nucleation.spec import load_nucleation_spec
+    import yaml
+    from pathlib import Path
+
+    # Two Cd share one Cl → only one package can be kept
+    # Se0, Cd1 (core), Cd2, Cd3, Cl4, Cl5, Cl6  (Cl5 shared if both want it)
+    symbols = ("Se", "Cd", "Cd", "Cd", "Cl", "Cl", "Cl")
+    coords = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.5, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [5.0, 3.0, 0.0],
+            [5.0, -2.3, 0.0],
+            [5.0, 1.5, 0.0],  # shared bridge-like Cl
+            [5.0, 5.0, 0.0],
+        ],
+        dtype=float,
+    )
+    edges = (
+        (0, 1),
+        (1, 2),
+        (2, 4),
+        (2, 5),  # package A: Cd2-Cl4,Cl5
+        (3, 5),
+        (3, 6),  # package B: Cd3-Cl5,Cl6  shares Cl5
+    )
+    parent = ParentStructure(
+        k=1,
+        p=2,
+        structure_id="overlap",
+        symbols=symbols,
+        coordinates=coords,
+        energy_eV=-1.0,
+        edges=edges,
+        core_edges=((0, 1), (1, 2)),
+        wbo=None,
+    )
+    # minimal spec-like object via real pack
+    ROOT = Path(__file__).resolve().parents[1]
+    PACK = ROOT / "geometry_packs" / "cdse_cdcl2"
+    driver = yaml.safe_load((PACK / "run_gxtb.yaml").read_text())
+    rules = yaml.safe_load((PACK / "graph_rules.yaml").read_text())
+    merged = {k: v for k, v in driver.items() if k != "include"}
+    merged.update(yaml.safe_load((PACK / "motifs.yaml").read_text()))
+    merged.update(yaml.safe_load((PACK / "embed.yaml").read_text()))
+    merged.update(rules)
+    merged["cif"] = str(ROOT / "examples/cifs/CdSe_zb.cif")
+    merged.setdefault("relaxation", {})["enabled"] = False
+    import tempfile
+    from pathlib import Path as P
+
+    tmp = P(tempfile.mkdtemp()) / "s.yaml"
+    tmp.write_text(yaml.safe_dump(merged, sort_keys=False))
+    map_spec = load_nucleation_spec(str(tmp))
+    pkgs = identify_packages(parent, map_spec)
+    atoms = []
+    for pk in pkgs:
+        atoms.extend([pk.cd, pk.cl[0], pk.cl[1]])
+    assert len(atoms) == len(set(atoms)), "packages must be atom-disjoint"
+    assert len(pkgs) == 1  # only one non-overlapping package fits
 
 
 def test_select_parents_respects_window_and_dec(map_spec) -> None:
