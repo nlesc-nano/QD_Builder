@@ -877,14 +877,12 @@ class GrowthLog:
         text = str(msg)
         if text.startswith("[growth-job]"):
             self._job_i += 1
-            # Renormalize to a short fixed-width line
-            # [growth-job] k=3 p=2 id=... E_eV=... t_s=... relax=ok
             parts = text.replace("[growth-job]", "").strip().split()
             kv = {}
             for part in parts:
                 if "=" in part:
-                    k, v = part.split("=", 1)
-                    kv[k] = v
+                    key, val = part.split("=", 1)
+                    kv[key] = val
             sid = kv.get("id", "?")
             e = kv.get("E_eV", "n/a")
             t = kv.get("t_s", "?")
@@ -892,6 +890,15 @@ class GrowthLog:
             k = kv.get("k", "?")
             p = kv.get("p", "?")
             err = kv.get("err", "")
+            into = kv.get("into", "")
+            if rel == "merged" or e == "merged":
+                target = into or "?"
+                print(
+                    f"  job {self._job_i:4d}  k={k} p={p}  {sid:28s}  "
+                    f"E={'merged':>16s}      t={t:>6s}s  status=merged→{target}",
+                    flush=True,
+                )
+                return
             extra = f"  ({err})" if err and rel == "fail" else ""
             print(
                 f"  job {self._job_i:4d}  k={k} p={p}  {sid:28s}  "
@@ -1034,13 +1041,30 @@ def run_growth_step(
                 n_ok = sum(
                     1
                     for iso in bin_res.isomers
-                    if iso.xtb_converged and iso.xtb_energy_eV is not None
+                    if iso.xtb_energy_eV is not None
                 )
-                n_fail = n_iso - n_ok
+                n_merged = sum(
+                    1
+                    for rec in getattr(bin_res, "graph_merge_records", []) or []
+                )
+                n_fail = max(0, n_iso - n_ok)
                 log.line(
                     f"bin k={k} p={p} done: isomers={n_iso}  "
-                    f"relax_ok={n_ok}  relax_fail={n_fail}"
+                    f"with_E={n_ok}  no_E={n_fail}  "
+                    f"graph_merges={n_merged}"
                 )
+                from .formation import format_bin_ranking
+
+                ranking = format_bin_ranking(
+                    bin_res.isomers,
+                    k=k,
+                    p=p,
+                    refs=growth.references,
+                    package_p_m=tuple(growth.monomer_p_values) or (1, 2, 3),
+                    delta_mu=tuple(growth.delta_mu_cdcl2_eV)
+                    or (-0.5, 0.0, 0.5),
+                )
+                print(ranking, flush=True)
             if out is not None:
                 _write_growth_bin(out, bin_res, growth)
 

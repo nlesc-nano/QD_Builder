@@ -37,6 +37,12 @@ references:
   # eV = Ha * 27.211386245988 (match index.csv xtb_energy_eV columns)
   energy_cdse_eV: -69909.0850929154
   energy_cdcl2_eV: -29610.6502672544
+  # Min total energies E(1, p_m) from gxtb target k1 bins (eV) — for dE_pkg
+  # ΔE_pkg(k,p; p_m) = E(k,p) − k·E(1,p_m) − (p − k·p_m)·E(CdCl2)
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
 
 # Parent selection from a finished map (relaxed cores)
 parents:

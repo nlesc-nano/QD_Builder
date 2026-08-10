@@ -5013,6 +5013,12 @@ class _CandidateScreen:
                     (source_id, existing.structure_id, detail)
                 )
                 if self.progress is not None:
+                    # Compact growth log: this is a merge, not a relax failure.
+                    self.progress(
+                        f"[growth-job] k={self.k} p={self.p} "
+                        f"id={source_id} E_eV=merged t_s=0.0 "
+                        f"relax=merged into={existing.structure_id}"
+                    )
                     self.progress(f"[molecular] {detail}")
             return None
         self.processed.add(source_certificate)
