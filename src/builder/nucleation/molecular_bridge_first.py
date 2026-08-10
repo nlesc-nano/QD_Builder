@@ -1349,8 +1349,14 @@ def iter_cl_attachments_bridge_target(
     # carry exactly one Cl and doubles only appear as p rises and pairs run out
     # (0.3% of pairs at k5p1, 8.9% at k5p11); 3+ never occurs.
     tiers = [(1, True), (1, False)] if avoid_triangles else [(1, False)]
-    if max_shared_per_pair > 1:
-        tiers.append((max_shared_per_pair, False))
+    # Clamp to the chemical rule.  Without this the doubles tier is built from
+    # bridge_target_max_shared_per_pair alone and can place two Cl on a pair
+    # that max_shared_ligands_per_host_pair forbids: the screen would then
+    # reject the emission while the tier loop counted it as productive and
+    # stopped descending -- the same failure that emptied the p=1 bins.
+    doubles_cap = min(max_shared_per_pair, max_shared)
+    if doubles_cap > 1:
+        tiers.append((doubles_cap, False))
     # ``count_window`` is how many *productive* bridge counts to emit, not how
     # many to try: 0 keeps the historical behaviour of stopping at the first
     # one that yields anything.  Widening it covers the observed spread --
