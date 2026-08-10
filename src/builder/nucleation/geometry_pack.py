@@ -50,6 +50,8 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "selection_max_per_skeleton",
     "selection_per_skeleton_from_k",
     "selection_per_skeleton_from_p",
+    "decoration_mode_from_k",
+    "decoration_mode_at_or_above",
     "bridge_first_target_bridge_fraction",
     "bridge_first_maximize_bridged_pairs",
     "passivate_min_cd_cn",
@@ -670,6 +672,12 @@ class GeometryPack:
             "selection_per_skeleton_from_p": int(
                 self.graph_rules.get("selection_per_skeleton_from_p", 0)
             ),
+            "decoration_mode_from_k": int(
+                self.graph_rules.get("decoration_mode_from_k", 0)
+            ),
+            "decoration_mode_at_or_above": str(
+                self.graph_rules.get("decoration_mode_at_or_above", "")
+            ).strip().lower(),
             "bridge_first_target_bridge_fraction": float(
                 self.graph_rules.get(
                     "bridge_first_target_bridge_fraction", 0.0

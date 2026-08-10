@@ -40,24 +40,49 @@ graph_rules:
   forbid_mu3_host_bridge_overlap: true
 
   # ---- how decorations are generated -----------------------------------
+  # k<=2: motif_bridge_first, which also explores terminal-heavy decorations
+  # that the bridge-target generator never emits.  The whole k<=2 range is 121
+  # graphs, so it is exhaustive and the caps below barely bind.
+  # k>=3: motif_bridge_target, which picks the bridge set first and reaches
+  # exactly 2p bridges -- the count the bin optimum tracks
+  # (n_bridges = 0.964*(2p) - 0.36, r=0.993 over 29 g-xTB bins).
   decoration_mode: motif_bridge_first
+  decoration_mode_from_k: 3
+  decoration_mode_at_or_above: motif_bridge_target
 
-  # Soft bridge load: THIS is what bounds bridges per Cd, not the hard cap.
-  # 3 cuts mean terminal Cl from 2.99 to 1.82 at k3p4 and keeps the k3p3
-  # energy-minimum family intact.
-  bridge_first_prefer_bridges_per_cd: 3
-  bridge_first_hard_max_bridges_per_cd: 2
+  # Must be <= the hard cap or it never fires: the hard check runs first and
+  # unconditionally.  Read only by motif_bridge_first, so this is a k<=2 knob.
+  bridge_first_prefer_bridges_per_cd: 2
+  # 3, not 2: the measured optimum needs 2.0-2.6 bridges per Cd, and a cap of
+  # 2 limits total bridges to n_Cd -- which makes the best known structure
+  # unconstructible in every bin with p >~ k+1.  4 changes nothing further.
+  bridge_first_hard_max_bridges_per_cd: 3
 
-  # |Aut| grows factorially in equivalent precursor cations (mean 8388 at
-  # k4p9).  Capping it takes that bin from 1541 s to 4.7 s and costs ~7% of
-  # graphs at k4p7 -- without it k=5 is not enumerable.
+  # |Aut| cap for the motif_bridge_first beam, which canonicalises every state
+  # at O(|Aut|.n log n).  Does not bind at k<=2; kept because that mode is
+  # still selectable.  The bridge-target generator prunes orbits instead and
+  # uses its own cap (bridge_target_max_automorphisms, default 4096) -- at 64
+  # it silently falls back to no pruning and over-emits 72x at k2p5.
   bridge_first_max_automorphisms: 64
 
+  # Emit only the 2p shell.  Window 1 would add 2p-1 (44% of bin best-deciles
+  # against 15% for 2p) but the reservoir samples shells in proportion to
+  # their size, and 2p-1 is ~8x larger at k3p4 -- so it would crowd out the
+  # small, rich 2p shell.  Revisit if the budget is made shell-stratified.
+  bridge_target_count_window: 0
+
   # ---- which graphs reach 3D -------------------------------------------
-  # Relative Wiener-index cut against the bin's own most compact graph.  A
-  # fixed rank cut is wrong here: it prunes the same fraction everywhere,
-  # and the lowest-energy graph is often not the most compact.  Measured
-  # over nine bins with known energies, 0.20 loses no bin minimum, 0.10
-  # loses one, and a top-20% rank cut loses four.
-  selection_order: compactness
-  selection_max_wiener_excess: 0.20
+  # Spend the budget across skeletons, not deeply on a few: best-per-skeleton
+  # spans 0.7-2.9 eV in a bin while decorations of one skeleton at 2p span
+  # 0.3-0.5 eV.  Reservoir-sampled over each skeleton's full enumeration, so
+  # the hungriest-host-first emission order does not bias the sample.
+  # Measured best-of-N within a skeleton: N=8 is 0.048 eV off that skeleton's
+  # best, N=20 is 0.003 eV.  Candidates map 1:1 to accepted structures
+  # (measured k3p2 and k2p3), so this is also the g-xTB job size.
+  #   k=3: 37 skeletons -> <=740 runs;  k=4: 261 -> <=5220
+  selection_max_per_skeleton: 20
+  selection_per_skeleton_from_k: 3
+
+  # selection_order / selection_max_wiener_excess are deliberately absent.
+  # The compactness cut removed 3 graphs of 121 at k<=2 and kept 93% at k3p4;
+  # the per-skeleton budget supersedes it.

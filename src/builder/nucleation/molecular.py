@@ -4855,6 +4855,11 @@ class _CandidateScreen:
         default_factory=dict
     )
     _reservoir_rng: Any = None
+    #: candidate id -> seed skeleton fingerprint.  In the collect_only path
+    #: isomers are constructed in the second pass, after the skeleton loop has
+    #: finished, so ``skeleton_fp`` no longer holds the originating skeleton.
+    _state_fp: Dict[int, str] = field(default_factory=dict)
+    _current_fp: str = ""
     #: how many sound frames to keep per coordination vector before calling a
     #: molecule unrealisable; 0 keeps every one of them
     frame_options: int = 0
@@ -4974,6 +4979,11 @@ class _CandidateScreen:
         if stats.get("success", 0.0) > 0.5:
             self.bin_result.optimizer_successes += 1
 
+    def _seed_fp(self, state: _State) -> str:
+        """Fingerprint of the skeleton this candidate came from."""
+
+        return self._state_fp.get(id(state), self.skeleton_fp)
+
     def _motif_factor_enabled(self) -> bool:
         if self.pack is None:
             return False
@@ -4982,6 +4992,9 @@ class _CandidateScreen:
 
     def _offer_motif_factor(self, state: _State) -> Optional[MolecularIsomer]:
         """Reconstruct and xTB-test one graph without a skeleton-first frame."""
+
+        # Pin the originating skeleton before any derived state is built.
+        self._current_fp = self._seed_fp(state)
 
         from .molecular_motif_reconstruct import reconstruct_motif_state
 
@@ -5185,7 +5198,7 @@ class _CandidateScreen:
                     ),
                 )
             iso = MolecularIsomer(
-                seed_skeleton=self.skeleton_fp,
+                seed_skeleton=self._current_fp,
                 k=self.k,
                 p=self.p,
                 structure_id=structure_id,
@@ -5496,6 +5509,7 @@ class _CandidateScreen:
             # and every budget/selection setting was silently inert whenever
             # reconstruction.method was motif_factor.
             entry = (int(graph.number_of_edges()), state)
+            self._state_fp[id(state)] = self.skeleton_fp
             if self.max_per_skeleton <= 0:
                 self.pool.append(entry)
                 return None
@@ -6042,7 +6056,7 @@ class _CandidateScreen:
             return None
         self.processed.add(certificate)
         isomer = MolecularIsomer(
-            seed_skeleton=self.skeleton_fp,
+            seed_skeleton=self._seed_fp(state),
             k=self.k,
             p=self.p,
             structure_id=(
@@ -6590,6 +6604,16 @@ def enumerate_molecular_bin(
             getattr(check_spec.graph_rules, "decoration_mode", "graph_multiset")
             or "graph_multiset"
         ).strip().lower()
+        # Small bins want a looser generator (k<=2 is 121 graphs exhaustively);
+        # from k=3 the bridge-target generator is what reaches 2p at all.
+        _from_k = int(
+            getattr(check_spec.graph_rules, "decoration_mode_from_k", 0) or 0
+        )
+        _above = str(
+            getattr(check_spec.graph_rules, "decoration_mode_at_or_above", "")
+        ).strip().lower()
+        if _from_k > 0 and _above and k >= _from_k:
+            decoration_mode = _above
         profile_mode = resolved_mode
         if profile_mode == "precomputed":
             level = max_structure_level_possible(k, p, check_spec)
