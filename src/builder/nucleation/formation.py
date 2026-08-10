@@ -340,11 +340,11 @@ def format_bin_ranking(
     pms = tuple(int(x) for x in package_p_m)
     dmu_show = select_display_delta_mu(delta_mu, max_points=3)
 
-    # ── isomer ranking ──────────────────────────────────────────────
+    # --- isomer ranking (ASCII only: safe for HPC log locales) --------
     pkg_hdr = "  ".join(f"{'dE_pkg'+str(pm):>8}" for pm in pms)
     lines: list[str] = [
-        f"  ── ranking k={k} p={p}  "
-        f"({len(rows)} isomers with E; most stable → least; eV) ──",
+        f"  -- ranking k={k} p={p}  "
+        f"({len(rows)} isomers with E; most stable -> least; eV) --",
         "  "
         + f"{'rk':>3}  {'id':28s}  {'E':>14}  {'dE_bin':>7}  {'dE_f':>8}"
         + (f"  {pkg_hdr}" if pms else ""),
@@ -374,15 +374,15 @@ def format_bin_ranking(
         lines.append(f"  ... ({len(rows) - n_show} more isomers not shown)")
 
     lines.append(
-        "  dE_f = E − k E(CdSe) − p E(CdCl2);  "
-        "dE_pkg(p_m) = E − k E(1,p_m) − (p−k p_m) E(CdCl2)"
+        "  dE_f = E - k E(CdSe) - p E(CdCl2);  "
+        "dE_pkg(p_m) = E - k E(1,p_m) - (p-k p_m) E(CdCl2)"
     )
 
     if refs is None:
-        lines.append("  (no monomer references — grand potential skipped)")
+        lines.append("  (no monomer references - grand potential skipped)")
         return "\n".join(lines)
 
-    # ── grand potential (compact) ───────────────────────────────────
+    # --- grand potential (compact, ASCII) -----------------------------
     method = refs.method or "g-xTB"
     dmu_labels = "  ".join(f"{dm:+.1f}".rjust(10) for dm in dmu_show)
     free_vals = "  ".join(
@@ -391,20 +391,20 @@ def format_bin_ranking(
     lines.extend(
         [
             "",
-            f"  ── grand potential ({method}, report-only) ──",
-            "  Ω = E − k·μ_CdSe⁰ − p·(E(CdCl2) + Δμ)",
-            "      Δμ ≡ μ_CdCl2 − E(CdCl2);  Δμ_CdSe = 0 (not scanned)",
+            f"  -- grand potential ({method}, report-only) --",
+            "  Omega = E - k*mu_CdSe0 - p*(E(CdCl2) + dmu)",
+            "      dmu = mu_CdCl2 - E(CdCl2);  dmu_CdSe = 0 (not scanned)",
             f"  bin winner: {winner.structure_id}   E = {e_win:.4f} eV",
             "",
-            f"  free CdSe baseline   μ_CdSe⁰ = E(CdSe) = "
+            f"  free CdSe baseline   mu_CdSe0 = E(CdSe) = "
             f"{refs.mu_cdse0_free_eV():.4f} eV",
-            f"    {'Δμ_CdCl2':>10}  {dmu_labels}",
-            f"    {'Ω_free':>10}  {free_vals}",
+            f"    {'dmu_CdCl2':>10}  {dmu_labels}",
+            f"    {'Omega_free':>10}  {free_vals}",
             "",
-            "  ligated baselines   μ_CdSe⁰(p_m) = E(1,p_m) − p_m E(CdCl2)",
+            "  ligated baselines   mu_CdSe0(p_m) = E(1,p_m) - p_m E(CdCl2)",
             "  "
-            + f"{'p_m':>4}  {'μ_CdSe⁰':>12}  {'dE_pkg':>8}  "
-            + "  ".join(f"{('Ω@'+f'{dm:+.1f}'):>10}" for dm in dmu_show),
+            + f"{'p_m':>4}  {'mu_CdSe0':>12}  {'dE_pkg':>8}  "
+            + "  ".join(f"{('O@'+f'{dm:+.1f}'):>10}" for dm in dmu_show),
         ]
     )
     any_pkg = False
@@ -434,8 +434,8 @@ def format_bin_ranking(
         )
 
     lines.append(
-        "  note: within one (k,p) bin Ω only shifts by −p Δμ — "
-        "isomer order = total energy; compare Ω across p (or k) for lean/rich"
+        "  note: within one (k,p) bin Omega only shifts by -p dmu - "
+        "isomer order = total energy; compare Omega across p (or k) for lean/rich"
     )
     return "\n".join(lines)
 
@@ -479,7 +479,7 @@ def format_package_growth_profile(
     """
 
     if refs is None:
-        return "  (no monomer references — package profile skipped)"
+        return "  (no monomer references - package profile skipped)"
 
     pms = tuple(int(x) for x in package_p_m)
     ks = tuple(int(x) for x in k_values)
@@ -487,15 +487,17 @@ def format_package_growth_profile(
     _ = delta_mu
 
     col_w = 10
-    # header label width for row stubs like "k = 3  (3,·)"
+    # header label width for row stubs like "k = 3"
     stub_w = 14
+    # ASCII placeholder for missing bins (em dash breaks non-UTF8 HPC logs)
+    miss = "n/a"
 
     def _col_headers() -> str:
         return "".join(f"{('p_m=' + str(pm)):>{col_w}s}" for pm in pms)
 
     def _fmt_cell(val: Optional[float]) -> str:
         if val is None:
-            return f"{'—':>{col_w}s}"
+            return f"{miss:>{col_w}s}"
         return f"{val:{col_w}.3f}"
 
     # Build matrices: dE_f* (relative) and dE_f (absolute)
@@ -521,10 +523,10 @@ def format_package_growth_profile(
             de_f_star[(k, pm)] = de_f - k * de_f_1
 
     lines: list[str] = [
-        f"  ── package growth profile ({method}, report-only) ──",
-        "  path: column p_m uses composition (k, p = k·p_m)",
-        "  dE_f* = dE_f(k) − k·dE_f(1) = dE_pkg   "
-        "(0 at k=1; more negative → more stable)",
+        f"  -- package growth profile ({method}, report-only) --",
+        "  path: column p_m uses composition (k, p = k*p_m)",
+        "  dE_f* = dE_f(k) - k*dE_f(1) = dE_pkg   "
+        "(0 at k=1; more negative -> more stable)",
         "",
         "  relative formation  dE_f*  (eV)",
         "  " + f"{'':>{stub_w}s}" + _col_headers(),
@@ -539,7 +541,7 @@ def format_package_growth_profile(
         [
             "",
             "  absolute formation  dE_f  (eV)   "
-            "[Ω_free at Δμ=0; not zeroed at k=1]",
+            "[Omega_free at dmu=0; not zeroed at k=1]",
             "  " + f"{'':>{stub_w}s}" + _col_headers(),
         ]
     )
@@ -568,8 +570,8 @@ def format_package_growth_profile(
     n_miss = sum(1 for v in de_f_star.values() if v is None)
     if n_miss:
         lines.append(
-            "  — = bin not available yet (map/growth has no energy for that "
-            "(k, k·p_m))"
+            "  n/a = bin not available yet (map/growth has no energy for that "
+            "(k, k*p_m))"
         )
     return "\n".join(lines)
 

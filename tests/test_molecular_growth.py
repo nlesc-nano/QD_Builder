@@ -45,6 +45,65 @@ def test_growth_config_loads() -> None:
     assert cfg.max_shed >= 1
     assert cfg.references is not None
     assert cfg.references.energy_cdse_eV < 0
+    assert cfg.use_coord_carry
+    assert cfg.local_cleanup_cycles > 0
+    assert cfg.shed_mode == "wbo"
+
+
+def test_shed_packages_coords_and_place(map_spec) -> None:
+    from builder.nucleation.molecular_growth import (
+        place_monomer_and_packages,
+        shed_packages_coords,
+    )
+
+    symbols = ("Se", "Cd", "Cd", "Cl", "Cl")
+    coords = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.5, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [5.0, 2.3, 0.0],
+            [5.0, -2.3, 0.0],
+        ],
+        dtype=float,
+    )
+    edges = ((0, 1), (1, 2), (2, 3), (2, 4))
+    parent = ParentStructure(
+        k=1,
+        p=1,
+        structure_id="fake",
+        symbols=symbols,
+        coordinates=coords,
+        energy_eV=-1.0,
+        edges=edges,
+        core_edges=((0, 1), (1, 2)),
+        wbo={(2, 3): 0.5, (2, 4): 0.4},
+    )
+    pkgs = identify_packages(parent, map_spec)
+    # s=0 keep all
+    s0, c0, e0, sc0 = shed_packages_coords(parent, s=0, packages=pkgs)
+    assert len(s0) == 5 and sc0 == ()
+    # s=1 removes the package Cd+2Cl → Se + core Cd remain
+    s1, c1, e1, sc1 = shed_packages_coords(parent, s=1, packages=pkgs)
+    assert len(s1) == 2
+    assert set(s1) == {"Se", "Cd"}
+    assert len(sc1) == 1
+    # place monomer + p_m=1 package
+    s2, c2, e2 = place_monomer_and_packages(
+        s1,
+        c1,
+        e1,
+        k_parent=1,
+        p_after_shed=0,
+        p_m=1,
+        spec=map_spec,
+        pack=None,
+    )
+    # Se, Cd (core host), + Se, Cd (monomer), + Cd, Cl, Cl (package)
+    assert s2.count("Se") == 2
+    assert s2.count("Cd") == 3
+    assert s2.count("Cl") == 2
+    assert c2.shape[0] == len(s2)
 
 
 def test_identify_packages_two_cl(map_spec) -> None:
@@ -157,6 +216,8 @@ def test_grow_cores_produces_child_bins(map_spec) -> None:
         decorations_per_skeleton=1,
         max_skeletons_frac=1.0,
         max_skeletons_cap=5,
+        start_from="relaxed_coords",
+        local_cleanup_enabled=False,  # no gxtb in unit test
     )
     # parent_core_in_blocks needs matching layout — force core as block edges
     result = grow_cores_from_parents([parent], growth=cfg, spec=map_spec)
@@ -166,3 +227,8 @@ def test_grow_cores_produces_child_bins(map_spec) -> None:
     # composition check: p_child = 2 - s + p_m
     for ch in result.channels:
         assert ch.p_child == ch.p_parent - ch.shed + ch.p_m
+    # move B seeds present when start_from=relaxed_coords
+    assert result.coord_seeds
+    moves = {ch.move for ch in result.channels}
+    assert "graph" in moves
+    assert "coord" in moves
