@@ -233,6 +233,17 @@ class CoordSeed:
 
 
 @dataclass
+class RankedIsomer:
+    """Lightweight energy row for merged A+B bin rankings."""
+
+    structure_id: str
+    xtb_energy_eV: float
+    seed_skeleton: str = "------"
+    growth_move: str = "?"  # A | B
+    parent_id: str = ""
+
+
+@dataclass
 class GrowthStepResult:
     """Outcome of growing all parents from k → k+1."""
 
@@ -1751,7 +1762,7 @@ class GrowthLog:
             flush=True,
         )
         print(
-            f"[growth]   path: core graph → Cl decorate → motif_factor → g-xTB "
+            f"[growth]   path: core graph -> Cl decorate -> motif_factor -> g-xTB "
             f"(≤{self._xtb_starts} opt/unique graph); merges free",
             flush=True,
         )
@@ -1793,7 +1804,7 @@ class GrowthLog:
             f"merge={self._bin_merge}  fail={self._bin_fail}  "
             f"wall={wall:.1f}s  optΣ={self._bin_opt_s:.1f}s  "
             f"reconΣ={self._bin_recon_s:.1f}s  "
-            f"(other≈{max(0.0, wall - self._bin_opt_s - self._bin_recon_s):.1f}s "
+            f"(other~{max(0.0, wall - self._bin_opt_s - self._bin_recon_s):.1f}s "
             f"decorate/merge/overhead)",
             flush=True,
         )
@@ -1866,12 +1877,11 @@ class GrowthLog:
                 self.n_merge += 1
                 self._bin_merge += 1
                 target = into or "?"
-                # compact merge line (stage already says move A / decorate)
+                # Dup graph certificate: no new g-xTB.  Keep one short line.
                 print(
-                    f"  {self.n_merge:4d}  merge  k={k} p={p}  "
+                    f"  {self.n_merge:4d}  dup  k={k} p={p}  "
                     f"{self._formula_kp(k, p)}  "
-                    f"+dt={dt:5.1f}s  "
-                    f"{sid} -> {target}",
+                    f"already={target}  +dt={dt:5.1f}s",
                     flush=True,
                 )
                 return
@@ -1890,11 +1900,26 @@ class GrowthLog:
             child_f = self._formula_kp(k, p)
 
             if move in ("B", "coord", "b"):
-                # N  k=.. p=.. -s=.. +p_m=.. -> [CdSe]_k(CdCl2)_p  E ... parent=
+                # Arithmetic base is the *parent* composition:
+                #   p_child = p_parent - s + p_m
+                # Show parent formula first so "p=2 -s=2 +p_m=1" is never misread.
+                if k_par == "" or p_par == "":
+                    pk, pp = self._parent_kp_from_id(parent)
+                else:
+                    try:
+                        pk, pp = int(k_par), int(p_par)
+                    except ValueError:
+                        pk, pp = self._parent_kp_from_id(parent)
+                if pk is not None and pp is not None:
+                    parent_f = self._formula_kp(pk, pp)
+                    stoich = (
+                        f"{parent_f}  -s={shed} +p_m={p_m} -> {child_f}"
+                    )
+                else:
+                    stoich = f"-s={shed} +p_m={p_m} -> {child_f}"
                 parent_bit = f"  parent={parent}" if parent else ""
                 print(
-                    f"  {self.n_gxtb:4d}  k={k} p={p}  "
-                    f"-s={shed} +p_m={p_m} -> {child_f}  "
+                    f"  {self.n_gxtb:4d}  {stoich}  "
                     f"E={e:>14s}  "
                     f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
                     f"+dt={dt:5.1f}s  {rel}{extra}"
@@ -1951,7 +1976,8 @@ def run_growth_step(
         else:
             progress(msg)
 
-    n_stages = 4 if decorate else 3
+    # load, grow, [B opt], [A decorate], [merged rank], write
+    n_stages = 5 if decorate else 3
 
     if log:
         log.stage(
@@ -2031,7 +2057,7 @@ def run_growth_step(
         log.line(
             f"channels={len(result.channels)}  unique_cores={n_cores}  "
             f"coord_seeds={n_seeds}  "
-            f"(A→redecorate; B→full opt of carried geometry)"
+            f"(A->redecorate; B->full opt of carried geometry)"
         )
         log.set_work_plan(
             cores_total=n_cores,
@@ -2040,7 +2066,7 @@ def run_growth_step(
         )
     elif progress:
         progress(
-            f"[growth] k={k_from}→{k_from + 1}: "
+            f"[growth] k={k_from}->{k_from + 1}: "
             f"{len(result.channels)} channels, {n_cores} unique child cores, "
             f"bins={sorted(result.skeleton_catalog)}"
         )
@@ -2053,6 +2079,8 @@ def run_growth_step(
         print(prior, flush=True)
 
     child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    # Merged A+B energy rows per (k,p); ranked once after all bins finish
+    bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
     if decorate and (result.skeleton_catalog or result.coord_seeds):
         if pack is None and map_spec.geometry_pack:
             try:
@@ -2078,7 +2106,7 @@ def run_growth_step(
                     n_stages,
                     "move B: full opt of coord-carried seeds",
                     n_seeds=n_seeds,
-                    note="WBO shed + placed monomer; already cleaned if enabled",
+                    note="WBO shed + placed monomer; ranking deferred",
                 )
             _opt_coord_seeds(
                 result.coord_seeds,
@@ -2088,20 +2116,23 @@ def run_growth_step(
                 output_dir=out,
                 progress=log if log else progress,
                 child_minima=child_minima,
+                bin_ranks=bin_ranks,
             )
 
         if log and result.skeleton_catalog:
             log.stage(
-                3 if not result.coord_seeds else 3,
+                3,
                 n_stages,
                 "move A: decorate cores + motif_factor + opt",
                 total_cores=n_cores,
                 note=(
-                    "graph cores → Cl redecorate → motif_factor → g-xTB; "
-                    "merges free"
+                    "graph cores -> Cl redecorate -> motif_factor -> g-xTB; "
+                    "dup graphs skip opt; ranking after all bins"
                 ),
             )
         done_cores = 0
+        cation = map_spec.core.cation
+        anion = map_spec.core.anion
         for (k, p), cores in sorted(result.skeleton_catalog.items()):
             n_coord = len(result.coord_seeds.get((k, p), ()))
             if log:
@@ -2113,8 +2144,9 @@ def run_growth_step(
                     cores_total=n_cores,
                 )
                 log.line(
-                    f"  bin moves: A_graph_cores={len(cores)}  "
-                    f"B_coord_seeds={n_coord} (B already opted if present)"
+                    f"  bin: A_graph_cores={len(cores)}  "
+                    f"B_coord_seeds={n_coord} (B already opted; "
+                    f"rank merged at end)"
                 )
             elif progress:
                 progress(
@@ -2146,6 +2178,12 @@ def run_growth_step(
                         "energy_eV": float(best.xtb_energy_eV),
                         "structure_id": best.structure_id,
                     }
+            # accumulate move-A rows for final merged ranking
+            bin_ranks[(k, p)].extend(
+                _ranked_from_molecular_isomers(
+                    bin_res.isomers, move="A", cation=cation, anion=anion
+                )
+            )
             if log:
                 n_iso = len(bin_res.isomers)
                 n_ok = len(with_e)
@@ -2154,6 +2192,9 @@ def run_growth_step(
                     for rec in getattr(bin_res, "graph_merge_records", []) or []
                 )
                 n_fail = max(0, n_iso - n_ok)
+                n_b = sum(
+                    1 for r in bin_ranks[(k, p)] if r.growth_move == "B"
+                )
                 log.end_bin(
                     k=k,
                     p=p,
@@ -2163,18 +2204,44 @@ def run_growth_step(
                     n_merged=n_merged,
                     raw_graphs=getattr(bin_res, "raw_graphs", None),
                 )
+                log.line(
+                    f"  deferred rank pool k={k} p={p}: "
+                    f"A={n_ok} B={n_b} (print after all bins)"
+                )
+            if out is not None:
+                _write_growth_bin(out, bin_res, growth)
+
+        # ---- Final merged rankings for every child (k,p) ----
+        if log and bin_ranks:
+            log.stage(
+                4,
+                n_stages,
+                "merged rankings A+B per (k,p)",
+                note="all sheddings/packages/moves for each composition",
+            )
+            for (k, p) in sorted(bin_ranks):
+                rows = bin_ranks[(k, p)]
+                if not rows:
+                    continue
+                n_a = sum(1 for r in rows if r.growth_move == "A")
+                n_b = sum(1 for r in rows if r.growth_move == "B")
                 ranking = format_bin_ranking(
-                    bin_res.isomers,
+                    rows,
                     k=k,
                     p=p,
                     refs=growth.references,
                     package_p_m=tuple(growth.monomer_p_values) or (1, 2, 3),
                     delta_mu=tuple(growth.delta_mu_cdcl2_eV)
                     or (-1.0, 0.0, 1.0),
+                    title_note=f"merged A={n_a} B={n_b}",
                 )
                 print(ranking, flush=True)
-            if out is not None:
-                _write_growth_bin(out, bin_res, growth)
+                # refresh child_minima from merged pool
+                best = min(rows, key=lambda r: r.xtb_energy_eV)
+                child_minima[(k, p)] = {
+                    "energy_eV": float(best.xtb_energy_eV),
+                    "structure_id": best.structure_id,
+                }
 
     # Package growth profile: k=1…k_child along p = k·p_m for each package
     if log:
@@ -2217,6 +2284,69 @@ def run_growth_step(
     return result
 
 
+def _core_skeleton_fp(
+    core_edges: EdgeList,
+    *,
+    symbols: Optional[Sequence[str]] = None,
+    cation: str = "Cd",
+    anion: str = "Se",
+) -> str:
+    """Short fingerprint of a Cd-Se core edge list (for ranking colours)."""
+
+    if not core_edges:
+        return "------"
+    g = nx.Graph()
+    nodes = {n for e in core_edges for n in e}
+    for n in nodes:
+        el = anion if symbols is not None and n < len(symbols) and symbols[n] == anion else cation
+        # Without symbols, parity of index is unreliable; mark both as 'X'
+        if symbols is None:
+            el = "X"
+        g.add_node(n, el=el)
+    g.add_edges_from(core_edges)
+    try:
+        return nx.weisfeiler_lehman_graph_hash(
+            g, node_attr="el", iterations=4
+        )[:6]
+    except Exception:
+        return "------"
+
+
+def _ranked_from_molecular_isomers(
+    isomers: Sequence[Any],
+    *,
+    move: str = "A",
+    cation: str = "Cd",
+    anion: str = "Se",
+) -> List[RankedIsomer]:
+    """Collect energy rows from MolecularIsomer-like objects."""
+
+    from .molecular import skeleton_fingerprint
+
+    out: List[RankedIsomer] = []
+    for iso in isomers:
+        e = getattr(iso, "xtb_energy_eV", None)
+        if e is None:
+            continue
+        skel = getattr(iso, "seed_skeleton", None) or ""
+        if not skel and getattr(iso, "atoms", None) is not None:
+            try:
+                skel = skeleton_fingerprint(
+                    iso.atoms, iso.graph, cation, anion
+                )
+            except Exception:
+                skel = "------"
+        out.append(
+            RankedIsomer(
+                structure_id=str(iso.structure_id),
+                xtb_energy_eV=float(e),
+                seed_skeleton=str(skel or "------")[:6],
+                growth_move=move,
+            )
+        )
+    return out
+
+
 def _opt_coord_seeds(
     coord_seeds: Mapping[Tuple[int, int], Sequence[CoordSeed]],
     *,
@@ -2226,6 +2356,7 @@ def _opt_coord_seeds(
     output_dir: Optional[Path],
     progress: Optional[Any],
     child_minima: Dict[Tuple[int, int], Dict[str, Any]],
+    bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]],
 ) -> None:
     """Full g-xTB opt for move-B coordinate seeds; write XYZ + index rows."""
 
@@ -2242,6 +2373,8 @@ def _opt_coord_seeds(
     settings = XtbSettings.from_pack(base)
     cutoffs = bond_cutoffs_from_spec(map_spec)
     log = progress if isinstance(progress, GrowthLog) else None
+    cation = map_spec.core.cation
+    anion = map_spec.core.anion
 
     flat: List[CoordSeed] = []
     for key in sorted(coord_seeds):
@@ -2249,11 +2382,16 @@ def _opt_coord_seeds(
     if log:
         log.line(f"move B: full g-xTB opt of {len(flat)} coord-carried children")
         log.line(
-            "child p = p_parent - s + p_m;  formula = [CdSe]_k(CdCl2)_p"
+            "p_child = p_parent - s + p_m;  "
+            "row shows parent formula -s +p_m -> child formula"
         )
         log.line(
-            "row: N  k=.. p=.. -s=.. +p_m=.. -> [CdSe]_k(CdCl2)_p  "
-            "E  opt clean +dt  status  parent=.."
+            "row: N  [CdSe]_kpar(CdCl2)_ppar  -s=.. +p_m=.. -> "
+            "[CdSe]_k(CdCl2)_p  E  opt clean +dt  status  parent=.."
+        )
+        log.line(
+            "NOTE: per-(k,p) ranking is deferred until move A finishes "
+            "(merge A redecorate + B coord into each bin)"
         )
     elif progress:
         progress(f"[growth] move B: opt {len(flat)} coord seeds")
@@ -2306,6 +2444,41 @@ def _opt_coord_seeds(
                 "energy_eV": e,
                 "structure_id": seed.structure_id,
             }
+        # Prefer fingerprint of the *relaxed* Cd-Se core when available
+        skel = _core_skeleton_fp(
+            seed.core_edges, symbols=seed.symbols, cation=cation, anion=anion
+        )
+        if xr.coordinates is not None and cutoffs:
+            try:
+                from .molecular import skeleton_fingerprint
+                from .xtb_relax import relaxed_edges as _re
+
+                full_e = _re(list(seed.symbols), xr.coordinates, cutoffs)
+                g = nx.Graph()
+                for i, sym in enumerate(seed.symbols):
+                    if sym in (cation, anion):
+                        g.add_node(i)
+                for a, b in full_e:
+                    if a in g and b in g:
+                        g.add_edge(a, b)
+                atoms = [
+                    type("Atom", (), {"symbol": seed.symbols[i]})()
+                    for i in range(len(seed.symbols))
+                ]
+                skel = skeleton_fingerprint(
+                    atoms, g, cation, anion
+                )
+            except Exception:
+                pass
+        bin_ranks.setdefault((seed.k, seed.p), []).append(
+            RankedIsomer(
+                structure_id=seed.structure_id,
+                xtb_energy_eV=e,
+                seed_skeleton=str(skel or "------")[:6],
+                growth_move="B",
+                parent_id=seed.parent_id,
+            )
+        )
         if output_dir is None:
             continue
         bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"

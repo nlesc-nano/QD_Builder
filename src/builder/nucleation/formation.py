@@ -306,6 +306,10 @@ def select_display_delta_mu(
     return tuple(sorted(picked)[:max_points])
 
 
+# ANSI colours cycled over skeleton fingerprints (TTY only)
+_SKEL_COLOURS = ("36", "33", "35", "32", "34", "31")
+
+
 def format_bin_ranking(
     isomers: Sequence[Any],
     *,
@@ -315,12 +319,13 @@ def format_bin_ranking(
     package_p_m: Sequence[int] = (1, 2, 3),
     delta_mu: Sequence[float] = (-1.0, 0.0, 1.0),
     max_isomers: int = 20,
+    use_colour: Optional[bool] = None,
+    title_note: str = "",
 ) -> str:
     """Human-readable bin ranking + compact grand-potential snapshot.
 
-    Isomer table: E, dE_bin, dE_f, dE_pkg(p_m).  Grand-potential block uses
-    g-xTB free and ligated μ_CdSe⁰ baselines with a *few* Δμ_CdCl₂ points
-    (not a full 2D surface).  Report-only.
+    Isomer table: skel, move, E, dE_bin, dE_f, dE_pkg(p_m).  Optional TTY
+    colour groups rows by skeleton fingerprint.  Report-only.
     """
 
     rows = []
@@ -340,19 +345,40 @@ def format_bin_ranking(
     pms = tuple(int(x) for x in package_p_m)
     dmu_show = select_display_delta_mu(delta_mu, max_points=3)
 
-    # --- isomer ranking (ASCII only: safe for HPC log locales) --------
+    if use_colour is None:
+        import os
+        import sys
+
+        use_colour = (
+            sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        )
+
+    colour_of: Dict[str, str] = {}
+    note = f"  {title_note}" if title_note else ""
+    # --- isomer ranking (ASCII numbers; optional ANSI colour by skel) ---
     pkg_hdr = "  ".join(f"{'dE_pkg'+str(pm):>8}" for pm in pms)
     lines: list[str] = [
-        f"  -- ranking k={k} p={p}  "
-        f"({len(rows)} isomers with E; most stable -> least; eV) --",
+        f"  -- ranking k={k} p={p}  [CdSe]_{k}(CdCl2)_{p}  "
+        f"({len(rows)} with E; most stable -> least){note} --",
         "  "
-        + f"{'rk':>3}  {'id':28s}  {'E':>14}  {'dE_bin':>7}  {'dE_f':>8}"
+        + f"{'rk':>3}  {'skel':6s}  {'mv':2s}  {'id':28s}  "
+        + f"{'E':>14}  {'dE_bin':>7}  {'dE_f':>8}"
         + (f"  {pkg_hdr}" if pms else ""),
     ]
     for rank, iso in enumerate(rows[:n_show], start=1):
         e = float(iso.xtb_energy_eV)
         de_bin = e - emin
         de_f = refs.formation_eV(e, k, p) if refs else float("nan")
+        skel = str(
+            getattr(iso, "seed_skeleton", None)
+            or getattr(iso, "skeleton", None)
+            or "------"
+        )[:6]
+        move = str(getattr(iso, "growth_move", getattr(iso, "move", "?")))[:1]
+        if skel not in colour_of:
+            colour_of[skel] = _SKEL_COLOURS[
+                len(colour_of) % len(_SKEL_COLOURS)
+            ]
         pkg_cols = []
         for pm in pms:
             if refs is None:
@@ -364,15 +390,21 @@ def format_bin_ranking(
             )
         line = (
             "  "
-            + f"{rank:3d}  {iso.structure_id:28s}  {e:14.4f}  "
-            + f"{de_bin:7.3f}  {de_f:8.3f}"
+            + f"{rank:3d}  {skel:6s}  {move:2s}  {iso.structure_id:28s}  "
+            + f"{e:14.4f}  {de_bin:7.3f}  {de_f:8.3f}"
         )
         if pkg_cols:
             line += "  " + "  ".join(pkg_cols)
+        if use_colour:
+            line = f"\033[{colour_of[skel]}m{line}\033[0m"
         lines.append(line)
     if len(rows) > n_show:
         lines.append(f"  ... ({len(rows) - n_show} more isomers not shown)")
 
+    lines.append(
+        f"  skel: Cd-Se core fingerprint ({len(colour_of)} distinct); "
+        "mv=A redecorate / B coord-carry; same colour = same skeleton"
+    )
     lines.append(
         "  dE_f = E - k E(CdSe) - p E(CdCl2);  "
         "dE_pkg(p_m) = E - k E(1,p_m) - (p-k p_m) E(CdCl2)"
