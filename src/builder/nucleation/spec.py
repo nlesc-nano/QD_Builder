@@ -668,6 +668,12 @@ def load_nucleation_spec(
                 selection_per_skeleton_from_p=int(
                     graph_rules_raw.get("selection_per_skeleton_from_p", 0)
                 ),
+                decoration_mode_from_k=int(
+                    graph_rules_raw.get("decoration_mode_from_k", 0)
+                ),
+                decoration_mode_at_or_above=str(
+                    graph_rules_raw.get("decoration_mode_at_or_above", "")
+                ).strip().lower(),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
                 ),

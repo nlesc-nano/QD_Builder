@@ -470,6 +470,12 @@ class NucleationGraphRules:
     #: 47% and pointless; k4p4 has 3040 where it is 0.66% and essential.
     selection_per_skeleton_from_k: int = 0
     selection_per_skeleton_from_p: int = 0
+    #: From this k onward use ``decoration_mode_at_or_above`` instead of
+    #: ``decoration_mode``.  0 disables the switch.  Small bins benefit from a
+    #: looser generator (k<=2 is 121 graphs exhaustively), while k>=3 needs the
+    #: bridge-target generator to reach 2p at all.
+    decoration_mode_from_k: int = 0
+    decoration_mode_at_or_above: str = ""
     #: Target TOTAL bridging chlorides as a fraction of the 2p Cl budget.
     #: In the most stable structure of every measured (k,p) bin essentially
     #: every Cl bridges: n_bridges(best) = 0.96*(2p) - 0.21 with r=0.994 over

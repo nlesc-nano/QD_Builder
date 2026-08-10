@@ -32,6 +32,14 @@ def target_pack(tmp_path_factory) -> Path:
     driver = yaml.safe_load((PACK_DIR / "run_gxtb.yaml").read_text())
     rules = yaml.safe_load((PACK_DIR / "graph_rules.yaml").read_text())
     rules["graph_rules"]["decoration_mode"] = "motif_bridge_target"
+    # Pin the generator settings the expected counts were measured under, so
+    # this stays a test of orbit pruning rather than of pack policy.
+    rules["graph_rules"]["bridge_first_hard_max_bridges_per_cd"] = 2
+    rules["graph_rules"]["bridge_target_count_window"] = 0
+    rules["graph_rules"].pop("decoration_mode_from_k", None)
+    rules["graph_rules"].pop("decoration_mode_at_or_above", None)
+    rules["graph_rules"].pop("selection_max_per_skeleton", None)
+    rules["graph_rules"].pop("selection_per_skeleton_from_k", None)
     # no selection cut: count what the generator makes, not what survives it
     rules["graph_rules"].pop("selection_order", None)
     rules["graph_rules"].pop("selection_max_wiener_excess", None)
