@@ -713,15 +713,21 @@ def identify_packages(
     parent: ParentStructure,
     spec: NucleationSpec,
 ) -> List[CdCl2Package]:
-    """Find CdCl2-like packages on the relaxed graph.
+    """Find **non-overlapping** CdCl2 packages on the relaxed graph.
 
-    Prefers Cd with exactly two Cl neighbours.  Score: sum of WBO(Cd–Cl) if
-    available, else inverse mean distance (longer bonds → lower score → shed
-    first).
+    Each package is one Cd + two Cl.  Candidates are scored (WBO sum if
+    available, else longer Cd–Cl → weaker → shed first), then greedily kept
+    in score order so that **no two packages share a Cd or Cl**.
+
+    Overlapping assignment was a real bug: shedding s packages could remove
+    s Cd but fewer than 2s Cl (shared Cl double-counted), leaving the wrong
+    composition (extra Cl ≈ −12 keV on g-xTB) while still labelling
+    ``[CdSe]_k(CdCl2)_p``.
     """
 
     ligand = spec.precursor.ligand
     cation = spec.precursor.center
+    anion = spec.core.anion
     symbols = parent.symbols
     coords = parent.coordinates
     # adjacency from edges
@@ -730,14 +736,15 @@ def identify_packages(
         neigh[a].append(b)
         neigh[b].append(a)
 
-    packages: List[CdCl2Package] = []
+    candidates: List[CdCl2Package] = []
     for i, sym in enumerate(symbols):
         if sym != cation:
             continue
         cl_n = [j for j in neigh[i] if symbols[j] == ligand]
         if len(cl_n) < 2:
             continue
-        # take the two closest Cl as the package
+        # Prefer true precursor-like Cd: at least one Cl; optional Se still ok
+        # (surface core Cd with two Cl can appear — non-overlap + score handles).
         cl_n = sorted(
             cl_n,
             key=lambda j: float(np.linalg.norm(coords[i] - coords[j])),
@@ -752,9 +759,36 @@ def identify_packages(
             d2 = float(np.linalg.norm(coords[i] - coords[c2]))
             # longer mean distance → weaker → smaller score
             score = -0.5 * (d1 + d2)
-        packages.append(CdCl2Package(cd=i, cl=(c1, c2), score=score))
-    packages.sort(key=lambda p: (p.score, p.cd))
+        # slight preference to shed Cd with fewer Se bonds (more precursor-like)
+        n_se = sum(1 for j in neigh[i] if symbols[j] == anion)
+        score = score + 0.01 * n_se
+        candidates.append(CdCl2Package(cd=i, cl=(c1, c2), score=score))
+    candidates.sort(key=lambda p: (p.score, p.cd))
+
+    # Greedy non-overlapping selection (least-bound first for shed order)
+    used: set = set()
+    packages: List[CdCl2Package] = []
+    for pkg in candidates:
+        atoms = {pkg.cd, pkg.cl[0], pkg.cl[1]}
+        if atoms & used:
+            continue
+        used |= atoms
+        packages.append(pkg)
     return packages
+
+
+def expected_composition(
+    k: int, p: int, *, cation: str = "Cd", anion: str = "Se", ligand: str = "Cl"
+) -> Dict[str, int]:
+    """Atom counts for neutral ``k CdSe + p CdCl2``."""
+
+    return {anion: int(k), cation: int(k + p), ligand: int(2 * p)}
+
+
+def composition_counts(symbols: Sequence[str]) -> Dict[str, int]:
+    from collections import Counter
+
+    return dict(Counter(symbols))
 
 
 def core_edges_after_removing_cd(
@@ -1172,12 +1206,26 @@ def build_coord_seed(
         symbols, coords, edges, shed_scores = shed_packages_coords(
             parent, s=s, packages=packages
         )
+        # After shed: expect k Se, k+(p-s) Cd, 2(p-s) Cl
+        p_left = parent.p - s
+        exp_after_shed = expected_composition(
+            parent.k,
+            p_left,
+            cation=spec.core.cation,
+            anion=spec.core.anion,
+            ligand=spec.precursor.ligand,
+        )
+        got_after = composition_counts(symbols)
+        if got_after != exp_after_shed:
+            # Overlapping packages or mis-tagged parent — refuse this channel
+            return None
+
         symbols, coords, edges = place_monomer_and_packages(
             symbols,
             coords,
             edges,
             k_parent=parent.k,
-            p_after_shed=parent.p - s,
+            p_after_shed=p_left,
             p_m=p_m,
             spec=spec,
             pack=pack,
@@ -1187,6 +1235,19 @@ def build_coord_seed(
 
     k_child = parent.k + 1
     p_child = parent.p - s + p_m
+    exp = expected_composition(
+        k_child,
+        p_child,
+        cation=spec.core.cation,
+        anion=spec.core.anion,
+        ligand=spec.precursor.ligand,
+    )
+    got = composition_counts(symbols)
+    if got != exp:
+        # Do not full-opt a misbuilt stoichiometry (would look like a "weird"
+        # isomer energy for the same [CdSe]_k(CdCl2)_p label).
+        return None
+
     sid = (
         f"coord_k{k_child:03d}_p{p_child:03d}_"
         f"from_{parent.structure_id}_s{s}_pm{p_m}_{serial:04d}"
@@ -1195,7 +1256,7 @@ def build_coord_seed(
     q = _formal_charge(symbols, spec)
     cleanup_s = 0.0
     cleanup_ok = False
-    notes = f"shed={s} p_m={p_m} charge={q}"
+    notes = f"shed={s} p_m={p_m} charge={q} atoms={got}"
     if growth.local_cleanup_enabled:
         if growth.require_charge_neutral_for_cleanup and q != 0:
             notes += " cleanup=skipped(non-neutral)"
@@ -1208,6 +1269,11 @@ def build_coord_seed(
                 structure_id=sid,
             )
             notes += f" {cnote}"
+            # cleanup can in principle change little; re-check counts unchanged
+            if composition_counts(
+                [symbols[i] for i in range(len(symbols))]
+            ) != exp:
+                pass  # symbols unchanged by cleanup
 
     core = core_edges_from_coords(symbols, coords, spec=spec, cutoffs=cutoffs)
     if not core:
