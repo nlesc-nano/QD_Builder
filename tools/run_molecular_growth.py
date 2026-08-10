@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from builder.nucleation.geometry_pack import load_geometry_pack  # noqa: E402
 from builder.nucleation.molecular_growth import (  # noqa: E402
     GrowthConfig,
+    GrowthLog,
     run_growth_step,
     write_growth_summary,
 )
@@ -114,7 +115,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="decorate graphs but skip 3D/opt",
     )
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress almost all progress",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="also print detailed [molecular] motif lines",
+    )
     args = parser.parse_args(argv)
 
     map_yaml, growth_yaml = _resolve_pack_files(
@@ -128,9 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.p_parents.strip():
         p_parents = [int(x) for x in args.p_parents.split(",") if x.strip()]
 
-    def progress(msg: str) -> None:
-        if not args.quiet:
-            print(msg, flush=True)
+    log = GrowthLog(verbose=args.verbose, quiet=args.quiet)
 
     out = args.output.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -139,10 +147,12 @@ def main(argv: list[str] | None = None) -> int:
         f"# loaded from\n# {map_yaml}\n"
     )
 
-    progress(f"[growth] pack map   : {map_yaml}")
-    progress(f"[growth] pack growth: {growth_yaml}")
-    progress(f"[growth] parents    : {args.parents}")
-    progress(f"[growth] k-from     : {args.k_from}")
+    log.line(f"pack     : {map_yaml.parent}")
+    log.line(f"parents  : {args.parents}")
+    log.line(f"k-from   : {args.k_from}")
+    log.line(f"output   : {out}")
+    if p_parents:
+        log.line(f"p-parents: {p_parents}")
 
     result = run_growth_step(
         run_dir=args.parents.expanduser().resolve(),
@@ -154,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         decorate=not args.cores_only,
         embed=not args.no_embed and not args.cores_only,
         output_dir=None if args.cores_only else out,
-        progress=progress,
+        progress=log,
     )
     write_growth_summary(result, out / "growth_channels.csv")
     with (out / "growth_parents.json").open("w") as handle:
@@ -185,9 +195,9 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f"{i}\t{edge_s}")
         (cat_dir / f"k{k:03d}_p{p:03d}.tsv").write_text("\n".join(lines) + "\n")
 
-    progress(
-        f"[growth] done: parents={result.parents_selected} "
-        f"channels={len(result.channels)} bins={catalog_meta}"
+    log.line(
+        f"DONE  parents={result.parents_selected}  "
+        f"channels={len(result.channels)}  bins={catalog_meta}"
     )
     return 0
 

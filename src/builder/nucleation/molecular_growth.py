@@ -845,6 +845,67 @@ def _store_channel(
     )
 
 
+class GrowthLog:
+    """Compact growth logger: stages + job lines; hides verbose molecular spam.
+
+    Always prints lines starting with ``[growth]`` or ``[growth-job]``.
+    With ``verbose=True``, also prints the rest (motif details, etc.).
+    """
+
+    def __init__(self, *, verbose: bool = False, quiet: bool = False) -> None:
+        self.verbose = bool(verbose)
+        self.quiet = bool(quiet)
+        self._job_i = 0
+
+    def stage(self, n: int, total: int, title: str, **fields: Any) -> None:
+        if self.quiet:
+            return
+        print(f"\n=== STAGE {n}/{total}: {title} ===", flush=True)
+        for key, value in fields.items():
+            print(f"  {key}: {value}", flush=True)
+
+    def line(self, msg: str) -> None:
+        if self.quiet:
+            return
+        print(f"[growth] {msg}", flush=True)
+
+    def __call__(self, msg: str) -> None:
+        """ProgressCallback-compatible."""
+
+        if self.quiet:
+            return
+        text = str(msg)
+        if text.startswith("[growth-job]"):
+            self._job_i += 1
+            # Renormalize to a short fixed-width line
+            # [growth-job] k=3 p=2 id=... E_eV=... t_s=... relax=ok
+            parts = text.replace("[growth-job]", "").strip().split()
+            kv = {}
+            for part in parts:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    kv[k] = v
+            sid = kv.get("id", "?")
+            e = kv.get("E_eV", "n/a")
+            t = kv.get("t_s", "?")
+            rel = kv.get("relax", "?")
+            k = kv.get("k", "?")
+            p = kv.get("p", "?")
+            err = kv.get("err", "")
+            extra = f"  ({err})" if err and rel == "fail" else ""
+            print(
+                f"  job {self._job_i:4d}  k={k} p={p}  {sid:28s}  "
+                f"E={e:>16s} eV  t={t:>6s}s  relax={rel}{extra}",
+                flush=True,
+            )
+            return
+        if text.startswith("[growth]"):
+            print(text, flush=True)
+            return
+        if self.verbose:
+            print(text, flush=True)
+
+
 def run_growth_step(
     *,
     run_dir: Path,
@@ -865,18 +926,68 @@ def run_growth_step(
     under ``output_dir`` if given.
     """
 
+    log = progress if isinstance(progress, GrowthLog) else None
+
+    def _p(msg: str) -> None:
+        if progress is None:
+            return
+        if log is not None:
+            if msg.startswith("[growth]") or msg.startswith("==="):
+                # stage/line helpers use print directly on GrowthLog
+                pass
+            progress(msg if msg.startswith("[") else f"[growth] {msg}")
+        else:
+            progress(msg)
+
+    n_stages = 4 if decorate else 3
+
+    if log:
+        log.stage(
+            1,
+            n_stages,
+            "load parents",
+            parents_dir=str(run_dir),
+            k_from=k_from,
+            p_filter=list(p_parents) if p_parents else "all",
+        )
     parents_all = load_parents_from_run(
         run_dir, k=k_from, spec=map_spec, p_values=p_parents
     )
     parents = select_parents(parents_all, growth, map_spec)
-    if progress:
+    if log:
+        log.line(
+            f"loaded {len(parents_all)} converged parents → "
+            f"selected {len(parents)} "
+            f"(window={growth.energy_window_eV} eV, "
+            f"≤{growth.decorations_per_skeleton} dec/core)"
+        )
+    elif progress:
         progress(
             f"[growth] k={k_from}: loaded {len(parents_all)} parents, "
             f"selected {len(parents)}"
         )
+
+    if log:
+        log.stage(
+            2,
+            n_stages,
+            f"grow cores  k={k_from} → k={k_from + 1}",
+            packages=list(growth.monomer_p_values),
+            max_shed=growth.max_shed,
+        )
     result = grow_cores_from_parents(parents, growth=growth, spec=map_spec)
-    if progress:
-        n_cores = sum(len(v) for v in result.skeleton_catalog.values())
+    n_cores = sum(len(v) for v in result.skeleton_catalog.values())
+    bin_plan = {
+        f"k{k}p{p}": len(cores)
+        for (k, p), cores in sorted(result.skeleton_catalog.items())
+    }
+    if log:
+        log.line(
+            f"channels={len(result.channels)}  unique_cores={n_cores}  "
+            f"(these cores will be decorated)"
+        )
+        log.line(f"plan by bin: {bin_plan}")
+    elif progress:
         progress(
             f"[growth] k={k_from}→{k_from + 1}: "
             f"{len(result.channels)} channels, {n_cores} unique child cores, "
@@ -889,8 +1000,22 @@ def run_growth_step(
         out = Path(output_dir) if output_dir else None
         if out:
             out.mkdir(parents=True, exist_ok=True)
+        if log:
+            log.stage(
+                3,
+                n_stages,
+                "decorate + embed + opt",
+                total_cores=n_cores,
+                note="one relax job per accepted decorated graph",
+            )
+        done_cores = 0
         for (k, p), cores in sorted(result.skeleton_catalog.items()):
-            if progress:
+            if log:
+                log.line(
+                    f"--- bin k={k} p={p}  cores={len(cores)}  "
+                    f"(running total cores {done_cores}/{n_cores}) ---"
+                )
+            elif progress:
                 progress(
                     f"[growth] decorate k={k} p={p} cores={len(cores)}"
                 )
@@ -903,8 +1028,31 @@ def run_growth_step(
                 precomputed_skeletons=cores,
                 progress=progress,
             )
+            done_cores += len(cores)
+            if log:
+                n_iso = len(bin_res.isomers)
+                n_ok = sum(
+                    1
+                    for iso in bin_res.isomers
+                    if iso.xtb_converged and iso.xtb_energy_eV is not None
+                )
+                n_fail = n_iso - n_ok
+                log.line(
+                    f"bin k={k} p={p} done: isomers={n_iso}  "
+                    f"relax_ok={n_ok}  relax_fail={n_fail}"
+                )
             if out is not None:
                 _write_growth_bin(out, bin_res, growth)
+
+    if log:
+        log.stage(
+            n_stages,
+            n_stages,
+            "write outputs",
+            output=str(output_dir) if output_dir else "(none)",
+            parents_selected=result.parents_selected,
+            child_cores=n_cores,
+        )
     return result
 
 
@@ -1003,6 +1151,7 @@ def write_growth_summary(result: GrowthStepResult, path: Path) -> None:
 
 __all__ = [
     "GrowthConfig",
+    "GrowthLog",
     "ParentStructure",
     "GrowthChannelResult",
     "GrowthStepResult",
