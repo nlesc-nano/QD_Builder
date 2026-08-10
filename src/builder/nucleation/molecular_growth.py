@@ -1248,9 +1248,10 @@ def build_coord_seed(
         # isomer energy for the same [CdSe]_k(CdCl2)_p label).
         return None
 
+    # Deterministic id (no running serial) so restarts skip the same jobs
     sid = (
         f"coord_k{k_child:03d}_p{p_child:03d}_"
-        f"from_{parent.structure_id}_s{s}_pm{p_m}_{serial:04d}"
+        f"from_{parent.structure_id}_s{s}_pm{p_m}"
     )
 
     q = _formal_charge(symbols, spec)
@@ -1622,22 +1623,29 @@ class GrowthLog:
     Always prints lines starting with ``[growth]`` or ``[growth-job]``.
     With ``verbose=True``, also prints the rest (motif details, etc.).
 
-    Distinguishes:
-      * **cores** — unique child Cd–Se skeletons (known up front)
-      * **gxtb** — real g-xTB opt calculations (known only as graphs appear)
-      * **merge** — duplicate graphs that skip g-xTB (free)
-
-    Timing on job lines:
-      * ``opt=``   wall time of the g-xTB binary (or 0 for merges)
-      * ``recon=`` motif_factor 3D rebuild for that unique graph (0 if merge)
-      * ``+Δ=``    wall clock since the previous job/bin event — this is what
-                   you actually wait, including Cl decoration between graphs
+    Optional ``log_path``: append-only file so Slurm resubmits continue the
+    same log (also print to stdout unless ``quiet``).
     """
 
-    def __init__(self, *, verbose: bool = False, quiet: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        verbose: bool = False,
+        quiet: bool = False,
+        log_path: Optional[Path] = None,
+    ) -> None:
         self.verbose = bool(verbose)
         self.quiet = bool(quiet)
         self._job_i = 0
+        self._log_path = Path(log_path) if log_path is not None else None
+        self._log_fh = None
+        if self._log_path is not None:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_fh = self._log_path.open("a", encoding="utf-8")
+            self._emit(
+                f"\n######## growth log resume/append  "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ########\n"
+            )
         # global tallies (all bins in this growth step)
         self.n_gxtb = 0
         self.n_merge = 0
@@ -1661,6 +1669,21 @@ class GrowthLog:
         self._bin_opt_s: float = 0.0
         self._bin_recon_s: float = 0.0
 
+    def _emit(self, text: str) -> None:
+        """Write to stdout (unless quiet) and append-only log file."""
+
+        line = text if text.endswith("\n") else text + "\n"
+        if not self.quiet:
+            print(line, end="", flush=True)
+        if self._log_fh is not None:
+            self._log_fh.write(line)
+            self._log_fh.flush()
+
+    def close(self) -> None:
+        if self._log_fh is not None:
+            self._log_fh.close()
+            self._log_fh = None
+
     def _tick(self) -> float:
         """Seconds since last mark; advances the mark."""
 
@@ -1670,54 +1693,48 @@ class GrowthLog:
         return dt
 
     def stage(self, n: int, total: int, title: str, **fields: Any) -> None:
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
         self._tick()
-        print(f"\n=== STAGE {n}/{total}: {title} ===", flush=True)
+        self._emit(f"\n=== STAGE {n}/{total}: {title} ===\n")
         for key, value in fields.items():
-            print(f"  {key}: {value}", flush=True)
+            self._emit(f"  {key}: {value}\n")
 
     def line(self, msg: str) -> None:
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
-        print(f"[growth] {msg}", flush=True)
+        self._emit(f"[growth] {msg}\n")
+
 
     def pipeline_blurb(self, growth: "GrowthConfig") -> None:
         """One-time note: both growth moves and timing keys."""
 
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
-        print("[growth] two growth moves (both when start_from=relaxed_coords):", flush=True)
-        print(
-            "[growth]   A graph: combinatorial precursor-Cd shed on core graph → "
-            f"p_m={list(growth.monomer_p_values)} inflate → Cl redecorate → "
-            "motif_factor rebuild → full g-xTB",
-            flush=True,
+        self.line("two growth moves (both when start_from=relaxed_coords):")
+        self.line(
+            "  A graph: combinatorial precursor-Cd shed on core graph -> "
+            f"p_m={list(growth.monomer_p_values)} inflate -> Cl redecorate -> "
+            "motif_factor rebuild -> full g-xTB"
         )
         if growth.use_coord_carry:
-            print(
-                "[growth]   B coord: parent XYZ → WBO package shed (s least-bound "
-                f"CdCl2) → place CdSe+p_m CdCl2 (embed distances) → "
+            self.line(
+                "  B coord: parent XYZ -> WBO package shed (s least-bound "
+                f"CdCl2) -> place CdSe+p_m CdCl2 (embed distances) -> "
                 f"cleanup {'ON' if growth.local_cleanup_enabled else 'OFF'}"
-                f"({growth.local_cleanup_method}, ≤{growth.local_cleanup_cycles} steps"
+                f"({growth.local_cleanup_method}, <={growth.local_cleanup_cycles} steps"
                 f"{', neutral-only' if growth.require_charge_neutral_for_cleanup else ''}"
-                f") → full g-xTB",
-                flush=True,
+                f") -> full g-xTB"
             )
         else:
-            print(
-                "[growth]   B coord: OFF (geometry.start_from != relaxed_coords)",
-                flush=True,
-            )
-        print(
-            f"[growth]   shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
-            f"prefer_low_shed={growth.prefer_low_shed}",
-            flush=True,
+            self.line("  B coord: OFF (geometry.start_from != relaxed_coords)")
+        self.line(
+            f"  shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
+            f"prefer_low_shed={growth.prefer_low_shed}"
         )
-        print(
-            "[growth]   timing keys: opt= full g-xTB; recon= motif_factor (A only); "
-            "cleanup= short prelax (B); +dt= wall since previous line",
-            flush=True,
+        self.line(
+            "  timing keys: opt= full g-xTB; recon= motif_factor (A only); "
+            "cleanup= short prelax (B); +dt= wall since previous line"
         )
 
     def set_work_plan(
@@ -1731,19 +1748,17 @@ class GrowthLog:
 
         self._cores_total = int(cores_total)
         self._xtb_starts = max(1, int(xtb_starts_per_graph))
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
-        print(
-            f"[growth] work plan: {self._cores_total} unique child cores "
-            f"across {len(bin_plan)} bins",
-            flush=True,
+        self.line(
+            f"work plan: {self._cores_total} unique child cores "
+            f"across {len(bin_plan)} bins"
         )
-        print(f"[growth]   by bin: {dict(bin_plan)}", flush=True)
-        print(
-            "[growth]   note: #g-xTB calcs ≠ #cores — each core yields 0+ Cl "
+        self.line(f"  by bin: {dict(bin_plan)}")
+        self.line(
+            "  note: #g-xTB calcs != #cores - each core yields 0+ Cl "
             "decorations; each *unique* graph runs "
-            f"≤{self._xtb_starts} g-xTB opt(s); merges skip g-xTB",
-            flush=True,
+            f"<={self._xtb_starts} g-xTB opt(s); merges skip g-xTB"
         )
 
     def log_channel_summary(
@@ -1753,7 +1768,7 @@ class GrowthLog:
     ) -> None:
         """Compact shed / package accounting after core growth."""
 
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
         by_s: Counter = Counter()
         by_pm: Counter = Counter()
@@ -1768,10 +1783,9 @@ class GrowthLog:
             by_s_cores[ch.shed] += ch.n_cores
             by_pm_cores[ch.p_m] += ch.n_cores
             by_move[getattr(ch, "move", "graph")] += 1
-        print(
-            f"[growth] channels: {n_ch}  "
-            f"(graph={by_move.get('graph', 0)}  coord={by_move.get('coord', 0)})",
-            flush=True,
+        self.line(
+            f"channels: {n_ch}  "
+            f"(graph={by_move.get('graph', 0)}  coord={by_move.get('coord', 0)})"
         )
         s_bits = [
             f"s={s}: ch={by_s[s]} cores+={by_s_cores[s]}"
@@ -1781,15 +1795,14 @@ class GrowthLog:
             f"p_m={pm}: ch={by_pm[pm]} cores+={by_pm_cores[pm]}"
             for pm in sorted(by_pm)
         ]
-        print(f"[growth]   by shed s:  {',  '.join(s_bits) or '(none)'}", flush=True)
-        print(f"[growth]   by p_m:     {',  '.join(pm_bits) or '(none)'}", flush=True)
+        self.line(f"  by shed s:  {',  '.join(s_bits) or '(none)'}")
+        self.line(f"  by p_m:     {',  '.join(pm_bits) or '(none)'}")
         n_pkg = sum(int(r.get("n_packages") or 0) for r in parent_records)
         n_wbo = sum(1 for r in parent_records if r.get("has_wbo"))
-        print(
-            f"[growth]   parent packages: {n_pkg} total; "
+        self.line(
+            f"  parent packages: {n_pkg} total; "
             f"{n_wbo}/{len(parent_records)} parents have WBO "
-            f"(coord shed uses WBO/distance rank; graph shed is combinatorial)",
-            flush=True,
+            f"(coord shed uses WBO/distance rank; graph shed is combinatorial)"
         )
 
     def begin_bin(
@@ -1815,29 +1828,23 @@ class GrowthLog:
         self._cores_total = int(cores_total)
         self._t_bin0 = time.perf_counter()
         self._tick()
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
         after = cores_done + cores
-        print(
-            f"[growth] --- bin k={k} p={p} ---",
-            flush=True,
+        self.line(f"--- bin k={k} p={p} ---")
+        self.line(
+            f"  cores in this bin: {cores}   "
+            f"(overall cores {cores_done} done -> {after}/{cores_total} after bin)"
         )
-        print(
-            f"[growth]   cores in this bin: {cores}   "
-            f"(overall cores {cores_done} done → {after}/{cores_total} after bin)",
-            flush=True,
-        )
-        print(
-            f"[growth]   path: core graph -> Cl decorate -> motif_factor -> g-xTB "
-            f"(≤{self._xtb_starts} opt/unique graph); merges free",
-            flush=True,
+        self.line(
+            f"  path: core graph -> Cl decorate -> motif_factor -> g-xTB "
+            f"(<={self._xtb_starts} opt/unique graph); merges free"
         )
         if self.n_gxtb or self.n_merge:
-            print(
-                f"[growth]   so far (all bins): gxtb={self.n_gxtb}  "
+            self.line(
+                f"  so far (all bins): gxtb={self.n_gxtb}  "
                 f"merge={self.n_merge}  fail={self.n_fail}  "
-                f"optΣ={self._sum_opt_s:.0f}s reconΣ={self._sum_recon_s:.0f}s",
-                flush=True,
+                f"optSum={self._sum_opt_s:.0f}s reconSum={self._sum_recon_s:.0f}s"
             )
 
     def end_bin(
@@ -1853,31 +1860,28 @@ class GrowthLog:
     ) -> None:
         """Close a bin with final job accounting."""
 
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
         wall = time.perf_counter() - self._t_bin0
         extra = ""
         if raw_graphs is not None:
             extra = f"  raw_graphs={raw_graphs}"
-        print(
-            f"[growth] bin k={k} p={p} done: isomers={n_iso}  "
+        self.line(
+            f"bin k={k} p={p} done: isomers={n_iso}  "
             f"with_E={n_ok}  no_E={n_fail}  graph_merges={n_merged}"
-            f"{extra}",
-            flush=True,
+            f"{extra}"
         )
-        print(
-            f"[growth]   this bin: gxtb={self._bin_gxtb}  "
+        self.line(
+            f"  this bin: gxtb={self._bin_gxtb}  "
             f"merge={self._bin_merge}  fail={self._bin_fail}  "
-            f"wall={wall:.1f}s  optΣ={self._bin_opt_s:.1f}s  "
-            f"reconΣ={self._bin_recon_s:.1f}s  "
+            f"wall={wall:.1f}s  optSum={self._bin_opt_s:.1f}s  "
+            f"reconSum={self._bin_recon_s:.1f}s  "
             f"(other~{max(0.0, wall - self._bin_opt_s - self._bin_recon_s):.1f}s "
-            f"decorate/merge/overhead)",
-            flush=True,
+            f"decorate/merge/overhead)"
         )
-        print(
-            f"[growth]   global: gxtb={self.n_gxtb}  merge={self.n_merge}  "
-            f"fail={self.n_fail}",
-            flush=True,
+        self.line(
+            f"  global: gxtb={self.n_gxtb}  merge={self.n_merge}  "
+            f"fail={self.n_fail}"
         )
         self._tick()
 
@@ -1902,7 +1906,7 @@ class GrowthLog:
     def __call__(self, msg: str) -> None:
         """ProgressCallback-compatible."""
 
-        if self.quiet:
+        if self.quiet and self._log_fh is None:
             return
         text = str(msg)
         if text.startswith("[growth-job]"):
@@ -1927,7 +1931,6 @@ class GrowthLog:
             shed = kv.get("s", kv.get("shed", "-"))
             p_m = kv.get("p_m", kv.get("pm", "-"))
             parent = kv.get("parent", kv.get("parent_id", ""))
-            # explicit parent k,p if provided
             k_par = kv.get("k_parent", kv.get("k_par", ""))
             p_par = kv.get("p_parent", kv.get("p_par", ""))
             try:
@@ -1943,12 +1946,39 @@ class GrowthLog:
                 self.n_merge += 1
                 self._bin_merge += 1
                 target = into or "?"
-                # Dup graph certificate: no new g-xTB.  Keep one short line.
-                print(
+                self._emit(
                     f"  {self.n_merge:4d}  dup  k={k} p={p}  "
                     f"{self._formula_kp(k, p)}  "
-                    f"already={target}  +dt={dt:5.1f}s",
-                    flush=True,
+                    f"already={target}  +dt={dt:5.1f}s\n"
+                )
+                return
+
+            # resume skip: still count as completed work, not a new opt
+            if err == "resume_skip":
+                self.n_gxtb += 1
+                self._bin_gxtb += 1
+                child_f = self._formula_kp(k, p)
+                if k_par == "" or p_par == "":
+                    pk, pp = self._parent_kp_from_id(parent)
+                else:
+                    try:
+                        pk, pp = int(k_par), int(p_par)
+                    except ValueError:
+                        pk, pp = self._parent_kp_from_id(parent)
+                if pk is not None and pp is not None:
+                    stoich = (
+                        f"{self._formula_kp(pk, pp)}  -s={shed} +p_m={p_m} "
+                        f"-> {child_f}"
+                    )
+                else:
+                    stoich = f"-s={shed} +p_m={p_m} -> {child_f}"
+                parent_bit = f"  parent={parent}" if parent else ""
+                self._emit(
+                    f"  {self.n_gxtb:4d}  {stoich}  "
+                    f"E={e:>14s}  "
+                    f"opt=  0.0s clean={recon_s:4.1f}s "
+                    f"+dt={dt:5.1f}s  resume_skip"
+                    f"{parent_bit}\n"
                 )
                 return
 
@@ -1966,9 +1996,6 @@ class GrowthLog:
             child_f = self._formula_kp(k, p)
 
             if move in ("B", "coord", "b"):
-                # Arithmetic base is the *parent* composition:
-                #   p_child = p_parent - s + p_m
-                # Show parent formula first so "p=2 -s=2 +p_m=1" is never misread.
                 if k_par == "" or p_par == "":
                     pk, pp = self._parent_kp_from_id(parent)
                 else:
@@ -1984,29 +2011,27 @@ class GrowthLog:
                 else:
                     stoich = f"-s={shed} +p_m={p_m} -> {child_f}"
                 parent_bit = f"  parent={parent}" if parent else ""
-                print(
+                self._emit(
                     f"  {self.n_gxtb:4d}  {stoich}  "
                     f"E={e:>14s}  "
                     f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
                     f"+dt={dt:5.1f}s  {rel}{extra}"
-                    f"{parent_bit}",
-                    flush=True,
+                    f"{parent_bit}\n"
                 )
             else:
-                # move A redecorate
-                print(
+                self._emit(
                     f"  {self.n_gxtb:4d}  k={k} p={p}  {child_f}  redecorate  "
                     f"E={e:>14s}  "
                     f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
-                    f"+dt={dt:5.1f}s  {rel}{extra}",
-                    flush=True,
+                    f"+dt={dt:5.1f}s  {rel}{extra}\n"
                 )
             return
         if text.startswith("[growth]"):
-            print(text, flush=True)
+            self._emit(text if text.endswith("\n") else text + "\n")
             return
         if self.verbose:
-            print(text, flush=True)
+            self._emit(text if text.endswith("\n") else text + "\n")
+
 
 
 def run_growth_step(
@@ -2021,15 +2046,44 @@ def run_growth_step(
     embed: bool = True,
     output_dir: Optional[Path] = None,
     progress: Optional[Any] = None,
+    resume: bool = True,
 ) -> GrowthStepResult:
     """Select parents at ``k_from``, grow cores to k+1, optionally decorate.
 
     When ``decorate`` is true, each child (k, p) bin is built with
     ``enumerate_molecular_bin(..., precomputed_skeletons=...)`` and written
     under ``output_dir`` if given.
+
+    Restart (``resume=True``, default):
+      * skip finished k-step if ``.step_kXXX_complete`` exists
+      * skip move-B opts already in ``index.csv`` / ``*_xtb.xyz``
+      * skip move-A bins with ``.bin_A_complete`` marker (reload ranks from index)
     """
 
     log = progress if isinstance(progress, GrowthLog) else None
+    out_path = Path(output_dir) if output_dir else None
+
+    # Entire step already finished
+    if (
+        resume
+        and out_path is not None
+        and step_complete_marker(out_path, k_from).is_file()
+    ):
+        if log:
+            log.line(
+                f"RESUME: step k={k_from}->{k_from + 1} already complete "
+                f"({step_complete_marker(out_path, k_from).name}); skipping work"
+            )
+        # Minimal result so multi-step CLI can continue
+        return GrowthStepResult(
+            k_from=k_from,
+            k_to=k_from + 1,
+            parents_selected=0,
+            channels=[],
+            skeleton_catalog={},
+            parent_records=[],
+            coord_seeds={},
+        )
 
     def _p(msg: str) -> None:
         if progress is None:
@@ -2218,6 +2272,49 @@ def run_growth_step(
                 progress(
                     f"[growth] decorate k={k} p={p} cores={len(cores)}"
                 )
+
+            # ---- resume: skip finished move-A bins ----
+            if (
+                resume
+                and out is not None
+                and bin_A_complete_marker(out, k, p).is_file()
+            ):
+                if log:
+                    log.line(
+                        f"  RESUME: skip move A for k={k} p={p} "
+                        f"({bin_A_complete_marker(out, k, p).name})"
+                    )
+                # reload A rows from index; B rows already in bin_ranks
+                existing_a = _load_ranked_from_disk(
+                    out, k, p, move_filter="A"
+                )
+                # if move column missing, load all non-B
+                if not existing_a:
+                    all_rows = _load_ranked_from_disk(out, k, p)
+                    existing_a = [
+                        r for r in all_rows if r.growth_move != "B"
+                    ]
+                bin_ranks[(k, p)].extend(existing_a)
+                for r in existing_a:
+                    prev = child_minima.get((k, p))
+                    if prev is None or r.xtb_energy_eV < float(
+                        prev["energy_eV"]
+                    ):
+                        child_minima[(k, p)] = {
+                            "energy_eV": r.xtb_energy_eV,
+                            "structure_id": r.structure_id,
+                        }
+                done_cores += len(cores)
+                if log:
+                    n_b = sum(
+                        1 for r in bin_ranks[(k, p)] if r.growth_move == "B"
+                    )
+                    log.line(
+                        f"  resumed rank pool k={k} p={p}: "
+                        f"A={len(existing_a)} B={n_b}"
+                    )
+                continue
+
             bin_res = enumerate_molecular_bin(
                 k,
                 p,
@@ -2276,6 +2373,14 @@ def run_growth_step(
                 )
             if out is not None:
                 _write_growth_bin(out, bin_res, growth)
+                # mark bin A finished for restart
+                marker = bin_A_complete_marker(out, k, p)
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    f"k={k} p={p} isomers={len(bin_res.isomers)} "
+                    f"with_E={len(with_e)}\n",
+                    encoding="utf-8",
+                )
 
         # ---- Final merged rankings for every child (k,p) ----
         if log and bin_ranks:
@@ -2308,6 +2413,17 @@ def run_growth_step(
                     "energy_eV": float(best.xtb_energy_eV),
                     "structure_id": best.structure_id,
                 }
+
+        # mark whole k->k+1 step complete for multi-step / resubmit
+        if out is not None and decorate:
+            step_complete_marker(out, k_from).write_text(
+                f"k_from={k_from} k_to={k_from + 1} complete\n",
+                encoding="utf-8",
+            )
+            if log:
+                log.line(
+                    f"checkpoint: wrote {step_complete_marker(out, k_from).name}"
+                )
 
     # Package growth profile: k=1…k_child along p = k·p_m for each package
     if log:
@@ -2348,6 +2464,136 @@ def run_growth_step(
             child_cores=n_cores,
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Restart / checkpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def step_complete_marker(output_dir: Path, k_from: int) -> Path:
+    return Path(output_dir) / f".step_k{int(k_from):03d}_complete"
+
+
+def bin_A_complete_marker(output_dir: Path, k: int, p: int) -> Path:
+    return Path(output_dir) / f"k{int(k):03d}" / f"p{int(p):03d}" / ".bin_A_complete"
+
+
+def _parse_energy_from_xyz_comment(path: Path) -> Optional[float]:
+    """Read energy_eV=... from the second line of an XYZ if present."""
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    m = re.search(r"energy_eV\s*=\s*([-+0-9.eE]+)", lines[1])
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _index_rows_by_id(output_dir: Path) -> Dict[str, Dict[str, str]]:
+    """Map structure_id -> last index.csv row."""
+
+    path = Path(output_dir) / "index.csv"
+    out: Dict[str, Dict[str, str]] = {}
+    if not path.is_file():
+        return out
+    with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+        for row in csv.DictReader(handle):
+            sid = (row.get("structure_id") or "").strip()
+            if sid:
+                out[sid] = row
+    return out
+
+
+def _index_has_energy(output_dir: Path, structure_id: str) -> Optional[float]:
+    rows = _index_rows_by_id(output_dir)
+    row = rows.get(structure_id)
+    if not row:
+        return None
+    try:
+        e = float(row.get("xtb_energy_eV") or "")
+    except ValueError:
+        return None
+    return e if math.isfinite(e) else None
+
+
+def _append_index_row_unique(
+    output_dir: Path,
+    row: Dict[str, Any],
+    fieldnames: Sequence[str],
+) -> bool:
+    """Append one index row if structure_id not already present. Return True if written."""
+
+    sid = str(row.get("structure_id") or "")
+    if not sid:
+        return False
+    if _index_has_energy(output_dir, sid) is not None:
+        return False
+    index_path = Path(output_dir) / "index.csv"
+    write_header = not index_path.is_file()
+    with index_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=list(fieldnames), extrasaction="ignore"
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return True
+
+
+def _load_ranked_from_disk(
+    output_dir: Path,
+    k: int,
+    p: int,
+    *,
+    move_filter: Optional[str] = None,
+) -> List[RankedIsomer]:
+    """Rebuild ranking rows for (k,p) from index.csv (+ xyz energy fallback)."""
+
+    rows: List[RankedIsomer] = []
+    index_path = Path(output_dir) / "index.csv"
+    if not index_path.is_file():
+        return rows
+    with index_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                rk, rp = int(row["k"]), int(row["p"])
+            except (KeyError, ValueError):
+                continue
+            if rk != k or rp != p:
+                continue
+            move = (row.get("move") or "?").strip()
+            if move_filter is not None and move != move_filter:
+                # move column: "coord" for B, often empty/1 for A
+                if move_filter == "B" and move not in ("coord", "B", "b"):
+                    continue
+                if move_filter == "A" and move in ("coord", "B", "b"):
+                    continue
+            sid = (row.get("structure_id") or "").strip()
+            try:
+                e = float(row.get("xtb_energy_eV") or "")
+            except ValueError:
+                continue
+            if not sid or not math.isfinite(e):
+                continue
+            gmove = "B" if move in ("coord", "B", "b") else "A"
+            rows.append(
+                RankedIsomer(
+                    structure_id=sid,
+                    xtb_energy_eV=e,
+                    seed_skeleton="------",
+                    growth_move=gmove,
+                    parent_id=str(row.get("parent_id") or ""),
+                )
+            )
+    return rows
 
 
 def _core_skeleton_fp(
@@ -2462,7 +2708,66 @@ def _opt_coord_seeds(
     elif progress:
         progress(f"[growth] move B: opt {len(flat)} coord seeds")
 
+    n_skip = 0
+    n_run = 0
     for seed in flat:
+        pk, pp = GrowthLog._parent_kp_from_id(seed.parent_id)
+        k_par = "" if pk is None else str(pk)
+        p_par = "" if pp is None else str(pp)
+        recon_s = float(seed.cleanup_s)
+        bdir = (
+            None
+            if output_dir is None
+            else Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+        )
+        xyz_path = (
+            None
+            if bdir is None
+            else bdir / f"{seed.structure_id}_xtb.xyz"
+        )
+
+        # ---- restart: skip if energy already on disk ----
+        e_existing: Optional[float] = None
+        if output_dir is not None:
+            e_existing = _index_has_energy(output_dir, seed.structure_id)
+            if e_existing is None and xyz_path is not None and xyz_path.is_file():
+                e_existing = _parse_energy_from_xyz_comment(xyz_path)
+        if e_existing is not None:
+            n_skip += 1
+            e = float(e_existing)
+            if progress is not None:
+                progress(
+                    f"[growth-job] k={seed.k} p={seed.p} move=B "
+                    f"s={seed.shed} p_m={seed.p_m} "
+                    f"k_parent={k_par} p_parent={p_par} "
+                    f"parent={seed.parent_id} "
+                    f"id={seed.structure_id} "
+                    f"t_s=0.0 recon_s={recon_s:.1f} "
+                    f"E_eV={e:.6f} relax=ok err=resume_skip"
+                )
+            prev = child_minima.get((seed.k, seed.p))
+            if prev is None or e < float(prev["energy_eV"]):
+                child_minima[(seed.k, seed.p)] = {
+                    "energy_eV": e,
+                    "structure_id": seed.structure_id,
+                }
+            skel = _core_skeleton_fp(
+                seed.core_edges,
+                symbols=seed.symbols,
+                cation=cation,
+                anion=anion,
+            )
+            bin_ranks.setdefault((seed.k, seed.p), []).append(
+                RankedIsomer(
+                    structure_id=seed.structure_id,
+                    xtb_energy_eV=e,
+                    seed_skeleton=str(skel or "------")[:6],
+                    growth_move="B",
+                    parent_id=seed.parent_id,
+                )
+            )
+            continue
+
         t0 = time.perf_counter()
         batch = [
             {
@@ -2475,11 +2780,7 @@ def _opt_coord_seeds(
         results = relax_structures(batch, settings, cutoffs)
         xr = results[0]
         opt_s = time.perf_counter() - t0
-        recon_s = float(seed.cleanup_s)  # report cleanup time under recon slot
-        # parent k,p from id (k002_p003_...) for the stoich line
-        pk, pp = GrowthLog._parent_kp_from_id(seed.parent_id)
-        k_par = "" if pk is None else str(pk)
-        p_par = "" if pp is None else str(pp)
+        n_run += 1
         if progress is not None:
             base = (
                 f"[growth-job] k={seed.k} p={seed.p} move=B "
@@ -2562,9 +2863,6 @@ def _opt_coord_seeds(
         for sym, pos in zip(seed.symbols, coords):
             lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
         xyz.write_text("\n".join(lines) + "\n")
-        # append index.csv
-        index_path = Path(output_dir) / "index.csv"
-        write_header = not index_path.is_file()
         refs = growth.references
         fields = [
             "k",
@@ -2581,30 +2879,32 @@ def _opt_coord_seeds(
         ]
         for dmu in growth.delta_mu_cdcl2_eV:
             fields.append(f"Omega_dmu_{dmu:+.2f}")
-        with index_path.open("a", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            row = {
-                "k": seed.k,
-                "p": seed.p,
-                "structure_id": seed.structure_id,
-                "xtb_energy_eV": f"{e:.8f}",
-                "xtb_converged": bool(xr.converged),
-                "dE_f_eV": "",
-                "growth": "1",
-                "move": "coord",
-                "shed": seed.shed,
-                "p_m": seed.p_m,
-                "parent_id": seed.parent_id,
-            }
-            if refs is not None:
-                de_f = refs.formation_eV(e, seed.k, seed.p)
-                row["dE_f_eV"] = f"{de_f:.8f}"
-                for dmu in growth.delta_mu_cdcl2_eV:
-                    key = f"Omega_dmu_{dmu:+.2f}"
-                    row[key] = f"{refs.grand_potential_eV(e, seed.k, seed.p, dmu):.8f}"
-            writer.writerow(row)
+        row = {
+            "k": seed.k,
+            "p": seed.p,
+            "structure_id": seed.structure_id,
+            "xtb_energy_eV": f"{e:.8f}",
+            "xtb_converged": bool(xr.converged),
+            "dE_f_eV": "",
+            "growth": "1",
+            "move": "coord",
+            "shed": seed.shed,
+            "p_m": seed.p_m,
+            "parent_id": seed.parent_id,
+        }
+        if refs is not None:
+            de_f = refs.formation_eV(e, seed.k, seed.p)
+            row["dE_f_eV"] = f"{de_f:.8f}"
+            for dmu in growth.delta_mu_cdcl2_eV:
+                key = f"Omega_dmu_{dmu:+.2f}"
+                row[key] = f"{refs.grand_potential_eV(e, seed.k, seed.p, dmu):.8f}"
+        _append_index_row_unique(Path(output_dir), row, fields)
+
+    if log:
+        log.line(
+            f"move B opts: ran={n_run}  resumed/skipped={n_skip}  "
+            f"total_seeds={len(flat)}"
+        )
 
 
 def _write_growth_bin(
@@ -2612,13 +2912,14 @@ def _write_growth_bin(
     bin_res: Any,
     growth: GrowthConfig,
 ) -> None:
-    """Write a lightweight index + formation columns for one bin."""
+    """Write a lightweight index + formation columns for one bin.
+
+    Index rows are skipped if ``structure_id`` is already present (restart-safe).
+    """
 
     k, p = bin_res.k, bin_res.p
     bdir = out_dir / f"k{k:03d}" / f"p{p:03d}"
     bdir.mkdir(parents=True, exist_ok=True)
-    index_path = out_dir / "index.csv"
-    write_header = not index_path.is_file()
     refs = growth.references
     fields = [
         "k",
@@ -2628,37 +2929,41 @@ def _write_growth_bin(
         "xtb_converged",
         "dE_f_eV",
         "growth",
+        "move",
     ]
     for dmu in growth.delta_mu_cdcl2_eV:
         fields.append(f"Omega_dmu_{dmu:+.2f}")
 
-    with index_path.open("a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        if write_header:
-            writer.writeheader()
-        for iso in bin_res.isomers:
-            e = iso.xtb_energy_eV
-            row = {
-                "k": k,
-                "p": p,
-                "structure_id": iso.structure_id,
-                "xtb_energy_eV": "" if e is None else f"{e:.8f}",
-                "xtb_converged": iso.xtb_converged,
-                "dE_f_eV": "",
-                "growth": "1",
-            }
-            if e is not None and refs is not None:
-                de_f = refs.formation_eV(e, k, p)
-                row["dE_f_eV"] = f"{de_f:.8f}"
-                for dmu in growth.delta_mu_cdcl2_eV:
-                    key = f"Omega_dmu_{dmu:+.2f}"
-                    row[key] = f"{refs.grand_potential_eV(e, k, p, dmu):.8f}"
-            writer.writerow(row)
-            if iso.xtb_coordinates is not None or iso.coordinates is not None:
-                coords = iso.xtb_coordinates or iso.coordinates
-                xyz = bdir / f"{iso.structure_id}_xtb.xyz"
+    for iso in bin_res.isomers:
+        e = iso.xtb_energy_eV
+        row = {
+            "k": k,
+            "p": p,
+            "structure_id": iso.structure_id,
+            "xtb_energy_eV": "" if e is None else f"{e:.8f}",
+            "xtb_converged": iso.xtb_converged,
+            "dE_f_eV": "",
+            "growth": "1",
+            "move": "A",
+        }
+        if e is not None and refs is not None:
+            de_f = refs.formation_eV(e, k, p)
+            row["dE_f_eV"] = f"{de_f:.8f}"
+            for dmu in growth.delta_mu_cdcl2_eV:
+                key = f"Omega_dmu_{dmu:+.2f}"
+                row[key] = f"{refs.grand_potential_eV(e, k, p, dmu):.8f}"
+        if e is not None:
+            _append_index_row_unique(out_dir, row, fields)
+        if iso.xtb_coordinates is not None or iso.coordinates is not None:
+            coords = iso.xtb_coordinates or iso.coordinates
+            xyz = bdir / f"{iso.structure_id}_xtb.xyz"
+            # do not overwrite a finished xyz on restart unless missing
+            if not xyz.is_file():
                 symbols = [a.symbol for a in iso.atoms]
-                lines = [str(len(symbols)), f"{iso.structure_id} energy_eV={e}"]
+                lines = [
+                    str(len(symbols)),
+                    f"{iso.structure_id} energy_eV={e}",
+                ]
                 for sym, pos in zip(symbols, coords):
                     lines.append(
                         f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
