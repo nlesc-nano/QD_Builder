@@ -144,6 +144,17 @@ def _min_cd_cn_policy(k: int, p: int, spec: NucleationSpec) -> int:
     return max(base, 2) if spec.enforce_min_cn else base
 
 
+# Optional Cython beam-key kernel (falls back to pure Python).
+try:
+    from . import _beam_key as _beam_key  # type: ignore
+
+    _BEAM_KEY_BACKEND = "cython" if getattr(_beam_key, "is_cython", lambda: False)() else "ext"
+except Exception:  # noqa: BLE001
+    from . import _beam_key_fallback as _beam_key  # type: ignore
+
+    _BEAM_KEY_BACKEND = "python"
+
+
 @dataclass
 class _PlaceState:
     """Partial decoration state for beam search."""
@@ -171,13 +182,14 @@ class _PlaceState:
         )
 
     def key(self) -> Tuple:
-        return (
-            tuple(self.cn),
-            tuple(self.n_bridge),
-            tuple(self.n_term),
-            tuple(sorted(self.bridges)),
-            tuple(sorted(self.mu3)),
-            tuple(sorted(self.terminals_on)),
+        return _beam_key.identity_state_key(
+            self.cn,
+            self.n_bridge,
+            self.n_term,
+            self.bridges,
+            self.mu3,
+            self.terminals_on,
+            self.remaining_cl,
         )
 
 
@@ -297,19 +309,21 @@ def sequential_passivate(
     if not slot_maps:
         slot_maps = [tuple(range(n_cd))]
 
-    # Inverses as tuples (list indexing, not dict hashing) and the composed
-    # host relabelling cd_list[mapping[position[host]]] precomputed per
-    # automorphism, so the hot loop does one dict lookup instead of three.
+    # Inverses as tuples (list indexing, not dict hashing) and dense host
+    # relabel arrays (index = host_id, value = relabeled host) so the Cython
+    # hot loop does one integer index instead of a dict hash.
     slot_inverses: List[Tuple[int, ...]] = []
-    host_relabels: List[Dict[int, int]] = []
+    max_host_id = max(cd_list) if cd_list else 0
+    host_relabels: List[Tuple[int, ...]] = []
     for mapping in slot_maps:
         inverse = [0] * n_cd
         for original, mapped in enumerate(mapping):
             inverse[mapped] = original
         slot_inverses.append(tuple(inverse))
-        host_relabels.append(
-            {host: cd_list[mapping[position[host]]] for host in cd_list}
-        )
+        dense = [-1] * (max_host_id + 1)
+        for host in cd_list:
+            dense[host] = cd_list[mapping[position[host]]]
+        host_relabels.append(tuple(dense))
 
     # An asymmetric skeleton has only the identity automorphism, so there is
     # nothing to canonicalize -- the single candidate *is* the key.  This is
@@ -336,20 +350,15 @@ def sequential_passivate(
         identity_only = True
 
     def _identity_key(st: _PlaceState) -> Tuple:
-        """Key for an asymmetric skeleton: no relabelling to apply.
+        """Key for an asymmetric skeleton: no relabelling to apply."""
 
-        ``st.bridges`` entries are already ``(min, max)`` (they come from
-        ``pair_list``) and ``st.mu3`` triples are stored pre-sorted by
-        ``apply_mu3``, so only the outer ordering is needed here.
-        """
-
-        return (
-            tuple(st.cn),
-            tuple(st.n_bridge),
-            tuple(st.n_term),
-            tuple(sorted(st.bridges)),
-            tuple(sorted(st.mu3)),
-            tuple(sorted(st.terminals_on)),
+        return _beam_key.identity_state_key(
+            st.cn,
+            st.n_bridge,
+            st.n_term,
+            st.bridges,
+            st.mu3,
+            st.terminals_on,
             st.remaining_cl,
         )
 
@@ -358,53 +367,26 @@ def sequential_passivate(
 
         if identity_only:
             return _identity_key(st)
-        best: Optional[Tuple] = None
-        for mapping, inverse, relabel in zip(
-            slot_maps, slot_inverses, host_relabels
-        ):
-            bridge_list = []
-            for a, b in st.bridges:
-                ra = relabel[a]
-                rb = relabel[b]
-                bridge_list.append((ra, rb) if ra <= rb else (rb, ra))
-            bridge_list.sort()
-            bridges = tuple(bridge_list)
-            mu3_list = []
-            for x, y, z in st.mu3:
-                rx = relabel[x]
-                ry = relabel[y]
-                rz = relabel[z]
-                # three-element sorting network: cheaper than sorted() here
-                if rx > ry:
-                    rx, ry = ry, rx
-                if ry > rz:
-                    ry, rz = rz, ry
-                if rx > ry:
-                    rx, ry = ry, rx
-                mu3_list.append((rx, ry, rz))
-            mu3_list.sort()
-            mu3 = tuple(mu3_list)
-            terminals = tuple(sorted(mapping[slot] for slot in st.terminals_on))
-            candidate = (
-                tuple(map(st.cn.__getitem__, inverse)),
-                tuple(map(st.n_bridge.__getitem__, inverse)),
-                tuple(map(st.n_term.__getitem__, inverse)),
-                bridges,
-                mu3,
-                terminals,
-                st.remaining_cl,
-            )
-            if best is None or candidate < best:
-                best = candidate
-        return best
+        return _beam_key.canonical_state_key(
+            st.cn,
+            st.n_bridge,
+            st.n_term,
+            st.bridges,
+            st.mu3,
+            st.terminals_on,
+            st.remaining_cl,
+            slot_maps,
+            slot_inverses,
+            host_relabels,
+        )
 
     def free_cap(st: _PlaceState, i: int) -> int:
         return max_cd - st.cn[i]
 
     def pair_bridge_count(st: _PlaceState, pr: Tuple[int, int]) -> int:
         pr = (min(pr[0], pr[1]), max(pr[0], pr[1]))
-        return sum(1 for b in st.bridges if b == pr) + sum(
-            1 for tri in st.mu3 if pr[0] in tri and pr[1] in tri
+        return int(
+            _beam_key.pair_bridge_count(st.bridges, st.mu3, pr[0], pr[1])
         )
 
     def apply_mu3(st: _PlaceState, tri: Tuple[int, int, int], tag: str) -> Optional[_PlaceState]:

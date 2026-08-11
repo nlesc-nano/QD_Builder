@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "cython>=3.0", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,6 +28,8 @@ xtb = ["ase>=3.22", "xtb>=22.1"]
 # Post-run analysis in tools/ and scripts/.
 analysis = ["pandas>=2.0", "matplotlib>=3.7"]
 test = ["pytest>=7.4"]
+# Beam-search acceleration (optional native extension).
+speed = ["cython>=3.0"]
 
 [project.scripts]
 nc-builder = "builder.main:main"

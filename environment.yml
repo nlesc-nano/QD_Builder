@@ -44,4 +44,9 @@ dependencies:
   # --- test suite -----------------------------------------------------------
   - pytest>=7.4
 
+  # --- optional beam-search acceleration (state_key Cython kernel) ----------
+  # Not required: pure-Python fallback is used if the extension is not built.
+  # Needs a system C compiler (gcc/clang) for `pip install -e .` / build_ext.
+  - cython>=3.0
+
   - pip
