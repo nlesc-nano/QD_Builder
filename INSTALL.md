@@ -15,6 +15,29 @@ python -c "import builder.nucleation.molecular as m; print('ok')"
 python -m pytest tests -q -k "molecular or nucleation"
 ```
 
+### Optional: Cython beam-search kernel
+
+Decoration at high skeleton symmetry spends most of its wall time in the
+bridge-first `state_key` orbit.  An optional native extension (~5× on that
+path) is built when a C compiler is available:
+
+```bash
+# regenerates C from .pyx if Cython is installed, then compiles
+pip install -e ".[speed]"
+# or, with Cython already present / with a pre-generated _beam_key.c:
+python setup.py build_ext --inplace
+```
+
+Confirm the backend after install:
+
+```bash
+python -c "from builder.nucleation.molecular_bridge_first import _BEAM_KEY_BACKEND as b; print(b)"
+# cython  → native extension in use
+# python  → pure-Python fallback (still correct, slower on high-|Aut| bins)
+```
+
+Without the extension the package imports and runs unchanged.
+
 ## What is in the environment
 
 | group | packages | needed for |
