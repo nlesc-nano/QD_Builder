@@ -280,13 +280,19 @@ rings:
 # ----------------------------------------------------------OPTIMIZER--------
 relaxation:
   enabled: true
-  method: GFN1-xTB
-  accuracy: 1.0
-  electronic_temperature: 300.0
-  max_iterations: 500
-  fmax: 0.02
-  max_steps: 500
-  python: ~/miniconda3/envs/xtb/bin/python
+  method: g-xTB
+  binary: gxtb
+  charge: 0
+  # Cap geo_opt at 100; keep maxcycle endpoints; prune Se–Cl/Se–Se/Cd–Cd.
+  max_steps: 100
+  accept_maxcycle: true
+  timeout_s: 1800
   check_connectivity: true
   bond_order_threshold: 0.5
+  # Mid-gap bond-like floors (Å); see run_gxtb.yaml / gxtb_k1k5 analysis.
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80
 

@@ -341,12 +341,24 @@ These are *audit* thresholds for judging a relaxed geometry. They are not the
 embedding (79% of *embedded* structures sit below the Cd-Cd construction floor,
 so applying it post-relaxation would delete most of a run).
 
+Set them in the pack under ``relaxation.artifact_min_distance`` (g-xTB packs
+already do).  Code defaults match the table if the key is omitted.
+
+```yaml
+relaxation:
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80
+```
+
 | pair | audit threshold | basis |
 |---|---|---|
 | Cd-Cd | **2.80** | see below |
 | Se-Se | 2.80 | real Se-Se bonds form at 2.34 |
 | Cl-Se | 2.80 | real Cl-Se bonds form at 2.19 |
-| Cl-Cl | 3.00 | never violated in practice |
+| Cl-Cl | 2.80 | Cl₂-like contacts ~2.0; nonbond ≥~3.3 |
 
 The Cd-Cd value is set from 42829 relaxed Cd-Cd distances. Nothing exists below
 2.64 A, and the population splits by bridging context:

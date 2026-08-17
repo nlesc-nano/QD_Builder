@@ -53,5 +53,18 @@ relaxation:
   method: g-xTB
   binary: gxtb
   charge: 0                  # k CdSe + p CdCl2 is neutral by construction
+  # Cap geo_opt: after ~100 steps remaining energy change is usually
+  # sub-kcal/mol.  Endpoints that hit the cap are kept (accept_maxcycle)
+  # unless the post-relax artifact prune finds Se–Cl / Se–Se / Cd–Cd contacts.
+  max_steps: 100
+  accept_maxcycle: true
   timeout_s: 1800
   check_connectivity: true
+  # Mid-gap bond-like artifact floors (Å) from gxtb_k1k5 — NOT construction
+  # pair_rules.min_distance (those are ~0.4–1 Å longer and kill non-bonds).
+  # Bond peaks ~2.1–2.7; bridged Cd…Cd ≥~2.90; nonbond bulk ≥~3.1–3.7.
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80

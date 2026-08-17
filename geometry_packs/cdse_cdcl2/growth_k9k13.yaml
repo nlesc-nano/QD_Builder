@@ -1,0 +1,126 @@
+# Production envelope for parent k = 9 … 13 (rigid MSC → first crystal).
+#
+# This is still the *molecular* path.  Stacking (zb vs wz vs Cossairt
+# polytwistane) is left to local tet + relax — do not switch on the CIF
+# lattice engine here.  tet_sites = vacant tet holes, not “this is zb”.
+#
+# Wulff anchor at the top of the window:
+#   Cd16Se13Cl6 = (CdSe)13(CdCl2)3 = (k, p) = (13, 3), Q = 0
+#   12 surface Se stay CN3; p_sat = 15 is the CN4 ceiling — do not grow there.
+#   p_surf(13, β=2) = 11 is the area cap; the compact crystal is p = 3.
+# Prefer lean parent p (2–5) when you reach k=12–13:
+#   --p-parents 2,3,4
+#
+# Explosion control (tighter than k4k8):
+#   s_max = 1, then 0 at k=12–13 (do not tear a closed shell)
+#   p_m = 1 only
+#   attach = local
+#   1 decoration / skeleton, cap 8 skeletons / bin
+#   A: 3 graphs/core at k=9–11, OFF at k=12–13 (B only)
+#   budget.max_opts_per_k = 80 as a hard stop
+#
+# Expected 3D jobs / step (central, if you stay inside the budget):
+#   k=9→10, 10→11, 11→12 :  ~50 B + ~150–250 A  ≈  200–300
+#   k=12→13               :  ~25 B, A off        ≈  25
+# Campaign k=9→13         :  ~700–900  (high ~1500 if A fills the budget)
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2 \
+#     --growth growth_k9k13.yaml \
+#     --parents <k8 run> --k-from 9 --k-to 13 \
+#     --output runs/growth_k9_to_k13
+
+schema_version: 1
+name: cdse_growth_k9k13
+
+monomer_p_values: [1]           # incoming unit is one [CdSe](CdCl2)
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 0                    # no extra package above p_surf (lean toward Wulff)
+
+parents:
+  energy_window_eV: 0.35        # tighter than k4k8 (0.50); landscape is stiffer
+  rank_by: energy
+  max_skeletons_frac: 0.25
+  max_skeletons_cap: 8
+  decorations_per_skeleton: 1
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 1                   # by_k drops this to 0 at k=12–13
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true              # A on at k=9–11 only; by_k turns it off at 12–13
+  full_opt: g-xTB
+
+moves:
+  graph: true
+  coord: true                   # B is the kinetic path
+
+max_children_per_channel: 20    # half of k4k8
+selection_max_per_skeleton: 3   # half of k4k8
+
+budget:
+  max_opts_per_k: 80            # hard stop; prefer diverse skeletons
+
+# Local tet holes only — not a zinc-blende assignment.
+# Stacking (zb pyramid vs wz cage vs InP-like) is left to relax.
+lattice_switch:
+  enabled: true
+  from_k: 7
+  decoration_mode: tet_sites
+  require_any:
+    - min_cn4_fraction: 0.45
+    - min_six_rings: 2
+  fallback: motif_bridge_target
+
+# by_k overrides only the keys it names.
+by_k:
+  - k_min: 9
+    k_max: 11
+    monomer_p_values: [1]
+    max_shed: 1
+    redecorate: true
+    max_children_per_channel: 20
+    selection_max_per_skeleton: 3
+  - k_min: 12
+    k_max: 13
+    monomer_p_values: [1]
+    max_shed: 0                 # add onto an open site; do not strip the shell
+    redecorate: false           # B only — last step before the Wulff reference
+    energy_window_eV: 0.25
+    max_skeletons_cap: 6
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
+  # Report-only.  Use Ω to pick the next parents, not to delete graphs.

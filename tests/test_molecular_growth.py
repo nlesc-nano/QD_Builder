@@ -244,6 +244,205 @@ def test_select_parents_respects_window_and_dec(map_spec) -> None:
     assert "m0" in ids
 
 
+def test_surface_law_matches_lattice_engine() -> None:
+    from builder.nucleation.engine import _p_surf
+    from builder.nucleation.molecular_growth import (
+        effective_s_max,
+        p_surf_capacity,
+    )
+
+    for beta in (1.5, 2.0, 2.5):
+        for k in range(1, 13):
+            assert p_surf_capacity(k, beta) == _p_surf(k, beta)
+    # β=2: p_surf(2)=3, (3)=4, (7)=7.
+    # 8^{2/3} is 4 in exact arithmetic but 3.999… in float, so floor(2·) = 7.
+    assert p_surf_capacity(2, 2.0) == 3
+    assert p_surf_capacity(3, 2.0) == 4
+    assert p_surf_capacity(7, 2.0) == 7
+    assert p_surf_capacity(8, 2.0) == 7
+    # s_max = min(p, floor(α p_surf), hard).  At k=7, p_surf=7 so the
+    # surface term is not the tight bound — YAML max_shed (hard) is.
+    assert effective_s_max(7, 7, beta=2.0, alpha=1.0, hard=2) == 2
+    assert effective_s_max(7, 7, beta=2.0, alpha=1.0, hard=1) == 1
+    assert effective_s_max(2, 5, beta=2.0, alpha=1.0, hard=2) == 2
+    assert effective_s_max(4, 4, beta=0.0, alpha=1.0, hard=2) == 2
+
+
+def test_by_k_window_picks_k7() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k4k8.yaml")
+    w4 = cfg.window_for(4)
+    w7 = cfg.window_for(7)
+    assert w4.monomer_p_values == (1, 2)
+    assert w4.max_shed == 1
+    assert w7.monomer_p_values == (1,)
+    assert w7.max_shed == 1
+    assert w7.attach == "local"
+    assert not w7.allow_p_child(8, w7.p_surf(8) + w7.p_slack + 1)
+    assert w7.allow_p_child(8, w7.p_surf(8))
+
+
+def test_by_k_window_k9k13() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k9k13.yaml")
+    w9 = cfg.window_for(9)
+    w12 = cfg.window_for(12)
+    w13 = cfg.window_for(13)
+    assert w9.monomer_p_values == (1,)
+    assert w9.max_shed == 1
+    assert w9.child_redecorate is True
+    assert w9.attach == "local"
+    assert w9.selection_max_per_skeleton == 3
+    assert w9.max_children_per_channel == 20
+    assert w9.max_opts_per_k == 80
+    assert w12.max_shed == 0
+    assert w12.child_redecorate is False
+    assert w13.max_shed == 0
+    assert w13.child_redecorate is False
+    assert w13.energy_window_eV == 0.25
+    # p_slack=0: child p may not exceed p_surf(k+1)
+    assert w9.allow_p_child(10, w9.p_surf(10))
+    assert not w9.allow_p_child(10, w9.p_surf(10) + 1)
+
+
+def test_survey_yaml_budget_and_attach() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_survey.yaml")
+    w = cfg.window_for(3)
+    assert w.attach == "enumerate"
+    assert w.max_opts_per_k == 120
+    assert w.surface_beta == 2.5
+
+
+def test_opt_budget_caps_seeds_then_cores() -> None:
+    from builder.nucleation.molecular_growth import (
+        CoordSeed,
+        GrowthStepResult,
+        _apply_opt_budget,
+    )
+
+    seeds = {
+        (3, 2): [
+            CoordSeed(
+                k=3,
+                p=2,
+                structure_id=f"s{i}",
+                parent_id="p",
+                shed=0,
+                p_m=1,
+                symbols=("Se",),
+                coordinates=np.zeros((1, 3)),
+                core_edges=(),
+            )
+            for i in range(5)
+        ]
+    }
+    catalog = {(3, 2): [((0, 1),), ((0, 2),), ((0, 3),)]}
+    result = GrowthStepResult(
+        k_from=2,
+        k_to=3,
+        parents_selected=1,
+        channels=[],
+        skeleton_catalog=catalog,
+        coord_seeds=seeds,
+    )
+    capped = _apply_opt_budget(result, 4)
+    assert sum(len(v) for v in capped.coord_seeds.values()) == 4
+    assert sum(len(v) for v in capped.skeleton_catalog.values()) == 0
+    result2 = GrowthStepResult(
+        k_from=2,
+        k_to=3,
+        parents_selected=1,
+        channels=[],
+        skeleton_catalog=catalog,
+        coord_seeds=seeds,
+    )
+    capped2 = _apply_opt_budget(result2, 7)
+    assert sum(len(v) for v in capped2.coord_seeds.values()) == 5
+    assert sum(len(v) for v in capped2.skeleton_catalog.values()) == 2
+
+
+def test_wbo_persist_and_reload(tmp_path) -> None:
+    from builder.nucleation.molecular_growth import (
+        load_parent_wbo,
+        write_wbo_file,
+    )
+
+    orders = [
+        [0.0, 0.8, 0.1],
+        [0.8, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+    ]
+    xyz = tmp_path / "k002_p001_mol0001_xtb.xyz"
+    xyz.write_text("1\ntest\nSe 0 0 0\n")
+    write_wbo_file(xyz.with_suffix(".wbo"), orders)
+    parsed, src = load_parent_wbo(
+        xyz, structure_id="k002_p001_mol0001", run_dir=tmp_path
+    )
+    assert src == "wbo_file"
+    assert parsed[(0, 1)] == pytest.approx(0.8)
+    # missing wbo → none (distance fallback is the caller)
+    empty = tmp_path / "other.xyz"
+    empty.write_text("1\nx\nSe 0 0 0\n")
+    parsed2, src2 = load_parent_wbo(
+        empty, structure_id="missing", run_dir=tmp_path
+    )
+    assert parsed2 is None
+    assert src2 == "none"
+
+
+def test_grow_cores_respects_p_surf_cap(map_spec) -> None:
+    """High p_m channels above p_surf(k+1)+slack are dropped."""
+    from builder.nucleation.molecular import _enumerate_inorganic_edge_sets
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    sets, _ = _enumerate_inorganic_edge_sets(
+        2, 2, map_spec, max_skeletons=20, mode="free"
+    )
+    if not sets:
+        pytest.skip("no free skeletons at k2p2")
+    core = tuple(sorted((min(a, b), max(a, b)) for a, b in sets[0]))
+    symbols = tuple(["Se"] * 2 + ["Cd"] * 4 + ["Cl"] * 4)
+    parent = ParentStructure(
+        k=2,
+        p=2,
+        structure_id="core0",
+        symbols=symbols,
+        coordinates=np.random.RandomState(0).randn(len(symbols), 3) * 2.0,
+        energy_eV=-100.0,
+        edges=core,
+        core_edges=core,
+    )
+    cfg = GrowthConfig.from_yaml(GROWTH_YAML)
+    cfg = GrowthConfig(
+        raw=cfg.raw,
+        monomer_p_values=(1, 2, 3),
+        references=cfg.references,
+        energy_window_eV=5.0,
+        max_shed=1,
+        prefer_low_shed=True,
+        max_children_per_channel=20,
+        decorations_per_skeleton=1,
+        max_skeletons_frac=1.0,
+        max_skeletons_cap=5,
+        start_from="graph_only",
+        local_cleanup_enabled=False,
+        surface_beta=2.0,
+        surface_alpha=1.0,
+        p_slack=0,
+        move_coord=False,
+        attach="local",
+    )
+    # p_surf(3)=4, slack=0 → p_child ≤ 4.  parent p=2, s=0, p_m=3 → 5 dropped.
+    result = grow_cores_from_parents([parent], growth=cfg, spec=map_spec)
+    child_ps = {ch.p_child for ch in result.channels}
+    assert 5 not in child_ps
+    assert all(p <= 4 for p in child_ps)
+
+
 def test_grow_cores_produces_child_bins(map_spec) -> None:
     """Synthetic connected parent core grows to k+1 cores for packages."""
     # Use real shed_and_grow path: need legal parent core at k=2 p=2

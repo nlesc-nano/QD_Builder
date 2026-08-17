@@ -1,0 +1,128 @@
+# Production envelope for parent k = 4 … 8 (mid size).
+#
+# Lattice calibration from the smallest faceted Wulff
+# ----------------------------------------------------
+#   python -m builder examples/cifs/CdSe_zb.cif \
+#     examples/core-only/cdse_minimum_wulff.yaml \
+#     -o ... --positive-q-mode add
+# gives Cd16Se13Cl6 = (CdSe)13(CdCl2)3, i.e. (k, p) = (13, 3), Q = 0.
+# One interior Se is CN4; the other 12 Se sit on anion-rich {111} and stay
+# CN3.  Passivation only charge-balances (3 extra Cd + 6 Cl).  It does not
+# fill vacant Se tetrahedra.  Those 12 leftover slots are a Z-type CdCl2
+# reservoir: p_sat = 3 + 12 = 15 if every Se is driven to CN4.  That is the
+# coordination ceiling, not the growth target.  The compact-crystal p is 3;
+# p_surf(13, β=2) = 11 sits between those two numbers.
+#
+# Why s_max → 0–1 and p_m → 1 around k = 7
+# -----------------------------------------
+# p_surf(7) = floor(2.0 * 7^(2/3)) ≈ 7, so p ~ k: a closed monolayer.
+# Shedding two complete CdCl2 packages tears a hole in that shell.
+# NC Z-type displacement is sequential and local (Owen), so s = 0
+# (add onto an open site) or s = 1 (open one site).  After the burst
+# the incoming unit is one [CdSe](CdCl2); extra chloride already sits
+# in the residual shell p − s.  p_m = 3 would land above p_surf(k+1).
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2 \
+#     --growth growth_k4k8.yaml \
+#     --parents <k3 run> --k-from 4 --k-to 8 --output runs/growth_k4_to_k8
+#
+# by_k overlays only the keys it names.  Surface law still applies.
+
+schema_version: 1
+name: cdse_growth_k4k8
+
+monomer_p_values: [1, 2]        # drop p_m=3 (kills the high-p tail)
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 1
+
+parents:
+  energy_window_eV: 0.50
+  rank_by: energy
+  max_skeletons_frac: 0.30
+  max_skeletons_cap: 12
+  decorations_per_skeleton: 1
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 1                   # this hard cap is what makes s_max=0–1 at k≥7
+                                # (p_surf itself is ~k and would allow shedding the whole shell)
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true              # A on but hard-capped below
+  full_opt: g-xTB
+
+moves:
+  graph: true
+  coord: true                   # B is the cheap kinetic path; keep it
+
+max_children_per_channel: 40
+selection_max_per_skeleton: 6
+
+# tet_sites ≠ zinc-blende.  Three different meanings of "tetrahedral":
+#   (1) local tet holes on a cation  →  tet_sites decoration (this switch)
+#   (2) overall pyramidal / tet *shape* of an MSC
+#   (3) zinc-blende *lattice* (ABC stacking of those tet units)
+# Literature (Owen / Cossairt), not interchangeable:
+#   Cd35Se20(X)30(L)30   Beecher, Owen JACS 2014
+#       cation-rich zb tetrahedron; (111) Cd-rich faces.  Larger: Cd56Se35, Cd84Se56.
+#       CdSe also has a *second* family: stoichiometric pseudo-wz cages
+#       (Cd14Se13 Hyeon; Cd21Se20 ~ In37P20 analogue, Cossairt 2023).
+#   In37P20(O2CR)51      Gary, Cossairt JACS 2016
+#       tet *shape*, [In21P20]3+ core + 16 surface In.  Pseudo-wurtzite /
+#       polytwistane, *not* zb (deviates from known crystal phases).
+#   In26As18(O2CR)24(PR3)3  Sandeno, Cossairt ACS Cent. Sci. 2024
+#       *not* In37As20.  Anisotropic / bullet; anion-sublattice kin of InP;
+#       compared to wz, not zb.  Many 3-coordinate As.
+# Zinc-blende / Wulff crystal cut (CIF engine) is later: first closed shape
+# here is Cd16Se13Cl6 at k=13.  That is not this switch.
+# Trigger on local tet character only (CN4, six-rings).  Do not use
+# RMSD-to-zb here — that would call a cluster a crystal.  from_k=7 is
+# “local tet holes exist”, not “already zb”.
+lattice_switch:
+  enabled: true
+  from_k: 7
+  decoration_mode: tet_sites
+  require_any:
+    - min_cn4_fraction: 0.45    # local tet, not a zb test
+    - min_six_rings: 2
+    # max_core_rmsd_to_zb_A: 0.40   # crystal diagnostic; leave off
+  fallback: motif_bridge_target
+
+by_k:
+  - {k_min: 4, k_max: 6, monomer_p_values: [1, 2], max_shed: 1}
+  - {k_min: 7, k_max: 8, monomer_p_values: [1],    max_shed: 1}
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]

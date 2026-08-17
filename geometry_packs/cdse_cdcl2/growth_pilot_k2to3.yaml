@@ -1,0 +1,46 @@
+schema_version: 1
+name: cdse_cdcl2_growth_pilot_k2
+monomer_p_values:
+- 1
+- 2
+references:
+  method: g-xTB
+  cdse_dir: /Users/ivaninfante/Documents/University/Programs/Nucleation/graphs/xtb/cdse
+  cdcl2_dir: /Users/ivaninfante/Documents/University/Programs/Nucleation/graphs/xtb/cdcl2
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+parents:
+  energy_window_eV: 1.0
+  rank_by: energy
+  max_skeletons_frac: 0.3
+  max_skeletons_cap: 25
+  decorations_per_skeleton: 2
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+shed:
+  mode: wbo
+  max_shed: 1
+  prefer_low_shed: true
+  wbo_source: parent_opt
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: GFN1-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+child:
+  redecorate: true
+  full_opt: g-xTB
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV:
+  - -1.0
+  - -0.5
+  - 0.0
+  - 0.5
+  - 1.0

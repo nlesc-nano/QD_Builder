@@ -1,3 +1,13 @@
+# Default / legacy growth.yaml (backward compatible).
+# Prefer a named envelope:
+#   growth_survey.yaml   — new system, few hundred structures
+#   growth_k2k3.yaml     — production k=2,3
+#   growth_k4k8.yaml     — production k=4–8 (surface law + local attach)
+#   growth_k9k13.yaml    — production k=9–13 (lean, A off at 12–13)
+#
+# Default / legacy file.  Named envelopes live beside this one:
+#   growth_survey.yaml, growth_k2k3.yaml, growth_k4k8.yaml, growth_k9k13.yaml
+#
 # Molecular package growth + thermodynamic reporting.
 #
 # This file is for the growth path only.  It does not change which graphs

@@ -1,5 +1,9 @@
 """Tetrahedral slot scaffold for molecular Cl decoration (Layer A).
 
+Local tetrahedral holes on Cd — not zinc-blende long-range order.
+A magic-size cluster can use these slots while still being a molecule.
+Zinc-blende / Wulff cuts belong to the CIF lattice engine.
+
 After the Cd–Se frame is fixed:
 
 1. Each Cd gets vacant **tetrahedral** directions relative to already-placed

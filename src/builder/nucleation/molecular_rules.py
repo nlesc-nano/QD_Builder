@@ -59,6 +59,129 @@ def resolved_contact_cutoffs(
     return cutoffs
 
 
+#: Post-relax *bond-like artifact* floors (Å) — NOT construction pair_rules.
+#:
+#: Mined from gxtb_k1k5 (~24k clean ``*_xtb.xyz``, Aug 2025).  Construction
+#: floors (Cd–Cd 3.0, Se–Se 3.8, Cl–Se 2.7) sit in the **non-bonded** bulk and
+#: would reject most of a run.  Real covalent-like collapses form much shorter
+#: and leave a gap before ordinary non-bonded contacts:
+#:
+#:   pair    bond-like peak      nonbond bulk / notes         mid-gap floor
+#:   Cd-Cd   2.02; bare 2.64-2.78  bridged μ-X ≥ ~2.90; bulk ≥3.1   2.80
+#:   Se-Se   2.30-2.40             bulk ≥ ~3.7                     2.80
+#:   Cl-Se   2.10-2.30             bulk ≥ ~3.5                     2.80
+#:   Cl-Cl   1.95-2.10             bulk ≥ ~3.3                     2.80
+#:
+#: At 2.80, doubly-bridged Cd(μ-X)₂Cd rhombi (floor ~2.90) are kept; bare
+#: metal-like Cd…Cd and genuine Se–Se / Se–Cl bonds are pruned.  See also
+#: INSTALL.md "Audit thresholds for relaxed structures".
+DEFAULT_RELAX_ARTIFACT_MIN_DISTANCE: Dict[str, float] = {
+    "Cd-Cd": 2.80,
+    "Se-Se": 2.80,
+    "Cl-Se": 2.80,
+    "Cl-Cl": 2.80,
+}
+
+DEFAULT_RELAX_ARTIFACT_PAIRS: Tuple[str, ...] = tuple(
+    DEFAULT_RELAX_ARTIFACT_MIN_DISTANCE.keys()
+)
+
+
+def resolved_relax_artifact_floors(
+    floors: Optional[Mapping[str, float]] = None,
+) -> Dict[str, float]:
+    """Mid-gap artifact floors; optional overrides by pair key (``Cd-Cd``, …)."""
+
+    out = dict(DEFAULT_RELAX_ARTIFACT_MIN_DISTANCE)
+    if floors:
+        for key, value in floors.items():
+            parts = str(key).replace("_", "-").split("-")
+            if len(parts) != 2:
+                continue
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                continue
+            if val > 0.0:
+                out[pair_key(parts[0], parts[1])] = val
+    return out
+
+
+def forbidden_pair_contact_violations(
+    symbols: Sequence[str],
+    coordinates: Sequence[Sequence[float]],
+    spec: Optional[NucleationSpec] = None,
+    *,
+    pairs: Optional[Sequence[str]] = None,
+    floors: Optional[Mapping[str, float]] = None,
+) -> List[str]:
+    """Hard post-relax bond-like artifacts (mid-gap distance prune).
+
+    **Does not** use ``graph_rules.pair_rules.min_distance`` (those are
+    construction / non-bonded contact walls, ~0.4–1.0 Å longer than a real
+    bond).  Uses :data:`DEFAULT_RELAX_ARTIFACT_MIN_DISTANCE` instead, in the
+    gap between covalent-like collapses and ordinary non-bonded separations.
+
+    Independent of the enumerated graph: a Se–Cl contact that *forms* during
+    g-xTB is not an input edge.  Returns codes ``artifact:Cl-Se:i-j:r<floor``.
+
+    ``spec`` is accepted for API compatibility and ignored for floors.
+    """
+
+    del spec  # floors are deliberately independent of construction pair_rules
+    resolved = resolved_relax_artifact_floors(floors)
+    if pairs is not None:
+        allowed = {
+            pair_key(*str(k).replace("_", "-").split("-")[:2])
+            for k in pairs
+            if len(str(k).replace("_", "-").split("-")) >= 2
+        }
+        resolved = {k: v for k, v in resolved.items() if k in allowed}
+    if not resolved:
+        return []
+
+    coords = np.asarray(coordinates, dtype=float)
+    n = len(symbols)
+    if coords.shape != (n, 3):
+        return ["geometry:coordinate_shape"]
+    viol: List[str] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pk = pair_key(symbols[i], symbols[j])
+            limit = resolved.get(pk)
+            if limit is None:
+                continue
+            dist = float(np.linalg.norm(coords[i] - coords[j]))
+            if dist < limit:
+                viol.append(
+                    f"artifact:{pk}:{i}-{j}:{dist:.3f}<{limit:.3f}"
+                )
+    # Near-collapse (any species) is always unreasonable.
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = float(np.linalg.norm(coords[i] - coords[j]))
+            if dist < 0.75:
+                pk = pair_key(symbols[i], symbols[j])
+                code = f"artifact:overlap:{pk}:{i}-{j}:{dist:.3f}<0.750"
+                if code not in viol and not any(
+                    v.startswith(f"artifact:{pk}:{i}-{j}:") for v in viol
+                ):
+                    viol.append(code)
+    return viol
+
+
+def is_hard_relax_artifact(code: str) -> bool:
+    """Whether a violation code is a ranking-disqualifying relax artifact.
+
+    Only ``artifact:…`` (and legacy bare ``overlap:…``) codes qualify.
+    Soft ``contact:…`` hits from construction pair_rules are *not* hard
+    ranking disqualifiers — those floors are too long for post-relax use.
+    """
+
+    s = str(code)
+    return s.startswith("artifact:") or s.startswith("overlap:")
+
+
 def coordinate_contact_violations(
     symbols: Sequence[str],
     coordinates: Sequence[Sequence[float]],

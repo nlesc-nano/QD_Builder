@@ -65,6 +65,41 @@ def test_shedding_reduces_precursor_count(spec):
     assert children
 
 
+def test_local_attach_children_are_legal(spec):
+    """Local attach must not invent cores the exhaustive enumerator rejects."""
+    sets, _ = _enumerate_inorganic_edge_sets(
+        1, 2, spec, max_skeletons=1000, extra_skeleton_edges=None
+    )
+    edges = [tuple(sorted((min(a, b), max(a, b)) for a, b in s)) for s in sets]
+    children = grow_generation(
+        edges, k=1, p=2, p_out=2, spec=spec, attach="local"
+    )
+    exhaustive = _exhaustive_certs(2, 2, spec)
+    produced = {core_certificate(c, 2, 2, spec) for c in children}
+    assert produced <= exhaustive
+    assert children
+
+
+def test_lineage_recall_k2_documented(spec):
+    """Recall of exhaustive k=2 p=2 cores from all k=1 p=2 parents.
+
+    Lineage is greedy: this records the fraction, it does not require 100%.
+    """
+    sets, _ = _enumerate_inorganic_edge_sets(
+        1, 2, spec, max_skeletons=1000, extra_skeleton_edges=None
+    )
+    edges = [tuple(sorted((min(a, b), max(a, b)) for a, b in s)) for s in sets]
+    children = grow_generation(
+        edges, k=1, p=2, p_out=2, spec=spec, attach="enumerate"
+    )
+    exhaustive = _exhaustive_certs(2, 2, spec)
+    produced = {core_certificate(c, 2, 2, spec) for c in children}
+    recall = len(produced & exhaustive) / max(1, len(exhaustive))
+    assert recall >= 0.0
+    # Keep a loose floor so a broken generator fails loudly.
+    assert recall >= 0.25 or not exhaustive
+
+
 def test_dedup_is_by_isomorphism(spec):
     """Two runs over the same parents must not report isomorphic duplicates."""
     sets, _ = _enumerate_inorganic_edge_sets(

@@ -131,16 +131,25 @@ def shed_and_grow(
     p_out: int,
     spec: NucleationSpec,
     max_children: int = 20000,
+    attach: str = "enumerate",
 ) -> List[EdgeList]:
     """Children at ``(k + 1, p_out)`` grown from one parent core at ``(k, p)``.
 
     ``p - p_out`` precursor cations are shed, then one core monomer (one
-    cation + one anion) is attached in every legal way.
+    cation + one anion) is attached.
+
+    ``attach``:
+      * ``enumerate`` — all legal subset attaches (survey / recall).
+      * ``local`` — one surface event: new Se–Cd always bonded, new Se to
+        exactly one existing Cd, new Cd to 0–2 existing Se.
     """
 
     shed = p - p_out
     if shed < 0:
         return []
+    mode = str(attach or "enumerate").lower()
+    if mode not in {"local", "enumerate"}:
+        raise ValueError(f"attach must be 'local' or 'enumerate', got {attach!r}")
     se_ids, cd_ids = _blocks(k, p)
     max_se = int(spec.graph_rules.max_cn.get(spec.core.anion, 4))
     max_cd = int(spec.graph_rules.max_cn.get(spec.core.cation, 4))
@@ -171,59 +180,97 @@ def shed_and_grow(
         open_cd = [n for n in kept_cd if stripped.degree(n) < max_cd]
         open_se = [n for n in kept_se if stripped.degree(n) < max_se]
 
-        # The new anion may bond existing cations and/or the new cation; the
-        # new cation may bond existing anions and/or the new anion.  At least
-        # one of those must tie the monomer to the parent or the child is
-        # disconnected.
-        for bond_monomer in (True, False):
-            se_room = max_se - (1 if bond_monomer else 0)
-            cd_room = max_cd - (1 if bond_monomer else 0)
-            for n_se_links in range(0, min(se_room, len(open_cd)) + 1):
-                for se_partners in combinations(open_cd, n_se_links):
-                    for n_cd_links in range(0, min(cd_room, len(open_se)) + 1):
-                        for cd_partners in combinations(open_se, n_cd_links):
-                            if not bond_monomer and not (
-                                se_partners and cd_partners
-                            ):
-                                continue
-                            if not se_partners and not cd_partners:
-                                continue
-                            child = stripped.copy()
-                            child.add_node(new_se)
-                            child.add_node(new_cd)
-                            if bond_monomer:
-                                child.add_edge(new_se, new_cd)
-                            for host in se_partners:
-                                child.add_edge(new_se, host)
-                            for anion in cd_partners:
-                                child.add_edge(new_cd, anion)
-                            if not nx.is_connected(child):
-                                continue
-                            relabelled = _canonical_relabel(
-                                child,
-                                kept_se + [new_se],
-                                kept_cd + [new_cd],
-                                k + 1,
-                                p_out,
-                            )
-                            if relabelled is None:
-                                continue
-                            if relabelled in children:
-                                continue
-                            if not _core_is_legal(
-                                relabelled, k + 1, p_out, spec
-                            ):
-                                continue
-                            cert = core_certificate(
-                                relabelled, k + 1, p_out, spec
-                            )
-                            if cert in seen_certs:
-                                continue
-                            seen_certs.add(cert)
-                            children[relabelled] = None
-                            if len(children) >= max_children:
-                                return list(children)
+        if mode == "local":
+            attach_iter = _local_attach_patterns(
+                open_cd, open_se, max_cd=max_cd, max_se=max_se
+            )
+        else:
+            attach_iter = _enumerate_attach_patterns(
+                open_cd, open_se, max_cd=max_cd, max_se=max_se
+            )
+
+        for bond_monomer, se_partners, cd_partners in attach_iter:
+            child = stripped.copy()
+            child.add_node(new_se)
+            child.add_node(new_cd)
+            if bond_monomer:
+                child.add_edge(new_se, new_cd)
+            for host in se_partners:
+                child.add_edge(new_se, host)
+            for anion in cd_partners:
+                child.add_edge(new_cd, anion)
+            if not nx.is_connected(child):
+                continue
+            relabelled = _canonical_relabel(
+                child,
+                kept_se + [new_se],
+                kept_cd + [new_cd],
+                k + 1,
+                p_out,
+            )
+            if relabelled is None:
+                continue
+            if relabelled in children:
+                continue
+            if not _core_is_legal(
+                relabelled, k + 1, p_out, spec
+            ):
+                continue
+            cert = core_certificate(
+                relabelled, k + 1, p_out, spec
+            )
+            if cert in seen_certs:
+                continue
+            seen_certs.add(cert)
+            children[relabelled] = None
+            if len(children) >= max_children:
+                return list(children)
     return list(children)
+
+
+def _local_attach_patterns(
+    open_cd: Sequence[int],
+    open_se: Sequence[int],
+    *,
+    max_cd: int,
+    max_se: int,
+) -> Iterable[Tuple[bool, Tuple[int, ...], Tuple[int, ...]]]:
+    """One CdSe addition at a surface site (always bond the new pair)."""
+
+    del max_se  # new Se uses one existing host; CN check is on the host
+    if not open_cd:
+        return
+    # new Cd already bonded to new Se, so at most max_cd-1 extra Se links
+    cd_link_max = min(2, max(0, int(max_cd) - 1), len(open_se))
+    for host in open_cd:
+        for n_cd_links in range(0, cd_link_max + 1):
+            for cd_partners in combinations(open_se, n_cd_links):
+                yield True, (int(host),), tuple(cd_partners)
+
+
+def _enumerate_attach_patterns(
+    open_cd: Sequence[int],
+    open_se: Sequence[int],
+    *,
+    max_cd: int,
+    max_se: int,
+) -> Iterable[Tuple[bool, Tuple[int, ...], Tuple[int, ...]]]:
+    """All legal subset attaches (historical / survey path)."""
+
+    for bond_monomer in (True, False):
+        se_room = max_se - (1 if bond_monomer else 0)
+        cd_room = max_cd - (1 if bond_monomer else 0)
+        for n_se_links in range(0, min(se_room, len(open_cd)) + 1):
+            for se_partners in combinations(open_cd, n_se_links):
+                for n_cd_links in range(0, min(cd_room, len(open_se)) + 1):
+                    for cd_partners in combinations(open_se, n_cd_links):
+                        if not bond_monomer and not (
+                            se_partners and cd_partners
+                        ):
+                            continue
+                        if not se_partners and not cd_partners:
+                            continue
+                        yield bond_monomer, tuple(se_partners), tuple(cd_partners)
 
 
 def grow_generation(
@@ -234,6 +281,7 @@ def grow_generation(
     p_out: int,
     spec: NucleationSpec,
     max_children: int = 20000,
+    attach: str = "enumerate",
 ) -> List[EdgeList]:
     """Deduplicated children at ``(k + 1, p_out)`` from many parents.
 
@@ -252,6 +300,7 @@ def grow_generation(
             p_out=p_out,
             spec=spec,
             max_children=max_children,
+            attach=attach,
         ):
             cert = core_certificate(child, k + 1, p_out, spec)
             if cert in certs:
