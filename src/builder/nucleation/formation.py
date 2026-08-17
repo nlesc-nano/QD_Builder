@@ -335,7 +335,7 @@ def format_bin_ranking(
             continue
         rows.append(iso)
     if not rows:
-        return "  (no converged energies to rank)"
+        return "  (no usable energies to rank)"
 
     rows.sort(key=lambda iso: float(iso.xtb_energy_eV))
     emin = float(rows[0].xtb_energy_eV)

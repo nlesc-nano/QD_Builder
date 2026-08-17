@@ -108,6 +108,15 @@ relaxation:
   binary: gxtb
   # xtb_path: /scratch/iinfante/software/xtb-gxtb-linux-x86_64/share/xtb
   charge: 0                 # k CdSe + p CdCl2 is neutral by construction
+  # Cap geo_opt at 100; keep maxcycle endpoints; prune Se–Cl/Se–Se/Cd–Cd.
+  max_steps: 100
+  accept_maxcycle: true
   timeout_s: 1800
   check_connectivity: true
+  # Mid-gap bond-like floors (Å); see run_gxtb.yaml / gxtb_k1k5 analysis.
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80
 

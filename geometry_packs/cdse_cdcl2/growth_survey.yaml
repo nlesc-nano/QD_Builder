@@ -1,0 +1,85 @@
+# Survey profile — new chemistry, find the rules.
+#
+# Use this when the system is not yet CdSe-calibrated.  Enumerate more
+# decorations than you will keep later, relax a few hundred structures,
+# then lock production YAMLs (growth_k2k3.yaml / growth_k4k8.yaml) to
+# the patterns you see (bridge count ~ 2p, CN histograms, six-rings).
+#
+# Target: ~200–400 g-xTB jobs across k=1–5, not thousands.
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2 \
+#     --growth growth_survey.yaml \
+#     --parents <map> --k-from 2 --k-to 4 --output runs/survey
+#
+# Surface law (same algebra as the lattice engine):
+#   p_surf(k) = floor(beta * k^(2/3))
+#   s_max     = min(p, floor(alpha * p_surf(k)), max_shed)
+#   drop a channel if p_child = p - s + p_m  >  p_surf(k+1) + p_slack
+
+schema_version: 1
+name: survey_new_system
+
+monomer_p_values: [1, 2, 3]
+
+# Optional; omit on a new system until you have pinned free-molecule energies.
+# references:
+#   method: g-xTB
+#   energy_cdse_eV: ...
+#   energy_cdcl2_eV: ...
+
+surface:
+  beta: 2.5          # slightly rich so high-p isomers stay visible
+  alpha: 1.0
+  p_slack: 2
+
+parents:
+  energy_window_eV: 1.5
+  rank_by: energy
+  max_skeletons_frac: 0.50
+  max_skeletons_cap: 12
+  decorations_per_skeleton: 2
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  # g-xTB parents almost never have a wbo file.  distance = longer Cd–Cl
+  # is weaker and sheds first.  Set persist_wbo so later steps can use
+  # Wiberg if a backend actually wrote bond orders.
+  mode: distance          # distance | wbo | enumerate
+  max_shed: 2
+  prefer_low_shed: true   # order only; all s still run
+  persist_wbo: true
+
+attach: enumerate         # all legal monomer attaches (slow, complete)
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true
+  full_opt: g-xTB
+
+moves:
+  graph: true
+  coord: true
+
+# Not 20 — still enough to see 2p-bridge vs terminal-heavy decorations.
+selection_max_per_skeleton: 8
+max_children_per_channel: 80
+
+budget:
+  max_opts_per_k: 120     # hard stop after this many g-xTB jobs at one k
+  prefer: diverse_skeletons
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
+  # Report-only.  Does not prune parents, channels, or decorations.

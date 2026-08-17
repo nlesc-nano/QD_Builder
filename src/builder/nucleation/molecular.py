@@ -38,7 +38,9 @@ from ..nc_types import NucleationSpec
 from .geometry_pack import GeometryPack, load_geometry_pack
 from .molecular_rules import (
     allowed_bond_pairs,
+    forbidden_pair_contact_violations,
     inorganic_component_count,
+    is_hard_relax_artifact,
     molecular_geometry_ok,
     molecular_graph_ok,
     molecular_graph_violations,
@@ -5352,6 +5354,102 @@ class _CandidateScreen:
                     _ok, violations = molecular_geometry_ok(
                         final_state, xr.coordinates, self.spec
                     )
+                # Hard artifacts (Se–Cl / Se–Se / Cd–Cd contacts, collapses)
+                # over-stabilize g-xTB energies — always run and rank-disqualify.
+                symbols_here = [atom.symbol for atom in state.atoms]
+                artifacts = forbidden_pair_contact_violations(
+                    symbols_here,
+                    xr.coordinates,
+                    self.spec,
+                    floors=xtb_settings.artifact_min_distance or None,
+                )
+                if artifacts:
+                    for code in artifacts:
+                        if code not in violations:
+                            violations.append(code)
+                hard_artifacts = [
+                    v for v in violations if is_hard_relax_artifact(str(v))
+                ] or list(artifacts)
+
+                relax_tag = (
+                    "ok"
+                    if xr.converged
+                    else (
+                        "maxcycle"
+                        if str(getattr(xr, "status", "") or "") == "maxcycle"
+                        or (
+                            not xr.converged
+                            and int(xr.steps) >= int(xtb_settings.max_steps) > 0
+                        )
+                        else "unconv"
+                    )
+                )
+
+                if hard_artifacts:
+                    # Keep diagnostic geometry on disk, but strip energy so
+                    # formation / bin ranking never use the artifact minimum.
+                    trial.final_violations = tuple(str(v) for v in hard_artifacts)
+                    post_audit_elapsed = time.perf_counter() - post_audit_started
+                    if self.progress is not None:
+                        energy = (
+                            "-" if xr.energy_eV is None
+                            else f"{float(xr.energy_eV):.6f} eV"
+                        )
+                        self.progress(
+                            f"[molecular] motif graph graph{graph_number:04d} "
+                            f"start{candidate.start_index:02d} | xtb=OK | "
+                            f"converged={str(xr.converged).lower()} | "
+                            f"steps={xr.steps}/{xtb_settings.max_steps} | "
+                            f"max_force={('-' if xr.max_force is None else f'{float(xr.max_force):.5f}')} | "
+                            f"time_s={xtb_elapsed:.3f} | energy={energy} | "
+                            f"post_xtb_audit=ARTIFACT(pruned from ranking) | "
+                            f"audit_time_s={post_audit_elapsed:.3f} | "
+                            f"violations={'|'.join(str(v) for v in hard_artifacts)} | "
+                            f"file=motif_trials/graph{graph_number:04d}_start{candidate.start_index:02d}_xtb.xyz"
+                        )
+                        self.progress(
+                            f"[growth-job] k={self.k} p={self.p} move=A "
+                            f"id=graph{graph_number:04d}_s{candidate.start_index:02d} "
+                            f"E_eV=n/a t_s={xtb_elapsed:.1f} "
+                            f"recon_s={reconstruction_elapsed:.1f} "
+                            f"relax=artifact "
+                            f"err={'|'.join(str(v) for v in hard_artifacts[:3])}"
+                        )
+                    self._record_failure_details(
+                        final_state,
+                        hard_artifacts,
+                        stage="xtb_artifact_prune",
+                        coordinates=xr.coordinates,
+                        snapshot_kind="molecule",
+                    )
+                    from dataclasses import replace as _dc_replace
+
+                    pruned_xr = _dc_replace(
+                        xr,
+                        energy_eV=None,
+                        error="artifact:"
+                        + "|".join(str(v) for v in hard_artifacts[:4]),
+                    )
+                    warning_iso = add_isomer(
+                        final_state,
+                        xr.coordinates,
+                        start_index=candidate.start_index,
+                        constructed=candidate.coordinates,
+                        xtb_result=pruned_xr,
+                    )
+                    if warning_iso is not None:
+                        warning_iso = replace(
+                            warning_iso,
+                            violations=tuple(str(v) for v in hard_artifacts),
+                            xtb_energy_eV=None,
+                            xtb_error="artifact:" + "|".join(
+                                str(v) for v in hard_artifacts[:4]
+                            ),
+                        )
+                        self.seen[warning_iso.certificate] = warning_iso
+                        produced.append(warning_iso)
+                    continue
+
                 if violations:
                     trial.final_violations = tuple(str(v) for v in violations)
                     post_audit_elapsed = time.perf_counter() - post_audit_started
@@ -5444,7 +5542,7 @@ class _CandidateScreen:
                             f"E_eV={e_s} "
                             f"t_s={xtb_elapsed:.1f} "
                             f"recon_s={reconstruction_elapsed:.1f} "
-                            f"relax={'ok' if xr.converged else 'fail'}"
+                            f"relax={relax_tag}"
                         )
                         self.progress(
                             f"[molecular] motif graph graph{graph_number:04d} "
@@ -6163,6 +6261,7 @@ def _relax_bin_with_xtb(
     results = relax_structures(batch, settings, cutoffs)
     by_id = {entry["id"]: res for entry, res in zip(batch, results)}
     ok = 0
+    n_artifact = 0
     updated: List[MolecularIsomer] = []
     for iso in bin_result.isomers:
         res = by_id.get(iso.structure_id)
@@ -6183,6 +6282,41 @@ def _relax_bin_with_xtb(
             )
             relaxed_state = _State(atoms=iso.atoms, graph=after)
             cert = _graph_certificate(relaxed_state)
+            arts = ()
+            if res.coordinates is not None:
+                arts = tuple(
+                    forbidden_pair_contact_violations(
+                        [a.symbol for a in iso.atoms],
+                        res.coordinates,
+                        spec,
+                        floors=settings.artifact_min_distance or None,
+                    )
+                )
+            if arts:
+                n_artifact += 1
+                updated.append(
+                    replace(
+                        iso,
+                        xtb_energy_eV=None,
+                        xtb_gap_eV=res.gap_eV,
+                        xtb_steps=res.steps,
+                        xtb_converged=res.converged,
+                        xtb_coordinates=res.coordinates,
+                        xtb_connectivity_changed=len(res.connectivity_changed),
+                        xtb_relaxed_bonds=after.number_of_edges(),
+                        xtb_bonds_delta=(
+                            after.number_of_edges() - iso.graph.number_of_edges()
+                        ),
+                        xtb_error="artifact:" + "|".join(arts[:4]),
+                        violations=arts,
+                        xtb_same_topology=(cert == iso.certificate),
+                        xtb_matches=(
+                            "" if cert == iso.certificate
+                            else (known or {}).get(cert, "")
+                        ),
+                    )
+                )
+                continue
             updated.append(
                 replace(
                     iso,
@@ -6221,6 +6355,7 @@ def _relax_bin_with_xtb(
         progress(
             f"    xtb: {ok}/{len(batch)} relaxed | spread {span:.2f} eV | "
             f"{drifted} with changed connectivity"
+            + (f" | {n_artifact} artifact-pruned" if n_artifact else "")
         )
 
 
@@ -11718,6 +11853,12 @@ def write_molecular_map(
                         )
                     ),
                 )
+                if iso.xtb_bond_orders is not None:
+                    from .xtb_relax import write_wbo_file
+
+                    write_wbo_file(
+                        relaxed.with_suffix(".wbo"), iso.xtb_bond_orders
+                    )
                 xtb_path = str(relaxed)
             cl_t, cl_2, cl_3 = iso.xtb_relaxed_cl_motifs
             xtb_csv = ",".join(

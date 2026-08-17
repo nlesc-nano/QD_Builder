@@ -6,10 +6,14 @@ Simple usage (recommended) — one pack folder that contains
 
     python tools/run_molecular_growth.py \\
       --pack-dir /path/to/graphs/growth \\
+      --growth  growth_k2k3.yaml \\
       --parents  /path/to/runs/gxtb_cdse_target_k1k2_p1p5 \\
       --k-from 2 \\
       --p-parents all \\
       --output  /path/to/runs/growth_k2_to_k3
+
+Named envelopes in the pack: growth_survey.yaml, growth_k2k3.yaml,
+growth_k4k8.yaml, growth_k9k13.yaml.  Default is growth.yaml.
 
 Parent p bins::
 
@@ -63,9 +67,15 @@ def _resolve_pack_files(
         if not pack_dir.is_dir():
             raise SystemExit(f"--pack-dir is not a directory: {pack_dir}")
         map_p = pack_dir / "run_gxtb.yaml"
-        grow_p = pack_dir / "growth.yaml"
         if not map_p.is_file():
             raise SystemExit(f"missing {map_p}")
+        if growth_yaml is not None:
+            grow_p = Path(growth_yaml).expanduser()
+            if not grow_p.is_file():
+                grow_p = pack_dir / growth_yaml
+            grow_p = grow_p.resolve()
+        else:
+            grow_p = pack_dir / "growth.yaml"
         if not grow_p.is_file():
             raise SystemExit(f"missing {grow_p}")
         return map_p, grow_p
@@ -207,7 +217,11 @@ def main(argv: list[str] | None = None) -> int:
         "--growth",
         type=Path,
         default=None,
-        help="(advanced) growth.yaml; use --pack-dir instead",
+        help=(
+            "growth YAML.  With --pack-dir, a bare name such as "
+            "growth_k2k3.yaml is resolved inside the pack folder.  "
+            "Default: <pack-dir>/growth.yaml"
+        ),
     )
     parser.add_argument(
         "--parents",

@@ -60,6 +60,7 @@ from .molecular_lineage import (
 )
 from .spec import load_nucleation_spec
 from .xtb_relax import relaxed_edges
+from .xtb_relax import write_wbo_file as _write_wbo_file
 
 FloatArray = np.ndarray
 Edge = Tuple[int, int]
@@ -70,6 +71,155 @@ Vec3 = Tuple[float, float, float]
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+
+def p_surf_capacity(k: int, beta: float) -> int:
+    """Quasi-spherical surface excess: floor(β · k^{2/3}).
+
+    Same algebra as ``engine._p_surf`` (lattice nucleation).  ``beta <= 0``
+    disables the surface law (return 0).
+    """
+
+    if int(k) <= 0 or float(beta) <= 0.0:
+        return 0
+    return int(math.floor(float(beta) * (float(k) ** (2.0 / 3.0))))
+
+
+def effective_s_max(
+    k: int,
+    p: int,
+    *,
+    beta: float,
+    alpha: float,
+    hard: int,
+) -> int:
+    """Packages removable at parent size k.
+
+    ``s_max = min(p, floor(α · p_surf(k)), hard)`` when β > 0; otherwise
+    ``min(p, hard)``.  ``hard`` is the YAML ``shed.max_shed`` cap.
+    """
+
+    p = max(0, int(p))
+    hard = max(0, int(hard))
+    if p <= 0 or hard <= 0:
+        return 0
+    if float(beta) <= 0.0:
+        return min(p, hard)
+    surface = p_surf_capacity(k, beta)
+    s_max = min(p, int(math.floor(max(0.0, float(alpha)) * surface)), hard)
+    return max(0, s_max)
+
+
+@dataclass(frozen=True)
+class LatticeSwitch:
+    """When a parent has *local* tetrahedral holes, decorate with tet_sites.
+
+    tet_sites ≠ zinc-blende.  A magic-size cluster can be locally tetrahedral
+    (vacant tet directions on Cd, CN3/CN4 Se) without long-range zb order.
+    Zinc-blende / Wulff is a later hop to the CIF lattice engine (k≈13+).
+    """
+
+    enabled: bool = False
+    from_k: int = 7
+    decoration_mode: str = "tet_sites"
+    fallback: str = "motif_bridge_target"
+    min_cn4_fraction: Optional[float] = None
+    min_six_rings: Optional[int] = None
+    max_core_rmsd_to_zb_A: Optional[float] = None
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "LatticeSwitch":
+        if not isinstance(raw, dict) or not raw:
+            return cls()
+        cn4 = six = rmsd = None
+        require = raw.get("require_any") or []
+        if isinstance(require, dict):
+            require = [require]
+        for item in require:
+            if not isinstance(item, dict):
+                continue
+            if "min_cn4_fraction" in item:
+                cn4 = float(item["min_cn4_fraction"])
+            if "min_six_rings" in item:
+                six = int(item["min_six_rings"])
+            if "max_core_rmsd_to_zb_A" in item:
+                rmsd = float(item["max_core_rmsd_to_zb_A"])
+        if "min_cn4_fraction" in raw:
+            cn4 = float(raw["min_cn4_fraction"])
+        if "min_six_rings" in raw:
+            six = int(raw["min_six_rings"])
+        if "max_core_rmsd_to_zb_A" in raw:
+            rmsd = float(raw["max_core_rmsd_to_zb_A"])
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            from_k=int(raw.get("from_k", 7)),
+            decoration_mode=str(raw.get("decoration_mode", "tet_sites")),
+            fallback=str(raw.get("fallback", "motif_bridge_target")),
+            min_cn4_fraction=cn4,
+            min_six_rings=six,
+            max_core_rmsd_to_zb_A=rmsd,
+        )
+
+
+@dataclass(frozen=True)
+class GrowthWindow:
+    """Resolved envelope for one parent k (top-level YAML + matching ``by_k``)."""
+
+    k_from: int
+    monomer_p_values: Tuple[int, ...]
+    max_shed: int
+    attach: str
+    energy_window_eV: float
+    max_skeletons_frac: float
+    max_skeletons_cap: int
+    decorations_per_skeleton: int
+    max_children_per_channel: int
+    move_graph: bool
+    move_coord: bool
+    child_redecorate: bool
+    selection_max_per_skeleton: int
+    surface_beta: float
+    surface_alpha: float
+    p_slack: int
+    persist_wbo: bool
+    shed_mode: str
+    prefer_low_shed: bool
+    max_opts_per_k: int
+    lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
+
+    def p_surf(self, k: int) -> int:
+        return p_surf_capacity(k, self.surface_beta)
+
+    def s_max_for(self, k: int, p: int) -> int:
+        return effective_s_max(
+            k,
+            p,
+            beta=self.surface_beta,
+            alpha=self.surface_alpha,
+            hard=self.max_shed,
+        )
+
+    def allow_p_child(self, k_child: int, p_child: int) -> bool:
+        if self.surface_beta <= 0.0:
+            return True
+        return int(p_child) <= self.p_surf(k_child) + int(self.p_slack)
+
+    def describe(self) -> str:
+        cap = (
+            f"p_surf({self.k_from})={self.p_surf(self.k_from)} "
+            f"p_child≤p_surf({self.k_from + 1})+{self.p_slack}"
+            f"={self.p_surf(self.k_from + 1) + self.p_slack}"
+            if self.surface_beta > 0.0
+            else "p_surf=off"
+        )
+        return (
+            f"k={self.k_from}: p_m={list(self.monomer_p_values)} "
+            f"max_shed={self.max_shed} attach={self.attach} "
+            f"β={self.surface_beta} α={self.surface_alpha} {cap} "
+            f"moves A={self.move_graph} B={self.move_coord} "
+            f"redecorate={self.child_redecorate} "
+            f"shed={self.shed_mode}"
+        )
 
 
 @dataclass
@@ -84,10 +234,21 @@ class GrowthConfig:
     max_skeletons_frac: float = 0.30
     max_skeletons_cap: int = 25
     decorations_per_skeleton: int = 2
-    shed_mode: str = "wbo"
+    shed_mode: str = "distance"
     max_shed: int = 2
     prefer_low_shed: bool = True
+    persist_wbo: bool = True
     max_children_per_channel: int = 500
+    attach: str = "enumerate"
+    move_graph: bool = True
+    move_coord: bool = True
+    surface_beta: float = 0.0
+    surface_alpha: float = 1.0
+    p_slack: int = 1
+    selection_max_per_skeleton: int = 0
+    max_opts_per_k: int = 0
+    lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
+    by_k: Tuple[Dict[str, Any], ...] = ()
     # geometry / move B (coordinate carry-over)
     start_from: str = "relaxed_coords"  # relaxed_coords | graph_only
     place_monomer: str = "embed_tables"
@@ -104,6 +265,8 @@ class GrowthConfig:
     def use_coord_carry(self) -> bool:
         """True when move B (3D carry-over) should run."""
 
+        if not self.move_coord:
+            return False
         return str(self.start_from).lower() in {
             "relaxed_coords",
             "relaxed",
@@ -111,6 +274,83 @@ class GrowthConfig:
             "coordinate",
             "coordinates",
         }
+
+    def window_for(self, k: int) -> GrowthWindow:
+        """Top-level settings overlaid with the first matching ``by_k`` block."""
+
+        k = int(k)
+        overlay: Dict[str, Any] = {}
+        for block in self.by_k:
+            k_min = int(block.get("k_min", 1))
+            k_max = int(block.get("k_max", k_min))
+            if k_min <= k <= k_max:
+                overlay = dict(block)
+                break
+        p_vals = overlay.get("monomer_p_values", self.monomer_p_values)
+        moves = overlay.get("moves")
+        move_graph = self.move_graph
+        move_coord = self.move_coord
+        if isinstance(moves, dict):
+            move_graph = bool(moves.get("graph", move_graph))
+            move_coord = bool(moves.get("coord", move_coord))
+        elif "move_graph" in overlay:
+            move_graph = bool(overlay["move_graph"])
+        elif "move_coord" in overlay:
+            move_coord = bool(overlay["move_coord"])
+        child = overlay.get("child")
+        redecorate = self.child_redecorate
+        if isinstance(child, dict) and "redecorate" in child:
+            redecorate = bool(child["redecorate"])
+        elif "redecorate" in overlay:
+            redecorate = bool(overlay["redecorate"])
+        return GrowthWindow(
+            k_from=k,
+            monomer_p_values=tuple(int(x) for x in p_vals),
+            max_shed=int(overlay.get("max_shed", self.max_shed)),
+            attach=str(overlay.get("attach", self.attach)).lower(),
+            energy_window_eV=float(
+                overlay.get("energy_window_eV", self.energy_window_eV)
+            ),
+            max_skeletons_frac=float(
+                overlay.get("max_skeletons_frac", self.max_skeletons_frac)
+            ),
+            max_skeletons_cap=int(
+                overlay.get("max_skeletons_cap", self.max_skeletons_cap)
+            ),
+            decorations_per_skeleton=int(
+                overlay.get(
+                    "decorations_per_skeleton", self.decorations_per_skeleton
+                )
+            ),
+            max_children_per_channel=int(
+                overlay.get(
+                    "max_children_per_channel", self.max_children_per_channel
+                )
+            ),
+            move_graph=move_graph,
+            move_coord=move_coord,
+            child_redecorate=redecorate,
+            selection_max_per_skeleton=int(
+                overlay.get(
+                    "selection_max_per_skeleton",
+                    self.selection_max_per_skeleton,
+                )
+            ),
+            surface_beta=float(overlay.get("surface_beta", self.surface_beta)),
+            surface_alpha=float(
+                overlay.get("surface_alpha", self.surface_alpha)
+            ),
+            p_slack=int(overlay.get("p_slack", self.p_slack)),
+            persist_wbo=bool(overlay.get("persist_wbo", self.persist_wbo)),
+            shed_mode=str(overlay.get("shed_mode", self.shed_mode)).lower(),
+            prefer_low_shed=bool(
+                overlay.get("prefer_low_shed", self.prefer_low_shed)
+            ),
+            max_opts_per_k=int(
+                overlay.get("max_opts_per_k", self.max_opts_per_k)
+            ),
+            lattice=self.lattice,
+        )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "GrowthConfig":
@@ -130,6 +370,15 @@ class GrowthConfig:
         if not isinstance(child, dict):
             child = {}
         mu = raw.get("chemical_potential") or {}
+        surface = raw.get("surface") or {}
+        if not isinstance(surface, dict):
+            surface = {}
+        moves = raw.get("moves") or {}
+        if not isinstance(moves, dict):
+            moves = {}
+        budget = raw.get("budget") or {}
+        if not isinstance(budget, dict):
+            budget = {}
         refs = None
         if raw.get("references"):
             try:
@@ -140,6 +389,23 @@ class GrowthConfig:
         dmu = ()
         if mu.get("enabled", True):
             dmu = tuple(float(x) for x in (mu.get("delta_mu_cdcl2_eV") or ()))
+        by_k_raw = raw.get("by_k") or []
+        if not isinstance(by_k_raw, list):
+            raise ValueError("growth.yaml by_k must be a list of mappings")
+        by_k = tuple(dict(b) for b in by_k_raw if isinstance(b, dict))
+        attach = str(raw.get("attach", "enumerate")).lower()
+        if attach not in {"local", "enumerate"}:
+            raise ValueError(
+                f"growth.yaml attach must be 'local' or 'enumerate', got {attach!r}"
+            )
+        shed_mode = str(shed.get("mode", "distance")).lower()
+        if shed_mode in {"wbo", "enumerate"}:
+            pass
+        elif shed_mode not in {"distance", "gfn1_wbo"}:
+            raise ValueError(
+                f"growth.yaml shed.mode must be distance|wbo|enumerate|gfn1_wbo, "
+                f"got {shed_mode!r}"
+            )
         return cls(
             raw=raw,
             monomer_p_values=tuple(int(x) for x in p_vals),
@@ -151,12 +417,25 @@ class GrowthConfig:
             decorations_per_skeleton=int(
                 parents.get("decorations_per_skeleton", 2)
             ),
-            shed_mode=str(shed.get("mode", "wbo")).lower(),
+            shed_mode=shed_mode,
             max_shed=int(shed.get("max_shed", 2)),
             prefer_low_shed=bool(shed.get("prefer_low_shed", True)),
+            persist_wbo=bool(shed.get("persist_wbo", True)),
             max_children_per_channel=int(
                 raw.get("max_children_per_channel", 500)
             ),
+            attach=attach,
+            move_graph=bool(moves.get("graph", True)),
+            move_coord=bool(moves.get("coord", True)),
+            surface_beta=float(surface.get("beta", 0.0)),
+            surface_alpha=float(surface.get("alpha", 1.0)),
+            p_slack=int(surface.get("p_slack", 1)),
+            selection_max_per_skeleton=int(
+                raw.get("selection_max_per_skeleton", 0)
+            ),
+            max_opts_per_k=int(budget.get("max_opts_per_k", 0)),
+            lattice=LatticeSwitch.from_raw(raw.get("lattice_switch")),
+            by_k=by_k,
             start_from=str(geom.get("start_from", "relaxed_coords")),
             place_monomer=str(geom.get("place_monomer", "embed_tables")),
             clash_policy=str(geom.get("clash_policy", "soft")),
@@ -190,6 +469,7 @@ class ParentStructure:
     edges: EdgeList  # distance-inferred full graph
     core_edges: EdgeList  # Cd–Se only
     wbo: Optional[Dict[Tuple[int, int], float]] = None
+    wbo_source: str = "none"  # wbo_file | csv | distance | none
     source_path: str = ""
 
     @property
@@ -314,6 +594,80 @@ def parse_wbo(path: Path) -> Dict[Tuple[int, int], float]:
             continue
         out[(min(i, j), max(i, j))] = w
     return out
+
+
+def write_wbo_file(
+    path: Path,
+    bond_orders: Sequence[Sequence[float]],
+    *,
+    threshold: float = 0.05,
+) -> None:
+    """Write an xtb-style 1-based ``wbo`` file next to a relaxed XYZ."""
+
+    _write_wbo_file(path, bond_orders, threshold=threshold)
+
+
+def _wbo_from_bond_orders_csv(
+    csv_path: Path, structure_id: str
+) -> Dict[Tuple[int, int], float]:
+    """Parse ``xtb_bond_orders.csv`` rows for one structure id."""
+
+    out: Dict[Tuple[int, int], float] = {}
+    if not csv_path.is_file():
+        return out
+    with csv_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("structure_id") or "") != structure_id:
+                continue
+            try:
+                i, j = int(row["left"]), int(row["right"])
+                w = float(row.get("wiberg") or row.get("order") or "")
+            except (KeyError, ValueError, TypeError):
+                continue
+            out[(min(i, j), max(i, j))] = w
+    return out
+
+
+def load_parent_wbo(
+    xyz_path: Path,
+    *,
+    structure_id: str,
+    run_dir: Optional[Path] = None,
+) -> Tuple[Optional[Dict[Tuple[int, int], float]], str]:
+    """WBO for a parent: ``*.wbo`` next to XYZ, then map CSV, else none.
+
+    g-xTB does not write Wiberg files; GFN-xTB ``wbo`` and the map dump
+    ``xtb_bond_orders.csv`` are the two real sources.
+    """
+
+    candidates = [
+        xyz_path.with_suffix(".wbo"),
+        xyz_path.with_name(xyz_path.stem + ".wbo"),
+        xyz_path.with_name("wbo"),
+        xyz_path.parent / "wbo",
+    ]
+    for cand in candidates:
+        parsed = parse_wbo(cand)
+        if parsed:
+            return parsed, "wbo_file"
+    search_dirs = []
+    if run_dir is not None:
+        search_dirs.append(Path(run_dir))
+    search_dirs.append(xyz_path.parent)
+    if xyz_path.parent.parent != xyz_path.parent:
+        search_dirs.append(xyz_path.parent.parent)
+        if xyz_path.parent.parent.parent != xyz_path.parent.parent:
+            search_dirs.append(xyz_path.parent.parent.parent)
+    seen: set = set()
+    for folder in search_dirs:
+        key = str(folder)
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed = _wbo_from_bond_orders_csv(folder / "xtb_bond_orders.csv", structure_id)
+        if parsed:
+            return parsed, "csv"
+    return None, "none"
 
 
 def core_edges_from_full(
@@ -545,20 +899,22 @@ def load_parents_from_run(
             core = core_edges_from_full(
                 symbols, edges, cation=cation, anion=anion
             )
-            wbo_path = xyz_path.parent / "wbo"
-            if not wbo_path.is_file():
-                wbo_path = xyz_path.with_name("wbo")
+            sid_use = sid or xyz_path.stem
+            wbo, wbo_src = load_parent_wbo(
+                xyz_path, structure_id=sid_use, run_dir=run_dir
+            )
             parents.append(
                 ParentStructure(
                     k=k,
                     p=rp,
-                    structure_id=sid or xyz_path.stem,
+                    structure_id=sid_use,
                     symbols=tuple(symbols),
                     coordinates=coords,
                     energy_eV=energy,
                     edges=edges,
                     core_edges=core,
-                    wbo=parse_wbo(wbo_path) or None,
+                    wbo=wbo,
+                    wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
                 )
             )
@@ -594,17 +950,22 @@ def load_parents_from_run(
             core = core_edges_from_full(
                 symbols, edges, cation=cation, anion=anion
             )
+            sid_use = xyz_path.stem.replace("_xtb", "")
+            wbo, wbo_src = load_parent_wbo(
+                xyz_path, structure_id=sid_use, run_dir=run_dir
+            )
             parents.append(
                 ParentStructure(
                     k=k,
                     p=rp,
-                    structure_id=xyz_path.stem.replace("_xtb", ""),
+                    structure_id=sid_use,
                     symbols=tuple(symbols),
                     coordinates=coords,
                     energy_eV=energy,
                     edges=edges,
                     core_edges=core,
-                    wbo=None,
+                    wbo=wbo,
+                    wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
                 )
             )
@@ -662,11 +1023,12 @@ def select_parents(
 
     selected: List[ParentStructure] = []
     for (k, p), group in sorted(by_bin.items()):
+        win = growth.window_for(k)
         emin = min(x.energy_eV for x in group)
         windowed = [
             x
             for x in group
-            if x.energy_eV <= emin + growth.energy_window_eV
+            if x.energy_eV <= emin + win.energy_window_eV
         ]
         if not windowed:
             windowed = [min(group, key=lambda x: x.energy_eV)]
@@ -684,14 +1046,14 @@ def select_parents(
         n_keep = max(
             1,
             min(
-                growth.max_skeletons_cap,
-                int(math.ceil(growth.max_skeletons_frac * max(1, len(skel_ranked)))),
+                win.max_skeletons_cap,
+                int(math.ceil(win.max_skeletons_frac * max(1, len(skel_ranked)))),
             ),
         )
         n_keep = min(n_keep, len(skel_ranked))
         for _fp, members in skel_ranked[:n_keep]:
             members_sorted = sorted(members, key=lambda x: x.energy_eV)
-            selected.extend(members_sorted[: growth.decorations_per_skeleton])
+            selected.extend(members_sorted[: win.decorations_per_skeleton])
     return selected
 
 
@@ -858,6 +1220,195 @@ def parent_core_in_blocks(
         cation=spec.core.cation,
         anion=spec.core.anion,
     )
+
+
+def parent_cn4_fraction(parent: ParentStructure, spec: NucleationSpec) -> float:
+    """Fraction of inorganic (Cd/Se) atoms with degree ≥ 4 on the parent graph."""
+
+    cation, anion = spec.core.cation, spec.core.anion
+    inorganic = [
+        i
+        for i, sym in enumerate(parent.symbols)
+        if sym in {cation, anion}
+    ]
+    if not inorganic:
+        return 0.0
+    deg: Dict[int, int] = {i: 0 for i in inorganic}
+    inorg = set(inorganic)
+    for a, b in parent.core_edges:
+        if a in inorg and b in inorg:
+            deg[a] = deg.get(a, 0) + 1
+            deg[b] = deg.get(b, 0) + 1
+    n4 = sum(1 for i in inorganic if deg.get(i, 0) >= 4)
+    return n4 / float(len(inorganic))
+
+
+def parent_six_ring_count(parent: ParentStructure, spec: NucleationSpec) -> int:
+    """Cd–Se 6-rings on the remapped parent core, or 0 if remap fails."""
+
+    from .molecular import count_cdse_six_rings
+
+    core = parent_core_in_blocks(parent, spec)
+    if not core:
+        return 0
+    return int(count_cdse_six_rings(core, parent.k, parent.p))
+
+
+def parent_rmsd_to_zb_A(
+    parent: ParentStructure, spec: NucleationSpec
+) -> Optional[float]:
+    """Kabsch RMSD of the inorganic core vs a zb fragment from ``spec.cif``.
+
+    Returns None if the CIF cannot be read or the fragment is too small.
+    """
+
+    cif = getattr(spec, "cif", None)
+    if not cif or not Path(str(cif)).is_file():
+        return None
+    cation, anion = spec.core.cation, spec.core.anion
+    core_idx = [
+        i
+        for i, sym in enumerate(parent.symbols)
+        if sym in {cation, anion}
+    ]
+    if len(core_idx) < 4:
+        return None
+    try:
+        from pymatgen.core import Structure
+
+        struct = Structure.from_file(str(cif))
+        struct.make_supercell((3, 3, 3))
+    except Exception:
+        return None
+    sites = [
+        site
+        for site in struct.sites
+        if str(site.specie.symbol) in {cation, anion}
+    ]
+    if len(sites) < len(core_idx):
+        return None
+    # Take the first N zb sites of matching element counts (compact origin cube).
+    want_cat = sum(1 for i in core_idx if parent.symbols[i] == cation)
+    want_an = len(core_idx) - want_cat
+    picked: List[Any] = []
+    n_cat = n_an = 0
+    origin = sites[0].coords
+    ordered = sorted(sites, key=lambda s: float(np.linalg.norm(s.coords - origin)))
+    for site in ordered:
+        sym = str(site.specie.symbol)
+        if sym == cation and n_cat < want_cat:
+            picked.append(site)
+            n_cat += 1
+        elif sym == anion and n_an < want_an:
+            picked.append(site)
+            n_an += 1
+        if n_cat == want_cat and n_an == want_an:
+            break
+    if len(picked) != len(core_idx):
+        return None
+    # Align by element-sorted coordinates (not a true matching — diagnostic only).
+    def _sorted_xyz(symbols: Sequence[str], coords: FloatArray) -> FloatArray:
+        order = sorted(range(len(symbols)), key=lambda i: (symbols[i], i))
+        return np.asarray(coords, dtype=float)[order]
+
+    parent_xyz = _sorted_xyz(
+        [parent.symbols[i] for i in core_idx],
+        parent.coordinates[core_idx],
+    )
+    zb_xyz = _sorted_xyz(
+        [str(s.specie.symbol) for s in picked],
+        np.asarray([s.coords for s in picked], dtype=float),
+    )
+    parent_xyz = parent_xyz - parent_xyz.mean(axis=0)
+    zb_xyz = zb_xyz - zb_xyz.mean(axis=0)
+    u, _s, vt = np.linalg.svd(parent_xyz.T @ zb_xyz)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vt[-1] *= -1
+        rot = vt.T @ u.T
+    aligned = parent_xyz @ rot.T
+    delta = aligned - zb_xyz
+    return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+
+
+def parent_has_local_tet(
+    parent: ParentStructure,
+    spec: NucleationSpec,
+    switch: LatticeSwitch,
+) -> Tuple[bool, str]:
+    """Local tetrahedral character (MSC), not zinc-blende long-range order.
+
+    CN4 fraction and six-rings mean “Cd has tet holes / rings exist”.
+    Optional RMSD-to-zb is a *crystal* diagnostic and should not be the
+    reason to turn on tet_sites; keep it off in production YAML.
+    """
+
+    reasons: List[str] = []
+    if switch.min_cn4_fraction is not None:
+        frac = parent_cn4_fraction(parent, spec)
+        reasons.append(f"cn4={frac:.2f}")
+        if frac >= float(switch.min_cn4_fraction):
+            return True, f"cn4_fraction={frac:.2f}"
+    if switch.min_six_rings is not None:
+        n6 = parent_six_ring_count(parent, spec)
+        reasons.append(f"r6={n6}")
+        if n6 >= int(switch.min_six_rings):
+            return True, f"six_rings={n6}"
+    if switch.max_core_rmsd_to_zb_A is not None:
+        rmsd = parent_rmsd_to_zb_A(parent, spec)
+        if rmsd is not None:
+            reasons.append(f"rmsd={rmsd:.2f}")
+            if rmsd <= float(switch.max_core_rmsd_to_zb_A):
+                return True, f"zb_rmsd={rmsd:.2f}A"
+    return False, "no_criterion (" + ",".join(reasons) + ")"
+
+
+def choose_decoration_mode(
+    parents: Sequence[ParentStructure],
+    *,
+    k_child: int,
+    spec: NucleationSpec,
+    switch: LatticeSwitch,
+) -> Tuple[str, str]:
+    """Return (mode, note) for decorating children at ``k_child``.
+
+    Empty mode means “leave the pack graph_rules alone”.
+    """
+
+    if not switch.enabled or int(k_child) < int(switch.from_k):
+        return "", "lattice_switch off or k < from_k"
+    for parent in parents:
+        ok, why = parent_has_local_tet(parent, spec, switch)
+        if ok:
+            return str(switch.decoration_mode), f"parent {parent.structure_id}: {why}"
+    fallback = str(switch.fallback or "")
+    if fallback:
+        return fallback, "no parent met local-tet tests"
+    return "", "no parent met local-tet tests"
+
+
+def parent_looks_zb_like(
+    parent: ParentStructure,
+    spec: NucleationSpec,
+    switch: LatticeSwitch,
+) -> Tuple[bool, str]:
+    """Deprecated name: local tet, not zb.  Use ``parent_has_local_tet``."""
+
+    return parent_has_local_tet(parent, spec, switch)
+
+
+def spec_with_decoration_mode(spec: NucleationSpec, mode: str) -> NucleationSpec:
+    """Copy of ``spec`` with ``graph_rules.decoration_mode`` forced to ``mode``."""
+
+    from dataclasses import replace
+
+    rules = replace(
+        spec.graph_rules,
+        decoration_mode=str(mode),
+        decoration_mode_from_k=0,
+        decoration_mode_at_or_above="",
+    )
+    return replace(spec, graph_rules=rules)
 
 
 # ---------------------------------------------------------------------------
@@ -1335,18 +1886,26 @@ def grow_cores_from_parents(
             skeleton_catalog={},
         )
     k = parents[0].k
+    window = growth.window_for(k)
     catalog: Dict[Tuple[int, int], Dict[EdgeList, None]] = {}
     channels: List[GrowthChannelResult] = []
     parent_records: List[Dict[str, Any]] = []
     coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = defaultdict(list)
     cutoffs = bond_cutoffs_from_spec(spec)
     seed_serial = 0
+    use_coord = bool(window.move_coord) and growth.use_coord_carry
+    use_graph = bool(window.move_graph)
 
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
         packages = identify_packages(parent, spec)
-        max_s = min(growth.max_shed, parent.p, len(packages) if packages else parent.p)
-        if growth.prefer_low_shed:
+        n_pkg = len(packages) if packages else parent.p
+        max_s = min(
+            window.s_max_for(parent.k, parent.p),
+            parent.p,
+            n_pkg,
+        )
+        if window.prefer_low_shed:
             s_order = list(range(0, max_s + 1))
         else:
             s_order = list(range(max_s, -1, -1))
@@ -1359,6 +1918,7 @@ def grow_cores_from_parents(
                 "energy_eV": parent.energy_eV,
                 "n_packages": len(packages),
                 "has_wbo": parent.wbo is not None,
+                "wbo_source": parent.wbo_source,
                 "source": parent.source_path,
             }
         )
@@ -1370,38 +1930,43 @@ def grow_cores_from_parents(
 
             # ---- Move A: graph catalog ----
             children_base: List[EdgeList] = []
-            if core is not None:
+            if use_graph and core is not None:
                 children_base = shed_and_grow(
                     core,
                     k=parent.k,
                     p=parent.p,
                     p_out=p_out,
                     spec=spec,
-                    max_children=growth.max_children_per_channel,
+                    max_children=window.max_children_per_channel,
+                    attach=window.attach,
                 )
-            for p_m in growth.monomer_p_values:
+            for p_m in window.monomer_p_values:
                 p_child = p_out + p_m
-                children_pm = _inflate_cores_with_precursor(
-                    children_base,
-                    k_child=parent.k + 1,
-                    p_from=p_out,
-                    p_to=p_child,
-                    spec=spec,
-                )
-                _store_channel(
-                    catalog,
-                    channels,
-                    parent,
-                    s,
-                    p_m,
-                    parent.k + 1,
-                    p_child,
-                    children_pm,
-                    move="graph",
-                )
+                if not window.allow_p_child(parent.k + 1, p_child):
+                    continue
+                children_pm: List[EdgeList] = []
+                if use_graph:
+                    children_pm = _inflate_cores_with_precursor(
+                        children_base,
+                        k_child=parent.k + 1,
+                        p_from=p_out,
+                        p_to=p_child,
+                        spec=spec,
+                    )
+                    _store_channel(
+                        catalog,
+                        channels,
+                        parent,
+                        s,
+                        p_m,
+                        parent.k + 1,
+                        p_child,
+                        children_pm,
+                        move="graph",
+                    )
 
                 # ---- Move B: coordinate carry-over ----
-                if growth.use_coord_carry:
+                if use_coord:
                     seed_serial += 1
                     if seed_serial == 1 or seed_serial % 5 == 0:
                         # visible progress: cleanup can take tens of seconds each
@@ -1567,6 +2132,44 @@ def _bond_extra_precursors(
     return tuple(sorted(set(e_list)))
 
 
+def _apply_opt_budget(
+    result: GrowthStepResult, max_opts: int
+) -> GrowthStepResult:
+    """Cap coordinate seeds plus unique cores so a survey stays a few hundred.
+
+    Seeds are kept first (one opt each); remaining slots become cores that
+    will be redecorated.  Catalog keys and channel lists are left intact.
+    """
+
+    if max_opts <= 0:
+        return result
+    kept_seeds: Dict[Tuple[int, int], List[CoordSeed]] = {}
+    used = 0
+    for key in sorted(result.coord_seeds):
+        bucket: List[CoordSeed] = []
+        for seed in result.coord_seeds[key]:
+            if used >= max_opts:
+                break
+            bucket.append(seed)
+            used += 1
+        if bucket:
+            kept_seeds[key] = bucket
+        if used >= max_opts:
+            break
+    remain = max(0, max_opts - used)
+    kept_cat: Dict[Tuple[int, int], List[EdgeList]] = {}
+    for key in sorted(result.skeleton_catalog):
+        cores = list(result.skeleton_catalog[key])
+        if remain <= 0:
+            break
+        take = cores[:remain]
+        kept_cat[key] = take
+        remain -= len(take)
+    result.coord_seeds = kept_seeds
+    result.skeleton_catalog = kept_cat
+    return result
+
+
 def _store_channel(
     catalog: Dict[Tuple[int, int], Dict[EdgeList, None]],
     channels: List[GrowthChannelResult],
@@ -1730,7 +2333,10 @@ class GrowthLog:
             self.line("  B coord: OFF (geometry.start_from != relaxed_coords)")
         self.line(
             f"  shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
-            f"prefer_low_shed={growth.prefer_low_shed}"
+            f"prefer_low_shed={growth.prefer_low_shed} "
+            f"attach={growth.attach} "
+            f"p_surf β={growth.surface_beta} α={growth.surface_alpha} "
+            f"slack={growth.p_slack}"
         )
         self.line(
             "  timing keys: opt= full g-xTB; recon= motif_factor (A only); "
@@ -1799,11 +2405,21 @@ class GrowthLog:
         self.line(f"  by p_m:     {',  '.join(pm_bits) or '(none)'}")
         n_pkg = sum(int(r.get("n_packages") or 0) for r in parent_records)
         n_wbo = sum(1 for r in parent_records if r.get("has_wbo"))
+        sources = Counter(
+            str(r.get("wbo_source") or "none") for r in parent_records
+        )
+        src_txt = ", ".join(f"{k}={v}" for k, v in sorted(sources.items()))
         self.line(
             f"  parent packages: {n_pkg} total; "
             f"{n_wbo}/{len(parent_records)} parents have WBO "
-            f"(coord shed uses WBO/distance rank; graph shed is combinatorial)"
+            f"({src_txt})"
         )
+        if n_wbo == 0 and parent_records:
+            self.line(
+                "  NOTE: no Wiberg files on parents (typical for g-xTB). "
+                "Package ranking falls back to Cd–Cl distance "
+                "(longer = weaker = shed first)."
+            )
 
     def begin_bin(
         self,
@@ -2112,13 +2728,15 @@ def run_growth_step(
         run_dir, k=k_from, spec=map_spec, p_values=p_parents
     )
     parents = select_parents(parents_all, growth, map_spec)
+    window = growth.window_for(k_from)
     if log:
         log.line(
             f"loaded {len(parents_all)} converged parents → "
             f"selected {len(parents)} "
-            f"(window={growth.energy_window_eV} eV, "
-            f"≤{growth.decorations_per_skeleton} dec/core)"
+            f"(window={window.energy_window_eV} eV, "
+            f"≤{window.decorations_per_skeleton} dec/core)"
         )
+        log.line(f"envelope: {window.describe()}")
     elif progress:
         progress(
             f"[growth] k={k_from}: loaded {len(parents_all)} parents, "
@@ -2131,12 +2749,14 @@ def run_growth_step(
             2,
             n_stages,
             f"grow cores  k={k_from} → k={k_from + 1}",
-            packages=list(growth.monomer_p_values),
-            max_shed=growth.max_shed,
-            move_A="graph combinatorial shed",
+            packages=list(window.monomer_p_values),
+            max_shed=window.max_shed,
+            attach=window.attach,
+            p_surf=window.p_surf(k_from) if window.surface_beta > 0 else "off",
+            move_A="graph" if window.move_graph else "off",
             move_B=(
-                "coord WBO shed + place + cleanup"
-                if growth.use_coord_carry
+                "coord WBO/distance shed + place + cleanup"
+                if window.move_coord and growth.use_coord_carry
                 else "off"
             ),
         )
@@ -2201,6 +2821,16 @@ def run_growth_step(
     child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
     # Merged A+B energy rows per (k,p); ranked once after all bins finish
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
+    do_redecorate = bool(decorate and window.child_redecorate)
+    if window.max_opts_per_k > 0:
+        result = _apply_opt_budget(result, window.max_opts_per_k)
+        n_cores = sum(len(v) for v in result.skeleton_catalog.values())
+        n_seeds = sum(len(v) for v in result.coord_seeds.values())
+        if log:
+            log.line(
+                f"budget: max_opts_per_k={window.max_opts_per_k} → "
+                f"cores={n_cores} coord_seeds={n_seeds}"
+            )
     if decorate and (result.skeleton_catalog or result.coord_seeds):
         if pack is None and map_spec.geometry_pack:
             try:
@@ -2239,7 +2869,7 @@ def run_growth_step(
                 bin_ranks=bin_ranks,
             )
 
-        if log and result.skeleton_catalog:
+        if log and result.skeleton_catalog and do_redecorate:
             log.stage(
                 3,
                 n_stages,
@@ -2250,10 +2880,42 @@ def run_growth_step(
                     "dup graphs skip opt; ranking after all bins"
                 ),
             )
+        elif log and result.skeleton_catalog and not do_redecorate:
+            log.line(
+                "move A redecorate: OFF (child.redecorate=false or --cores-only)"
+            )
         done_cores = 0
         cation = map_spec.core.cation
         anion = map_spec.core.anion
-        for (k, p), cores in sorted(result.skeleton_catalog.items()):
+        dec_mode, dec_note = choose_decoration_mode(
+            parents,
+            k_child=k_from + 1,
+            spec=map_spec,
+            switch=window.lattice,
+        )
+        dec_spec = (
+            spec_with_decoration_mode(map_spec, dec_mode)
+            if dec_mode
+            else map_spec
+        )
+        if window.selection_max_per_skeleton > 0:
+            from dataclasses import replace as _replace
+
+            dec_spec = _replace(
+                dec_spec,
+                graph_rules=_replace(
+                    dec_spec.graph_rules,
+                    selection_max_per_skeleton=int(
+                        window.selection_max_per_skeleton
+                    ),
+                    selection_per_skeleton_from_k=0,
+                ),
+            )
+        if log and do_redecorate:
+            log.line(f"decoration mode: {dec_mode}  ({dec_note})")
+        for (k, p), cores in sorted(
+            result.skeleton_catalog.items() if do_redecorate else ()
+        ):
             n_coord = len(result.coord_seeds.get((k, p), ()))
             if log:
                 log.begin_bin(
@@ -2318,7 +2980,7 @@ def run_growth_step(
             bin_res = enumerate_molecular_bin(
                 k,
                 p,
-                map_spec,
+                dec_spec,
                 pack=pack,
                 embed=embed,
                 precomputed_skeletons=cores,
@@ -2781,6 +3443,34 @@ def _opt_coord_seeds(
         xr = results[0]
         opt_s = time.perf_counter() - t0
         n_run += 1
+        # Prune g-xTB artifact endpoints (Se–Cl / Se–Se / Cd–Cd contacts).
+        artifact_codes: List[str] = []
+        if xr.ok and xr.coordinates is not None:
+            from .molecular_rules import forbidden_pair_contact_violations
+
+            artifact_codes = forbidden_pair_contact_violations(
+                list(seed.symbols),
+                xr.coordinates,
+                map_spec,
+                floors=settings.artifact_min_distance or None,
+            )
+        relax_tag = (
+            "artifact"
+            if artifact_codes
+            else (
+                "ok"
+                if xr.converged
+                else (
+                    "maxcycle"
+                    if str(getattr(xr, "status", "") or "") == "maxcycle"
+                    or (
+                        not xr.converged
+                        and int(xr.steps) >= int(settings.max_steps) > 0
+                    )
+                    else "unconv"
+                )
+            )
+        )
         if progress is not None:
             base = (
                 f"[growth-job] k={seed.k} p={seed.p} move=B "
@@ -2790,11 +3480,17 @@ def _opt_coord_seeds(
                 f"id={seed.structure_id} "
                 f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
             )
-            if xr.ok and xr.energy_eV is not None:
+            if artifact_codes:
+                progress(
+                    base
+                    + "E_eV=n/a "
+                    + f"relax=artifact err={'|'.join(artifact_codes[:3])}"
+                )
+            elif xr.ok and xr.energy_eV is not None:
                 progress(
                     base
                     + f"E_eV={float(xr.energy_eV):.6f} "
-                    + f"relax={'ok' if xr.converged else 'fail'}"
+                    + f"relax={relax_tag}"
                 )
             else:
                 progress(
@@ -2802,6 +3498,30 @@ def _opt_coord_seeds(
                     + "E_eV=n/a "
                     + f"relax=fail err={xr.error or 'coord_opt'}"
                 )
+        if artifact_codes:
+            # Still dump diagnostic XYZ (energy tagged as artifact) but do
+            # not enter ranking / child_minima.
+            if output_dir is not None and xr.coordinates is not None:
+                bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+                bdir.mkdir(parents=True, exist_ok=True)
+                xyz = bdir / f"{seed.structure_id}_xtb_artifact.xyz"
+                e_note = (
+                    "n/a"
+                    if xr.energy_eV is None
+                    else f"{float(xr.energy_eV):.6f}"
+                )
+                lines = [
+                    str(len(seed.symbols)),
+                    f"{seed.structure_id} ARTIFACT energy_eV={e_note} "
+                    f"violations={'|'.join(artifact_codes)} "
+                    f"parent={seed.parent_id}",
+                ]
+                for sym, pos in zip(seed.symbols, xr.coordinates):
+                    lines.append(
+                        f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
+                    )
+                xyz.write_text("\n".join(lines) + "\n")
+            continue
         if not xr.ok or xr.energy_eV is None:
             continue
         e = float(xr.energy_eV)
@@ -2863,6 +3583,8 @@ def _opt_coord_seeds(
         for sym, pos in zip(seed.symbols, coords):
             lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
         xyz.write_text("\n".join(lines) + "\n")
+        if growth.persist_wbo and getattr(xr, "bond_orders", None):
+            write_wbo_file(xyz.with_suffix(".wbo"), xr.bond_orders)
         refs = growth.references
         fields = [
             "k",

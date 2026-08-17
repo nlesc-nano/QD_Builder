@@ -15,15 +15,45 @@ per batch.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = ["XtbSettings", "XtbResult", "relax_structures"]
 
 _WORKER = Path(__file__).resolve().parents[3] / "tools" / "xtb_worker.py"
+
+
+def _is_gxtb(method: str) -> bool:
+    """Whether ``method`` selects the g-xTB Hamiltonian."""
+
+    return str(method).strip().lower().replace("_", "-") in {
+        "g-xtb", "gxtb", "g-xtb-cli",
+    }
+
+
+def _parse_artifact_min_distance(raw: Any) -> Dict[str, float]:
+    """Parse ``relaxation.artifact_min_distance`` pair → Å floors."""
+
+    if not isinstance(raw, Mapping):
+        return {}
+    out: Dict[str, float] = {}
+    for key, value in raw.items():
+        parts = str(key).replace("_", "-").split("-")
+        if len(parts) != 2:
+            continue
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            continue
+        if val <= 0.0:
+            continue
+        a, b = sorted((parts[0].strip(), parts[1].strip()))
+        out[f"{a}-{b}"] = val
+    return out
 
 
 @dataclass(frozen=True)
@@ -52,20 +82,46 @@ class XtbSettings:
     check_connectivity: bool = True
     #: wall-clock guard for one worker batch; 0 disables the guard
     timeout_s: float = 0.0
+    #: Keep geometry+energy when the optimiser hits ``max_steps`` without
+    #: formal convergence.  g-xTB often plateaus sub-kcal/mol well before the
+    #: force threshold; those endpoints are usable if artifact-pruned later.
+    accept_maxcycle: bool = True
+    #: Post-relax bond-like artifact floors (Å) by element pair key
+    #: (``"Cd-Cd"``, ``"Se-Se"``, ``"Cl-Se"``, ``"Cl-Cl"``, …).  Mid-gap between
+    #: covalent collapses and ordinary non-bonded contacts — **not** the same
+    #: as construction ``pair_rules.min_distance``.  Empty → code defaults.
+    #: Pack YAML::
+    #:
+    #:   relaxation:
+    #:     artifact_min_distance:
+    #:       Cd-Cd: 2.80
+    #:       Se-Se: 2.80
+    #:       Cl-Se: 2.80
+    #:       Cl-Cl: 2.80
+    artifact_min_distance: Mapping[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_pack(cls, raw: Optional[Mapping[str, Any]]) -> "XtbSettings":
         if not isinstance(raw, Mapping):
             return cls()
         python = raw.get("python")
+        method = str(raw.get("method", "GFN1-xTB"))
+        # g-xTB defaults: short maxcycle (100).  Beyond that, most remaining
+        # steps are sub-kcal/mol noise; packs can still override.
+        default_max_steps = 100 if _is_gxtb(method) else 500
+        max_steps = int(raw.get("max_steps", default_max_steps))
+        accept_maxcycle = bool(raw.get("accept_maxcycle", True))
+        artifact_min_distance = _parse_artifact_min_distance(
+            raw.get("artifact_min_distance", raw.get("artifact_floors"))
+        )
         return cls(
             enabled=bool(raw.get("enabled", False)),
-            method=str(raw.get("method", "GFN1-xTB")),
+            method=method,
             accuracy=float(raw.get("accuracy", 1.0)),
             electronic_temperature=float(raw.get("electronic_temperature", 300.0)),
             max_iterations=int(raw.get("max_iterations", 500)),
             fmax=float(raw.get("fmax", 0.02)),
-            max_steps=int(raw.get("max_steps", 500)),
+            max_steps=max_steps,
             python=None if python is None else str(Path(python).expanduser()),
             binary=(
                 None if raw.get("binary") is None
@@ -78,6 +134,8 @@ class XtbSettings:
             charge=int(raw.get("charge", 0)),
             check_connectivity=bool(raw.get("check_connectivity", True)),
             timeout_s=float(raw.get("timeout_s", 0.0)),
+            accept_maxcycle=accept_maxcycle,
+            artifact_min_distance=artifact_min_distance,
         )
 
     def payload(self) -> Dict[str, Any]:
@@ -88,6 +146,8 @@ class XtbSettings:
             "max_iterations": self.max_iterations,
             "fmax": self.fmax,
             "max_steps": self.max_steps,
+            "accept_maxcycle": self.accept_maxcycle,
+            "artifact_min_distance": dict(self.artifact_min_distance or {}),
         }
 
 
@@ -104,6 +164,8 @@ class XtbResult:
     coordinates: Optional[Tuple[Tuple[float, float, float], ...]] = None
     bond_orders: Optional[List[List[float]]] = None
     error: str = ""
+    #: ``converged`` | ``maxcycle`` | ``not_converged`` | failure tag
+    status: str = ""
     #: pairs that gained or lost a bond relative to the input graph
     connectivity_changed: Tuple[Tuple[int, int], ...] = ()
     #: the graph implied by the relaxed coordinates
@@ -112,14 +174,6 @@ class XtbResult:
 
 #: Hartree -> eV, so CLI energies match the eV the python worker reports.
 _HARTREE_EV = 27.211386245988
-
-
-def _is_gxtb(method: str) -> bool:
-    """Whether ``method`` selects the g-xTB Hamiltonian."""
-
-    return str(method).strip().lower().replace("_", "-") in {
-        "g-xtb", "gxtb", "g-xtb-cli",
-    }
 
 
 #: the banner is per-process state, so a batch prints it once, not per bin
@@ -169,6 +223,8 @@ def describe_backend(settings: "XtbSettings") -> List[str]:
         f"[relax] command   : {' '.join(cmd)}",
         f"[relax] timeout_s : {settings.timeout_s:g}"
         f"    charge: {int(settings.charge)}",
+        f"[relax] max_steps : {int(settings.max_steps)}"
+        f"    accept_maxcycle: {bool(settings.accept_maxcycle)}",
     ]
     if resolved is None:
         lines.append(
@@ -195,19 +251,18 @@ def _cli_command(binary: str, settings: "XtbSettings") -> List[str]:
     cmd = [binary, "in.xyz", "--gxtb", "--opt"]
     if settings.charge:
         cmd += ["--chrg", str(int(settings.charge))]
-    # Optional xcontrol (e.g. maxcycle for short cleanup) written beside in.xyz
-    if int(settings.max_steps) > 0 and int(settings.max_steps) < 500:
+    # xcontrol carries $opt maxcycle — gxtb CLI ignores max_steps alone.
+    if int(settings.max_steps) > 0:
         cmd += ["--input", "xcontrol"]
     return cmd
 
 
 def _write_cli_xcontrol(work: Path, settings: "XtbSettings") -> None:
-    """Limit geometry steps for short cleanups (gxtb CLI ignores max_steps alone)."""
+    """Write xtb/gxtb ``$opt maxcycle=…`` so ``max_steps`` is enforced."""
 
     max_steps = int(settings.max_steps)
-    if max_steps <= 0 or max_steps >= 500:
+    if max_steps <= 0:
         return
-    # xtb/tblite reads $opt maxcycle from the input file
     (work / "xcontrol").write_text(
         "$opt\n"
         f"  maxcycle={max_steps}\n"
@@ -216,15 +271,59 @@ def _write_cli_xcontrol(work: Path, settings: "XtbSettings") -> None:
     )
 
 
+def _parse_cli_opt_status(log: str, max_steps: int) -> Tuple[bool, int, str]:
+    """Return ``(converged, steps, status_note)`` from a gxtb/xtb log.
+
+    ``status_note`` is empty on formal convergence, ``maxcycle`` when the
+    step cap stopped the run, or a short failure tag otherwise.
+    """
+
+    converged = "GEOMETRY OPTIMIZATION CONVERGED" in log
+    steps = 0
+    m = re.search(r"CONVERGED AFTER\s+(\d+)\s+ITERATIONS", log, re.I)
+    if m:
+        steps = int(m.group(1))
+    if not steps:
+        m = re.search(
+            r"(?:FAILED TO CONVERGE|not converged|MAXCYCLE|"
+            r"maximum number of optimization cycles)"
+            r"[^\n]*?(\d+)",
+            log,
+            re.I,
+        )
+        if m:
+            steps = int(m.group(1))
+    if not steps:
+        # last cycle counter printed during the run
+        cycles = re.findall(
+            r"(?:cycle|iter(?:ation)?)\s*[:=]?\s*(\d+)", log, re.I
+        )
+        if cycles:
+            steps = int(cycles[-1])
+    if converged:
+        return True, steps, ""
+    if max_steps > 0 and (steps >= max_steps or steps == 0):
+        # steps==0: some builds omit the counter but still hit the cap
+        return False, (steps if steps > 0 else max_steps), "maxcycle"
+    if "FAILED TO CONVERGE" in log.upper() or "not converged" in log.lower():
+        return False, steps, "not_converged"
+    return False, steps, "not_converged"
+
+
 def _run_cli(structures, settings) -> List[Dict[str, Any]]:
     """Drive a standalone xtb/g-xTB binary, one optimisation per structure.
 
     g-xTB has no Python binding, so it is run as ``<binary> in.xyz --gxtb
     --opt`` in a scratch directory per structure.  Energy and geometry come
     from ``xtbopt.xyz``; Wiberg orders from ``wbo`` when present.
+
+    When ``accept_maxcycle`` is true (default), a run that hits ``max_steps``
+    without formal force convergence is still ``ok`` if energy and geometry
+    are present — formal convergence is reported via ``converged=False`` and
+    ``status=maxcycle``.  Unreasonable endpoints (Se–Cl / Se–Se / Cd–Cd
+    contacts) are rejected later by the post-relax artifact prune.
     """
 
-    import re
     import shutil
     import tempfile
 
@@ -235,6 +334,11 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
     if not _BACKEND_BANNER_DONE:
         _BACKEND_BANNER_DONE = True
         print("\n".join(describe_backend(settings)), flush=True)
+        print(
+            f"[relax] max_steps : {int(settings.max_steps)}  "
+            f"accept_maxcycle: {bool(settings.accept_maxcycle)}",
+            flush=True,
+        )
 
     out: List[Dict[str, Any]] = []
     for entry in structures:
@@ -294,11 +398,9 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
             gaps = re.findall(r"HOMO-LUMO gap\s+(-?\d+\.\d+)\s*eV", log)
             if gaps:
                 gap = float(gaps[-1])
-            converged = "GEOMETRY OPTIMIZATION CONVERGED" in log
-            steps = 0
-            m = re.search(r"CONVERGED AFTER\s+(\d+)\s+ITERATIONS", log)
-            if m:
-                steps = int(m.group(1))
+            converged, steps, status = _parse_cli_opt_status(
+                log, int(settings.max_steps)
+            )
             bond_orders = None
             wbo = Path(work) / "wbo"
             if wbo.exists():
@@ -310,12 +412,30 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
                     i, j, w = int(parts[0]) - 1, int(parts[1]) - 1, float(parts[2])
                     if 0 <= i < n and 0 <= j < n:
                         bond_orders[i][j] = bond_orders[j][i] = w
+            has_energy = energy_eh is not None
+            # Accept maxcycle endpoints when geometry + energy exist.
+            if has_energy and not converged and not settings.accept_maxcycle:
+                out.append({
+                    "id": entry["id"], "ok": False,
+                    "energy_eV": energy_eh * _HARTREE_EV,
+                    "gap_eV": gap, "steps": steps, "converged": False,
+                    "positions": positions, "bond_orders": bond_orders,
+                    "error": f"not_converged:{status or 'fail'}",
+                    "status": status or "not_converged",
+                })
+                continue
+            err = ""
+            if not has_energy:
+                err = "no energy in output"
+            elif not converged:
+                err = ""  # usable endpoint; status carries maxcycle tag
             out.append({
-                "id": entry["id"], "ok": energy_eh is not None,
+                "id": entry["id"], "ok": has_energy,
                 "energy_eV": None if energy_eh is None else energy_eh * _HARTREE_EV,
                 "gap_eV": gap, "steps": steps, "converged": converged,
                 "positions": positions, "bond_orders": bond_orders,
-                "error": "" if energy_eh is not None else "no energy in output",
+                "error": err,
+                "status": ("converged" if converged else (status or "not_converged")),
             })
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -370,6 +490,27 @@ def _run_in_subprocess(structures, settings) -> List[Dict[str, Any]]:
             {"id": e["id"], "ok": False, "error": f"bad worker output: {exc}"}
             for e in structures
         ]
+
+
+def write_wbo_file(
+    path,
+    bond_orders,
+    *,
+    threshold: float = 0.05,
+) -> None:
+    """Write an xtb-style 1-based ``wbo`` file next to a relaxed XYZ."""
+
+    from pathlib import Path as _Path
+
+    lines = []
+    n = len(bond_orders)
+    for i in range(n):
+        row = bond_orders[i]
+        for j in range(i + 1, min(n, len(row))):
+            w = float(row[j])
+            if abs(w) >= threshold:
+                lines.append(f"{i + 1:5d} {j + 1:5d} {w:.8f}")
+    _Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def relaxed_edges(
@@ -453,6 +594,9 @@ def relax_structures(
                 relaxed_edges(entry["symbols"], coords, bond_cutoffs)
             )
             drift = _connectivity_drift(after, entry["edges"])
+        status = str(r.get("status") or "")
+        if not status:
+            status = "converged" if r.get("converged") else "not_converged"
         results.append(
             XtbResult(
                 ok=True,
@@ -465,6 +609,8 @@ def relax_structures(
                 max_force=r.get("max_force"),
                 coordinates=coords,
                 bond_orders=r.get("bond_orders"),
+                error=str(r.get("error") or ""),
+                status=status,
                 connectivity_changed=drift,
                 relaxed_edges=after,
             )

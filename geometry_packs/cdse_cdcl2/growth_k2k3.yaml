@@ -1,0 +1,78 @@
+# Production envelope for parent k = 2 and 3 (early molecular).
+#
+# At this size the object is still a molecule: almost every Cd is surface,
+# incoming units can be well solvated (p_m = 1,2,3), and shedding 1–2
+# Z-type CdCl2 packages to open a site is physically normal.
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2 \
+#     --growth growth_k2k3.yaml \
+#     --parents <map> --k-from 2 --k-to 3 --output runs/growth_k2_to_k3
+#
+# Surface law (lattice engine, scenario A):
+#   p_surf(k) = floor(2.0 * k^(2/3))     →  p_surf(2)=3, p_surf(3)=4, p_surf(4)=5
+#   s_max     = min(p, floor(1.0 * p_surf), 2)
+#   keep channel only if p_child ≤ p_surf(k+1) + 1
+
+schema_version: 1
+name: cdse_growth_k2k3
+
+monomer_p_values: [1, 2, 3]     # molecule: incoming unit can stay solvated
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 1                    # allow p_surf+1 so bin winners are not clipped
+
+parents:
+  energy_window_eV: 0.75        # calibration also allowed 1.0
+  rank_by: energy
+  max_skeletons_frac: 0.30
+  max_skeletons_cap: 20
+  decorations_per_skeleton: 2
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance                # honest: g-xTB maps do not write wbo
+  max_shed: 2
+  prefer_low_shed: true         # enumeration order, not a filter
+  persist_wbo: true
+
+attach: local                   # new Se–Cd bonded; Se→1 Cd; Cd→0–2 Se
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true              # move A on: k=2–3 is still cheap enough
+  full_opt: g-xTB
+
+moves:
+  graph: true
+  coord: true
+
+max_children_per_channel: 80
+# graph_rules already: bridge-first k<=2, bridge-target from k=3
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
