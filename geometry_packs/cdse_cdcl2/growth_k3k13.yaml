@@ -1,0 +1,190 @@
+# One-shot envelope: parent k = 3 … 13 (child k = 4 … 13).
+#
+# Chains the k2k3 / k4k8 / k8k13 policies so one CLI run can go from a
+# finished k=3 tree to the Wulff-size window.  by_k overlays only the
+# keys it names.  Soft rules (diamonds, F6 quality, terminal Se3Cl) are
+# on for the whole range; asphericity stays off so rods/platelets compete.
+#
+#   --k-from is the first PARENT k.  A k=3-wide run is the parent tree:
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir . --growth growth_k3k13.yaml \
+#     --parents runs/growth_k2_to_k3_wide \
+#     --k-from 3 --k-to 13 --p-parents all \
+#     --output runs/growth_k3_to_k13
+#
+# Resume: same command, same --output.  Use a NEW output if the old tree
+# was grown without these soft rules and you want them from k=3.
+#
+# Surface: p_surf(k) = floor(2.0 * k^(2/3)); p_slack 1 until k=12.
+
+schema_version: 1
+name: cdse_growth_k3k13
+
+monomer_p_values: [1, 2]        # k=3 default; by_k drops p_m=2 from k=7
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 1
+
+parents:
+  energy_window_eV: 2.0
+  rank_by: energy               # window is raw E; soft_rules re-rank inside it
+  max_skeletons_frac: 1.0
+  max_skeletons_cap: 50
+  decorations_per_skeleton: 2
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 2
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true              # A on at k=3; by_k turns it off from k=4
+  redecorate_slack: false
+  full_opt: g-xTB
+  full_opt_cycles: 150
+
+moves:
+  graph: true
+  coord: true
+
+max_children_per_channel: 80
+selection_max_per_skeleton: 6
+
+lattice_switch:
+  enabled: true
+  from_k: 7
+  decoration_mode: tet_sites
+  require_any:
+    - min_cn4_fraction: 0.45
+    - min_six_rings: 2
+  fallback: motif_bridge_target
+
+# Parent k of each step.  First match wins.
+by_k:
+  - k_min: 3
+    k_max: 3
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 2.0
+    max_skeletons_cap: 50
+    decorations_per_skeleton: 2
+    redecorate: true
+    moves: {graph: true, coord: true}
+    max_children_per_channel: 80
+    selection_max_per_skeleton: 6
+    p_slack: 1
+  - k_min: 4
+    k_max: 5
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 2.0
+    max_skeletons_cap: 50
+    decorations_per_skeleton: 1
+    redecorate: false
+    moves: {graph: false, coord: true}
+    max_children_per_channel: 40
+    selection_max_per_skeleton: 6
+    p_slack: 1
+  - k_min: 6
+    k_max: 6
+    monomer_p_values: [1, 2]
+    max_shed: 1
+    energy_window_eV: 1.0
+    max_skeletons_cap: 50
+    decorations_per_skeleton: 1
+    redecorate: false
+    moves: {graph: false, coord: true}
+    p_slack: 1
+  - k_min: 7
+    k_max: 10
+    monomer_p_values: [1]
+    max_shed: 1
+    energy_window_eV: 1.0
+    max_skeletons_cap: 15
+    decorations_per_skeleton: 1
+    redecorate: false
+    moves: {graph: false, coord: true}
+    max_children_per_channel: 20
+    selection_max_per_skeleton: 3
+    p_slack: 1
+  - k_min: 11
+    k_max: 11
+    monomer_p_values: [1]
+    max_shed: 1
+    energy_window_eV: 0.75
+    max_skeletons_cap: 12
+    decorations_per_skeleton: 1
+    redecorate: false
+    moves: {graph: false, coord: true}
+    max_children_per_channel: 20
+    p_slack: 1
+  - k_min: 12
+    k_max: 13
+    monomer_p_values: [1]
+    max_shed: 0
+    energy_window_eV: 0.50
+    max_skeletons_cap: 10
+    decorations_per_skeleton: 1
+    redecorate: false
+    moves: {graph: false, coord: true}
+    max_children_per_channel: 20
+    p_slack: 0
+
+soft_rules:
+  enabled: true
+  diamond:
+    enabled: true
+    weight_eV: 0.15
+    fused_weight_eV: 0.30
+    from_k: 2
+  f6:
+    enabled: true
+    weight_eV: -0.04
+    dirty_weight_eV: 0.20
+    from_k: 3
+  terminal_se3cl:
+    enabled: true
+    weight_eV: 0.20
+    from_k: 4
+  se1cl3:
+    enabled: true
+    weight_eV: 0.05
+    from_k: 6
+  asphericity:
+    enabled: false
+    weight_eV: 1.0
+    only_if_dirty_f6: true
+    from_k: 6
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]

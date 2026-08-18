@@ -80,6 +80,32 @@ budget:
   max_opts_per_k: 120     # hard stop after this many g-xTB jobs at one k
   prefer: diverse_skeletons
 
+soft_rules:
+  enabled: true
+  diamond:
+    enabled: true
+    weight_eV: 0.15
+    fused_weight_eV: 0.30
+    from_k: 2
+  f6:
+    enabled: true
+    weight_eV: -0.04
+    dirty_weight_eV: 0.20
+    from_k: 3
+  terminal_se3cl:
+    enabled: true
+    weight_eV: 0.20
+    from_k: 4
+  se1cl3:
+    enabled: true
+    weight_eV: 0.05
+    from_k: 6
+  asphericity:
+    enabled: false
+    weight_eV: 1.0
+    only_if_dirty_f6: true
+    from_k: 6
+
 chemical_potential:
   enabled: true
   delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]

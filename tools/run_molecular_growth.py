@@ -13,7 +13,8 @@ Simple usage (recommended) — one pack folder that contains
       --output  /path/to/runs/growth_k2_to_k3
 
 Named envelopes in the pack: growth_survey.yaml, growth_k2k3.yaml,
-growth_k4k8.yaml, growth_k9k13.yaml.  Default is growth.yaml.
+growth_k4k8.yaml, growth_k9k13.yaml, growth_k3k13.yaml (one-shot
+k=3→13).  Default is growth.yaml.
 
 Parent p bins::
 

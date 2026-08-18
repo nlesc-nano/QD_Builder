@@ -48,6 +48,12 @@ from .formation import (
     load_monomer_references,
 )
 from .geometry_pack import GeometryPack, load_geometry_pack
+from .soft_rules import (
+    INDEX_FIELDS as SOFT_INDEX_FIELDS,
+    SoftRulesConfig,
+    apply_soft_columns,
+    describe_structure,
+)
 from .molecular import (
     _index_blocks,
     _symbols_for_composition,
@@ -187,6 +193,7 @@ class GrowthWindow:
     prefer_low_shed: bool
     max_opts_per_k: int
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
+    soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
 
     def p_surf(self, k: int) -> int:
         return p_surf_capacity(k, self.surface_beta)
@@ -229,7 +236,8 @@ class GrowthWindow:
             f"moves A={self.move_graph} B={self.move_coord} "
             f"redecorate={self.child_redecorate} "
             f"A_slack={'on' if self.child_redecorate_slack else 'off'} "
-            f"shed={self.shed_mode}"
+            f"shed={self.shed_mode} "
+            f"soft={'on' if self.soft_rules.enabled else 'off'}"
         )
 
 
@@ -273,6 +281,7 @@ class GrowthConfig:
     child_full_opt: str = "g-xTB"
     child_full_opt_cycles: int = 150
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
+    soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
 
     @property
     def use_coord_carry(self) -> bool:
@@ -322,6 +331,7 @@ class GrowthConfig:
             redecorate = bool(overlay["redecorate"])
         if "redecorate_slack" in overlay:
             redecorate_slack = bool(overlay["redecorate_slack"])
+        soft = self.soft_rules.merged_with(overlay.get("soft_rules"))
         return GrowthWindow(
             k_from=k,
             monomer_p_values=tuple(int(x) for x in p_vals),
@@ -370,6 +380,7 @@ class GrowthConfig:
                 overlay.get("max_opts_per_k", self.max_opts_per_k)
             ),
             lattice=self.lattice,
+            soft_rules=soft,
         )
 
     @classmethod
@@ -475,6 +486,7 @@ class GrowthConfig:
                 )
             ),
             delta_mu_cdcl2_eV=dmu,
+            soft_rules=SoftRulesConfig.from_raw(raw.get("soft_rules")),
         )
 
 
@@ -1095,10 +1107,16 @@ def select_parents(
         for x in windowed:
             fp = _core_fingerprint(x, spec)
             buckets.setdefault(fp, []).append(x)
-        # rank skeletons by best energy
+        def _score(x: ParentStructure) -> float:
+            if not win.soft_rules.enabled:
+                return float(x.energy_eV)
+            desc = describe_structure(x.symbols, x.coordinates, spec)
+            return win.soft_rules.rank_score_eV(x.energy_eV, desc, k)
+
+        # rank skeletons by best energy (or E + soft penalty)
         skel_ranked = sorted(
             buckets.items(),
-            key=lambda kv: min(y.energy_eV for y in kv[1]),
+            key=lambda kv: min(_score(y) for y in kv[1]),
         )
         n_keep = max(
             1,
@@ -1109,7 +1127,7 @@ def select_parents(
         )
         n_keep = min(n_keep, len(skel_ranked))
         for _fp, members in skel_ranked[:n_keep]:
-            members_sorted = sorted(members, key=lambda x: x.energy_eV)
+            members_sorted = sorted(members, key=_score)
             selected.extend(members_sorted[: win.decorations_per_skeleton])
     return selected
 
@@ -3083,7 +3101,8 @@ def run_growth_step(
             f"loaded {len(parents_all)} converged parents → "
             f"selected {len(parents)} "
             f"(window={window.energy_window_eV} eV, "
-            f"≤{window.decorations_per_skeleton} dec/core)"
+            f"≤{window.decorations_per_skeleton} dec/core"
+            f"{', soft rank' if window.soft_rules.enabled else ''})"
         )
         log.line(f"envelope: {window.describe()}")
     elif progress:
@@ -3410,7 +3429,7 @@ def run_growth_step(
                     f"A={n_ok} B={n_b} (print after all bins)"
                 )
             if out is not None:
-                _write_growth_bin(out, bin_res, growth)
+                _write_growth_bin(out, bin_res, growth, spec=map_spec)
                 # mark bin A finished for restart
                 marker = bin_A_complete_marker(out, k, p)
                 marker.parent.mkdir(parents=True, exist_ok=True)
@@ -3989,6 +4008,7 @@ def _opt_coord_seeds(
             ]
             for dmu in growth.delta_mu_cdcl2_eV:
                 fields.append(f"Omega_dmu_{dmu:+.2f}")
+            fields.extend(SOFT_INDEX_FIELDS)
             row = {
                 "k": seed.k,
                 "p": seed.p,
@@ -4002,6 +4022,15 @@ def _opt_coord_seeds(
                 "p_m": seed.p_m,
                 "parent_id": seed.parent_id,
             }
+            apply_soft_columns(
+                row,
+                symbols=list(seed.symbols),
+                coords=np.asarray(coords, dtype=float),
+                energy_eV=e,
+                k=seed.k,
+                rules=growth.window_for(seed.k).soft_rules,
+                spec=map_spec,
+            )
             if refs is not None:
                 de_f = refs.formation_eV(e, seed.k, seed.p)
                 row["dE_f_eV"] = f"{de_f:.8f}"
@@ -4021,6 +4050,7 @@ def _write_growth_bin(
     out_dir: Path,
     bin_res: Any,
     growth: GrowthConfig,
+    spec: Optional[NucleationSpec] = None,
 ) -> None:
     """Write a lightweight index + formation columns for one bin.
 
@@ -4043,6 +4073,7 @@ def _write_growth_bin(
     ]
     for dmu in growth.delta_mu_cdcl2_eV:
         fields.append(f"Omega_dmu_{dmu:+.2f}")
+    fields.extend(SOFT_INDEX_FIELDS)
 
     for iso in bin_res.isomers:
         e = iso.xtb_energy_eV
@@ -4056,6 +4087,17 @@ def _write_growth_bin(
             "growth": "1",
             "move": "A",
         }
+        coords = iso.xtb_coordinates or iso.coordinates
+        if coords is not None:
+            apply_soft_columns(
+                row,
+                symbols=[a.symbol for a in iso.atoms],
+                coords=np.asarray(coords, dtype=float),
+                energy_eV=e,
+                k=k,
+                rules=growth.window_for(k).soft_rules,
+                spec=spec,
+            )
         if e is not None and refs is not None:
             de_f = refs.formation_eV(e, k, p)
             row["dE_f_eV"] = f"{de_f:.8f}"
@@ -4137,6 +4179,7 @@ __all__ = [
     "build_coord_seed",
     "compact_growth_id",
     "assign_compact_b_ids",
+    "SoftRulesConfig",
     "grow_cores_from_parents",
     "run_growth_step",
     "write_growth_summary",
