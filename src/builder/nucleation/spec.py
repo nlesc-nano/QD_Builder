@@ -756,6 +756,23 @@ def load_nucleation_spec(
                         or (3, 3, 3)
                     )
                 ),
+                reject_new_cdse_4rings=bool(
+                    graph_rules_raw.get("reject_new_cdse_4rings", False)
+                ),
+                rank_cores_by_fusion=bool(
+                    graph_rules_raw.get("rank_cores_by_fusion", False)
+                ),
+                rank_decorations_by_motifs=bool(
+                    graph_rules_raw.get("rank_decorations_by_motifs", False)
+                ),
+                construction_score={
+                    str(key): float(val)
+                    for key, val in (
+                        graph_rules_raw.get("construction_score") or {}
+                    ).items()
+                }
+                if isinstance(graph_rules_raw.get("construction_score"), dict)
+                else {},
             ),
 
             geometry_rules=_parse_geometry_rules(

@@ -204,6 +204,44 @@ class SoftDescriptors:
         }
 
 
+# Dimensionless construction score (graph_rules.construction_score).
+# Same motif family as the post-relax eV rank, but this is *graph* cost.
+DEFAULT_CONSTRUCTION_SCORE: Dict[str, float] = {
+    "n4": 15.0,
+    "n4_fused": 30.0,
+    "f6_clean": -4.0,
+    "f6_dirty": 20.0,
+    "terminal_se3cl": 20.0,
+    "se1cl3": 5.0,
+}
+
+
+def construction_score(
+    desc: SoftDescriptors,
+    spec: Optional[NucleationSpec] = None,
+) -> float:
+    """Lower is better.  Used when choosing cores / decorations."""
+
+    weights = dict(DEFAULT_CONSTRUCTION_SCORE)
+    raw = {}
+    if spec is not None:
+        raw = getattr(spec.graph_rules, "construction_score", None) or {}
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            try:
+                weights[str(key)] = float(val)
+            except (TypeError, ValueError):
+                continue
+    return float(
+        weights.get("n4", 0.0) * desc.n4
+        + weights.get("n4_fused", 0.0) * desc.n4_fused
+        + weights.get("f6_clean", 0.0) * desc.f6_clean
+        + weights.get("f6_dirty", 0.0) * desc.f6_dirty
+        + weights.get("terminal_se3cl", 0.0) * desc.n_term_se3cl
+        + weights.get("se1cl3", 0.0) * desc.n_se1cl3
+    )
+
+
 INDEX_FIELDS: Tuple[str, ...] = (
     "n4",
     "n4_fused",
@@ -218,15 +256,16 @@ INDEX_FIELDS: Tuple[str, ...] = (
 )
 
 
-def describe_structure(
+def describe_from_neigh(
     symbols: Sequence[str],
-    coords: np.ndarray,
+    neigh: Sequence[Sequence[int]],
     spec: Optional[NucleationSpec] = None,
+    *,
+    asphericity: float = 0.0,
 ) -> SoftDescriptors:
-    """Bond-graph descriptors of a relaxed XYZ."""
+    """Same counts as ``describe_structure``, from an explicit neighbour list."""
 
     cation, anion, ligand = _species(spec)
-    neigh = _neighbour_lists(symbols, coords, _cutoffs_from_spec(spec))
     fours = _cdse_four_rings(symbols, neigh, cation=cation, anion=anion)
     sixes = _cdse_six_rings(symbols, neigh, cation=cation, anion=anion)
     n4_fused = 0
@@ -252,7 +291,6 @@ def describe_structure(
                 for cl in cl_hosts
             ):
                 n_term += 1
-    asp = _asphericity(symbols, coords, (cation, anion))
     return SoftDescriptors(
         n4=len(fours),
         n4_fused=n4_fused,
@@ -261,8 +299,38 @@ def describe_structure(
         n6=len(sixes),
         n_term_se3cl=n_term,
         n_se1cl3=n_se1cl3,
-        asphericity=asp,
+        asphericity=float(asphericity),
     )
+
+
+def describe_structure(
+    symbols: Sequence[str],
+    coords: np.ndarray,
+    spec: Optional[NucleationSpec] = None,
+) -> SoftDescriptors:
+    """Bond-graph descriptors of a relaxed XYZ."""
+
+    cation, anion, _ligand = _species(spec)
+    neigh = _neighbour_lists(symbols, coords, _cutoffs_from_spec(spec))
+    asp = _asphericity(symbols, coords, (cation, anion))
+    return describe_from_neigh(symbols, neigh, spec, asphericity=asp)
+
+
+def describe_graph(
+    symbols: Sequence[str],
+    edges: Sequence[Tuple[int, int]],
+    spec: Optional[NucleationSpec] = None,
+) -> SoftDescriptors:
+    """Descriptors of a construction graph (no coordinates)."""
+
+    n = len(symbols)
+    neigh: List[List[int]] = [[] for _ in range(n)]
+    for a, b in edges:
+        ia, ib = int(a), int(b)
+        if 0 <= ia < n and 0 <= ib < n:
+            neigh[ia].append(ib)
+            neigh[ib].append(ia)
+    return describe_from_neigh(symbols, neigh, spec, asphericity=0.0)
 
 
 @dataclass(frozen=True)
@@ -415,7 +483,6 @@ class SoftRulesConfig:
         self, energy_eV: float, desc: SoftDescriptors, k: int
     ) -> float:
         return float(energy_eV) + self.penalty_eV(desc, k)
-
 
 def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> None:
     for key, val in src.items():

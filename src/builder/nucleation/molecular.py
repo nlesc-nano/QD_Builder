@@ -36,6 +36,7 @@ from .xtb_relax import XtbSettings, relax_structures
 from ..io_utils import write_xyz
 from ..nc_types import NucleationSpec
 from .geometry_pack import GeometryPack, load_geometry_pack
+from .soft_rules import construction_score, describe_graph
 from .molecular_rules import (
     allowed_bond_pairs,
     forbidden_pair_contact_violations,
@@ -4857,6 +4858,7 @@ class _CandidateScreen:
         default_factory=dict
     )
     _reservoir_rng: Any = None
+    _reservoir_ranked: bool = False
     #: candidate id -> seed skeleton fingerprint.  In the collect_only path
     #: isomers are constructed in the second pass, after the skeleton loop has
     #: finished, so ``skeleton_fp`` no longer holds the originating skeleton.
@@ -5655,7 +5657,26 @@ class _CandidateScreen:
                 self.skeleton_index, ([], 0)
             )
             seen_n += 1
-            if len(kept) < self.max_per_skeleton:
+            rank = bool(
+                getattr(self.spec.graph_rules, "rank_decorations_by_motifs", False)
+            )
+            if rank:
+                self._reservoir_ranked = True
+                symbols = [a.symbol for a in state.atoms]
+                edges = [
+                    (int(a), int(b)) for a, b in state.graph.edges
+                ]
+                score = construction_score(
+                    describe_graph(symbols, edges, self.spec), self.spec
+                )
+                # kept holds (score, entry); flatten unwraps later
+                if len(kept) < self.max_per_skeleton:
+                    kept.append((score, entry))
+                    kept.sort(key=lambda item: item[0])
+                elif score < kept[-1][0]:
+                    kept[-1] = (score, entry)
+                    kept.sort(key=lambda item: item[0])
+            elif len(kept) < self.max_per_skeleton:
                 kept.append(entry)
             else:
                 if self._reservoir_rng is None:
@@ -7204,9 +7225,12 @@ def enumerate_molecular_bin(
         if screen.max_per_skeleton > 0 and screen._reservoir:
             # Round-robin so a bin truncated by any later budget still holds
             # every skeleton, rather than all of the first few.
-            buckets = [
-                kept for _idx, (kept, _n) in sorted(screen._reservoir.items())
-            ]
+            buckets = []
+            for _idx, (kept, _n) in sorted(screen._reservoir.items()):
+                if screen._reservoir_ranked:
+                    buckets.append([item[1] for item in kept])
+                else:
+                    buckets.append(kept)
             offered = sum(n for _kept, n in screen._reservoir.values())
             screen.pool = [
                 bucket[i]

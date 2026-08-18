@@ -12,6 +12,7 @@ from builder.nucleation.soft_rules import (
     SoftDescriptors,
     SoftRulesConfig,
     _share_hist,
+    describe_graph,
     describe_structure,
 )
 
@@ -132,3 +133,36 @@ def test_growth_yaml_exposes_soft_rules() -> None:
     assert w8.soft_rules.enabled is True
     w13 = cfg.window_for(13)
     assert w13.soft_rules.diamond.from_k == 2
+
+
+def test_graph_rules_expose_construction_bias() -> None:
+    from builder.nucleation.spec import load_nucleation_spec
+    import yaml
+
+    driver = yaml.safe_load((PACK / "run_gxtb.yaml").read_text())
+    rules = yaml.safe_load((PACK / "graph_rules.yaml").read_text())
+    merged = {k: v for k, v in driver.items() if k != "include"}
+    merged.update(rules)
+    merged["cif"] = str(PACK.parents[1] / "examples" / "cifs" / "CdSe_zb.cif")
+    path = PACK.parents[1] / "geometry_packs" / "cdse_cdcl2"  # unused
+    tmp = Path(__file__).resolve().parents[1] / "examples" / "cifs" / "CdSe_zb.cif"
+    import tempfile
+
+    out = Path(tempfile.mkdtemp()) / "map.yaml"
+    merged["cif"] = str(tmp)
+    out.write_text(yaml.safe_dump(merged, sort_keys=False))
+    spec = load_nucleation_spec(str(out))
+    assert spec.graph_rules.reject_new_cdse_4rings is True
+    assert spec.graph_rules.rank_cores_by_fusion is True
+    assert spec.graph_rules.rank_decorations_by_motifs is True
+    assert spec.graph_rules.construction_score["n4"] == 15
+    assert spec.graph_rules.construction_score["f6_clean"] == -4
+
+
+def test_describe_graph_matches_coord_counts() -> None:
+    symbols, coords = _diamond_xyz()
+    from_xyz = describe_structure(symbols, coords)
+    edges = [(0, 2), (0, 3), (1, 2), (1, 3)]
+    from_graph = describe_graph(symbols, edges)
+    assert from_graph.n4 == from_xyz.n4 == 1
+    assert from_graph.n4_fused == 0
