@@ -556,6 +556,97 @@ def test_grow_cores_produces_child_bins(map_spec) -> None:
     moves = {ch.move for ch in result.channels}
     assert "graph" in moves
     assert "coord" in moves
+    from builder.nucleation.molecular_growth import parse_compact_serial
+
+    for seeds in result.coord_seeds.values():
+        for seed in seeds:
+            assert parse_compact_serial(seed.structure_id) is not None
+            assert seed.structure_id.startswith(f"k{seed.k:03d}_p{seed.p:03d}_B")
+            assert "from_" not in seed.structure_id
+            assert len(seed.structure_id) <= 16
+
+
+def test_compact_growth_id_does_not_nest_parent() -> None:
+    from builder.nucleation.molecular_growth import (
+        CoordSeed,
+        assign_compact_b_ids,
+        compact_growth_id,
+        parse_compact_serial,
+    )
+
+    long_parent = (
+        "coord_k005_p004_from_coord_k004_p003_from_"
+        "k003_p002_mol0001_s1_pm1_s0_pm2"
+    )
+    assert compact_growth_id(6, 5, "B", 7) == "k006_p005_B0007"
+    assert parse_compact_serial("k006_p005_B0007") == 7
+    assert parse_compact_serial(long_parent) is None
+    seeds = [
+        CoordSeed(
+            k=6,
+            p=5,
+            structure_id="tmp",
+            parent_id=long_parent,
+            shed=1,
+            p_m=1,
+            symbols=("Se",),
+            coordinates=np.zeros((1, 3)),
+            core_edges=(),
+        ),
+        CoordSeed(
+            k=6,
+            p=5,
+            structure_id="tmp",
+            parent_id="k005_p004_B0003",
+            shed=0,
+            p_m=1,
+            symbols=("Se",),
+            coordinates=np.zeros((1, 3)),
+            core_edges=(),
+        ),
+    ]
+    assign_compact_b_ids(seeds, output_dir=None)
+    assert seeds[0].structure_id == "k006_p005_B0001"
+    assert seeds[1].structure_id == "k006_p005_B0002"
+    assert all(len(s.structure_id) == 15 for s in seeds)
+
+
+def test_assign_compact_b_ids_reuses_finished_lineage(tmp_path) -> None:
+    from builder.nucleation.molecular_growth import (
+        CoordSeed,
+        assign_compact_b_ids,
+    )
+
+    (tmp_path / "index.csv").write_text(
+        "k,p,structure_id,xtb_energy_eV,xtb_converged,move,shed,p_m,parent_id\n"
+        "4,3,k004_p003_B0004,-10.0,True,coord,1,1,k003_p002_mol0001\n",
+        encoding="utf-8",
+    )
+    seed = CoordSeed(
+        k=4,
+        p=3,
+        structure_id="tmp",
+        parent_id="k003_p002_mol0001",
+        shed=1,
+        p_m=1,
+        symbols=("Se",),
+        coordinates=np.zeros((1, 3)),
+        core_edges=(),
+    )
+    other = CoordSeed(
+        k=4,
+        p=3,
+        structure_id="tmp",
+        parent_id="k003_p002_mol0002",
+        shed=0,
+        p_m=1,
+        symbols=("Se",),
+        coordinates=np.zeros((1, 3)),
+        core_edges=(),
+    )
+    assign_compact_b_ids([seed, other], output_dir=tmp_path)
+    assert seed.structure_id == "k004_p003_B0004"
+    assert other.structure_id == "k004_p003_B0005"
 
 
 def test_growth_log_global_and_block_index(tmp_path) -> None:

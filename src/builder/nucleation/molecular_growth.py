@@ -1828,6 +1828,154 @@ def local_cleanup_structure(
     )
 
 
+def compact_growth_id(k: int, p: int, move: str, serial: int) -> str:
+    """Short, non-nested child id.  k/p live in the path; lineage is metadata.
+
+    Move B used to embed the full parent ``structure_id``, so names grew
+    one generation per step and hit filesystem limits around k ~ 8–10.
+    """
+
+    letter = "B" if str(move).lower() in {"b", "coord", "coordinate"} else "A"
+    return f"k{int(k):03d}_p{int(p):03d}_{letter}{int(serial):04d}"
+
+
+def parse_compact_serial(structure_id: str, *, move: str = "B") -> Optional[int]:
+    """Return the serial in ``k003_p002_B0007``, or None if not that scheme."""
+
+    letter = "B" if str(move).lower() in {"b", "coord", "coordinate"} else "A"
+    m = re.fullmatch(
+        rf"k(\d+)_p(\d+)_{letter}(\d+)",
+        str(structure_id),
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return int(m.group(3))
+
+
+def _lineage_key(
+    k: int, p: int, parent_id: str, shed: int, p_m: int
+) -> Tuple[int, int, str, int, int]:
+    return (int(k), int(p), str(parent_id), int(shed), int(p_m))
+
+
+def _lineage_energy_map(
+    output_dir: Optional[Path],
+) -> Dict[Tuple[int, int, str, int, int], Tuple[str, float]]:
+    """(k, p, parent_id, shed, p_m) → (structure_id, energy_eV) from index."""
+
+    out: Dict[Tuple[int, int, str, int, int], Tuple[str, float]] = {}
+    if output_dir is None:
+        return out
+    path = Path(output_dir) / "index.csv"
+    if not path.is_file():
+        return out
+    with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+        for row in csv.DictReader(handle):
+            move = (row.get("move") or "").strip().lower()
+            if move not in {"coord", "b"}:
+                continue
+            parent_id = (row.get("parent_id") or "").strip()
+            sid = (row.get("structure_id") or "").strip()
+            if not parent_id or not sid:
+                continue
+            try:
+                k = int(row["k"])
+                p = int(row["p"])
+                shed = int(row.get("shed") or 0)
+                p_m = int(row.get("p_m") or 0)
+                energy = float(row.get("xtb_energy_eV") or "")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(energy):
+                continue
+            out[_lineage_key(k, p, parent_id, shed, p_m)] = (sid, energy)
+    return out
+
+
+def _used_b_serials(output_dir: Optional[Path], k: int, p: int) -> set:
+    """Serials already taken by ``k###_p###_B####`` in this bin."""
+
+    used: set = set()
+    if output_dir is None:
+        return used
+    bdir = Path(output_dir) / f"k{int(k):03d}" / f"p{int(p):03d}"
+    if bdir.is_dir():
+        for path in bdir.glob("*_xtb*.xyz"):
+            stem = path.name.split("_xtb", 1)[0]
+            serial = parse_compact_serial(stem, move="B")
+            if serial is not None:
+                used.add(serial)
+    index_path = Path(output_dir) / "index.csv"
+    if index_path.is_file():
+        with index_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    if int(row.get("k") or -1) != int(k):
+                        continue
+                    if int(row.get("p") or -1) != int(p):
+                        continue
+                except ValueError:
+                    continue
+                serial = parse_compact_serial(
+                    str(row.get("structure_id") or ""), move="B"
+                )
+                if serial is not None:
+                    used.add(serial)
+    return used
+
+
+def assign_compact_b_ids(
+    seeds: Sequence[CoordSeed],
+    output_dir: Optional[Path] = None,
+) -> None:
+    """Give each B seed a short id; reuse a finished lineage on restart.
+
+    New files are ``k###_p###_B0001_xtb.xyz``.  Parent, shed and p_m stay
+    in ``index.csv`` and the XYZ comment — not in the filename.
+    """
+
+    if not seeds:
+        return
+    lineage = _lineage_energy_map(output_dir)
+    by_bin: Dict[Tuple[int, int], List[CoordSeed]] = defaultdict(list)
+    for seed in seeds:
+        by_bin[(int(seed.k), int(seed.p))].append(seed)
+    for (k, p), group in by_bin.items():
+        used = _used_b_serials(output_dir, k, p)
+        occupied = {
+            hit[0]
+            for s in group
+            if (hit := lineage.get(
+                _lineage_key(s.k, s.p, s.parent_id, s.shed, s.p_m)
+            ))
+        }
+        next_serial = (max(used) + 1) if used else 1
+        for seed in group:
+            hit = lineage.get(
+                _lineage_key(seed.k, seed.p, seed.parent_id, seed.shed, seed.p_m)
+            )
+            if hit is not None:
+                seed.structure_id = hit[0]
+                continue
+            current = parse_compact_serial(seed.structure_id, move="B")
+            if (
+                current is not None
+                and seed.structure_id.startswith(f"k{k:03d}_p{p:03d}_")
+                and current not in used
+                and seed.structure_id not in occupied
+            ):
+                used.add(current)
+                occupied.add(seed.structure_id)
+                continue
+            while next_serial in used:
+                next_serial += 1
+            seed.structure_id = compact_growth_id(k, p, "B", next_serial)
+            used.add(next_serial)
+            occupied.add(seed.structure_id)
+            next_serial += 1
+
+
 def build_coord_seed(
     parent: ParentStructure,
     *,
@@ -1890,11 +2038,9 @@ def build_coord_seed(
         # isomer energy for the same [CdSe]_k(CdCl2)_p label).
         return None
 
-    # Deterministic id (no running serial) so restarts skip the same jobs
-    sid = (
-        f"coord_k{k_child:03d}_p{p_child:03d}_"
-        f"from_{parent.structure_id}_s{s}_pm{p_m}"
-    )
+    # Short per-bin serial.  Parent / s / p_m stay in index.csv + XYZ comment
+    # so names do not nest the parent id (that grew past NAME_MAX).
+    sid = compact_growth_id(k_child, p_child, "B", serial)
 
     q = _formal_charge(symbols, spec)
     cleanup_s = 0.0
@@ -1984,6 +2130,7 @@ def grow_cores_from_parents(
     coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = defaultdict(list)
     cutoffs = bond_cutoffs_from_spec(spec)
     seed_serial = 0
+    bin_serial: Dict[Tuple[int, int], int] = defaultdict(int)
     use_coord = bool(window.move_coord) and growth.use_coord_carry
     use_graph = bool(window.move_graph)
 
@@ -2068,6 +2215,7 @@ def grow_cores_from_parents(
                             f"{'+cleanup' if growth.local_cleanup_enabled else ''})",
                             flush=True,
                         )
+                    p_child_guess = parent.p - s + p_m
                     seed = build_coord_seed(
                         parent,
                         s=s,
@@ -2076,9 +2224,13 @@ def grow_cores_from_parents(
                         spec=spec,
                         pack=pack,
                         cutoffs=cutoffs,
-                        serial=seed_serial,
+                        serial=bin_serial[(parent.k + 1, p_child_guess)] + 1,
                     )
                     if seed is not None:
+                        bin_serial[(seed.k, seed.p)] += 1
+                        seed.structure_id = compact_growth_id(
+                            seed.k, seed.p, "B", bin_serial[(seed.k, seed.p)]
+                        )
                         coord_seeds[(seed.k, seed.p)].append(seed)
                         # also register core for redecorate diversity
                         if seed.core_edges:
@@ -3573,6 +3725,8 @@ def _opt_coord_seeds(
         for key in sorted(coord_seeds)
         if coord_seeds[key]
     ]
+    for _, seeds in groups:
+        assign_compact_b_ids(seeds, output_dir)
     n_flat = sum(len(seeds) for _, seeds in groups)
     if log:
         log.line(f"move B: full g-xTB opt of {n_flat} coord-carried children")
@@ -3981,6 +4135,8 @@ __all__ = [
     "shed_packages_coords",
     "place_monomer_and_packages",
     "build_coord_seed",
+    "compact_growth_id",
+    "assign_compact_b_ids",
     "grow_cores_from_parents",
     "run_growth_step",
     "write_growth_summary",
