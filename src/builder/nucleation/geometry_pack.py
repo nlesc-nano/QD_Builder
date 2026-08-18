@@ -73,6 +73,10 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "selection_order",
     "selection_top_fraction",
     "selection_max_wiener_excess",
+    "reject_new_cdse_4rings",
+    "rank_cores_by_fusion",
+    "rank_decorations_by_motifs",
+    "construction_score",
 })
 
 
@@ -734,6 +738,18 @@ class GeometryPack:
                 for x in (
                     self.graph_rules.get("ring_min_pattern_se") or (3, 3, 3)
                 )
+            ),
+            "reject_new_cdse_4rings": bool(
+                self.graph_rules.get("reject_new_cdse_4rings", False)
+            ),
+            "rank_cores_by_fusion": bool(
+                self.graph_rules.get("rank_cores_by_fusion", False)
+            ),
+            "rank_decorations_by_motifs": bool(
+                self.graph_rules.get("rank_decorations_by_motifs", False)
+            ),
+            "construction_score": dict(
+                self.graph_rules.get("construction_score") or {}
             ),
         }
 

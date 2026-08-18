@@ -34,6 +34,24 @@ graph_rules:
   require_inorganic_connected: true
   enforce_min_cn: true
 
+  # Graph construction bias (not the post-relax eV rank in growth.yaml).
+  # Same motifs as ~2p: steer which graphs are built / kept.
+  #   reject_new_cdse_4rings   B: drop a child that *gained* a Cd2Se2 diamond
+  #   rank_cores_by_fusion     prefer clean 6-ring fusions, fewer diamonds
+  #   rank_decorations_by_motifs  keep best decorations, not a random sample
+  # construction_score is dimensionless (lower better); Cd–Se–Cd–Cl rhombi
+  # are not n4.  F6: share 2 or 3 is clean, share ≥ 4 is dirty.
+  reject_new_cdse_4rings: true
+  rank_cores_by_fusion: true
+  rank_decorations_by_motifs: true
+  construction_score:
+    n4: 15
+    n4_fused: 30
+    f6_clean: -4
+    f6_dirty: 20
+    terminal_se3cl: 20
+    se1cl3: 5
+
   min_bridged_host_cn: 3                # a bridge needs hosts of CN >= 3
   max_shared_ligands_per_host_pair: 1   # one Cl per Cd-Cd pair
   forbid_mono_se_dual_terminal: true

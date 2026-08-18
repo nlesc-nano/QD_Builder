@@ -52,6 +52,7 @@ from .soft_rules import (
     INDEX_FIELDS as SOFT_INDEX_FIELDS,
     SoftRulesConfig,
     apply_soft_columns,
+    describe_graph,
     describe_structure,
 )
 from .molecular import (
@@ -2060,6 +2061,14 @@ def build_coord_seed(
     # so names do not nest the parent id (that grew past NAME_MAX).
     sid = compact_growth_id(k_child, p_child, "B", serial)
 
+    if bool(getattr(spec.graph_rules, "reject_new_cdse_4rings", False)):
+        parent_n4 = describe_structure(
+            parent.symbols, parent.coordinates, spec
+        ).n4
+        child_n4 = describe_structure(symbols, coords, spec).n4
+        if child_n4 > parent_n4:
+            return None
+
     q = _formal_charge(symbols, spec)
     cleanup_s = 0.0
     cleanup_ok = False
@@ -2081,6 +2090,12 @@ def build_coord_seed(
                 [symbols[i] for i in range(len(symbols))]
             ) != exp:
                 pass  # symbols unchanged by cleanup
+            if bool(getattr(spec.graph_rules, "reject_new_cdse_4rings", False)):
+                parent_n4 = describe_structure(
+                    parent.symbols, parent.coordinates, spec
+                ).n4
+                if describe_structure(symbols, coords, spec).n4 > parent_n4:
+                    return None
 
     core = core_edges_from_coords(symbols, coords, spec=spec, cutoffs=cutoffs)
     if not core:
@@ -2196,6 +2211,13 @@ def grow_cores_from_parents(
                     max_children=window.max_children_per_channel,
                     attach=window.attach,
                 )
+                children_base = _rank_child_cores(
+                    children_base,
+                    k=parent.k + 1,
+                    p=p_out,
+                    spec=spec,
+                    cap=window.max_children_per_channel,
+                )
             for p_m in window.monomer_p_values:
                 p_child = p_out + p_m
                 if not window.allow_p_child(parent.k + 1, p_child):
@@ -2208,6 +2230,13 @@ def grow_cores_from_parents(
                         p_from=p_out,
                         p_to=p_child,
                         spec=spec,
+                    )
+                    children_pm = _rank_child_cores(
+                        children_pm,
+                        k=parent.k + 1,
+                        p=p_child,
+                        spec=spec,
+                        cap=window.max_children_per_channel,
                     )
                     _store_channel(
                         catalog,
@@ -2291,6 +2320,37 @@ def grow_cores_from_parents(
         parent_records=parent_records,
         coord_seeds=dict(coord_seeds),
     )
+
+
+def _rank_child_cores(
+    cores: Sequence[EdgeList],
+    *,
+    k: int,
+    p: int,
+    spec: NucleationSpec,
+    cap: int,
+) -> List[EdgeList]:
+    """Keep the lowest-construction-cost cores (F6 / no diamonds)."""
+
+    from .soft_rules import construction_score
+
+    items = list(cores)
+    if not items:
+        return []
+    if not bool(getattr(spec.graph_rules, "rank_cores_by_fusion", False)):
+        return items
+    anion, cation = spec.core.anion, spec.core.cation
+    symbols = [anion] * int(k) + [cation] * (int(k) + int(p))
+    scored = [
+        (
+            construction_score(describe_graph(symbols, edges, spec), spec),
+            edges,
+        )
+        for edges in items
+    ]
+    scored.sort(key=lambda kv: kv[0])
+    keep = scored[: max(0, int(cap))] if cap > 0 else scored
+    return [edges for _cost, edges in keep]
 
 
 def _remap_after_drop(

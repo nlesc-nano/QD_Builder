@@ -552,6 +552,14 @@ class NucleationGraphRules:
     multi_ring_ladder: bool = True
     ring_min_pattern_cd: Tuple[int, ...] = (3, 3, 4)
     ring_min_pattern_se: Tuple[int, ...] = (3, 3, 3)
+    #: Drop a B child that *gained* a Cd–Se–Cd–Se 4-ring vs its parent.
+    reject_new_cdse_4rings: bool = False
+    #: Prefer cores with more clean 6-ring fusions / fewer diamonds.
+    rank_cores_by_fusion: bool = False
+    #: Keep the best decorations per skeleton (not a random reservoir).
+    rank_decorations_by_motifs: bool = False
+    #: Integer weights for the construction score (lower is better).
+    construction_score: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
