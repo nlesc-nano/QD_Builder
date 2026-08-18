@@ -1,13 +1,28 @@
 # Production envelope for parent k = 2 and 3 (early molecular).
 #
+# High-T restart: do not kill lean / high isomers at low k.  The previous
+# 0.75 eV / 30% / cap-20 cut selected 14 of 89 map parents and dropped the
+# p = 1 line by k = 3.  Window 2.0 eV and cap 50 (frac = 1 so the cap is
+# the only limit) keep p = 1 and p = 2 as parents of later steps.
+# max_shed = 2 so p_child = p − 2 + 1 = p − 1 is open (lean Wulff path).
+#
 # At this size the object is still a molecule: almost every Cd is surface,
 # incoming units can be well solvated (p_m = 1,2,3), and shedding 1–2
-# Z-type CdCl2 packages to open a site is physically normal.
+# Z-type CdCl2 packages to open a site is physically normal.  Move A stays
+# on — k = 2–3 is cheap; A is B-only from k = 4 (growth_k4k8.yaml).
 #
-#   python tools/run_molecular_growth.py \
-#     --pack-dir geometry_packs/cdse_cdcl2 \
-#     --growth growth_k2k3.yaml \
-#     --parents <map> --k-from 2 --k-to 3 --output runs/growth_k2_to_k3
+# Use a NEW --output.  Resubmitting into runs/growth_k2_to_k3 will resume
+# the old 0.75 eV step and skip the work.
+#
+#   cd .../Nucleation/graphs/growth
+#   python .../QD_builder/tools/run_molecular_growth.py \
+#     --pack-dir . --growth growth_k2k3.yaml \
+#     --parents ../runs/gxtb_cdse_target_k1k2_p1p5 \
+#     --k-from 2 --k-to 3 --output runs/growth_k2_to_k3_wide
+#
+# Then k = 4 … 8 from that output:
+#   --growth growth_k4k8.yaml --parents runs/growth_k2_to_k3_wide \
+#   --k-from 4 --k-to 8 --output runs/growth_k4_wide_B
 #
 # Surface law (lattice engine, scenario A):
 #   p_surf(k) = floor(2.0 * k^(2/3))     →  p_surf(2)=3, p_surf(3)=4, p_surf(4)=5
@@ -36,17 +51,17 @@ surface:
   p_slack: 1                    # allow p_surf+1 so bin winners are not clipped
 
 parents:
-  energy_window_eV: 0.75        # calibration also allowed 1.0
+  energy_window_eV: 2.0        # high-T; was 0.75 and killed lean p
   rank_by: energy
-  max_skeletons_frac: 0.30
-  max_skeletons_cap: 20
+  max_skeletons_frac: 1.0      # do not also take 30% — cap below is the limit
+  max_skeletons_cap: 50        # per (k,p) bin
   decorations_per_skeleton: 2
   core_source: relaxed
   bond_cutoffs: from_graph_rules
 
 shed:
   mode: distance                # honest: g-xTB maps do not write wbo
-  max_shed: 2
+  max_shed: 2                   # p − 1 channel open (s=2, p_m=1)
   prefer_low_shed: true         # enumeration order, not a filter
   persist_wbo: true
 
@@ -64,13 +79,16 @@ geometry:
 
 child:
   redecorate: true              # move A on: k=2–3 is still cheap enough
+  redecorate_slack: false       # A only for p≤p_surf
   full_opt: g-xTB
+  full_opt_cycles: 150         # A+B geo-opt; cleanup stays 20
 
 moves:
   graph: true
-  coord: true
+  coord: true                   # B is the kinetic path; keep it
 
 max_children_per_channel: 80
+selection_max_per_skeleton: 6
 # graph_rules already: bridge-first k<=2, bridge-target from k=3
 
 chemical_potential:

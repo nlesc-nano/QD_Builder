@@ -87,7 +87,9 @@ geometry:
 
 child:
   redecorate: true             # move A: redecorate graph cores
+  redecorate_slack: false      # A only for p≤p_surf; slack bin is B-only
   full_opt: g-xTB              # full opt for both moves
+  full_opt_cycles: 150         # A+B geo-opt maxcycle; cleanup stays 20
 
 # Report-only condition scan (does NOT steer growth)
 chemical_potential:

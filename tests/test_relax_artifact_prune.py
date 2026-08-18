@@ -26,7 +26,7 @@ def test_default_floors_are_mid_gap_not_construction():
 
 
 def test_se_cl_bond_like_pruned_nonbond_kept():
-    # Bond-like Se–Cl at 2.15 (artifact peak ~2.1–2.3)
+    # Terminal Se–Cl at 2.15 (Cl not on two Cd) — still an artifact
     symbols = ["Cd", "Se", "Cl"]
     bonded = [
         (0.0, 0.0, 0.0),
@@ -43,6 +43,31 @@ def test_se_cl_bond_like_pruned_nonbond_kept():
         (2.5, 3.6, 0.0),
     ]
     assert forbidden_pair_contact_violations(symbols, nonbond) == []
+
+
+def test_rhombic_cl_se_kept_even_if_short():
+    """μ2 Cl on a Cd–Se–Cd face: short Cl…Se is allowed (g-xTB overbinds)."""
+
+    # Cd 0, Cd 1, Se 2, Cl 3 — diamond like mol0042
+    symbols = ["Cd", "Cd", "Se", "Cl"]
+    coords = [
+        (0.0, 0.0, 0.0),
+        (3.60, 0.0, 0.0),
+        (1.80, 1.85, 0.0),
+        (1.80, -1.70, 0.0),
+    ]
+    # Cl–Se ~ 3.55 in this layout — squeeze Cl toward Se to ~2.40
+    coords[3] = (1.80, 1.85 - 2.40, 0.0)
+    import numpy as np
+
+    d_clse = float(np.linalg.norm(np.array(coords[3]) - np.array(coords[2])))
+    d_cdcl = [
+        float(np.linalg.norm(np.array(coords[3]) - np.array(coords[i])))
+        for i in (0, 1)
+    ]
+    assert d_clse < 2.80
+    assert all(x < 2.90 for x in d_cdcl)
+    assert forbidden_pair_contact_violations(symbols, coords) == []
 
 
 def test_cd_cd_bare_pruned_bridged_kept():

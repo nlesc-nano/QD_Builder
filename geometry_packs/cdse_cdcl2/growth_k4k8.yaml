@@ -51,18 +51,17 @@ surface:
   p_slack: 1
 
 parents:
-  energy_window_eV: 0.50
+  energy_window_eV: 2.0        # wide at low k; by_k tightens to 1.0 from k=6
   rank_by: energy
-  max_skeletons_frac: 0.30
-  max_skeletons_cap: 12
+  max_skeletons_frac: 1.0      # do not also take 30% — cap below is the limit
+  max_skeletons_cap: 50        # per (k,p) bin
   decorations_per_skeleton: 1
   core_source: relaxed
   bond_cutoffs: from_graph_rules
 
 shed:
   mode: distance
-  max_shed: 1                   # this hard cap is what makes s_max=0–1 at k≥7
-                                # (p_surf itself is ~k and would allow shedding the whole shell)
+  max_shed: 2                   # high-T / more core rewrite at k≤5; by_k drops this
   prefer_low_shed: true
   persist_wbo: true
 
@@ -79,8 +78,10 @@ geometry:
   require_charge_neutral_for_cleanup: true
 
 child:
-  redecorate: true              # A on but hard-capped below
+  redecorate: false             # B only — A already paid at k=4
+  redecorate_slack: false
   full_opt: g-xTB
+  full_opt_cycles: 150         # A+B geo-opt; cleanup stays 20
 
 moves:
   graph: true
@@ -120,8 +121,9 @@ lattice_switch:
   fallback: motif_bridge_target
 
 by_k:
-  - {k_min: 4, k_max: 6, monomer_p_values: [1, 2], max_shed: 1}
-  - {k_min: 7, k_max: 8, monomer_p_values: [1],    max_shed: 1}
+  - {k_min: 4, k_max: 5, monomer_p_values: [1, 2], max_shed: 2}
+  - {k_min: 6, k_max: 6, monomer_p_values: [1, 2], max_shed: 1, energy_window_eV: 1.0}
+  - {k_min: 7, k_max: 8, monomer_p_values: [1], max_shed: 1, energy_window_eV: 1.0}
 
 chemical_potential:
   enabled: true

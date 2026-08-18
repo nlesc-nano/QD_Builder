@@ -10,9 +10,12 @@ import yaml
 
 from builder.nucleation.molecular_growth import (
     GrowthConfig,
+    GrowthLog,
     ParentStructure,
+    full_opt_relaxation_raw,
     grow_cores_from_parents,
     identify_packages,
+    parent_k_inventory,
     select_parents,
 )
 from builder.nucleation.molecular_lineage import shed_and_grow
@@ -39,6 +42,18 @@ def map_spec(tmp_path_factory):
     return load_nucleation_spec(str(path))
 
 
+def test_parent_k_inventory_from_index(tmp_path) -> None:
+    (tmp_path / "index.csv").write_text(
+        "k,p,structure_id,xtb_energy_eV,xtb_converged\n"
+        "3,2,a,-1.0,True\n"
+        "3,3,b,-1.0,False\n"
+        "3,4,c,-1.0,True\n"
+        "5,1,d,-1.0,True\n",
+        encoding="utf-8",
+    )
+    assert parent_k_inventory(tmp_path) == {3: 2, 5: 1}
+
+
 def test_growth_config_loads() -> None:
     cfg = GrowthConfig.from_yaml(GROWTH_YAML)
     assert cfg.monomer_p_values == (1, 2, 3)
@@ -46,8 +61,20 @@ def test_growth_config_loads() -> None:
     assert cfg.references is not None
     assert cfg.references.energy_cdse_eV < 0
     assert cfg.use_coord_carry
-    assert cfg.local_cleanup_cycles > 0
+    assert cfg.local_cleanup_cycles == 20
+    assert cfg.child_full_opt_cycles == 150
     assert cfg.shed_mode == "wbo"
+
+
+def test_full_opt_cycles_cap_not_cleanup() -> None:
+    cfg = GrowthConfig.from_yaml(GROWTH_YAML)
+    raw = full_opt_relaxation_raw(None, cfg)
+    assert raw["max_steps"] == 150
+    assert raw["method"] == "g-xTB"
+    # cleanup still uses its own 20-cycle cap, even if the pack said 500
+    assert cfg.local_cleanup_cycles == 20
+    cfg.child_full_opt_cycles = 80
+    assert full_opt_relaxation_raw(None, cfg)["max_steps"] == 80
 
 
 def test_shed_packages_coords_and_place(map_spec) -> None:
@@ -268,6 +295,27 @@ def test_surface_law_matches_lattice_engine() -> None:
     assert effective_s_max(4, 4, beta=0.0, alpha=1.0, hard=2) == 2
 
 
+def test_k2k3_wide_parent_window() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k2k3.yaml")
+    w2 = cfg.window_for(2)
+    w3 = cfg.window_for(3)
+    assert w2.monomer_p_values == (1, 2, 3)
+    assert w2.max_shed == 2
+    assert w2.energy_window_eV == 2.0
+    assert w2.max_skeletons_cap == 50
+    assert w2.max_skeletons_frac == 1.0
+    assert w2.child_redecorate is True
+    assert not w2.child_redecorate_slack
+    assert w2.allow_redecorate(3, w2.p_surf(3))
+    assert not w2.allow_redecorate(3, w2.p_surf(3) + 1)
+    assert w2.selection_max_per_skeleton == 6
+    assert w3.energy_window_eV == 2.0
+    assert w3.max_shed == 2
+    assert w3.child_redecorate is True
+
+
 def test_by_k_window_picks_k7() -> None:
     from builder.nucleation.molecular_growth import GrowthConfig
 
@@ -275,12 +323,23 @@ def test_by_k_window_picks_k7() -> None:
     w4 = cfg.window_for(4)
     w7 = cfg.window_for(7)
     assert w4.monomer_p_values == (1, 2)
-    assert w4.max_shed == 1
+    assert w4.max_shed == 2
+    assert w4.energy_window_eV == 2.0
+    assert w4.max_skeletons_cap == 50
+    assert w4.max_skeletons_frac == 1.0
     assert w7.monomer_p_values == (1,)
     assert w7.max_shed == 1
+    assert w7.energy_window_eV == 1.0
     assert w7.attach == "local"
     assert not w7.allow_p_child(8, w7.p_surf(8) + w7.p_slack + 1)
     assert w7.allow_p_child(8, w7.p_surf(8))
+    assert w4.child_redecorate is False
+    assert not w4.allow_redecorate(4, w4.p_surf(4))
+    assert w4.allow_p_child(4, w4.p_surf(4) + w4.p_slack)
+    w5 = cfg.window_for(5)
+    assert w5.child_redecorate is False
+    assert w5.max_shed == 2
+    assert not w5.allow_redecorate(6, w5.p_surf(6))
 
 
 def test_by_k_window_k9k13() -> None:
@@ -497,3 +556,56 @@ def test_grow_cores_produces_child_bins(map_spec) -> None:
     moves = {ch.move for ch in result.channels}
     assert "graph" in moves
     assert "coord" in moves
+
+
+def test_growth_log_global_and_block_index(tmp_path) -> None:
+    path = tmp_path / "growth.log"
+    log = GrowthLog(quiet=True, log_path=path)
+    log.set_block_plan(2)
+    log.begin_block(2, label="B k=4 p=3")
+    log(
+        "[growth-job] k=4 p=3 move=B s=1 p_m=2 "
+        "k_parent=3 p_parent=2 parent=k003_p002_mol0001 "
+        "id=c1 t_s=1.2 recon_s=0.3 steps=87 max_steps=150 "
+        "E_eV=-10.0 relax=ok"
+    )
+    log(
+        "[growth-job] k=4 p=3 move=B s=1 p_m=2 "
+        "k_parent=3 p_parent=2 parent=k003_p002_mol0001 "
+        "id=c2 t_s=1.1 recon_s=0.2 steps=150 max_steps=150 "
+        "E_eV=-10.1 relax=ok"
+    )
+    log.begin_bin(k=4, p=6, cores=2, cores_done=0, cores_total=2, jobs=2)
+    log(
+        "[growth-job] k=4 p=6 move=A id=a1 "
+        "E_eV=-11.0 t_s=2.0 recon_s=0.4 steps=40 max_steps=150 relax=ok"
+    )
+    log(
+        "[growth-job] k=4 p=6 move=A id=a2 "
+        "E_eV=-11.1 t_s=2.1 recon_s=0.5 steps=12 max_steps=150 relax=ok"
+    )
+    log.close()
+    text = path.read_text(encoding="utf-8")
+    assert "block 2/2" in text
+    # global index keeps climbing; block index resets per block
+    assert "     1   1/2  [CdSe]_3(CdCl2)_2" in text
+    assert "cyc=87/150" in text
+    assert "     2   2/2  [CdSe]_3(CdCl2)_2" in text
+    assert "cyc=150/150" in text
+    assert "     3   1/2  k=4 p=6" in text
+    assert "     4   2/2  k=4 p=6" in text
+    # extra jobs in a block grow the denominator instead of showing i > N
+    log2 = GrowthLog(quiet=True, log_path=path)
+    log2.begin_block(1, label="overflow")
+    log2(
+        "[growth-job] k=5 p=1 move=A id=x1 "
+        "E_eV=-1.0 t_s=0.1 recon_s=0.0 relax=ok"
+    )
+    log2(
+        "[growth-job] k=5 p=1 move=A id=x2 "
+        "E_eV=-1.1 t_s=0.1 recon_s=0.0 relax=ok"
+    )
+    log2.close()
+    extra = path.read_text(encoding="utf-8")
+    assert "     1   1/1  k=5 p=1" in extra
+    assert "     2   2/2  k=5 p=1" in extra

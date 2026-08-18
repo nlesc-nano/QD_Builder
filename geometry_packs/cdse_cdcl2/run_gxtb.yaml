@@ -53,10 +53,10 @@ relaxation:
   method: g-xTB
   binary: gxtb
   charge: 0                  # k CdSe + p CdCl2 is neutral by construction
-  # Cap geo_opt: after ~100 steps remaining energy change is usually
+  # Cap geo_opt: after ~150 steps remaining energy change is usually
   # sub-kcal/mol.  Endpoints that hit the cap are kept (accept_maxcycle)
   # unless the post-relax artifact prune finds Se–Cl / Se–Se / Cd–Cd contacts.
-  max_steps: 100
+  max_steps: 150
   accept_maxcycle: true
   timeout_s: 1800
   check_connectivity: true
