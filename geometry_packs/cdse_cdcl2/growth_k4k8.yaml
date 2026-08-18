@@ -125,6 +125,32 @@ by_k:
   - {k_min: 6, k_max: 6, monomer_p_values: [1, 2], max_shed: 1, energy_window_eV: 1.0}
   - {k_min: 7, k_max: 8, monomer_p_values: [1], max_shed: 1, energy_window_eV: 1.0}
 
+soft_rules:
+  enabled: true
+  diamond:
+    enabled: true
+    weight_eV: 0.15
+    fused_weight_eV: 0.30
+    from_k: 2
+  f6:
+    enabled: true
+    weight_eV: -0.04
+    dirty_weight_eV: 0.20
+    from_k: 3
+  terminal_se3cl:
+    enabled: true
+    weight_eV: 0.20
+    from_k: 4
+  se1cl3:
+    enabled: true
+    weight_eV: 0.05
+    from_k: 6
+  asphericity:
+    enabled: false
+    weight_eV: 1.0
+    only_if_dirty_f6: true
+    from_k: 6
+
 chemical_potential:
   enabled: true
   delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]

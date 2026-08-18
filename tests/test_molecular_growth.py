@@ -64,6 +64,8 @@ def test_growth_config_loads() -> None:
     assert cfg.local_cleanup_cycles == 20
     assert cfg.child_full_opt_cycles == 150
     assert cfg.shed_mode == "wbo"
+    assert cfg.soft_rules.enabled is True
+    assert cfg.soft_rules.asphericity.enabled is False
 
 
 def test_full_opt_cycles_cap_not_cleanup() -> None:
@@ -271,6 +273,55 @@ def test_select_parents_respects_window_and_dec(map_spec) -> None:
     assert "m0" in ids
 
 
+def test_select_parents_prefers_fewer_diamonds(map_spec) -> None:
+    from builder.nucleation.soft_rules import describe_structure
+
+    def parent(sid, energy, coords, symbols):
+        return ParentStructure(
+            k=3,
+            p=2,
+            structure_id=sid,
+            symbols=tuple(symbols),
+            coordinates=np.asarray(coords, dtype=float),
+            energy_eV=energy,
+            edges=(),
+            core_edges=(),
+        )
+
+    free_sym = ["Se", "Cd", "Cd"]
+    free_xyz = np.array([[0.0, 0.0, 0.0], [2.6, 0.0, 0.0], [0.0, 2.6, 0.0]])
+    d_sym = ["Se", "Se", "Cd", "Cd"]
+    d_xyz = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [0.00, 3.80, 0.00],
+            [1.85, 1.90, 0.00],
+            [-1.85, 1.90, 0.00],
+        ],
+        dtype=float,
+    )
+    assert describe_structure(d_sym, d_xyz).n4 == 1
+    assert describe_structure(free_sym, free_xyz).n4 == 0
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k2k3.yaml")
+    cfg = GrowthConfig(
+        raw=cfg.raw,
+        energy_window_eV=1.0,
+        max_skeletons_frac=1.0,
+        max_skeletons_cap=10,
+        decorations_per_skeleton=1,
+        soft_rules=cfg.soft_rules,
+    )
+    sel = select_parents(
+        [
+            parent("diamond", 0.0, d_xyz, d_sym),
+            parent("free", 0.05, free_xyz, free_sym),
+        ],
+        cfg,
+        map_spec,
+    )
+    assert sel[0].structure_id == "free"
+
+
 def test_surface_law_matches_lattice_engine() -> None:
     from builder.nucleation.engine import _p_surf
     from builder.nucleation.molecular_growth import (
@@ -314,6 +365,38 @@ def test_k2k3_wide_parent_window() -> None:
     assert w3.energy_window_eV == 2.0
     assert w3.max_shed == 2
     assert w3.child_redecorate is True
+
+
+def test_k3k13_one_shot_windows() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k3k13.yaml")
+    w3 = cfg.window_for(3)
+    w5 = cfg.window_for(5)
+    w6 = cfg.window_for(6)
+    w8 = cfg.window_for(8)
+    w11 = cfg.window_for(11)
+    w12 = cfg.window_for(12)
+    assert w3.child_redecorate is True
+    assert w3.move_graph is True
+    assert w3.max_shed == 2
+    assert w3.monomer_p_values == (1, 2)
+    assert w3.energy_window_eV == 2.0
+    assert w5.child_redecorate is False
+    assert w5.move_graph is False
+    assert w5.move_coord is True
+    assert w5.max_shed == 2
+    assert w6.max_shed == 1
+    assert w6.energy_window_eV == 1.0
+    assert w8.monomer_p_values == (1,)
+    assert w8.max_skeletons_cap == 15
+    assert w11.energy_window_eV == 0.75
+    assert w12.max_shed == 0
+    assert w12.p_slack == 0
+    assert w12.energy_window_eV == 0.50
+    assert cfg.soft_rules.enabled is True
+    assert cfg.soft_rules.asphericity.enabled is False
+    assert w8.soft_rules.diamond.weight_eV == 0.15
 
 
 def test_by_k_window_picks_k7() -> None:

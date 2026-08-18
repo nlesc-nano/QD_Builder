@@ -91,6 +91,35 @@ child:
   full_opt: g-xTB              # full opt for both moves
   full_opt_cycles: 150         # A+B geo-opt maxcycle; cleanup stays 20
 
+# Soft ranking after the energy window: score = E + penalty (eV).
+# Does not force zb, a sphere, or a Wulff count.  Energy window still
+# uses raw E; these terms only re-rank inside that window.
+soft_rules:
+  enabled: true
+  diamond:                     # Cd–Se–Cd–Se 4-rings only (not Cd–Se–Cd–Cl)
+    enabled: true
+    weight_eV: 0.15            # per isolated diamond
+    fused_weight_eV: 0.30      # extra per 4-ring that shares an edge (ladder)
+    from_k: 2
+  f6:                          # 6-ring fusion quality
+    enabled: true
+    weight_eV: -0.04           # reward share = 2 or 3 (chair / adamantane)
+    dirty_weight_eV: 0.20      # penalize share ≥ 4 (diamond in the 6-ring mesh)
+    from_k: 3
+  terminal_se3cl:              # Se3 + dangling Cl (μ1).  Bridging Se3Cl is kept.
+    enabled: true
+    weight_eV: 0.20
+    from_k: 4
+  se1cl3:                      # precursor-like CdCl3 on one Se
+    enabled: true
+    weight_eV: 0.05
+    from_k: 6
+  asphericity:                 # off: rods / platelets stay allowed
+    enabled: false
+    weight_eV: 1.0
+    only_if_dirty_f6: true     # if turned on, only punish sausages
+    from_k: 6
+
 # Report-only condition scan (does NOT steer growth)
 chemical_potential:
   enabled: true
