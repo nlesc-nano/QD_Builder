@@ -36,6 +36,7 @@ geometry:
 child:
   redecorate: true
   full_opt: g-xTB
+  full_opt_cycles: 150         # A+B geo-opt; cleanup stays 20
 chemical_potential:
   enabled: true
   delta_mu_cdcl2_eV:

@@ -5292,6 +5292,8 @@ class _CandidateScreen:
                             f"id=graph{graph_number:04d}_s{candidate.start_index:02d} "
                             f"E_eV=n/a t_s={xtb_elapsed:.1f} "
                             f"recon_s={reconstruction_elapsed:.1f} "
+                            f"steps={int(xr.steps)} "
+                            f"max_steps={int(xtb_settings.max_steps)} "
                             f"relax=fail "
                             f"err={xr.error or 'no_coordinates'}"
                         )
@@ -5412,6 +5414,8 @@ class _CandidateScreen:
                             f"id=graph{graph_number:04d}_s{candidate.start_index:02d} "
                             f"E_eV=n/a t_s={xtb_elapsed:.1f} "
                             f"recon_s={reconstruction_elapsed:.1f} "
+                            f"steps={int(xr.steps)} "
+                            f"max_steps={int(xtb_settings.max_steps)} "
                             f"relax=artifact "
                             f"err={'|'.join(str(v) for v in hard_artifacts[:3])}"
                         )
@@ -5542,6 +5546,8 @@ class _CandidateScreen:
                             f"E_eV={e_s} "
                             f"t_s={xtb_elapsed:.1f} "
                             f"recon_s={reconstruction_elapsed:.1f} "
+                            f"steps={int(xr.steps)} "
+                            f"max_steps={int(xtb_settings.max_steps)} "
                             f"relax={relax_tag}"
                         )
                         self.progress(

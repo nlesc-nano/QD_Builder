@@ -357,7 +357,7 @@ relaxation:
 |---|---|---|
 | Cd-Cd | **2.80** | see below |
 | Se-Se | 2.80 | real Se-Se bonds form at 2.34 |
-| Cl-Se | 2.80 | real Cl-Se bonds form at 2.19 |
+| Cl-Se | 2.80 | real Cl-Se bonds form at 2.19; **μ2/μ3 Cl on a Cd–Se–Cd face (4-ring) is kept** even if Cl…Se is shorter — only terminal-like Se–Cl is pruned |
 | Cl-Cl | 2.80 | Cl₂-like contacts ~2.0; nonbond ≥~3.3 |
 
 The Cd-Cd value is set from 42829 relaxed Cd-Cd distances. Nothing exists below

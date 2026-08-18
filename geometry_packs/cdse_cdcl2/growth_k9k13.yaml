@@ -80,7 +80,9 @@ geometry:
 
 child:
   redecorate: true              # A on at k=9–11 only; by_k turns it off at 12–13
+  redecorate_slack: false       # A only for p≤p_surf
   full_opt: g-xTB
+  full_opt_cycles: 150         # A+B geo-opt; cleanup stays 20
 
 moves:
   graph: true

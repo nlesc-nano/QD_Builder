@@ -177,6 +177,7 @@ class GrowthWindow:
     move_graph: bool
     move_coord: bool
     child_redecorate: bool
+    child_redecorate_slack: bool
     selection_max_per_skeleton: int
     surface_beta: float
     surface_alpha: float
@@ -204,6 +205,15 @@ class GrowthWindow:
             return True
         return int(p_child) <= self.p_surf(k_child) + int(self.p_slack)
 
+    def allow_redecorate(self, k_child: int, p_child: int) -> bool:
+        """Move A on this (k, p)?  Slack bins (p > p_surf) can stay B-only."""
+
+        if not self.child_redecorate:
+            return False
+        if self.child_redecorate_slack or self.surface_beta <= 0.0:
+            return True
+        return int(p_child) <= self.p_surf(int(k_child))
+
     def describe(self) -> str:
         cap = (
             f"p_surf({self.k_from})={self.p_surf(self.k_from)} "
@@ -218,6 +228,7 @@ class GrowthWindow:
             f"β={self.surface_beta} α={self.surface_alpha} {cap} "
             f"moves A={self.move_graph} B={self.move_coord} "
             f"redecorate={self.child_redecorate} "
+            f"A_slack={'on' if self.child_redecorate_slack else 'off'} "
             f"shed={self.shed_mode}"
         )
 
@@ -258,7 +269,9 @@ class GrowthConfig:
     local_cleanup_cycles: int = 20
     require_charge_neutral_for_cleanup: bool = True
     child_redecorate: bool = True
+    child_redecorate_slack: bool = True
     child_full_opt: str = "g-xTB"
+    child_full_opt_cycles: int = 150
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
 
     @property
@@ -299,10 +312,16 @@ class GrowthConfig:
             move_coord = bool(overlay["move_coord"])
         child = overlay.get("child")
         redecorate = self.child_redecorate
-        if isinstance(child, dict) and "redecorate" in child:
-            redecorate = bool(child["redecorate"])
-        elif "redecorate" in overlay:
+        redecorate_slack = self.child_redecorate_slack
+        if isinstance(child, dict):
+            if "redecorate" in child:
+                redecorate = bool(child["redecorate"])
+            if "redecorate_slack" in child:
+                redecorate_slack = bool(child["redecorate_slack"])
+        if "redecorate" in overlay:
             redecorate = bool(overlay["redecorate"])
+        if "redecorate_slack" in overlay:
+            redecorate_slack = bool(overlay["redecorate_slack"])
         return GrowthWindow(
             k_from=k,
             monomer_p_values=tuple(int(x) for x in p_vals),
@@ -330,6 +349,7 @@ class GrowthConfig:
             move_graph=move_graph,
             move_coord=move_coord,
             child_redecorate=redecorate,
+            child_redecorate_slack=redecorate_slack,
             selection_max_per_skeleton=int(
                 overlay.get(
                     "selection_max_per_skeleton",
@@ -446,7 +466,14 @@ class GrowthConfig:
                 geom.get("require_charge_neutral_for_cleanup", True)
             ),
             child_redecorate=bool(child.get("redecorate", True)),
+            child_redecorate_slack=bool(child.get("redecorate_slack", True)),
             child_full_opt=str(child.get("full_opt", "g-xTB")),
+            child_full_opt_cycles=int(
+                child.get(
+                    "full_opt_cycles",
+                    child.get("max_cycles", 150),
+                )
+            ),
             delta_mu_cdcl2_eV=dmu,
         )
 
@@ -838,6 +865,36 @@ def format_prior_map_rankings(
             )
         )
     return "\n\n".join(chunks)
+
+
+def parent_k_inventory(run_dir: Path) -> Dict[int, int]:
+    """Converged parent counts by k in a finished run (index.csv, else xyz)."""
+
+    run_dir = Path(run_dir)
+    counts: Dict[int, int] = {}
+    index_path = run_dir / "index.csv"
+    if index_path.is_file():
+        with index_path.open() as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    rk = int(row["k"])
+                except (KeyError, ValueError):
+                    continue
+                conv = str(row.get("xtb_converged", "true")).lower().strip()
+                if conv in ("false", "0", "no"):
+                    continue
+                counts[rk] = counts.get(rk, 0) + 1
+        if counts:
+            return dict(sorted(counts.items()))
+    for kdir in sorted(run_dir.glob("k[0-9][0-9][0-9]")):
+        try:
+            rk = int(kdir.name[1:])
+        except ValueError:
+            continue
+        n = sum(1 for _ in kdir.glob("p*/*_xtb.xyz"))
+        if n:
+            counts[rk] = n
+    return dict(sorted(counts.items()))
 
 
 def load_parents_from_run(
@@ -1664,6 +1721,40 @@ def core_edges_from_coords(
     return tuple(sorted(core))
 
 
+def full_opt_relaxation_raw(
+    pack: Optional[GeometryPack],
+    growth: GrowthConfig,
+) -> Dict[str, Any]:
+    """Pack ``relaxation:`` overlay for move A/B full geo-opt.
+
+    Caps ``max_steps`` at ``growth.child_full_opt_cycles`` (default 150).
+    Move-B pre-cleanup uses ``local_cleanup_structure`` instead and keeps
+    its own 20-cycle cap.
+    """
+
+    base: Dict[str, Any] = {}
+    if pack is not None and isinstance(pack.raw, dict):
+        base = dict(pack.raw.get("relaxation") or {})
+    base["enabled"] = True
+    if growth.child_full_opt:
+        base["method"] = growth.child_full_opt
+    cycles = int(growth.child_full_opt_cycles)
+    if cycles > 0:
+        base["max_steps"] = cycles
+    return base
+
+
+def overlay_pack_full_opt(
+    pack: Optional[GeometryPack],
+    growth: GrowthConfig,
+) -> None:
+    """Write the A/B maxcycle into ``pack.raw['relaxation']`` (move A reads it)."""
+
+    if pack is None or not isinstance(getattr(pack, "raw", None), dict):
+        return
+    pack.raw["relaxation"] = full_opt_relaxation_raw(pack, growth)
+
+
 def local_cleanup_structure(
     symbols: Sequence[str],
     coords: FloatArray,
@@ -2263,6 +2354,12 @@ class GrowthLog:
         self._cores_done: int = 0
         self._cores_total: int = 0
         self._xtb_starts: int = 1
+        # current optimization block (move-B (k,p) group or move-A bin)
+        self._block_i: int = 0
+        self._block_n: int = 0
+        self._block_seq: int = 0
+        self._n_blocks: int = 0
+        self._block_label: str = ""
         # wall clock
         self._t_mark: float = time.perf_counter()
         self._t_bin0: float = self._t_mark
@@ -2339,9 +2436,63 @@ class GrowthLog:
             f"slack={growth.p_slack}"
         )
         self.line(
+            f"  full opt: method={growth.child_full_opt} "
+            f"maxcycle={int(growth.child_full_opt_cycles)}  "
+            f"(A+B geo-opt; cleanup stays "
+            f"{int(growth.local_cleanup_cycles)} cycles)"
+        )
+        self.line(
             "  timing keys: opt= full g-xTB; recon= motif_factor (A only); "
             "cleanup= short prelax (B); +dt= wall since previous line"
         )
+
+    def set_block_plan(self, n_blocks: int) -> None:
+        """How many optimization blocks this step will open (B groups + A bins)."""
+
+        self._n_blocks = max(0, int(n_blocks))
+        self._block_seq = 0
+        self._block_i = 0
+        self._block_n = 0
+        self._block_label = ""
+
+    def begin_block(self, n_jobs: int, *, label: str = "") -> int:
+        """Start a running ``i/N`` counter for the next group of opts.
+
+        ``n_jobs`` is the planned number of structures to relax in this
+        block (exact for move B; cores, or cores×starts, for move A).
+        If more jobs arrive than planned, the denominator grows with ``i``.
+        """
+
+        self._block_seq += 1
+        self._block_i = 0
+        self._block_n = max(0, int(n_jobs))
+        self._block_label = str(label or "")
+        return self._block_seq
+
+    def _block_tag(self) -> str:
+        """``14/32`` (or ``14/?`` if the planned count is still unknown)."""
+
+        n = int(self._block_n)
+        i = int(self._block_i)
+        if n <= 0:
+            return f"{i:3d}/?"
+        width = max(2, len(str(n)))
+        return f"{i:{width}d}/{n}"
+
+    def _advance_block_job(self) -> str:
+        """Count one relax in the current block; return ``i/N`` tag."""
+
+        self._block_i += 1
+        if self._block_n > 0 and self._block_i > self._block_n:
+            self._block_n = self._block_i
+        return self._block_tag()
+
+    def _block_header_bit(self) -> str:
+        if self._n_blocks > 0:
+            return f"block {self._block_seq}/{self._n_blocks}"
+        if self._block_seq > 0:
+            return f"block {self._block_seq}"
+        return ""
 
     def set_work_plan(
         self,
@@ -2429,8 +2580,9 @@ class GrowthLog:
         cores: int,
         cores_done: int,
         cores_total: int,
+        jobs: Optional[int] = None,
     ) -> None:
-        """Open a bin header with core accounting."""
+        """Open a bin header with core accounting and a fresh ``i/N`` block."""
 
         self._bin_k = int(k)
         self._bin_p = int(p)
@@ -2442,15 +2594,25 @@ class GrowthLog:
         self._bin_recon_s = 0.0
         self._cores_done = int(cores_done)
         self._cores_total = int(cores_total)
+        planned = int(jobs) if jobs is not None else int(cores)
+        self.begin_block(planned, label=f"A k={k} p={p}")
         self._t_bin0 = time.perf_counter()
         self._tick()
         if self.quiet and self._log_fh is None:
             return
         after = cores_done + cores
-        self.line(f"--- bin k={k} p={p} ---")
+        blk = self._block_header_bit()
+        title = f"--- bin k={k} p={p} ---"
+        if blk:
+            title = f"{title}  {blk}"
+        self.line(title)
         self.line(
             f"  cores in this bin: {cores}   "
             f"(overall cores {cores_done} done -> {after}/{cores_total} after bin)"
+        )
+        self.line(
+            f"  opts in this block: {planned}   "
+            f"(job lines show global_n  i/{planned})"
         )
         self.line(
             f"  path: core graph -> Cl decorate -> motif_factor -> g-xTB "
@@ -2573,6 +2735,7 @@ class GrowthLog:
             if err == "resume_skip":
                 self.n_gxtb += 1
                 self._bin_gxtb += 1
+                blk = self._advance_block_job()
                 child_f = self._formula_kp(k, p)
                 if k_par == "" or p_par == "":
                     pk, pp = self._parent_kp_from_id(parent)
@@ -2590,7 +2753,7 @@ class GrowthLog:
                     stoich = f"-s={shed} +p_m={p_m} -> {child_f}"
                 parent_bit = f"  parent={parent}" if parent else ""
                 self._emit(
-                    f"  {self.n_gxtb:4d}  {stoich}  "
+                    f"  {self.n_gxtb:4d}  {blk}  {stoich}  "
                     f"E={e:>14s}  "
                     f"opt=  0.0s clean={recon_s:4.1f}s "
                     f"+dt={dt:5.1f}s  resume_skip"
@@ -2600,6 +2763,7 @@ class GrowthLog:
 
             self.n_gxtb += 1
             self._bin_gxtb += 1
+            blk = self._advance_block_job()
             self._sum_opt_s += opt_s
             self._sum_recon_s += recon_s
             self._bin_opt_s += opt_s
@@ -2610,6 +2774,12 @@ class GrowthLog:
             extra = f" ({err})" if err and rel == "fail" else ""
             recon_lab = "clean" if move in ("B", "coord", "b") else "recon"
             child_f = self._formula_kp(k, p)
+            steps = kv.get("steps", "")
+            max_steps = kv.get("max_steps", "")
+            if steps or max_steps:
+                cyc_bit = f" cyc={steps or '?'}/{max_steps or '?'}"
+            else:
+                cyc_bit = ""
 
             if move in ("B", "coord", "b"):
                 if k_par == "" or p_par == "":
@@ -2628,17 +2798,18 @@ class GrowthLog:
                     stoich = f"-s={shed} +p_m={p_m} -> {child_f}"
                 parent_bit = f"  parent={parent}" if parent else ""
                 self._emit(
-                    f"  {self.n_gxtb:4d}  {stoich}  "
+                    f"  {self.n_gxtb:4d}  {blk}  {stoich}  "
                     f"E={e:>14s}  "
-                    f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
+                    f"opt={opt_s:5.1f}s{cyc_bit} {recon_lab}={recon_s:4.1f}s "
                     f"+dt={dt:5.1f}s  {rel}{extra}"
                     f"{parent_bit}\n"
                 )
             else:
                 self._emit(
-                    f"  {self.n_gxtb:4d}  k={k} p={p}  {child_f}  redecorate  "
+                    f"  {self.n_gxtb:4d}  {blk}  k={k} p={p}  {child_f}  "
+                    f"redecorate  "
                     f"E={e:>14s}  "
-                    f"opt={opt_s:5.1f}s {recon_lab}={recon_s:4.1f}s "
+                    f"opt={opt_s:5.1f}s{cyc_bit} {recon_lab}={recon_s:4.1f}s "
                     f"+dt={dt:5.1f}s  {rel}{extra}\n"
                 )
             return
@@ -2729,6 +2900,32 @@ def run_growth_step(
     )
     parents = select_parents(parents_all, growth, map_spec)
     window = growth.window_for(k_from)
+    if not parents_all:
+        have = parent_k_inventory(run_dir)
+        have_txt = (
+            ", ".join(f"k={k} (n={n})" for k, n in have.items())
+            if have
+            else "none"
+        )
+        hint = ""
+        if have and k_from not in have:
+            first = min(have)
+            last = max(have)
+            hint = (
+                f"  --k-from is the *parent* size already in --parents, "
+                f"not the first child.  This run has {have_txt}.  "
+                f"To grow onward use --k-from {last} "
+                f"(e.g. --k-from {last} --k-to {last + 2})."
+            )
+        msg = (
+            f"no converged parents at k={k_from} in {run_dir} "
+            f"(available: {have_txt})"
+        )
+        if log:
+            log.line(msg)
+            if hint:
+                log.line(hint)
+        raise FileNotFoundError(msg + (("\n" + hint) if hint else ""))
     if log:
         log.line(
             f"loaded {len(parents_all)} converged parents → "
@@ -2844,13 +3041,29 @@ def run_growth_step(
             except (TypeError, ValueError):
                 pass
             log._xtb_starts = max(1, int(xtb_starts))
+        # After move-B cleanup (20 cycles).  A/B full opts read this cap.
+        overlay_pack_full_opt(pack, growth)
         out = Path(output_dir) if output_dir else None
         if out:
             out.mkdir(parents=True, exist_ok=True)
 
+        n_b_blocks = (
+            sum(1 for v in result.coord_seeds.values() if v)
+            if result.coord_seeds and embed
+            else 0
+        )
+        n_a_blocks = len(result.skeleton_catalog) if do_redecorate else 0
+        if log and (n_b_blocks or n_a_blocks):
+            log.line(
+                f"opt blocks this step: B groups={n_b_blocks}, "
+                f"A bins={n_a_blocks}; "
+                f"job lines show  global_n  i/N_block"
+            )
+
         # ---- Move B first: full opt of coordinate-carried seeds ----
         if result.coord_seeds and embed:
             if log:
+                log.set_block_plan(n_b_blocks)
                 log.stage(
                     3,
                     n_stages,
@@ -2870,6 +3083,7 @@ def run_growth_step(
             )
 
         if log and result.skeleton_catalog and do_redecorate:
+            log.set_block_plan(n_a_blocks)
             log.stage(
                 3,
                 n_stages,
@@ -2917,6 +3131,15 @@ def run_growth_step(
             result.skeleton_catalog.items() if do_redecorate else ()
         ):
             n_coord = len(result.coord_seeds.get((k, p), ()))
+            if not window.allow_redecorate(k, p):
+                cap = window.p_surf(k) if window.surface_beta > 0 else "?"
+                if log:
+                    log.line(
+                        f"skip move A k={k} p={p}: slack bin "
+                        f"(p > p_surf={cap}); B-only, rhombi still allowed"
+                    )
+                done_cores += len(cores)
+                continue
             if log:
                 log.begin_bin(
                     k=k,
@@ -2924,6 +3147,7 @@ def run_growth_step(
                     cores=len(cores),
                     cores_done=done_cores,
                     cores_total=n_cores,
+                    jobs=len(cores),
                 )
                 log.line(
                     f"  bin: A_graph_cores={len(cores)}  "
@@ -3338,29 +3562,26 @@ def _opt_coord_seeds(
 
     if not coord_seeds:
         return
-    base: Dict[str, Any] = {}
-    if pack is not None and isinstance(pack.raw, dict):
-        base = dict(pack.raw.get("relaxation") or {})
-    base["enabled"] = True
-    if growth.child_full_opt:
-        base["method"] = growth.child_full_opt
-    settings = XtbSettings.from_pack(base)
+    settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
     cutoffs = bond_cutoffs_from_spec(map_spec)
     log = progress if isinstance(progress, GrowthLog) else None
     cation = map_spec.core.cation
     anion = map_spec.core.anion
 
-    flat: List[CoordSeed] = []
-    for key in sorted(coord_seeds):
-        flat.extend(coord_seeds[key])
+    groups: List[Tuple[Tuple[int, int], List[CoordSeed]]] = [
+        (key, list(coord_seeds[key]))
+        for key in sorted(coord_seeds)
+        if coord_seeds[key]
+    ]
+    n_flat = sum(len(seeds) for _, seeds in groups)
     if log:
-        log.line(f"move B: full g-xTB opt of {len(flat)} coord-carried children")
+        log.line(f"move B: full g-xTB opt of {n_flat} coord-carried children")
         log.line(
             "p_child = p_parent - s + p_m;  "
             "row shows parent formula -s +p_m -> child formula"
         )
         log.line(
-            "row: N  [CdSe]_kpar(CdCl2)_ppar  -s=.. +p_m=.. -> "
+            "row: global  i/N_block  [CdSe]_kpar(CdCl2)_ppar  -s=.. +p_m=.. -> "
             "[CdSe]_k(CdCl2)_p  E  opt clean +dt  status  parent=.."
         )
         log.line(
@@ -3368,57 +3589,208 @@ def _opt_coord_seeds(
             "(merge A redecorate + B coord into each bin)"
         )
     elif progress:
-        progress(f"[growth] move B: opt {len(flat)} coord seeds")
+        progress(f"[growth] move B: opt {n_flat} coord seeds")
 
     n_skip = 0
     n_run = 0
-    for seed in flat:
-        pk, pp = GrowthLog._parent_kp_from_id(seed.parent_id)
-        k_par = "" if pk is None else str(pk)
-        p_par = "" if pp is None else str(pp)
-        recon_s = float(seed.cleanup_s)
-        bdir = (
-            None
-            if output_dir is None
-            else Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
-        )
-        xyz_path = (
-            None
-            if bdir is None
-            else bdir / f"{seed.structure_id}_xtb.xyz"
-        )
+    for kp, seeds in groups:
+        if log:
+            idx = log.begin_block(
+                len(seeds), label=f"B k={kp[0]} p={kp[1]}"
+            )
+            blk = log._block_header_bit() or f"block {idx}"
+            log.line(f"--- move B k={kp[0]} p={kp[1]} ---  {blk}")
+            log.line(
+                f"  opts in this block: {len(seeds)}   "
+                f"(job lines show global_n  i/{len(seeds)})"
+            )
+        for seed in seeds:
+            pk, pp = GrowthLog._parent_kp_from_id(seed.parent_id)
+            k_par = "" if pk is None else str(pk)
+            p_par = "" if pp is None else str(pp)
+            recon_s = float(seed.cleanup_s)
+            bdir = (
+                None
+                if output_dir is None
+                else Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+            )
+            xyz_path = (
+                None
+                if bdir is None
+                else bdir / f"{seed.structure_id}_xtb.xyz"
+            )
 
-        # ---- restart: skip if energy already on disk ----
-        e_existing: Optional[float] = None
-        if output_dir is not None:
-            e_existing = _index_has_energy(output_dir, seed.structure_id)
-            if e_existing is None and xyz_path is not None and xyz_path.is_file():
-                e_existing = _parse_energy_from_xyz_comment(xyz_path)
-        if e_existing is not None:
-            n_skip += 1
-            e = float(e_existing)
+            # ---- restart: skip if energy already on disk ----
+            e_existing: Optional[float] = None
+            if output_dir is not None:
+                e_existing = _index_has_energy(output_dir, seed.structure_id)
+                if e_existing is None and xyz_path is not None and xyz_path.is_file():
+                    e_existing = _parse_energy_from_xyz_comment(xyz_path)
+            if e_existing is not None:
+                n_skip += 1
+                e = float(e_existing)
+                if progress is not None:
+                    progress(
+                        f"[growth-job] k={seed.k} p={seed.p} move=B "
+                        f"s={seed.shed} p_m={seed.p_m} "
+                        f"k_parent={k_par} p_parent={p_par} "
+                        f"parent={seed.parent_id} "
+                        f"id={seed.structure_id} "
+                        f"t_s=0.0 recon_s={recon_s:.1f} "
+                        f"E_eV={e:.6f} relax=ok err=resume_skip"
+                    )
+                prev = child_minima.get((seed.k, seed.p))
+                if prev is None or e < float(prev["energy_eV"]):
+                    child_minima[(seed.k, seed.p)] = {
+                        "energy_eV": e,
+                        "structure_id": seed.structure_id,
+                    }
+                skel = _core_skeleton_fp(
+                    seed.core_edges,
+                    symbols=seed.symbols,
+                    cation=cation,
+                    anion=anion,
+                )
+                bin_ranks.setdefault((seed.k, seed.p), []).append(
+                    RankedIsomer(
+                        structure_id=seed.structure_id,
+                        xtb_energy_eV=e,
+                        seed_skeleton=str(skel or "------")[:6],
+                        growth_move="B",
+                        parent_id=seed.parent_id,
+                    )
+                )
+                continue
+
+            t0 = time.perf_counter()
+            batch = [
+                {
+                    "id": seed.structure_id,
+                    "symbols": list(seed.symbols),
+                    "positions": np.asarray(seed.coordinates, dtype=float).tolist(),
+                    "edges": list(seed.core_edges),
+                }
+            ]
+            results = relax_structures(batch, settings, cutoffs)
+            xr = results[0]
+            opt_s = time.perf_counter() - t0
+            n_run += 1
+            # Prune g-xTB artifact endpoints (Se–Cl / Se–Se / Cd–Cd contacts).
+            artifact_codes: List[str] = []
+            if xr.ok and xr.coordinates is not None:
+                from .molecular_rules import forbidden_pair_contact_violations
+
+                artifact_codes = forbidden_pair_contact_violations(
+                    list(seed.symbols),
+                    xr.coordinates,
+                    map_spec,
+                    floors=settings.artifact_min_distance or None,
+                )
+            relax_tag = (
+                "artifact"
+                if artifact_codes
+                else (
+                    "ok"
+                    if xr.converged
+                    else (
+                        "maxcycle"
+                        if str(getattr(xr, "status", "") or "") == "maxcycle"
+                        or (
+                            not xr.converged
+                            and int(xr.steps) >= int(settings.max_steps) > 0
+                        )
+                        else "unconv"
+                    )
+                )
+            )
             if progress is not None:
-                progress(
+                base = (
                     f"[growth-job] k={seed.k} p={seed.p} move=B "
                     f"s={seed.shed} p_m={seed.p_m} "
                     f"k_parent={k_par} p_parent={p_par} "
                     f"parent={seed.parent_id} "
                     f"id={seed.structure_id} "
-                    f"t_s=0.0 recon_s={recon_s:.1f} "
-                    f"E_eV={e:.6f} relax=ok err=resume_skip"
+                    f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
+                    f"steps={int(getattr(xr, 'steps', 0))} "
+                    f"max_steps={int(settings.max_steps)} "
                 )
+                if artifact_codes:
+                    progress(
+                        base
+                        + "E_eV=n/a "
+                        + f"relax=artifact err={'|'.join(artifact_codes[:3])}"
+                    )
+                elif xr.ok and xr.energy_eV is not None:
+                    progress(
+                        base
+                        + f"E_eV={float(xr.energy_eV):.6f} "
+                        + f"relax={relax_tag}"
+                    )
+                else:
+                    progress(
+                        base
+                        + "E_eV=n/a "
+                        + f"relax=fail err={xr.error or 'coord_opt'}"
+                    )
+            if artifact_codes:
+                # Still dump diagnostic XYZ (energy tagged as artifact) but do
+                # not enter ranking / child_minima.
+                if output_dir is not None and xr.coordinates is not None:
+                    bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    xyz = bdir / f"{seed.structure_id}_xtb_artifact.xyz"
+                    e_note = (
+                        "n/a"
+                        if xr.energy_eV is None
+                        else f"{float(xr.energy_eV):.6f}"
+                    )
+                    lines = [
+                        str(len(seed.symbols)),
+                        f"{seed.structure_id} ARTIFACT energy_eV={e_note} "
+                        f"violations={'|'.join(artifact_codes)} "
+                        f"parent={seed.parent_id}",
+                    ]
+                    for sym, pos in zip(seed.symbols, xr.coordinates):
+                        lines.append(
+                            f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
+                        )
+                    xyz.write_text("\n".join(lines) + "\n")
+                continue
+            if not xr.ok or xr.energy_eV is None:
+                continue
+            e = float(xr.energy_eV)
             prev = child_minima.get((seed.k, seed.p))
             if prev is None or e < float(prev["energy_eV"]):
                 child_minima[(seed.k, seed.p)] = {
                     "energy_eV": e,
                     "structure_id": seed.structure_id,
                 }
+            # Prefer fingerprint of the *relaxed* Cd-Se core when available
             skel = _core_skeleton_fp(
-                seed.core_edges,
-                symbols=seed.symbols,
-                cation=cation,
-                anion=anion,
+                seed.core_edges, symbols=seed.symbols, cation=cation, anion=anion
             )
+            if xr.coordinates is not None and cutoffs:
+                try:
+                    from .molecular import skeleton_fingerprint
+                    from .xtb_relax import relaxed_edges as _re
+
+                    full_e = _re(list(seed.symbols), xr.coordinates, cutoffs)
+                    g = nx.Graph()
+                    for i, sym in enumerate(seed.symbols):
+                        if sym in (cation, anion):
+                            g.add_node(i)
+                    for a, b in full_e:
+                        if a in g and b in g:
+                            g.add_edge(a, b)
+                    atoms = [
+                        type("Atom", (), {"symbol": seed.symbols[i]})()
+                        for i in range(len(seed.symbols))
+                    ]
+                    skel = skeleton_fingerprint(
+                        atoms, g, cation, anion
+                    )
+                except Exception:
+                    pass
             bin_ranks.setdefault((seed.k, seed.p), []).append(
                 RankedIsomer(
                     structure_id=seed.structure_id,
@@ -3428,204 +3800,66 @@ def _opt_coord_seeds(
                     parent_id=seed.parent_id,
                 )
             )
-            continue
-
-        t0 = time.perf_counter()
-        batch = [
-            {
-                "id": seed.structure_id,
-                "symbols": list(seed.symbols),
-                "positions": np.asarray(seed.coordinates, dtype=float).tolist(),
-                "edges": list(seed.core_edges),
-            }
-        ]
-        results = relax_structures(batch, settings, cutoffs)
-        xr = results[0]
-        opt_s = time.perf_counter() - t0
-        n_run += 1
-        # Prune g-xTB artifact endpoints (Se–Cl / Se–Se / Cd–Cd contacts).
-        artifact_codes: List[str] = []
-        if xr.ok and xr.coordinates is not None:
-            from .molecular_rules import forbidden_pair_contact_violations
-
-            artifact_codes = forbidden_pair_contact_violations(
-                list(seed.symbols),
-                xr.coordinates,
-                map_spec,
-                floors=settings.artifact_min_distance or None,
+            if output_dir is None:
+                continue
+            bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            coords = xr.coordinates or tuple(
+                map(tuple, np.asarray(seed.coordinates))
             )
-        relax_tag = (
-            "artifact"
-            if artifact_codes
-            else (
-                "ok"
-                if xr.converged
-                else (
-                    "maxcycle"
-                    if str(getattr(xr, "status", "") or "") == "maxcycle"
-                    or (
-                        not xr.converged
-                        and int(xr.steps) >= int(settings.max_steps) > 0
-                    )
-                    else "unconv"
-                )
-            )
-        )
-        if progress is not None:
-            base = (
-                f"[growth-job] k={seed.k} p={seed.p} move=B "
-                f"s={seed.shed} p_m={seed.p_m} "
-                f"k_parent={k_par} p_parent={p_par} "
-                f"parent={seed.parent_id} "
-                f"id={seed.structure_id} "
-                f"t_s={opt_s:.1f} recon_s={recon_s:.1f} "
-            )
-            if artifact_codes:
-                progress(
-                    base
-                    + "E_eV=n/a "
-                    + f"relax=artifact err={'|'.join(artifact_codes[:3])}"
-                )
-            elif xr.ok and xr.energy_eV is not None:
-                progress(
-                    base
-                    + f"E_eV={float(xr.energy_eV):.6f} "
-                    + f"relax={relax_tag}"
-                )
-            else:
-                progress(
-                    base
-                    + "E_eV=n/a "
-                    + f"relax=fail err={xr.error or 'coord_opt'}"
-                )
-        if artifact_codes:
-            # Still dump diagnostic XYZ (energy tagged as artifact) but do
-            # not enter ranking / child_minima.
-            if output_dir is not None and xr.coordinates is not None:
-                bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
-                bdir.mkdir(parents=True, exist_ok=True)
-                xyz = bdir / f"{seed.structure_id}_xtb_artifact.xyz"
-                e_note = (
-                    "n/a"
-                    if xr.energy_eV is None
-                    else f"{float(xr.energy_eV):.6f}"
-                )
-                lines = [
-                    str(len(seed.symbols)),
-                    f"{seed.structure_id} ARTIFACT energy_eV={e_note} "
-                    f"violations={'|'.join(artifact_codes)} "
-                    f"parent={seed.parent_id}",
-                ]
-                for sym, pos in zip(seed.symbols, xr.coordinates):
-                    lines.append(
-                        f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
-                    )
-                xyz.write_text("\n".join(lines) + "\n")
-            continue
-        if not xr.ok or xr.energy_eV is None:
-            continue
-        e = float(xr.energy_eV)
-        prev = child_minima.get((seed.k, seed.p))
-        if prev is None or e < float(prev["energy_eV"]):
-            child_minima[(seed.k, seed.p)] = {
-                "energy_eV": e,
-                "structure_id": seed.structure_id,
-            }
-        # Prefer fingerprint of the *relaxed* Cd-Se core when available
-        skel = _core_skeleton_fp(
-            seed.core_edges, symbols=seed.symbols, cation=cation, anion=anion
-        )
-        if xr.coordinates is not None and cutoffs:
-            try:
-                from .molecular import skeleton_fingerprint
-                from .xtb_relax import relaxed_edges as _re
-
-                full_e = _re(list(seed.symbols), xr.coordinates, cutoffs)
-                g = nx.Graph()
-                for i, sym in enumerate(seed.symbols):
-                    if sym in (cation, anion):
-                        g.add_node(i)
-                for a, b in full_e:
-                    if a in g and b in g:
-                        g.add_edge(a, b)
-                atoms = [
-                    type("Atom", (), {"symbol": seed.symbols[i]})()
-                    for i in range(len(seed.symbols))
-                ]
-                skel = skeleton_fingerprint(
-                    atoms, g, cation, anion
-                )
-            except Exception:
-                pass
-        bin_ranks.setdefault((seed.k, seed.p), []).append(
-            RankedIsomer(
-                structure_id=seed.structure_id,
-                xtb_energy_eV=e,
-                seed_skeleton=str(skel or "------")[:6],
-                growth_move="B",
-                parent_id=seed.parent_id,
-            )
-        )
-        if output_dir is None:
-            continue
-        bdir = Path(output_dir) / f"k{seed.k:03d}" / f"p{seed.p:03d}"
-        bdir.mkdir(parents=True, exist_ok=True)
-        coords = xr.coordinates or tuple(
-            map(tuple, np.asarray(seed.coordinates))
-        )
-        xyz = bdir / f"{seed.structure_id}_xtb.xyz"
-        lines = [
-            str(len(seed.symbols)),
-            f"{seed.structure_id} energy_eV={e} move=coord "
-            f"shed={seed.shed} p_m={seed.p_m} parent={seed.parent_id} "
-            f"{seed.notes}",
-        ]
-        for sym, pos in zip(seed.symbols, coords):
-            lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
-        xyz.write_text("\n".join(lines) + "\n")
-        if growth.persist_wbo and getattr(xr, "bond_orders", None):
-            write_wbo_file(xyz.with_suffix(".wbo"), xr.bond_orders)
-        refs = growth.references
-        fields = [
-            "k",
-            "p",
-            "structure_id",
-            "xtb_energy_eV",
-            "xtb_converged",
-            "dE_f_eV",
-            "growth",
-            "move",
-            "shed",
-            "p_m",
-            "parent_id",
-        ]
-        for dmu in growth.delta_mu_cdcl2_eV:
-            fields.append(f"Omega_dmu_{dmu:+.2f}")
-        row = {
-            "k": seed.k,
-            "p": seed.p,
-            "structure_id": seed.structure_id,
-            "xtb_energy_eV": f"{e:.8f}",
-            "xtb_converged": bool(xr.converged),
-            "dE_f_eV": "",
-            "growth": "1",
-            "move": "coord",
-            "shed": seed.shed,
-            "p_m": seed.p_m,
-            "parent_id": seed.parent_id,
-        }
-        if refs is not None:
-            de_f = refs.formation_eV(e, seed.k, seed.p)
-            row["dE_f_eV"] = f"{de_f:.8f}"
+            xyz = bdir / f"{seed.structure_id}_xtb.xyz"
+            lines = [
+                str(len(seed.symbols)),
+                f"{seed.structure_id} energy_eV={e} move=coord "
+                f"shed={seed.shed} p_m={seed.p_m} parent={seed.parent_id} "
+                f"{seed.notes}",
+            ]
+            for sym, pos in zip(seed.symbols, coords):
+                lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
+            xyz.write_text("\n".join(lines) + "\n")
+            if growth.persist_wbo and getattr(xr, "bond_orders", None):
+                write_wbo_file(xyz.with_suffix(".wbo"), xr.bond_orders)
+            refs = growth.references
+            fields = [
+                "k",
+                "p",
+                "structure_id",
+                "xtb_energy_eV",
+                "xtb_converged",
+                "dE_f_eV",
+                "growth",
+                "move",
+                "shed",
+                "p_m",
+                "parent_id",
+            ]
             for dmu in growth.delta_mu_cdcl2_eV:
-                key = f"Omega_dmu_{dmu:+.2f}"
-                row[key] = f"{refs.grand_potential_eV(e, seed.k, seed.p, dmu):.8f}"
-        _append_index_row_unique(Path(output_dir), row, fields)
+                fields.append(f"Omega_dmu_{dmu:+.2f}")
+            row = {
+                "k": seed.k,
+                "p": seed.p,
+                "structure_id": seed.structure_id,
+                "xtb_energy_eV": f"{e:.8f}",
+                "xtb_converged": bool(xr.converged),
+                "dE_f_eV": "",
+                "growth": "1",
+                "move": "coord",
+                "shed": seed.shed,
+                "p_m": seed.p_m,
+                "parent_id": seed.parent_id,
+            }
+            if refs is not None:
+                de_f = refs.formation_eV(e, seed.k, seed.p)
+                row["dE_f_eV"] = f"{de_f:.8f}"
+                for dmu in growth.delta_mu_cdcl2_eV:
+                    key = f"Omega_dmu_{dmu:+.2f}"
+                    row[key] = f"{refs.grand_potential_eV(e, seed.k, seed.p, dmu):.8f}"
+            _append_index_row_unique(Path(output_dir), row, fields)
 
     if log:
         log.line(
             f"move B opts: ran={n_run}  resumed/skipped={n_skip}  "
-            f"total_seeds={len(flat)}"
+            f"total_seeds={n_flat}"
         )
 
 
@@ -3750,4 +3984,6 @@ __all__ = [
     "grow_cores_from_parents",
     "run_growth_step",
     "write_growth_summary",
+    "full_opt_relaxation_raw",
+    "overlay_pack_full_opt",
 ]

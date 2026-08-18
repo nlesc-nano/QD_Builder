@@ -86,6 +86,13 @@ DEFAULT_RELAX_ARTIFACT_PAIRS: Tuple[str, ...] = tuple(
     DEFAULT_RELAX_ARTIFACT_MIN_DISTANCE.keys()
 )
 
+# Cd–Cl distance used only to count how many cations a Cl still sits on.
+# μ2/μ3 Cl on a Cd–Se–Cd face can get a short Cl…Se from g-xTB; that 4-ring
+# is an allowed motif.  Only Cl with fewer than this many Cd hosts is a
+# terminal Se–Cl artifact.
+_RHOMBUS_CL_CD_CUTOFF_A = 2.90
+_RHOMBUS_MIN_CD_HOSTS = 2
+
 
 def resolved_relax_artifact_floors(
     floors: Optional[Mapping[str, float]] = None,
@@ -107,6 +114,34 @@ def resolved_relax_artifact_floors(
     return out
 
 
+def _cl_still_bridges_cations(
+    symbols: Sequence[str],
+    coords: np.ndarray,
+    i: int,
+    j: int,
+    *,
+    cation: str,
+    ligand: str,
+) -> bool:
+    """True if the ligand atom of pair (i, j) still has ≥2 cation hosts."""
+
+    if symbols[i] == ligand:
+        cl_idx = i
+    elif symbols[j] == ligand:
+        cl_idx = j
+    else:
+        return False
+    n_cd = 0
+    for k, sym in enumerate(symbols):
+        if k == cl_idx or sym != cation:
+            continue
+        if float(np.linalg.norm(coords[k] - coords[cl_idx])) <= _RHOMBUS_CL_CD_CUTOFF_A:
+            n_cd += 1
+            if n_cd >= _RHOMBUS_MIN_CD_HOSTS:
+                return True
+    return False
+
+
 def forbidden_pair_contact_violations(
     symbols: Sequence[str],
     coordinates: Sequence[Sequence[float]],
@@ -125,10 +160,20 @@ def forbidden_pair_contact_violations(
     Independent of the enumerated graph: a Se–Cl contact that *forms* during
     g-xTB is not an input edge.  Returns codes ``artifact:Cl-Se:i-j:r<floor``.
 
-    ``spec`` is accepted for API compatibility and ignored for floors.
+    **Cl–Se exception:** a short Cl…Se is kept when that Cl still has two or
+    more Cd neighbours (μ2/μ3 on a Cd–Se–Cd face — an allowed 4-ring).
+    Only terminal-like Se–Cl (Cl on 0–1 Cd) is a ranking artifact.
+    ``spec`` sets cation/ligand/anion symbols when given; floors stay
+    independent of construction ``pair_rules``.
     """
 
-    del spec  # floors are deliberately independent of construction pair_rules
+    cation = "Cd"
+    ligand = "Cl"
+    anion = "Se"
+    if spec is not None:
+        cation = str(getattr(spec.core, "cation", cation) or cation)
+        ligand = str(getattr(spec.precursor, "ligand", ligand) or ligand)
+        anion = str(getattr(spec.core, "anion", anion) or anion)
     resolved = resolved_relax_artifact_floors(floors)
     if pairs is not None:
         allowed = {
@@ -145,6 +190,7 @@ def forbidden_pair_contact_violations(
     if coords.shape != (n, 3):
         return ["geometry:coordinate_shape"]
     viol: List[str] = []
+    ligand_anion = pair_key(ligand, anion)
     for i in range(n):
         for j in range(i + 1, n):
             pk = pair_key(symbols[i], symbols[j])
@@ -152,10 +198,20 @@ def forbidden_pair_contact_violations(
             if limit is None:
                 continue
             dist = float(np.linalg.norm(coords[i] - coords[j]))
-            if dist < limit:
-                viol.append(
-                    f"artifact:{pk}:{i}-{j}:{dist:.3f}<{limit:.3f}"
-                )
+            if dist >= limit:
+                continue
+            if pk == ligand_anion and _cl_still_bridges_cations(
+                symbols,
+                coords,
+                i,
+                j,
+                cation=cation,
+                ligand=ligand,
+            ):
+                continue
+            viol.append(
+                f"artifact:{pk}:{i}-{j}:{dist:.3f}<{limit:.3f}"
+            )
     # Near-collapse (any species) is always unreasonable.
     for i in range(n):
         for j in range(i + 1, n):
