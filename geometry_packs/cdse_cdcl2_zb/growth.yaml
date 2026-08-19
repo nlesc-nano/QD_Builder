@@ -1,20 +1,21 @@
-# zb occupation growth, parent k = 1 … 3 (child k = 2 … 4).
+# zb occupation growth, parent k = 1 … 12 (child k = 2 … 13).
 #
 # Soft rules OFF.  Move A/B OFF.  lattice_switch OFF.
 # Parent cut is energy window + cap + min_p only.
-# After g-xTB a child is kept only if it still embeds on zb.
+# After g-xTB a child is kept in the lineage only if its Cd-Se topology is
+# preserved.  Changed-topology endpoints remain on disk as off-path minima.
 #
 #   python tools/run_molecular_growth.py \
 #     --pack-dir geometry_packs/cdse_cdcl2_zb \
 #     --growth growth.yaml \
 #     --parents /path/to/gxtb_cdse_target_k1k2_p1p5 \
-#     --k-from 1 --k-to 4 --p-parents all \
-#     --output /path/to/growth_zb_k1_to_k4
+#     --k-from 1 --k-to 13 --p-parents all \
+#     --output /path/to/growth_zb_k1_to_k13
 #
 # NEW --output.  Do not resume an A/B tree.
 
 schema_version: 1
-name: cdse_growth_zb_k1k4
+name: cdse_growth_zb_k1k13
 
 monomer_p_values: [1, 2, 3]
 
@@ -39,7 +40,7 @@ parents:
   rank_by: energy
   max_skeletons_frac: 1.0
   max_skeletons_cap: 10
-  decorations_per_skeleton: 1
+  decorations_per_skeleton: 2
   min_p: 1
   core_source: relaxed
   bond_cutoffs: from_graph_rules
@@ -81,6 +82,13 @@ lattice_switch:
 soft_rules:
   enabled: false
 
+# A report-only comparison at k=13.  It never filters or ranks structures.
+endpoint_diagnostic:
+  enabled: true
+  k: 13
+  reference: k13_wulff_core.yaml
+  site_match_tolerance_A: 0.35
+
 by_k:
   - k_min: 1
     k_max: 1
@@ -112,7 +120,19 @@ by_k:
     max_shed: 2
     energy_window_eV: 0.60
     max_skeletons_cap: 8
-    decorations_per_skeleton: 1
+    decorations_per_skeleton: 2
+    min_p: 2
+    redecorate: true
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+  - k_min: 4
+    k_max: 12
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.60
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 2
     min_p: 2
     redecorate: true
     moves: {graph: false, coord: false, zb_sites: true}

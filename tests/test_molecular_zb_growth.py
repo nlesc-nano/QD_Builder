@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
@@ -11,19 +13,28 @@ import yaml
 from builder.nucleation.molecular_growth import (
     GrowthConfig,
     ParentStructure,
+    _opt_zb_occupations,
     grow_cores_from_parents,
 )
+from builder.nucleation.geometry_pack import load_geometry_pack
 from builder.nucleation.molecular_zb_growth import (
     attach_cdse,
+    endpoint_similarity_diagnostic,
+    ensure_occupation_identity,
     grow_zb_children,
     lattice_k1_occupation,
     lattice_model,
+    load_reference_occupation,
+    occupation_from_record,
+    occupation_to_record,
     place_cl_2p,
     seed_occupation,
+    shed_occupations,
     zb_embeddable,
 )
 from builder.nucleation.soft_rules import describe_structure
 from builder.nucleation.spec import load_nucleation_spec
+from builder.nucleation.xtb_relax import XtbResult
 
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "geometry_packs" / "cdse_cdcl2"
@@ -89,6 +100,85 @@ def test_grow_zb_children_stoich(map_spec) -> None:
         assert kid.p == 2  # 2 - 1 + 1
         assert kid.symbols.count("Se") == 2
         assert kid.symbols.count("Cd") == 4
+
+
+def test_shedding_is_exhaustive_before_soft_priority(map_spec) -> None:
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=1)
+    assert parent is not None
+    k2 = grow_zb_children(
+        parent, s=0, p_m=1, spec=map_spec, model=model, cap=0
+    )[0]
+    removals = shed_occupations(k2, 1, map_spec, model)
+    assert len(removals) >= 2
+
+    # WBO is a post-enumeration preference only: it must not change the set of
+    # legal children when no cap is requested.
+    baseline = grow_zb_children(
+        k2, s=1, p_m=1, spec=map_spec, model=model, cap=0
+    )
+    biased = grow_zb_children(
+        k2,
+        s=1,
+        p_m=1,
+        spec=map_spec,
+        model=model,
+        cap=0,
+        parent_wbo={(0, 2): 0.1, (1, 3): 1.5},
+    )
+    assert {item.occupation_id for item in baseline} == {
+        item.occupation_id for item in biased
+    }
+
+
+def test_occupation_manifest_round_trip(map_spec) -> None:
+    model = lattice_model(map_spec)
+    occupation = lattice_k1_occupation(map_spec, model, p=2)
+    assert occupation is not None
+    occupation.parent_occupation_ids = ("parent-occ-a", "parent-occ-b")
+    occupation.parent_structure_ids = ("parent-a", "parent-b")
+    restored = occupation_from_record(occupation_to_record(occupation))
+    ensure_occupation_identity(restored, model)
+    assert restored.occupation_id == occupation.occupation_id
+    assert restored.site_ids == occupation.site_ids
+    assert np.allclose(restored.coordinates, occupation.coordinates)
+    assert restored.parent_occupation_ids == occupation.parent_occupation_ids
+    assert restored.parent_structure_ids == occupation.parent_structure_ids
+
+
+def test_occupation_identity_is_spatial_and_cubic_invariant(map_spec) -> None:
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=1)
+    assert parent is not None
+    children = attach_cdse(parent, map_spec, model, cap=0)
+    same_graph = [
+        child for child in children if child.core_edges == children[0].core_edges
+    ]
+    assert len(same_graph) >= 2
+    assert same_graph[0].occupation_id != same_graph[1].occupation_id
+
+    transformed = replace(
+        same_graph[0],
+        coordinates=same_graph[0].coordinates[:, [2, 0, 1]]
+        * np.array([-1.0, 1.0, -1.0])
+        + np.array([12.0, -7.0, 3.0]),
+        site_ids=(),
+        occupation_id="",
+    )
+    ensure_occupation_identity(transformed, model)
+    assert transformed.occupation_id == same_graph[0].occupation_id
+
+
+def test_k13_wulff_endpoint_is_diagnostic_only(map_spec) -> None:
+    model = lattice_model(map_spec)
+    reference = load_reference_occupation(
+        PACK_ZB / "k13_wulff_core.yaml", map_spec, model
+    )
+    diagnostic = endpoint_similarity_diagnostic(reference, reference)
+    assert reference.k == 13 and reference.p == 3
+    assert diagnostic["site_overlap_fraction"] == pytest.approx(1.0)
+    assert diagnostic["assignment_rmsd_A"] == pytest.approx(0.0)
+    assert diagnostic["ranking_or_filtering_effect"] == "none"
 
 
 def test_diamond_is_not_zb_embeddable(map_spec) -> None:
@@ -169,9 +259,10 @@ def test_zb_pack_is_clean() -> None:
     assert w3.min_p_parent == 2
     assert w3.energy_window_eV == 0.60
     assert spec.graph_rules.decoration_mode == "motif_bridge_first"
-    # this pack only grows through parent k=3 (child k=4)
-    w4 = cfg.window_for(4)
-    assert w4.move_zb_sites is True
+    w12 = cfg.window_for(12)
+    assert w12.move_zb_sites is True
+    assert cfg.endpoint_diagnostic_k == 13
+    assert cfg.endpoint_reference == (PACK_ZB / "k13_wulff_core.yaml").resolve()
 
 
 def test_grow_cores_zb_move(map_spec) -> None:
@@ -202,7 +293,7 @@ def test_grow_cores_zb_move(map_spec) -> None:
 
 
 def test_grow_cores_uses_zb_pack_growth(map_spec) -> None:
-    """The clean k1k4 pack grows Z children and does not enable A/B."""
+    """The clean k1k13 pack grows Z children and does not enable A/B."""
 
     model = lattice_model(map_spec)
     occ = lattice_k1_occupation(map_spec, model, p=1)
@@ -222,3 +313,107 @@ def test_grow_cores_uses_zb_pack_growth(map_spec) -> None:
     assert {ch.move for ch in result.channels} == {"zb_sites"}
     assert result.zb_seeds
     assert not result.coord_seeds or not any(result.coord_seeds.values())
+
+
+def test_later_growth_uses_stored_lattice_not_relaxed_coordinates(map_spec) -> None:
+    model = lattice_model(map_spec)
+    k1 = lattice_k1_occupation(map_spec, model, p=1)
+    assert k1 is not None
+    k2 = grow_zb_children(
+        k1, s=0, p_m=1, spec=map_spec, model=model, cap=1
+    )[0]
+    distorted = np.asarray(k2.coordinates, dtype=float).copy()
+    distorted[0] += np.array([7.0, -4.0, 3.0])
+    parent = ParentStructure(
+        k=k2.k,
+        p=k2.p,
+        structure_id="relaxed_but_distorted",
+        symbols=k2.symbols,
+        coordinates=distorted,
+        energy_eV=-2.0,
+        edges=k2.core_edges,
+        core_edges=k2.core_edges,
+        zb_occupation=k2,
+    )
+    cfg = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    result = grow_cores_from_parents([parent], growth=cfg, spec=map_spec)
+    assert result.zb_stats is not None
+    assert result.zb_stats.snapped == 1
+    assert result.zb_stats.snap_fail == 0
+    assert result.zb_seeds
+    assert all(
+        child.parent_occupation_ids == (k2.occupation_id,)
+        for children in result.zb_seeds.values()
+        for child in children
+    )
+
+
+def test_zb_opt_indexes_only_topology_preserving_endpoints(
+    map_spec, monkeypatch, tmp_path: Path
+) -> None:
+    import builder.nucleation.xtb_relax as xtb_relax
+
+    model = lattice_model(map_spec)
+    occupation = lattice_k1_occupation(map_spec, model, p=1)
+    assert occupation is not None
+    occupation.parent_id = "parent-structure"
+    occupation.parent_structure_ids = ("parent-structure",)
+    growth = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    pack = load_geometry_pack(PACK_ZB / "run_gxtb.yaml")
+
+    def run_fake(output: Path, *, preserve: bool):
+        calls = []
+
+        def fake_relax(entries, _settings, _cutoffs):
+            calls.extend(entries)
+            results = []
+            for entry in entries:
+                edges = list(entry["edges"])
+                if not preserve:
+                    edges.remove(tuple(occupation.core_edges[0]))
+                results.append(
+                    XtbResult(
+                        ok=True,
+                        energy_eV=-12.5,
+                        converged=True,
+                        coordinates=tuple(
+                            tuple(float(value) for value in point)
+                            for point in entry["positions"]
+                        ),
+                        relaxed_edges=tuple(edges),
+                    )
+                )
+            return results
+
+        monkeypatch.setattr(xtb_relax, "relax_structures", fake_relax)
+        minima = {}
+        ranks = {}
+        _opt_zb_occupations(
+            {(1, 1): [occupation]},
+            growth=growth,
+            map_spec=map_spec,
+            pack=pack,
+            output_dir=output,
+            progress=None,
+            child_minima=minima,
+            bin_ranks=ranks,
+        )
+        records = [
+            json.loads(line)
+            for line in (output / "zb_occupations.jsonl").read_text().splitlines()
+        ]
+        return calls, minima, ranks, records
+
+    calls, minima, ranks, records = run_fake(tmp_path / "preserved", preserve=True)
+    assert 1 <= len(calls) <= 2
+    assert minima and ranks
+    assert records[0]["propagation_eligible"] is True
+    assert records[0]["topology_status"] == "preserved"
+    assert records[0]["core_rmsd_A"] == pytest.approx(0.0, abs=1.0e-10)
+
+    _calls, minima, ranks, records = run_fake(tmp_path / "changed", preserve=False)
+    assert not minima and not ranks
+    assert records[0]["propagation_eligible"] is False
+    assert records[0]["topology_status"] == "changed"
+    assert list((tmp_path / "changed").rglob("*_offpath.xyz"))
+    assert not (tmp_path / "changed" / "index.csv").exists()

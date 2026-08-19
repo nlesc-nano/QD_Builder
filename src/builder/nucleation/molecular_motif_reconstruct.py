@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -248,8 +248,15 @@ def reconstruct_motif_state(
     max_nfev: int = 40,
     overlap_min_A: float = 0.75,
     start_max_bond_error_A: float = 0.50,
+    core_coordinates: Optional[Mapping[int, Sequence[float]]] = None,
 ) -> MotifReconstructionResult:
-    """Return distinct whole-graph fits, including promising audit failures."""
+    """Return distinct whole-graph fits, including promising audit failures.
+
+    ``core_coordinates`` activates the Move-Z embedding mode.  The supplied
+    inorganic sites are the construction frame: reconstruction places and
+    relaxes the ligand shell around them, while the final g-xTB optimization
+    remains completely unconstrained.
+    """
 
     # Local import avoids a module cycle: molecular owns the authoritative
     # audit enumeration, while this module supplies an optional reconstruction.
@@ -271,6 +278,13 @@ def reconstruct_motif_state(
         return MotifReconstructionResult((), tuple(motif_errors), 0)
 
     n_atoms = len(state.atoms)
+    anchored: Dict[int, np.ndarray] = {}
+    if core_coordinates:
+        for raw_index, raw_point in core_coordinates.items():
+            index = int(raw_index)
+            point = np.asarray(raw_point, dtype=float)
+            if 0 <= index < n_atoms and point.shape == (3,) and np.all(np.isfinite(point)):
+                anchored[index] = point.copy()
     degrees = [int(state.graph.degree[i]) for i in range(n_atoms)]
     bonds = [
         (int(a), int(b), float(M._molecular_bond_length(state, pack, spec, a, b, degrees)))
@@ -339,6 +353,12 @@ def reconstruct_motif_state(
             values.append(0.20 * (actual - target) / width)
         for se, cl, cd1, cd2, width, weight in junction_coplanar:
             values.append(weight * _coplanarity_deg(xyz, se, cl, cd1, cd2) / width)
+        # Move Z: the lattice core is an embedding boundary condition, not a
+        # geometry-pack rejection contract.  A strong Cartesian tether keeps
+        # the optimizer focused on placing Cl; coordinates are reset exactly
+        # to the sites before the candidate is returned.
+        for index in sorted(anchored):
+            values.extend(((xyz[index] - anchored[index]) / 0.002).tolist())
         values.extend((np.mean(xyz, axis=0) / 0.10).tolist())
         # Break exact rotational degeneracy without making a rigid motif.
         values.extend((0.001 * (xyz - tether)).reshape(-1).tolist())
@@ -358,6 +378,25 @@ def reconstruct_motif_state(
         rng = np.random.default_rng(seed + 31 * graph_seed + start_index)
         initial += rng.normal(0.0, 0.18, initial.shape)
         initial -= np.mean(initial, axis=0)
+        if anchored:
+            ids = sorted(anchored)
+            source = initial[ids]
+            target = np.asarray([anchored[index] for index in ids], dtype=float)
+            if len(ids) >= 2:
+                source_center = source.mean(axis=0)
+                target_center = target.mean(axis=0)
+                u, _singular, vt = np.linalg.svd(
+                    (source - source_center).T @ (target - target_center)
+                )
+                rotation = u @ vt
+                if np.linalg.det(rotation) < 0.0:
+                    u[:, -1] *= -1.0
+                    rotation = u @ vt
+                initial = (initial - source_center) @ rotation + target_center
+            else:
+                initial += target[0] - source[0]
+            for index in ids:
+                initial[index] = anchored[index]
         try:
             residual_count = len(residual(initial.reshape(-1), initial))
             method = "lm" if residual_count >= initial.size else "trf"
@@ -375,6 +414,8 @@ def reconstruct_motif_state(
         xyz = np.asarray(fitted.x, dtype=float).reshape((n_atoms, 3))
         if not np.all(np.isfinite(xyz)):
             continue
+        for index, point in anchored.items():
+            xyz[index] = point
         bond_errors = [
             abs(float(np.linalg.norm(xyz[left] - xyz[right])) - target)
             for left, right, target in bonds

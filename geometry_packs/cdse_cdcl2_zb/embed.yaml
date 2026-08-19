@@ -182,5 +182,5 @@ rings:
         mode: derive_from_angles
         phi_deg: [55, -55, 55, -55, 55, -55]
         tol_deg: [15, 15, 15, 15, 15, 15]
-reconstruction: {method: motif_factor, audit: clashes_only, factor_starts_per_graph: 1, max_nfev: 8, layout_iterations: 40,
-  xtb_starts_per_graph: 1, overlap_min_A: 0.75, start_max_bond_error_A: 0.5}
+reconstruction: {method: motif_factor, audit: clashes_only, factor_starts_per_graph: 3, max_nfev: 40, layout_iterations: 40,
+  xtb_starts_per_graph: 2, overlap_min_A: 0.75, start_max_bond_error_A: 0.5}

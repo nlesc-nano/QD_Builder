@@ -18,7 +18,7 @@ cif: ../../examples/cifs/CdSe_zb.cif
 charges: {Cd: 2, Se: -2, Cl: -1}
 
 nucleation:
-  kmax: 4
+  kmax: 13
   mode: exact
   core_monomer: {cation: Cd, anion: Se}
   precursor: {center: Cd, ligand: Cl, ligand_count: 2}

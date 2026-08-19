@@ -18,6 +18,7 @@ Chemical-potential / grand-potential numbers are report-only
 from __future__ import annotations
 
 import csv
+import json
 import math
 import re
 import time
@@ -289,6 +290,9 @@ class GrowthConfig:
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
     min_p_parent: int = 1
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
+    endpoint_diagnostic_k: int = 0
+    endpoint_reference: Optional[Path] = None
+    endpoint_match_tolerance_A: float = 0.35
 
     @property
     def use_coord_carry(self) -> bool:
@@ -425,6 +429,14 @@ class GrowthConfig:
         budget = raw.get("budget") or {}
         if not isinstance(budget, dict):
             budget = {}
+        endpoint = raw.get("endpoint_diagnostic") or {}
+        if not isinstance(endpoint, dict):
+            endpoint = {}
+        endpoint_reference = None
+        if endpoint.get("enabled", False) and endpoint.get("reference"):
+            endpoint_reference = Path(str(endpoint["reference"]))
+            if not endpoint_reference.is_absolute():
+                endpoint_reference = (path.parent / endpoint_reference).resolve()
         refs = None
         if raw.get("references"):
             try:
@@ -504,6 +516,15 @@ class GrowthConfig:
             ),
             delta_mu_cdcl2_eV=dmu,
             soft_rules=SoftRulesConfig.from_raw(raw.get("soft_rules")),
+            endpoint_diagnostic_k=(
+                int(endpoint.get("k", 13))
+                if endpoint.get("enabled", False)
+                else 0
+            ),
+            endpoint_reference=endpoint_reference,
+            endpoint_match_tolerance_A=float(
+                endpoint.get("site_match_tolerance_A", 0.35)
+            ),
         )
 
 
@@ -527,6 +548,9 @@ class ParentStructure:
     wbo: Optional[Dict[Tuple[int, int], float]] = None
     wbo_source: str = "none"  # wbo_file | csv | distance | none
     source_path: str = ""
+    # Move-Z dual representation.  The relaxed XYZ supplies energy/feedback;
+    # this stored occupation is the sole source of lattice lineage.
+    zb_occupation: Optional[Any] = None
 
     @property
     def n_atoms(self) -> int:
@@ -943,6 +967,12 @@ def load_parents_from_run(
     cation = spec.core.cation
     anion = spec.core.anion
     parents: List[ParentStructure] = []
+    try:
+        from .molecular_zb_growth import load_occupation_manifest
+
+        zb_by_structure = load_occupation_manifest(run_dir)
+    except Exception:
+        zb_by_structure = {}
 
     index_path = run_dir / "index.csv"
     rows: List[Dict[str, str]] = []
@@ -1005,6 +1035,7 @@ def load_parents_from_run(
                     wbo=wbo,
                     wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
+                    zb_occupation=zb_by_structure.get(sid_use),
                 )
             )
         return parents
@@ -1056,6 +1087,7 @@ def load_parents_from_run(
                     wbo=wbo,
                     wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
+                    zb_occupation=zb_by_structure.get(sid_use),
                 )
             )
     return parents
@@ -1065,6 +1097,14 @@ def _core_fingerprint(
     parent: ParentStructure, spec: NucleationSpec
 ) -> Tuple[object, ...]:
     """Isomorphism class of the relaxed Cd–Se core."""
+
+    occupation = getattr(parent, "zb_occupation", None)
+    occupation_id = str(getattr(occupation, "occupation_id", "") or "")
+    if occupation_id:
+        # The ID is based on the complete coloured lattice site set modulo
+        # cubic symmetry and translation, so it preserves spatial occupation
+        # diversity that a Cd--Se edge graph alone cannot distinguish.
+        return ("zb", occupation_id, parent.k, parent.p)
 
     se_ids, cd_ids, _ = _index_blocks(parent.k, parent.p)
     # Map only inorganic nodes present in core edges
@@ -1148,7 +1188,40 @@ def select_parents(
             ),
         )
         n_keep = min(n_keep, len(skel_ranked))
-        for _fp, members in skel_ranked[:n_keep]:
+        retained_buckets = skel_ranked[:n_keep]
+        if skel_ranked and all(
+            getattr(member, "zb_occupation", None) is not None
+            for _fingerprint, members in skel_ranked
+            for member in members
+        ):
+            from .molecular_zb_growth import occupation_diversity_signature
+
+            retained_buckets = [skel_ranked[0]]
+            retained_keys = {skel_ranked[0][0]}
+            seen_classes = {
+                occupation_diversity_signature(
+                    skel_ranked[0][1][0].zb_occupation
+                )
+            }
+            for fingerprint, members in skel_ranked[1:]:
+                signature = occupation_diversity_signature(
+                    members[0].zb_occupation
+                )
+                if signature in seen_classes:
+                    continue
+                retained_buckets.append((fingerprint, members))
+                retained_keys.add(fingerprint)
+                seen_classes.add(signature)
+                if len(retained_buckets) >= n_keep:
+                    break
+            if len(retained_buckets) < n_keep:
+                retained_buckets.extend(
+                    item
+                    for item in skel_ranked
+                    if item[0] not in retained_keys
+                )
+                retained_buckets = retained_buckets[:n_keep]
+        for _fp, members in retained_buckets:
             members_sorted = sorted(members, key=_score)
             selected.extend(members_sorted[: win.decorations_per_skeleton])
     return selected
@@ -2239,10 +2312,11 @@ def grow_cores_from_parents(
     package shed on parent 3D → place CdSe + p_m CdCl2 → optional short
     cleanup → seed frames for full opt (and core added to catalog).
 
-    **Move Z (zb_sites):** snap the parent core onto zinc-blende sites,
-    shed extra Cd, fill a vacant CdSe pair (+ p_m precursor Cd).  Cl is
-    placed by the 2p law around that core at opt time.  The relaxed
-    child is kept only if it still embeds on zb.
+    **Move Z (zb_sites):** load the persistent zinc-blende occupation,
+    shed extra Cd, and fill a vacant CdSe pair (+ p_m precursor Cd).  The
+    relaxed parent supplies only soft local feedback.  Pack graph rules place
+    Cl, anchored multi-start reconstruction builds the 3D starts, and only a
+    topology-preserving converged g-xTB endpoint can propagate.
     """
 
     if not parents:
@@ -2266,16 +2340,16 @@ def grow_cores_from_parents(
     use_graph = bool(window.move_graph)
     use_zb = bool(getattr(window, "move_zb_sites", False))
     zb_seeds: Dict[Tuple[int, int], List[Any]] = defaultdict(list)
-    zb_seen: set = set()
+    zb_seen: Dict[str, Any] = {}
     zb_model = None
     zb_stats = None
     if use_zb:
         from .molecular_zb_growth import (
             ZbGrowStats,
+            ensure_occupation_identity,
             grow_zb_children,
             lattice_k1_occupation,
             lattice_model,
-            snap_parent,
         )
 
         zb_model = lattice_model(spec)
@@ -2311,15 +2385,21 @@ def grow_cores_from_parents(
         zb_occ = None
         if use_zb and zb_model is not None and zb_stats is not None:
             zb_stats.parents += 1
-            zb_occ, why = snap_parent(
-                parent.symbols,
-                parent.coordinates,
-                spec,
-                zb_model,
-                parent_id=parent.structure_id,
-                k=parent.k,
-                p=parent.p,
-            )
+            stored = getattr(parent, "zb_occupation", None)
+            why = "missing_occupation_manifest"
+            if stored is not None:
+                zb_occ = ensure_occupation_identity(stored, zb_model)
+                if zb_occ.k != parent.k or zb_occ.p != parent.p:
+                    why = (
+                        f"stored_stoich_k{zb_occ.k}p{zb_occ.p}"
+                    )
+                    zb_occ = None
+                else:
+                    zb_occ.parent_id = parent.structure_id
+                    why = "stored_occupation"
+            # A legacy parent tree can initialize Move Z only at k=1.  Every
+            # later step must load the occupation written by the prior step;
+            # relaxed-coordinate snapping is intentionally not a lineage path.
             if zb_occ is None and parent.k == 1:
                 zb_occ = lattice_k1_occupation(spec, zb_model, parent.p)
                 if zb_occ is not None:
@@ -2469,13 +2549,35 @@ def grow_cores_from_parents(
                         model=zb_model,
                         cap=int(window.max_children_per_channel),
                         stats=zb_stats,
+                        relaxed_parent_coordinates=np.asarray(
+                            parent.coordinates, dtype=float
+                        )[: len(zb_occ.symbols)],
+                        parent_wbo=(
+                            parent.wbo
+                            if tuple(parent.symbols[: len(zb_occ.symbols)])
+                            == tuple(zb_occ.symbols)
+                            else None
+                        ),
                     )
                     kept_kids = []
                     for kid in kids:
-                        uniq = (kid.k, kid.p, tuple(sorted(kid.core_edges)))
+                        uniq = str(kid.occupation_id)
                         if uniq in zb_seen:
+                            existing = zb_seen[uniq]
+                            existing.parent_occupation_ids = tuple(
+                                sorted(
+                                    set(existing.parent_occupation_ids)
+                                    | set(kid.parent_occupation_ids)
+                                )
+                            )
+                            existing.parent_structure_ids = tuple(
+                                sorted(
+                                    set(existing.parent_structure_ids)
+                                    | set(kid.parent_structure_ids)
+                                )
+                            )
                             continue
-                        zb_seen.add(uniq)
+                        zb_seen[uniq] = kid
                         kept_kids.append(kid)
                         zb_seeds[(kid.k, kid.p)].append(kid)
                         bucket = catalog.setdefault((kid.k, kid.p), {})
@@ -3471,9 +3573,10 @@ def run_growth_step(
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
     do_redecorate = bool(decorate and window.child_redecorate)
     if window.move_zb_sites and decorate:
-        # Z built the Cd–Se occupation.  Cl and 3D come from the pack
-        # (graph_rules decorate + embed.yaml), not a homemade Cl placer.
-        do_redecorate = True
+        # Move Z has its own occupation-aware decorator/embedder below.  The
+        # generic bin path stores only edge lists and would lose lattice-site
+        # identity.  In a mixed A+Z run it remains enabled for Move A cores.
+        do_redecorate = bool(window.move_graph)
     if window.max_opts_per_k > 0:
         result = _apply_opt_budget(result, window.max_opts_per_k)
         n_cores = sum(len(v) for v in result.skeleton_catalog.values())
@@ -3542,10 +3645,27 @@ def run_growth_step(
                 bin_ranks=bin_ranks,
             )
 
+        # ---- Move Z: persistent occupation -> graph decoration -> anchored
+        # embed -> unconstrained g-xTB.  This is intentionally separate from
+        # generic Move A because the latter owns no lattice-site metadata.
+        if result.zb_seeds and embed:
+            _opt_zb_occupations(
+                result.zb_seeds,
+                growth=growth,
+                map_spec=map_spec,
+                pack=pack,
+                output_dir=out,
+                progress=log if log else progress,
+                child_minima=child_minima,
+                bin_ranks=bin_ranks,
+                zb_stats=result.zb_stats,
+            )
+
         if log and window.move_zb_sites:
             log.line(
                 "move Z cores -> pack decorate (2p / bridge-target) -> "
-                "embed.yaml motif_factor -> g-xTB; keep only zb-embeddable"
+                "anchored embed.yaml motif_factor -> unconstrained g-xTB; "
+                "propagate only converged, topology-preserving endpoints"
             )
 
         if log and result.skeleton_catalog and do_redecorate:
@@ -4589,6 +4709,493 @@ def _filter_bin_zb_embeddable(
     return bin_res
 
 
+def _aligned_core_rmsd(
+    reference: Sequence[Sequence[float]],
+    candidate: Sequence[Sequence[float]],
+) -> float:
+    left = np.asarray(reference, dtype=float)
+    right = np.asarray(candidate, dtype=float)
+    if left.shape != right.shape or left.ndim != 2 or left.shape[1] != 3:
+        return float("nan")
+    left = left - left.mean(axis=0)
+    right = right - right.mean(axis=0)
+    u, _singular, vt = np.linalg.svd(right.T @ left)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    delta = right @ rotation - left
+    return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+
+
+def _select_zb_decorations(isomers: Sequence[Any], limit: int) -> List[Any]:
+    """Select graph-distinct ligand shells without an energy proxy.
+
+    One representative of every Cl-degree/Cd-coordination class is taken
+    before a second member of a class.  This keeps terminal/bridge alternatives
+    in the small pre-g-xTB budget instead of relying on generator order.
+    """
+
+    if limit <= 0 or len(isomers) <= limit:
+        return list(isomers)
+    buckets: Dict[Tuple[Any, ...], List[Any]] = defaultdict(list)
+    for isomer in isomers:
+        cl_degrees = Counter(
+            int(isomer.graph.degree[atom.atom_id])
+            for atom in isomer.atoms
+            if atom.symbol == "Cl"
+        )
+        cd_degrees = tuple(
+            sorted(
+                int(isomer.graph.degree[atom.atom_id])
+                for atom in isomer.atoms
+                if atom.symbol == "Cd"
+            )
+        )
+        signature = (
+            tuple(sorted(cl_degrees.items())),
+            cd_degrees,
+            int(isomer.graph.number_of_edges()),
+        )
+        buckets[signature].append(isomer)
+    ordered_keys = sorted(buckets, key=repr)
+    selected: List[Any] = []
+    depth = 0
+    while len(selected) < limit:
+        progressed = False
+        for key in ordered_keys:
+            if depth < len(buckets[key]):
+                selected.append(buckets[key][depth])
+                progressed = True
+                if len(selected) >= limit:
+                    break
+        if not progressed:
+            break
+        depth += 1
+    return selected
+
+
+def _append_zb_manifest(output_dir: Path, record: Mapping[str, Any]) -> None:
+    path = Path(output_dir) / "zb_occupations.jsonl"
+    structure_id = str(record.get("structure_id") or "")
+    replacement = json.dumps(dict(record), sort_keys=True)
+    if structure_id and path.is_file():
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for index, line in enumerate(lines):
+            try:
+                if str(json.loads(line).get("structure_id") or "") == structure_id:
+                    lines[index] = replacement
+                    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    return
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(replacement + "\n")
+
+
+def _append_jsonl_unique(
+    path: Path,
+    record: Mapping[str, Any],
+    *,
+    key: str,
+) -> None:
+    value = str(record.get(key) or "")
+    if value and path.is_file():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                if str(json.loads(line).get(key) or "") == value:
+                    return
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(dict(record), sort_keys=True) + "\n")
+
+
+def _opt_zb_occupations(
+    zb_seeds: Mapping[Tuple[int, int], Sequence[Any]],
+    *,
+    growth: GrowthConfig,
+    map_spec: NucleationSpec,
+    pack: Optional[GeometryPack],
+    output_dir: Optional[Path],
+    progress: Optional[Any],
+    child_minima: Dict[Tuple[int, int], Dict[str, Any]],
+    bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]],
+    zb_stats: Any = None,
+) -> None:
+    """Decorate stored ZB occupations, anchor-embed, relax, and audit.
+
+    The occupation is never reconstructed from the relaxed XYZ.  Graph rules
+    generate ligand shells, the geometry pack places them around the exact
+    lattice core, and only a converged topology-preserving endpoint is allowed
+    to seed the next ZB growth step.
+    """
+
+    if not zb_seeds or pack is None:
+        return
+
+    from dataclasses import replace as dc_replace
+
+    from .molecular import (
+        _graph_certificate,
+        enumerate_molecular_bin,
+        molecular_decoration_rule_violations,
+        molecular_graph_violations,
+    )
+    from .molecular_motif_reconstruct import (
+        motif_vocabulary_violations,
+        reconstruct_motif_state,
+    )
+    from .molecular_rules import forbidden_pair_contact_violations
+    from .molecular_zb_growth import (
+        endpoint_similarity_diagnostic,
+        lattice_model,
+        load_reference_occupation,
+        occupation_to_record,
+    )
+    from .types import _State
+    from .xtb_relax import XtbSettings, relax_structures
+
+    settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
+    cutoffs = bond_cutoffs_from_spec(map_spec)
+    recon = (pack.raw or {}).get("reconstruction") or {}
+    factor_starts = int(recon.get("factor_starts_per_graph", 3))
+    xtb_starts = int(recon.get("xtb_starts_per_graph", 2))
+    max_nfev = int(recon.get("max_nfev", 40))
+    decoration_limit = int(
+        getattr(map_spec.graph_rules, "selection_max_per_skeleton", 3) or 3
+    )
+    log = progress if isinstance(progress, GrowthLog) else None
+    endpoint_reference = None
+    if growth.endpoint_diagnostic_k > 0 and growth.endpoint_reference is not None:
+        endpoint_reference = load_reference_occupation(
+            growth.endpoint_reference,
+            map_spec,
+            lattice_model(map_spec),
+        )
+    for (k, p), occupations in sorted(zb_seeds.items()):
+        if log:
+            log.begin_block(len(occupations), label=f"Z k={k} p={p}")
+            log.line(
+                f"--- move Z k={k} p={p}: occupations={len(occupations)} "
+                f"decorations<={decoration_limit} embed={factor_starts}->{xtb_starts} ---"
+            )
+        for occupation in occupations:
+            if (
+                endpoint_reference is not None
+                and k == growth.endpoint_diagnostic_k
+            ):
+                diagnostic = endpoint_similarity_diagnostic(
+                    occupation,
+                    endpoint_reference,
+                    match_tolerance_A=growth.endpoint_match_tolerance_A,
+                )
+                if output_dir is not None:
+                    _append_jsonl_unique(
+                        Path(output_dir) / f"k{k:03d}_endpoint_diagnostics.jsonl",
+                        diagnostic,
+                        key="occupation_id",
+                    )
+                if log:
+                    log.line(
+                        f"endpoint diagnostic {occupation.occupation_id}: "
+                        f"Wulff-site overlap="
+                        f"{diagnostic['site_overlap_fraction']:.3f} "
+                        f"assignment_rmsd_A={diagnostic['assignment_rmsd_A']} "
+                        "(report only)"
+                    )
+            graph_bin = enumerate_molecular_bin(
+                k,
+                p,
+                map_spec,
+                pack=pack,
+                embed=False,
+                precomputed_skeletons=[occupation.core_edges],
+                progress=None,
+            )
+            decorations = _select_zb_decorations(
+                graph_bin.isomers, decoration_limit
+            )
+            if not decorations:
+                if zb_stats is not None:
+                    zb_stats.clash_skip += 1
+                continue
+
+            for decoration_index, isomer in enumerate(decorations, start=1):
+                n_core = len(occupation.symbols)
+                if tuple(isomer.symbols[:n_core]) != tuple(occupation.symbols):
+                    if zb_stats is not None:
+                        zb_stats.opt_fail += 1
+                    continue
+                state = _State(atoms=isomer.atoms, graph=isomer.graph.copy())
+                anchored = {
+                    index: np.asarray(occupation.coordinates[index], dtype=float)
+                    for index in range(n_core)
+                }
+                rebuilt = reconstruct_motif_state(
+                    state,
+                    pack,
+                    map_spec,
+                    starts=max(1, factor_starts),
+                    keep=max(1, xtb_starts),
+                    max_nfev=max_nfev,
+                    overlap_min_A=float(recon.get("overlap_min_A", 0.75)),
+                    start_max_bond_error_A=float(
+                        recon.get("start_max_bond_error_A", 0.50)
+                    ),
+                    core_coordinates=anchored,
+                )
+                candidates = [
+                    candidate
+                    for candidate in rebuilt.candidates
+                    if not candidate.audit_violations
+                ][: max(1, xtb_starts)]
+                if not candidates:
+                    if zb_stats is not None:
+                        zb_stats.clash_skip += 1
+                    continue
+
+                for candidate in candidates:
+                    sid = (
+                        f"k{k:03d}_p{p:03d}_Z"
+                        f"{occupation.occupation_id[-8:]}"
+                        f"d{decoration_index:02d}s{int(candidate.start_index):02d}"
+                    )
+                    source_edges = tuple(
+                        sorted(
+                            (min(int(a), int(b)), max(int(a), int(b)))
+                            for a, b in state.graph.edges
+                        )
+                    )
+                    payload = {
+                        "id": sid,
+                        "symbols": list(isomer.symbols),
+                        "positions": [list(point) for point in candidate.coordinates],
+                        "edges": list(source_edges),
+                    }
+                    t0 = time.perf_counter()
+                    xr = relax_structures([payload], settings, cutoffs)[0]
+                    # A max-cycle endpoint is evidence for a second start, not a
+                    # rankable minimum.  Restart once from the endpoint.
+                    if (
+                        xr.ok
+                        and not xr.converged
+                        and xr.coordinates is not None
+                    ):
+                        retry_payload = dict(payload)
+                        retry_payload["positions"] = [
+                            list(point) for point in xr.coordinates
+                        ]
+                        retry = relax_structures(
+                            [retry_payload], dc_replace(settings, accept_maxcycle=False), cutoffs
+                        )[0]
+                        if retry.ok and retry.coordinates is not None:
+                            xr = retry
+                    elapsed = time.perf_counter() - t0
+
+                    violations: List[str] = []
+                    topology_status = "unavailable"
+                    core_rmsd = float("nan")
+                    final_edges: Tuple[Tuple[int, int], ...] = ()
+                    propagation_eligible = False
+                    if xr.ok and xr.coordinates is not None:
+                        final_edges = tuple(
+                            sorted(
+                                (min(int(a), int(b)), max(int(a), int(b)))
+                                for a, b in xr.relaxed_edges
+                            )
+                        )
+                        final_graph = nx.Graph()
+                        final_graph.add_nodes_from(range(len(isomer.atoms)))
+                        final_graph.add_edges_from(final_edges)
+                        final_state = _State(
+                            atoms=isomer.atoms, graph=final_graph
+                        )
+                        violations.extend(
+                            molecular_graph_violations(final_state, map_spec)
+                        )
+                        violations.extend(
+                            molecular_decoration_rule_violations(
+                                final_state, map_spec
+                            )
+                        )
+                        violations.extend(
+                            motif_vocabulary_violations(
+                                final_state,
+                                cation=map_spec.core.cation,
+                                anion=map_spec.core.anion,
+                                ligand=map_spec.precursor.ligand,
+                                motif_definitions=pack.raw.get("motifs"),
+                            )
+                        )
+                        violations.extend(
+                            forbidden_pair_contact_violations(
+                                list(isomer.symbols),
+                                xr.coordinates,
+                                map_spec,
+                                floors=settings.artifact_min_distance or None,
+                            )
+                        )
+                        final_core = tuple(
+                            edge
+                            for edge in final_edges
+                            if {
+                                isomer.symbols[edge[0]],
+                                isomer.symbols[edge[1]],
+                            }
+                            == {map_spec.core.cation, map_spec.core.anion}
+                        )
+                        expected_core = tuple(sorted(occupation.core_edges))
+                        topology_status = (
+                            "preserved"
+                            if final_core == expected_core
+                            else "changed"
+                        )
+                        core_rmsd = _aligned_core_rmsd(
+                            occupation.coordinates,
+                            np.asarray(xr.coordinates, dtype=float)[:n_core],
+                        )
+                        propagation_eligible = bool(
+                            xr.converged
+                            and xr.energy_eV is not None
+                            and topology_status == "preserved"
+                            and not violations
+                        )
+                    else:
+                        violations.append(str(xr.error or "gxtb_failed"))
+
+                    status = (
+                        "propagate"
+                        if propagation_eligible
+                        else (
+                            "off_path"
+                            if topology_status == "changed" and xr.energy_eV is not None
+                            else "failed"
+                        )
+                    )
+                    if propagation_eligible and zb_stats is not None:
+                        zb_stats.opt_keep += 1
+                    elif topology_status == "changed" and zb_stats is not None:
+                        zb_stats.opt_reject_embed += 1
+                    elif zb_stats is not None:
+                        zb_stats.opt_fail += 1
+
+                    energy = None if xr.energy_eV is None else float(xr.energy_eV)
+                    if progress is not None:
+                        progress(
+                            f"[growth-job] k={k} p={p} move=Z id={sid} "
+                            f"occ={occupation.occupation_id} dec={decoration_index} "
+                            f"start={candidate.start_index} "
+                            f"E_eV={'n/a' if energy is None else f'{energy:.6f}'} "
+                            f"t_s={elapsed:.1f} topology={topology_status} "
+                            f"status={status} parent={occupation.parent_id}"
+                        )
+
+                    if output_dir is not None:
+                        bdir = Path(output_dir) / f"k{k:03d}" / f"p{p:03d}"
+                        bdir.mkdir(parents=True, exist_ok=True)
+                        coords_out = (
+                            xr.coordinates
+                            if xr.coordinates is not None
+                            else candidate.coordinates
+                        )
+                        suffix = "_xtb.xyz" if propagation_eligible else "_offpath.xyz"
+                        xyz_path = bdir / f"{sid}{suffix}"
+                        lines = [
+                            str(len(isomer.symbols)),
+                            f"{sid} energy_eV={energy} move=Z "
+                            f"occupation_id={occupation.occupation_id} "
+                            f"propagation_eligible={str(propagation_eligible).lower()} "
+                            f"topology={topology_status}",
+                        ]
+                        lines.extend(
+                            f"{symbol} {point[0]:.8f} {point[1]:.8f} {point[2]:.8f}"
+                            for symbol, point in zip(isomer.symbols, coords_out)
+                        )
+                        xyz_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        if xr.bond_orders is not None:
+                            write_wbo_file(
+                                xyz_path.with_suffix(".wbo"), xr.bond_orders
+                            )
+                        manifest_record = {
+                            "schema_version": 2,
+                            "structure_id": sid,
+                            "occupation": occupation_to_record(occupation),
+                            "parent_structure_id": occupation.parent_id,
+                            "parent_structure_ids": list(
+                                occupation.parent_structure_ids
+                            ),
+                            "decoration_id": f"dec{decoration_index:03d}",
+                            "decoration_certificate": repr(
+                                _graph_certificate(state)
+                            ),
+                            "embedding_start": int(candidate.start_index),
+                            "source_edges": [list(edge) for edge in source_edges],
+                            "final_edges": [list(edge) for edge in final_edges],
+                            "energy_eV": energy,
+                            "xtb_converged": bool(xr.converged),
+                            "topology_status": topology_status,
+                            "propagation_eligible": propagation_eligible,
+                            "core_rmsd_A": core_rmsd,
+                            "violations": list(dict.fromkeys(str(v) for v in violations)),
+                            "xyz": str(xyz_path.relative_to(output_dir)),
+                        }
+                        _append_zb_manifest(Path(output_dir), manifest_record)
+
+                    if not propagation_eligible or energy is None:
+                        continue
+                    previous = child_minima.get((k, p))
+                    if previous is None or energy < float(previous["energy_eV"]):
+                        child_minima[(k, p)] = {
+                            "energy_eV": energy,
+                            "structure_id": sid,
+                        }
+                    bin_ranks.setdefault((k, p), []).append(
+                        RankedIsomer(
+                            structure_id=sid,
+                            xtb_energy_eV=energy,
+                            seed_skeleton=occupation.occupation_id[-6:],
+                            growth_move="Z",
+                            parent_id=occupation.parent_id,
+                        )
+                    )
+                    if output_dir is not None:
+                        row = {
+                            "k": k,
+                            "p": p,
+                            "structure_id": sid,
+                            "xtb_energy_eV": f"{energy:.8f}",
+                            "xtb_converged": True,
+                            "dE_f_eV": "",
+                            "growth": "1",
+                            "move": "Z",
+                            "shed": occupation.shed,
+                            "p_m": occupation.p_m,
+                            "parent_id": occupation.parent_id,
+                            "occupation_id": occupation.occupation_id,
+                            "parent_occupation_ids": "|".join(
+                                occupation.parent_occupation_ids
+                            ),
+                            "parent_structure_ids": "|".join(
+                                occupation.parent_structure_ids
+                            ),
+                            "decoration_id": f"dec{decoration_index:03d}",
+                            "embedding_start": candidate.start_index,
+                            "topology_status": topology_status,
+                            "propagation_eligible": True,
+                            "core_rmsd_A": f"{core_rmsd:.8f}",
+                        }
+                        if growth.references is not None:
+                            row["dE_f_eV"] = f"{growth.references.formation_eV(energy, k, p):.8f}"
+                            for dmu in growth.delta_mu_cdcl2_eV:
+                                row[f"Omega_dmu_{dmu:+.2f}"] = (
+                                    f"{growth.references.grand_potential_eV(energy, k, p, dmu):.8f}"
+                                )
+                        _append_index_row_unique(
+                            Path(output_dir), row, _growth_index_fields(growth)
+                        )
+
+
 def _growth_index_fields(growth: GrowthConfig) -> List[str]:
     """Column order shared by Move A and Move B index writers.
 
@@ -4608,6 +5215,14 @@ def _growth_index_fields(growth: GrowthConfig) -> List[str]:
         "shed",
         "p_m",
         "parent_id",
+        "occupation_id",
+        "parent_occupation_ids",
+        "parent_structure_ids",
+        "decoration_id",
+        "embedding_start",
+        "topology_status",
+        "propagation_eligible",
+        "core_rmsd_A",
     ]
     for dmu in growth.delta_mu_cdcl2_eV:
         fields.append(f"Omega_dmu_{dmu:+.2f}")
