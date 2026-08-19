@@ -89,6 +89,23 @@ endpoint_diagnostic:
   reference: k13_wulff_core.yaml
   site_match_tolerance_A: 0.35
 
+# Consolidate g-xTB endpoints into relaxed basins before parent selection.
+# The test is invariant to translation, proper rotation, and permutations of
+# graph-equivalent atoms.  Raw XYZ/manifests are never deleted.
+minimum_consolidation:
+  enabled: true
+  energy_tolerance_eV: 0.01
+  pair_distance_rms_A: 0.05
+  core_rmsd_A: 0.10
+  full_rmsd_A: 0.15
+  max_displacement_A: 0.25
+  wbo_rms_tolerance: 0.15
+  require_wbo_when_available: false  # report WBO RMS; geometry/topology decide
+  allow_reflection: false
+  max_graph_mappings: 256
+  max_minima_per_occupation: 2
+  max_occupations_per_minimum: 0  # 0 = preserve every distinct ZB route
+
 by_k:
   - k_min: 1
     k_max: 1
