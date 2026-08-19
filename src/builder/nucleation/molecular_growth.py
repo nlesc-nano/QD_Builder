@@ -183,6 +183,7 @@ class GrowthWindow:
     max_children_per_channel: int
     move_graph: bool
     move_coord: bool
+    move_zb_sites: bool
     child_redecorate: bool
     child_redecorate_slack: bool
     selection_max_per_skeleton: int
@@ -193,6 +194,7 @@ class GrowthWindow:
     shed_mode: str
     prefer_low_shed: bool
     max_opts_per_k: int
+    min_p_parent: int = 1
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
 
@@ -235,9 +237,11 @@ class GrowthWindow:
             f"max_shed={self.max_shed} attach={self.attach} "
             f"β={self.surface_beta} α={self.surface_alpha} {cap} "
             f"moves A={self.move_graph} B={self.move_coord} "
+            f"Z={self.move_zb_sites} "
             f"redecorate={self.child_redecorate} "
             f"A_slack={'on' if self.child_redecorate_slack else 'off'} "
             f"shed={self.shed_mode} "
+            f"min_p={self.min_p_parent} "
             f"soft={'on' if self.soft_rules.enabled else 'off'}"
         )
 
@@ -262,6 +266,7 @@ class GrowthConfig:
     attach: str = "enumerate"
     move_graph: bool = True
     move_coord: bool = True
+    move_zb_sites: bool = False
     surface_beta: float = 0.0
     surface_alpha: float = 1.0
     p_slack: int = 1
@@ -282,6 +287,7 @@ class GrowthConfig:
     child_full_opt: str = "g-xTB"
     child_full_opt_cycles: int = 150
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
+    min_p_parent: int = 1
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
 
     @property
@@ -313,13 +319,17 @@ class GrowthConfig:
         moves = overlay.get("moves")
         move_graph = self.move_graph
         move_coord = self.move_coord
+        move_zb_sites = self.move_zb_sites
         if isinstance(moves, dict):
             move_graph = bool(moves.get("graph", move_graph))
             move_coord = bool(moves.get("coord", move_coord))
+            move_zb_sites = bool(moves.get("zb_sites", move_zb_sites))
         elif "move_graph" in overlay:
             move_graph = bool(overlay["move_graph"])
         elif "move_coord" in overlay:
             move_coord = bool(overlay["move_coord"])
+        if "move_zb_sites" in overlay:
+            move_zb_sites = bool(overlay["move_zb_sites"])
         child = overlay.get("child")
         redecorate = self.child_redecorate
         redecorate_slack = self.child_redecorate_slack
@@ -359,6 +369,7 @@ class GrowthConfig:
             ),
             move_graph=move_graph,
             move_coord=move_coord,
+            move_zb_sites=move_zb_sites,
             child_redecorate=redecorate,
             child_redecorate_slack=redecorate_slack,
             selection_max_per_skeleton=int(
@@ -379,6 +390,9 @@ class GrowthConfig:
             ),
             max_opts_per_k=int(
                 overlay.get("max_opts_per_k", self.max_opts_per_k)
+            ),
+            min_p_parent=int(
+                overlay.get("min_p", overlay.get("min_p_parent", self.min_p_parent))
             ),
             lattice=self.lattice,
             soft_rules=soft,
@@ -449,6 +463,7 @@ class GrowthConfig:
             decorations_per_skeleton=int(
                 parents.get("decorations_per_skeleton", 2)
             ),
+            min_p_parent=int(parents.get("min_p", parents.get("min_p_parent", 1))),
             shed_mode=shed_mode,
             max_shed=int(shed.get("max_shed", 2)),
             prefer_low_shed=bool(shed.get("prefer_low_shed", True)),
@@ -459,6 +474,7 @@ class GrowthConfig:
             attach=attach,
             move_graph=bool(moves.get("graph", True)),
             move_coord=bool(moves.get("coord", True)),
+            move_zb_sites=bool(moves.get("zb_sites", False)),
             surface_beta=float(surface.get("beta", 0.0)),
             surface_alpha=float(surface.get("alpha", 1.0)),
             p_slack=int(surface.get("p_slack", 1)),
@@ -577,6 +593,9 @@ class GrowthStepResult:
     coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = field(
         default_factory=dict
     )
+    #: move-Z zb occupations keyed by (k_child, p_child)
+    zb_seeds: Dict[Tuple[int, int], List[Any]] = field(default_factory=dict)
+    zb_stats: Any = None
 
 
 def bond_cutoffs_from_spec(spec: NucleationSpec) -> Dict[Tuple[str, str], float]:
@@ -1094,6 +1113,8 @@ def select_parents(
     selected: List[ParentStructure] = []
     for (k, p), group in sorted(by_bin.items()):
         win = growth.window_for(k)
+        if int(p) < int(win.min_p_parent):
+            continue
         emin = min(x.energy_eV for x in group)
         windowed = [
             x
@@ -1854,7 +1875,13 @@ def compact_growth_id(k: int, p: int, move: str, serial: int) -> str:
     one generation per step and hit filesystem limits around k ~ 8–10.
     """
 
-    letter = "B" if str(move).lower() in {"b", "coord", "coordinate"} else "A"
+    raw = str(move).lower()
+    if raw in {"b", "coord", "coordinate"}:
+        letter = "B"
+    elif raw in {"z", "zb", "zb_sites"}:
+        letter = "Z"
+    else:
+        letter = "A"
     return f"k{int(k):03d}_p{int(p):03d}_{letter}{int(serial):04d}"
 
 
@@ -1995,6 +2022,81 @@ def assign_compact_b_ids(
             next_serial += 1
 
 
+def _reject_new_cdse_4rings(spec: NucleationSpec) -> bool:
+    return bool(getattr(spec.graph_rules, "reject_new_cdse_4rings", False))
+
+
+def _parent_cdse_n4(parent: ParentStructure, spec: NucleationSpec) -> int:
+    """Cd–Se 4-ring count on the parent (relaxed XYZ when present)."""
+
+    coords = getattr(parent, "coordinates", None)
+    if coords is None:
+        return 0
+    try:
+        return int(describe_structure(parent.symbols, coords, spec).n4)
+    except Exception:
+        return 0
+
+
+def _graph_cdse_n4(
+    edges: Sequence[Edge],
+    *,
+    k: int,
+    p: int,
+    spec: NucleationSpec,
+) -> int:
+    """Cd–Se 4-ring count on a construction core (no coordinates)."""
+
+    anion, cation = spec.core.anion, spec.core.cation
+    symbols = [anion] * int(k) + [cation] * (int(k) + int(p))
+    try:
+        return int(describe_graph(symbols, edges, spec).n4)
+    except Exception:
+        return 0
+
+
+def _gained_cdse_4rings_3d(
+    parent: ParentStructure,
+    symbols: Sequence[str],
+    coords: Any,
+    spec: NucleationSpec,
+) -> bool:
+    """True when a 3D child has more Cd–Se diamonds than its parent."""
+
+    if not _reject_new_cdse_4rings(spec):
+        return False
+    try:
+        child_n4 = int(describe_structure(symbols, coords, spec).n4)
+    except Exception:
+        return False
+    return child_n4 > _parent_cdse_n4(parent, spec)
+
+
+def _drop_cores_with_new_4rings(
+    cores: Sequence[EdgeList],
+    *,
+    parent: ParentStructure,
+    k_child: int,
+    p_child: int,
+    spec: NucleationSpec,
+) -> List[EdgeList]:
+    """Move A: drop child cores that *gained* a Cd–Se 4-ring vs the parent.
+
+    Same rule as Move B.  Cd–Se–Cd–Cl rhombi are not n4.  A child that
+    merely *keeps* a parent diamond is kept.
+    """
+
+    if not _reject_new_cdse_4rings(spec) or not cores:
+        return list(cores)
+    parent_n4 = _parent_cdse_n4(parent, spec)
+    kept: List[EdgeList] = []
+    for edges in cores:
+        if _graph_cdse_n4(edges, k=k_child, p=p_child, spec=spec) > parent_n4:
+            continue
+        kept.append(edges)
+    return kept
+
+
 def build_coord_seed(
     parent: ParentStructure,
     *,
@@ -2061,13 +2163,8 @@ def build_coord_seed(
     # so names do not nest the parent id (that grew past NAME_MAX).
     sid = compact_growth_id(k_child, p_child, "B", serial)
 
-    if bool(getattr(spec.graph_rules, "reject_new_cdse_4rings", False)):
-        parent_n4 = describe_structure(
-            parent.symbols, parent.coordinates, spec
-        ).n4
-        child_n4 = describe_structure(symbols, coords, spec).n4
-        if child_n4 > parent_n4:
-            return None
+    if _gained_cdse_4rings_3d(parent, symbols, coords, spec):
+        return None
 
     q = _formal_charge(symbols, spec)
     cleanup_s = 0.0
@@ -2090,12 +2187,8 @@ def build_coord_seed(
                 [symbols[i] for i in range(len(symbols))]
             ) != exp:
                 pass  # symbols unchanged by cleanup
-            if bool(getattr(spec.graph_rules, "reject_new_cdse_4rings", False)):
-                parent_n4 = describe_structure(
-                    parent.symbols, parent.coordinates, spec
-                ).n4
-                if describe_structure(symbols, coords, spec).n4 > parent_n4:
-                    return None
+            if _gained_cdse_4rings_3d(parent, symbols, coords, spec):
+                return None
 
     core = core_edges_from_coords(symbols, coords, spec=spec, cutoffs=cutoffs)
     if not core:
@@ -2145,6 +2238,11 @@ def grow_cores_from_parents(
     **Move B (coord):** when ``geometry.start_from: relaxed_coords``, WBO
     package shed on parent 3D → place CdSe + p_m CdCl2 → optional short
     cleanup → seed frames for full opt (and core added to catalog).
+
+    **Move Z (zb_sites):** snap the parent core onto zinc-blende sites,
+    shed extra Cd, fill a vacant CdSe pair (+ p_m precursor Cd).  Cl is
+    placed by the 2p law around that core at opt time.  The relaxed
+    child is kept only if it still embeds on zb.
     """
 
     if not parents:
@@ -2166,6 +2264,22 @@ def grow_cores_from_parents(
     bin_serial: Dict[Tuple[int, int], int] = defaultdict(int)
     use_coord = bool(window.move_coord) and growth.use_coord_carry
     use_graph = bool(window.move_graph)
+    use_zb = bool(getattr(window, "move_zb_sites", False))
+    zb_seeds: Dict[Tuple[int, int], List[Any]] = defaultdict(list)
+    zb_seen: set = set()
+    zb_model = None
+    zb_stats = None
+    if use_zb:
+        from .molecular_zb_growth import (
+            ZbGrowStats,
+            grow_zb_children,
+            lattice_k1_occupation,
+            lattice_model,
+            snap_parent,
+        )
+
+        zb_model = lattice_model(spec)
+        zb_stats = ZbGrowStats()
 
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
@@ -2194,6 +2308,30 @@ def grow_cores_from_parents(
             }
         )
 
+        zb_occ = None
+        if use_zb and zb_model is not None and zb_stats is not None:
+            zb_stats.parents += 1
+            zb_occ, why = snap_parent(
+                parent.symbols,
+                parent.coordinates,
+                spec,
+                zb_model,
+                parent_id=parent.structure_id,
+                k=parent.k,
+                p=parent.p,
+            )
+            if zb_occ is None and parent.k == 1:
+                zb_occ = lattice_k1_occupation(spec, zb_model, parent.p)
+                if zb_occ is not None:
+                    zb_occ.parent_id = parent.structure_id
+                    why = "lattice_k1"
+            if zb_occ is None:
+                zb_stats.snap_fail += 1
+                if str(why).startswith("n4"):
+                    zb_stats.n4_reject += 1
+            else:
+                zb_stats.snapped += 1
+
         for s in s_order:
             p_out = parent.p - s
             if p_out < 0:
@@ -2210,6 +2348,13 @@ def grow_cores_from_parents(
                     spec=spec,
                     max_children=window.max_children_per_channel,
                     attach=window.attach,
+                )
+                children_base = _drop_cores_with_new_4rings(
+                    children_base,
+                    parent=parent,
+                    k_child=parent.k + 1,
+                    p_child=p_out,
+                    spec=spec,
                 )
                 children_base = _rank_child_cores(
                     children_base,
@@ -2229,6 +2374,13 @@ def grow_cores_from_parents(
                         k_child=parent.k + 1,
                         p_from=p_out,
                         p_to=p_child,
+                        spec=spec,
+                    )
+                    children_pm = _drop_cores_with_new_4rings(
+                        children_pm,
+                        parent=parent,
+                        k_child=parent.k + 1,
+                        p_child=p_child,
                         spec=spec,
                     )
                     children_pm = _rank_child_cores(
@@ -2308,6 +2460,45 @@ def grow_cores_from_parents(
                                 flush=True,
                             )
 
+                if use_zb and zb_occ is not None and zb_model is not None:
+                    kids = grow_zb_children(
+                        zb_occ,
+                        s=s,
+                        p_m=p_m,
+                        spec=spec,
+                        model=zb_model,
+                        cap=int(window.max_children_per_channel),
+                        stats=zb_stats,
+                    )
+                    kept_kids = []
+                    for kid in kids:
+                        uniq = (kid.k, kid.p, tuple(sorted(kid.core_edges)))
+                        if uniq in zb_seen:
+                            continue
+                        zb_seen.add(uniq)
+                        kept_kids.append(kid)
+                        zb_seeds[(kid.k, kid.p)].append(kid)
+                        bucket = catalog.setdefault((kid.k, kid.p), {})
+                        if kid.core_edges not in bucket:
+                            bucket[kid.core_edges] = None
+                    if zb_stats is not None:
+                        zb_stats.children += len(kept_kids)
+                    if kept_kids:
+                        channels.append(
+                            GrowthChannelResult(
+                                parent_id=parent.structure_id,
+                                k_parent=parent.k,
+                                p_parent=parent.p,
+                                shed=s,
+                                p_m=p_m,
+                                k_child=parent.k + 1,
+                                p_child=p_child,
+                                n_cores=len(kept_kids),
+                                core_edges=[kid.core_edges for kid in kept_kids],
+                                move="zb_sites",
+                            )
+                        )
+
     skeleton_catalog = {
         key: list(edges_map.keys()) for key, edges_map in catalog.items()
     }
@@ -2319,6 +2510,8 @@ def grow_cores_from_parents(
         skeleton_catalog=skeleton_catalog,
         parent_records=parent_records,
         coord_seeds=dict(coord_seeds),
+        zb_seeds=dict(zb_seeds),
+        zb_stats=zb_stats,
     )
 
 
@@ -2635,13 +2828,25 @@ class GrowthLog:
             return
         self._emit(f"[growth] {msg}\n")
 
+    def block(self, text: str) -> None:
+        """Write a multi-line block (bin rankings) to stdout and the log file.
+
+        ``print()`` alone never reaches ``growth_run.log``.
+        """
+
+        if self.quiet and self._log_fh is None:
+            return
+        if not text:
+            return
+        self._emit(text if text.endswith("\n") else text + "\n")
+
 
     def pipeline_blurb(self, growth: "GrowthConfig") -> None:
         """One-time note: both growth moves and timing keys."""
 
         if self.quiet and self._log_fh is None:
             return
-        self.line("two growth moves (both when start_from=relaxed_coords):")
+        self.line("growth moves:")
         self.line(
             "  A graph: combinatorial precursor-Cd shed on core graph -> "
             f"p_m={list(growth.monomer_p_values)} inflate -> Cl redecorate -> "
@@ -2657,7 +2862,17 @@ class GrowthLog:
                 f") -> full g-xTB"
             )
         else:
-            self.line("  B coord: OFF (geometry.start_from != relaxed_coords)")
+            self.line("  B coord: OFF")
+        if getattr(growth, "move_zb_sites", False):
+            self.line(
+                "  Z zb_sites: snap parent core onto zinc-blende -> "
+                "shed extra Cd -> fill vacant CdSe pair + p_m Cd -> "
+                "2p Cl on that core -> clash check -> full g-xTB -> "
+                "keep only if relaxed core still embeds on zb.  "
+                "Genealogy is the occupation, not the XYZ."
+            )
+        else:
+            self.line("  Z zb_sites: OFF")
         self.line(
             f"  shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
             f"prefer_low_shed={growth.prefer_low_shed} "
@@ -3161,7 +3376,9 @@ def run_growth_step(
             f"loaded {len(parents_all)} converged parents → "
             f"selected {len(parents)} "
             f"(window={window.energy_window_eV} eV, "
-            f"≤{window.decorations_per_skeleton} dec/core"
+            f"cap={window.max_skeletons_cap} skel, "
+            f"≤{window.decorations_per_skeleton} dec/core, "
+            f"min_p={window.min_p_parent}"
             f"{', soft rank' if window.soft_rules.enabled else ''})"
         )
         log.line(f"envelope: {window.describe()}")
@@ -3187,6 +3404,7 @@ def run_growth_step(
                 if window.move_coord and growth.use_coord_carry
                 else "off"
             ),
+            move_Z="zb_sites" if window.move_zb_sites else "off",
         )
     # load pack early so move B can use embed distances / cleanup settings
     if pack is None and map_spec.geometry_pack:
@@ -3222,11 +3440,13 @@ def run_growth_step(
 
     n_seeds = sum(len(v) for v in result.coord_seeds.values())
     if log:
+        n_zb = sum(len(v) for v in (result.zb_seeds or {}).values())
         log.line(
             f"channels={len(result.channels)}  unique_cores={n_cores}  "
-            f"coord_seeds={n_seeds}  "
-            f"(A->redecorate; B->full opt of carried geometry)"
+            f"coord_seeds={n_seeds}  zb_occupations={n_zb}"
         )
+        if result.zb_stats is not None:
+            log.line(result.zb_stats.as_log())
         log.set_work_plan(
             cores_total=n_cores,
             bin_plan=bin_plan,
@@ -3244,12 +3464,16 @@ def run_growth_step(
         prior = format_prior_map_rankings(
             run_dir, growth=growth, k_max=k_from
         )
-        print(prior, flush=True)
+        log.block(prior)
 
     child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
     # Merged A+B energy rows per (k,p); ranked once after all bins finish
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
     do_redecorate = bool(decorate and window.child_redecorate)
+    if window.move_zb_sites:
+        # Z owns decorate+opt from CIF core coords; motif_factor would
+        # throw the occupation away.
+        do_redecorate = False
     if window.max_opts_per_k > 0:
         result = _apply_opt_budget(result, window.max_opts_per_k)
         n_cores = sum(len(v) for v in result.skeleton_catalog.values())
@@ -3284,10 +3508,15 @@ def run_growth_step(
             else 0
         )
         n_a_blocks = len(result.skeleton_catalog) if do_redecorate else 0
-        if log and (n_b_blocks or n_a_blocks):
+        n_z_blocks = (
+            sum(1 for v in (result.zb_seeds or {}).values() if v)
+            if result.zb_seeds and embed
+            else 0
+        )
+        if log and (n_b_blocks or n_a_blocks or n_z_blocks):
             log.line(
                 f"opt blocks this step: B groups={n_b_blocks}, "
-                f"A bins={n_a_blocks}; "
+                f"A bins={n_a_blocks}, Z groups={n_z_blocks}; "
                 f"job lines show  global_n  i/N_block"
             )
 
@@ -3311,6 +3540,30 @@ def run_growth_step(
                 progress=log if log else progress,
                 child_minima=child_minima,
                 bin_ranks=bin_ranks,
+            )
+
+        if result.zb_seeds and embed:
+            if log:
+                log.set_block_plan(n_z_blocks)
+                log.stage(
+                    3,
+                    n_stages,
+                    "move Z: 2p Cl on zb core + full opt",
+                    n_occupations=sum(
+                        len(v) for v in result.zb_seeds.values()
+                    ),
+                    note="keep only zb-embeddable endpoints; no energy=None XYZ",
+                )
+            _opt_zb_seeds(
+                result.zb_seeds,
+                growth=growth,
+                map_spec=map_spec,
+                pack=pack,
+                output_dir=out,
+                progress=log if log else progress,
+                child_minima=child_minima,
+                bin_ranks=bin_ranks,
+                zb_stats=result.zb_stats,
             )
 
         if log and result.skeleton_catalog and do_redecorate:
@@ -3523,7 +3776,7 @@ def run_growth_step(
                     or (-1.0, 0.0, 1.0),
                     title_note=f"merged A={n_a} B={n_b}",
                 )
-                print(ranking, flush=True)
+                log.block(ranking)
                 # refresh child_minima from merged pool
                 best = min(rows, key=lambda r: r.xtb_energy_eV)
                 child_minima[(k, p)] = {
@@ -4053,22 +4306,7 @@ def _opt_coord_seeds(
             if growth.persist_wbo and getattr(xr, "bond_orders", None):
                 write_wbo_file(xyz.with_suffix(".wbo"), xr.bond_orders)
             refs = growth.references
-            fields = [
-                "k",
-                "p",
-                "structure_id",
-                "xtb_energy_eV",
-                "xtb_converged",
-                "dE_f_eV",
-                "growth",
-                "move",
-                "shed",
-                "p_m",
-                "parent_id",
-            ]
-            for dmu in growth.delta_mu_cdcl2_eV:
-                fields.append(f"Omega_dmu_{dmu:+.2f}")
-            fields.extend(SOFT_INDEX_FIELDS)
+            fields = _growth_index_fields(growth)
             row = {
                 "k": seed.k,
                 "p": seed.p,
@@ -4106,21 +4344,201 @@ def _opt_coord_seeds(
         )
 
 
-def _write_growth_bin(
-    out_dir: Path,
-    bin_res: Any,
+def _opt_zb_seeds(
+    zb_seeds: Mapping[Tuple[int, int], Sequence[Any]],
+    *,
     growth: GrowthConfig,
-    spec: Optional[NucleationSpec] = None,
+    map_spec: NucleationSpec,
+    pack: Optional[GeometryPack],
+    output_dir: Optional[Path],
+    progress: Optional[Any],
+    child_minima: Dict[Tuple[int, int], Dict[str, Any]],
+    bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]],
+    zb_stats: Any = None,
 ) -> None:
-    """Write a lightweight index + formation columns for one bin.
+    """2p-decorate zb cores, full opt, keep only zb-embeddable endpoints."""
 
-    Index rows are skipped if ``structure_id`` is already present (restart-safe).
+    from .molecular_zb_growth import (
+        construction_clash,
+        lattice_model,
+        place_cl_2p,
+        zb_embeddable,
+    )
+    from .xtb_relax import XtbSettings, relax_structures
+
+    if not zb_seeds:
+        return
+    settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
+    cutoffs = bond_cutoffs_from_spec(map_spec)
+    log = progress if isinstance(progress, GrowthLog) else None
+    try:
+        model = lattice_model(map_spec)
+    except Exception as exc:
+        if log:
+            log.line(f"move Z: cannot load zb CIF ({exc}); skip opt")
+        return
+
+    groups = [
+        (key, list(zb_seeds[key]))
+        for key in sorted(zb_seeds)
+        if zb_seeds[key]
+    ]
+    n_flat = sum(len(v) for _, v in groups)
+    if log:
+        log.line(f"move Z: decorate+opt {n_flat} zb occupations")
+        log.line(
+            "row: keep only endpoints that snap back onto zb "
+            "(n4 or snap fail are dropped, no XYZ)"
+        )
+
+    serial = 0
+    for (k, p), occs in groups:
+        if log:
+            log.begin_block(len(occs), label=f"Z k={k} p={p}")
+            log.line(f"--- move Z k={k} p={p} ---  {len(occs)} occupations")
+        for occ in occs:
+            serial += 1
+            sid = compact_growth_id(occ.k, occ.p, "Z", serial)
+            try:
+                symbols, coords, _edges = place_cl_2p(occ, map_spec, pack)
+            except Exception:
+                if zb_stats is not None:
+                    zb_stats.clash_skip += 1
+                continue
+            if construction_clash(symbols, coords, map_spec):
+                if zb_stats is not None:
+                    zb_stats.clash_skip += 1
+                if progress is not None:
+                    progress(
+                        f"[growth-job] k={occ.k} p={occ.p} move=Z "
+                        f"id={sid} E_eV=n/a relax=clash "
+                        f"parent={occ.parent_id}"
+                    )
+                continue
+            t0 = time.perf_counter()
+            batch = [
+                {
+                    "id": sid,
+                    "symbols": list(symbols),
+                    "positions": np.asarray(coords, dtype=float).tolist(),
+                    "edges": list(occ.core_edges),
+                }
+            ]
+            results = relax_structures(batch, settings, cutoffs)
+            xr = results[0]
+            opt_s = time.perf_counter() - t0
+            if not xr.ok or xr.energy_eV is None or xr.coordinates is None:
+                if zb_stats is not None:
+                    zb_stats.opt_fail += 1
+                if progress is not None:
+                    progress(
+                        f"[growth-job] k={occ.k} p={occ.p} move=Z "
+                        f"id={sid} t_s={opt_s:.1f} E_eV=n/a relax=fail "
+                        f"err={getattr(xr, 'error', None) or 'zb_opt'} "
+                        f"parent={occ.parent_id}"
+                    )
+                continue
+            ok, _emb, why = zb_embeddable(
+                list(symbols),
+                np.asarray(xr.coordinates, dtype=float),
+                map_spec,
+                model,
+                parent_id=occ.parent_id,
+            )
+            if not ok:
+                if zb_stats is not None:
+                    zb_stats.opt_reject_embed += 1
+                if progress is not None:
+                    progress(
+                        f"[growth-job] k={occ.k} p={occ.p} move=Z "
+                        f"id={sid} t_s={opt_s:.1f} "
+                        f"E_eV={float(xr.energy_eV):.6f} "
+                        f"relax=not_zb err={why} parent={occ.parent_id}"
+                    )
+                continue
+            if zb_stats is not None:
+                zb_stats.opt_keep += 1
+            e = float(xr.energy_eV)
+            if progress is not None:
+                progress(
+                    f"[growth-job] k={occ.k} p={occ.p} move=Z "
+                    f"s={occ.shed} p_m={occ.p_m} "
+                    f"parent={occ.parent_id} id={sid} "
+                    f"t_s={opt_s:.1f} E_eV={e:.6f} relax=ok"
+                )
+            prev = child_minima.get((occ.k, occ.p))
+            if prev is None or e < float(prev["energy_eV"]):
+                child_minima[(occ.k, occ.p)] = {
+                    "energy_eV": e,
+                    "structure_id": sid,
+                }
+            bin_ranks.setdefault((occ.k, occ.p), []).append(
+                RankedIsomer(
+                    structure_id=sid,
+                    xtb_energy_eV=e,
+                    seed_skeleton="zb----",
+                    growth_move="Z",
+                    parent_id=occ.parent_id,
+                )
+            )
+            if output_dir is None:
+                continue
+            bdir = Path(output_dir) / f"k{occ.k:03d}" / f"p{occ.p:03d}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            xyz = bdir / f"{sid}_xtb.xyz"
+            lines = [
+                str(len(symbols)),
+                f"{sid} energy_eV={e} move=Z shed={occ.shed} "
+                f"p_m={occ.p_m} parent={occ.parent_id}",
+            ]
+            for sym, pos in zip(symbols, xr.coordinates):
+                lines.append(f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}")
+            xyz.write_text("\n".join(lines) + "\n")
+            refs = growth.references
+            fields = _growth_index_fields(growth)
+            row = {
+                "k": occ.k,
+                "p": occ.p,
+                "structure_id": sid,
+                "xtb_energy_eV": f"{e:.8f}",
+                "xtb_converged": bool(xr.converged),
+                "dE_f_eV": "",
+                "growth": "1",
+                "move": "Z",
+                "shed": occ.shed,
+                "p_m": occ.p_m,
+                "parent_id": occ.parent_id,
+            }
+            apply_soft_columns(
+                row,
+                symbols=list(symbols),
+                coords=np.asarray(xr.coordinates, dtype=float),
+                energy_eV=e,
+                k=occ.k,
+                rules=growth.window_for(occ.k).soft_rules,
+                spec=map_spec,
+            )
+            if refs is not None:
+                de_f = refs.formation_eV(e, occ.k, occ.p)
+                row["dE_f_eV"] = f"{de_f:.8f}"
+                for dmu in growth.delta_mu_cdcl2_eV:
+                    key = f"Omega_dmu_{dmu:+.2f}"
+                    row[key] = (
+                        f"{refs.grand_potential_eV(e, occ.k, occ.p, dmu):.8f}"
+                    )
+            _append_index_row_unique(Path(output_dir), row, fields)
+
+    if log and zb_stats is not None:
+        log.line(zb_stats.as_log())
+
+
+def _growth_index_fields(growth: GrowthConfig) -> List[str]:
+    """Column order shared by Move A and Move B index writers.
+
+    A used to omit ``shed`` / ``p_m`` / ``parent_id``, so appending A rows
+    into a B-started ``index.csv`` shifted every soft-rule column.
     """
 
-    k, p = bin_res.k, bin_res.p
-    bdir = out_dir / f"k{k:03d}" / f"p{p:03d}"
-    bdir.mkdir(parents=True, exist_ok=True)
-    refs = growth.references
     fields = [
         "k",
         "p",
@@ -4130,22 +4548,52 @@ def _write_growth_bin(
         "dE_f_eV",
         "growth",
         "move",
+        "shed",
+        "p_m",
+        "parent_id",
     ]
     for dmu in growth.delta_mu_cdcl2_eV:
         fields.append(f"Omega_dmu_{dmu:+.2f}")
     fields.extend(SOFT_INDEX_FIELDS)
+    return fields
+
+
+def _write_growth_bin(
+    out_dir: Path,
+    bin_res: Any,
+    growth: GrowthConfig,
+    spec: Optional[NucleationSpec] = None,
+) -> None:
+    """Write a lightweight index + formation columns for one bin.
+
+    Index rows are skipped if ``structure_id`` is already present (restart-safe).
+    Failed / artifact A opts (``xtb_energy_eV is None``) are not written to
+    disk — they are not parents and they used to flood the bin with
+    ``energy_eV=None`` XYZ.
+    """
+
+    k, p = bin_res.k, bin_res.p
+    bdir = out_dir / f"k{k:03d}" / f"p{p:03d}"
+    bdir.mkdir(parents=True, exist_ok=True)
+    refs = growth.references
+    fields = _growth_index_fields(growth)
 
     for iso in bin_res.isomers:
         e = iso.xtb_energy_eV
+        if e is None:
+            continue
         row = {
             "k": k,
             "p": p,
             "structure_id": iso.structure_id,
-            "xtb_energy_eV": "" if e is None else f"{e:.8f}",
+            "xtb_energy_eV": f"{e:.8f}",
             "xtb_converged": iso.xtb_converged,
             "dE_f_eV": "",
             "growth": "1",
             "move": "A",
+            "shed": getattr(iso, "shed", ""),
+            "p_m": getattr(iso, "p_m", ""),
+            "parent_id": getattr(iso, "parent_id", ""),
         }
         coords = iso.xtb_coordinates or iso.coordinates
         if coords is not None:
@@ -4158,29 +4606,28 @@ def _write_growth_bin(
                 rules=growth.window_for(k).soft_rules,
                 spec=spec,
             )
-        if e is not None and refs is not None:
+        if refs is not None:
             de_f = refs.formation_eV(e, k, p)
             row["dE_f_eV"] = f"{de_f:.8f}"
             for dmu in growth.delta_mu_cdcl2_eV:
                 key = f"Omega_dmu_{dmu:+.2f}"
                 row[key] = f"{refs.grand_potential_eV(e, k, p, dmu):.8f}"
-        if e is not None:
-            _append_index_row_unique(out_dir, row, fields)
-        if iso.xtb_coordinates is not None or iso.coordinates is not None:
-            coords = iso.xtb_coordinates or iso.coordinates
-            xyz = bdir / f"{iso.structure_id}_xtb.xyz"
-            # do not overwrite a finished xyz on restart unless missing
-            if not xyz.is_file():
-                symbols = [a.symbol for a in iso.atoms]
-                lines = [
-                    str(len(symbols)),
-                    f"{iso.structure_id} energy_eV={e}",
-                ]
-                for sym, pos in zip(symbols, coords):
-                    lines.append(
-                        f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
-                    )
-                xyz.write_text("\n".join(lines) + "\n")
+        _append_index_row_unique(out_dir, row, fields)
+        if coords is None:
+            continue
+        xyz = bdir / f"{iso.structure_id}_xtb.xyz"
+        # do not overwrite a finished xyz on restart unless missing
+        if not xyz.is_file():
+            symbols = [a.symbol for a in iso.atoms]
+            lines = [
+                str(len(symbols)),
+                f"{iso.structure_id} energy_eV={e} move=A",
+            ]
+            for sym, pos in zip(symbols, coords):
+                lines.append(
+                    f"{sym} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}"
+                )
+            xyz.write_text("\n".join(lines) + "\n")
 
 
 def write_growth_summary(result: GrowthStepResult, path: Path) -> None:

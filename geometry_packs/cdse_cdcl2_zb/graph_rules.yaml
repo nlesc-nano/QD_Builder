@@ -1,0 +1,39 @@
+# Zinc-blende occupation growth — legal connectivity only.
+#
+# Cores are grown by filling CdSe_zb.cif tet sites, not by enumerating
+# Cd–Se graphs.  So this file does NOT:
+#   * forbid/score Cd2Se2 4-rings (zb attach cannot make them;
+#     zb_embeddable drops them after opt)
+#   * rank cores by fusion / construction_score
+#   * run the combinatorial decoration enumerator
+#
+# 2p Cl placement is done in code around the fixed zb core
+# (bridges on Cd pairs that share a Se).  The keys below are the
+# chemistry that placement still respects.
+
+graph_rules:
+
+  coordination:
+    Cd: {min: 2, max: 4}
+    Se: {min: 2, max: 4}
+    Cl: {min: 1, max: 3}
+
+  pair_rules:
+    Cd-Se: {bond: allowed,   bond_max_distance: 3.25}
+    Cd-Cl: {bond: allowed,   bond_max_distance: 2.90}
+    Cd-Cd: {bond: forbidden, min_distance: 3.00}
+    Se-Se: {bond: forbidden, min_distance: 3.80}
+    Cl-Se: {bond: forbidden, min_distance: 2.70}
+    Cl-Cl: {bond: forbidden, min_distance: 2.70}
+
+  allowed_neighbor_signatures:
+    Cl: [Cd1, Cd2, Cd3]
+
+  require_inorganic_connected: true
+  enforce_min_cn: true
+
+  # Rhombus / 2p Cl chemistry (not a diamond score).
+  min_bridged_host_cn: 3
+  max_shared_ligands_per_host_pair: 1
+  forbid_mono_se_dual_terminal: true
+  forbid_mu3_host_bridge_overlap: true

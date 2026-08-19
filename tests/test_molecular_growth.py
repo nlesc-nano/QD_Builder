@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -425,6 +426,80 @@ def test_by_k_window_picks_k7() -> None:
     assert not w5.allow_redecorate(6, w5.p_surf(6))
 
 
+def test_k1k13_tight_windows() -> None:
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k1k13.yaml")
+    w1 = cfg.window_for(1)
+    w2 = cfg.window_for(2)
+    w3 = cfg.window_for(3)
+    w4 = cfg.window_for(4)
+    w8 = cfg.window_for(8)
+    w12 = cfg.window_for(12)
+    assert w1.child_redecorate is False
+    assert w1.move_graph is False
+    assert w1.move_coord is False
+    assert w1.move_zb_sites is True
+    assert w1.monomer_p_values == (1, 2, 3)
+    assert w1.max_shed == 2
+    assert w1.energy_window_eV == 1.0
+    assert w1.max_skeletons_cap == 12
+    assert w1.min_p_parent == 1
+    assert w2.energy_window_eV == 0.80
+    assert w2.max_skeletons_cap == 10
+    assert w2.min_p_parent == 1
+    assert w2.move_zb_sites is True
+    assert w3.child_redecorate is False
+    assert w3.min_p_parent == 2
+    assert w3.energy_window_eV == 0.60
+    assert w3.max_skeletons_cap == 8
+    assert w3.max_children_per_channel == 20
+    assert w3.move_zb_sites is True
+    assert w4.child_redecorate is False
+    assert w4.move_graph is False
+    assert w4.move_coord is False
+    assert w4.move_zb_sites is True
+    assert w4.min_p_parent == 2
+    assert w4.energy_window_eV == 0.50
+    assert w8.monomer_p_values == (1,)
+    assert w8.max_skeletons_cap == 6
+    assert w8.min_p_parent == 2
+    assert w12.max_shed == 0
+    assert w12.p_slack == 0
+    assert w12.energy_window_eV == 0.30
+    assert cfg.soft_rules.enabled is False
+    assert cfg.soft_rules.asphericity.enabled is False
+
+
+def test_select_parents_honours_min_p(map_spec) -> None:
+    def make(pid, p, energy):
+        return ParentStructure(
+            k=3,
+            p=p,
+            structure_id=pid,
+            symbols=("Se", "Cd", "Cl"),
+            coordinates=np.zeros((3, 3)),
+            energy_eV=energy,
+            edges=(),
+            core_edges=(),
+        )
+
+    parents = [
+        make("p1a", 1, 0.0),
+        make("p1b", 1, 0.1),
+        make("p2a", 2, 0.0),
+        make("p2b", 2, 0.2),
+        make("p3a", 3, 0.0),
+    ]
+    cfg = GrowthConfig.from_yaml(PACK / "growth_k1k13.yaml")
+    sel = select_parents(parents, cfg, map_spec)
+    ids = {x.structure_id for x in sel}
+    assert "p1a" not in ids
+    assert "p1b" not in ids
+    assert "p2a" in ids
+    assert "p3a" in ids
+
+
 def test_by_k_window_k9k13() -> None:
     from builder.nucleation.molecular_growth import GrowthConfig
 
@@ -783,3 +858,154 @@ def test_growth_log_global_and_block_index(tmp_path) -> None:
     extra = path.read_text(encoding="utf-8")
     assert "     1   1/1  k=5 p=1" in extra
     assert "     2   2/2  k=5 p=1" in extra
+
+
+def test_growth_log_block_writes_ranking(tmp_path) -> None:
+    path = tmp_path / "growth.log"
+    log = GrowthLog(quiet=True, log_path=path)
+    log.stage(4, 5, "merged rankings A+B per (k,p)")
+    log.block("ranking k=4 p=3  merged A=2 B=1\n  1  k004_p003_mol0001  dE=0.000")
+    log.close()
+    text = path.read_text(encoding="utf-8")
+    assert "STAGE 4/5: merged rankings A+B per (k,p)" in text
+    assert "ranking k=4 p=3  merged A=2 B=1" in text
+    assert "k004_p003_mol0001" in text
+
+
+def test_write_growth_bin_skips_none_energy_and_aligns_fields(
+    tmp_path, map_spec
+) -> None:
+    from types import SimpleNamespace
+
+    from builder.nucleation.molecular_growth import (
+        _growth_index_fields,
+        _write_growth_bin,
+    )
+
+    cfg = GrowthConfig.from_yaml(GROWTH_YAML)
+    symbols = ["Se", "Cd", "Cl"]
+    coords = ((0.0, 0.0, 0.0), (2.6, 0.0, 0.0), (2.6, 0.0, 2.5))
+    atoms = tuple(SimpleNamespace(symbol=s) for s in symbols)
+    ok = SimpleNamespace(
+        structure_id="k004_p001_mol0002",
+        xtb_energy_eV=-309260.24,
+        xtb_converged=True,
+        xtb_coordinates=coords,
+        coordinates=coords,
+        atoms=atoms,
+    )
+    dead = SimpleNamespace(
+        structure_id="k004_p001_mol0001",
+        xtb_energy_eV=None,
+        xtb_converged=False,
+        xtb_coordinates=coords,
+        coordinates=coords,
+        atoms=atoms,
+    )
+    bin_res = SimpleNamespace(k=4, p=1, isomers=[dead, ok])
+    _write_growth_bin(tmp_path, bin_res, cfg, spec=map_spec)
+
+    bdir = tmp_path / "k004" / "p001"
+    assert (bdir / "k004_p001_mol0002_xtb.xyz").is_file()
+    assert not (bdir / "k004_p001_mol0001_xtb.xyz").is_file()
+    comment = (bdir / "k004_p001_mol0002_xtb.xyz").read_text().splitlines()[1]
+    assert "energy_eV=None" not in comment
+    assert "energy_eV=-309260.24" in comment
+
+    index_path = tmp_path / "index.csv"
+    text = index_path.read_text(encoding="utf-8")
+    header = text.splitlines()[0].split(",")
+    assert header == _growth_index_fields(cfg)
+    assert "shed" in header
+    assert "p_m" in header
+    assert "parent_id" in header
+    assert header.index("n4") < header.index("rank_score_eV")
+    rows = list(csv.DictReader(index_path.open()))
+    assert len(rows) == 1
+    assert rows[0]["structure_id"] == "k004_p001_mol0002"
+    assert rows[0]["move"] == "A"
+    assert rows[0]["rank_score_eV"]
+    # n4 is an integer count, not a shifted Omega / asphericity value
+    int(rows[0]["n4"])
+    float(rows[0]["rank_score_eV"])
+
+
+def test_drop_cores_with_new_4rings_keeps_parent_diamond(map_spec) -> None:
+    from builder.nucleation.molecular_growth import (
+        _drop_cores_with_new_4rings,
+        _graph_cdse_n4,
+        _parent_cdse_n4,
+    )
+    from builder.nucleation.soft_rules import describe_structure
+
+    # Open parent: two separate Cd–Se units, no diamond.
+    open_parent = ParentStructure(
+        k=2,
+        p=1,
+        structure_id="open",
+        symbols=("Se", "Se", "Cd", "Cd", "Cd", "Cl", "Cl"),
+        coordinates=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [6.0, 0.0, 0.0],
+                [2.6, 0.0, 0.0],
+                [8.6, 0.0, 0.0],
+                [10.0, 2.0, 0.0],
+                [2.6, 0.0, 2.5],
+                [10.0, 2.0, 2.5],
+            ]
+        ),
+        energy_eV=-1.0,
+        edges=(),
+        core_edges=((0, 2), (1, 3)),
+    )
+    assert describe_structure(
+        open_parent.symbols, open_parent.coordinates, map_spec
+    ).n4 == 0
+    assert _parent_cdse_n4(open_parent, map_spec) == 0
+
+    # k=3 p=1: 3 Se + 4 Cd.  Diamond on Se0/Se1 + Cd3/Cd4.
+    diamond = ((0, 3), (0, 4), (1, 3), (1, 4), (2, 5))
+    open_child = ((0, 3), (1, 4), (2, 5))
+    assert _graph_cdse_n4(diamond, k=3, p=1, spec=map_spec) == 1
+    assert _graph_cdse_n4(open_child, k=3, p=1, spec=map_spec) == 0
+
+    kept = _drop_cores_with_new_4rings(
+        [diamond, open_child],
+        parent=open_parent,
+        k_child=3,
+        p_child=1,
+        spec=map_spec,
+    )
+    assert open_child in kept
+    assert diamond not in kept
+
+    # Parent that already has the diamond: child with n4=1 is kept.
+    d_sym = ["Se", "Se", "Cd", "Cd"]
+    d_xyz = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [0.00, 3.80, 0.00],
+            [1.85, 1.90, 0.00],
+            [-1.85, 1.90, 0.00],
+        ]
+    )
+    diamond_parent = ParentStructure(
+        k=2,
+        p=0,
+        structure_id="dia",
+        symbols=tuple(d_sym),
+        coordinates=d_xyz,
+        energy_eV=-1.0,
+        edges=(),
+        core_edges=((0, 2), (0, 3), (1, 2), (1, 3)),
+    )
+    assert _parent_cdse_n4(diamond_parent, map_spec) == 1
+    kept2 = _drop_cores_with_new_4rings(
+        [diamond],
+        parent=diamond_parent,
+        k_child=3,
+        p_child=1,
+        spec=map_spec,
+    )
+    assert diamond in kept2

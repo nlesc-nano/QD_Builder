@@ -1,0 +1,40 @@
+# zb occupation driver.  Includes only the three stage files in this folder.
+#
+#   graph_rules.yaml  legal CN / pairs / 2p Cl chemistry
+#   motifs.yaml       Se/Cl environments (vocabulary)
+#   embed.yaml        g-xTB bond tables for Cl placement + artifact floors
+#
+# Core attach does not use motif_factor.  Rings come from CdSe_zb.cif sites.
+
+schema_version: 2
+name: cdse_cdcl2_zb
+
+include:
+  - graph_rules.yaml
+  - motifs.yaml
+  - embed.yaml
+
+cif: ../../examples/cifs/CdSe_zb.cif
+charges: {Cd: 2, Se: -2, Cl: -1}
+
+nucleation:
+  kmax: 4
+  mode: exact
+  core_monomer: {cation: Cd, anion: Se}
+  precursor: {center: Cd, ligand: Cl, ligand_count: 2}
+  site_tolerance: 0.2
+
+relaxation:
+  enabled: true
+  method: g-xTB
+  binary: gxtb
+  charge: 0
+  max_steps: 150
+  accept_maxcycle: true
+  timeout_s: 1800
+  check_connectivity: true
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80
