@@ -1,0 +1,186 @@
+# Metric tables for zb occupation growth.
+# Move Z places Cl on a *fixed* zb Cd–Se core using these Cd–Cl lengths.
+# `reconstruction.method: motif_factor` is unused on this path (cores are
+# CIF coordinates, not rebuilt).  Artifact floors live in run_gxtb.yaml.
+#
+# 3D embedding: the executable geometry the motif reconstruction targets.
+#
+# Every number is a g-xTB median over the k1-k5 dataset (644k bonds,
+# 711k angles).  Nothing in this file affects which graphs are built --
+# it only decides whether a graph can be turned into coordinates.
+# Auto-extracted from cdse_cdcl2_bridge_first_gxtb.yaml -- do not hand-edit
+# numbers here without re-deriving them from the g-xTB dataset.
+
+bonds:
+- {pair: CdCl_terminal, cn_cd: 3, cn_other: 1, r_A: 2.31, tol_A: 0.05}
+- {pair: CdCl_terminal, cn_cd: 4, cn_other: 1, r_A: 2.32, tol_A: 0.05}
+- {pair: CdCl_terminal, cn_cd: 5, cn_other: 1, r_A: 2.33, tol_A: 0.05}
+- {pair: CdCl_bridge, cn_cd: 3, cn_other: 2, r_A: 2.47, tol_A: 0.06}
+- {pair: CdCl_bridge, cn_cd: 3, cn_other: 3, r_A: 2.58, tol_A: 0.09}
+- {pair: CdCl_bridge, cn_cd: 3, cn_other: 4, r_A: 2.68, tol_A: 0.09}
+- {pair: CdCl_bridge, cn_cd: 4, cn_other: 2, r_A: 2.5, tol_A: 0.06}
+- {pair: CdCl_bridge, cn_cd: 4, cn_other: 3, r_A: 2.64, tol_A: 0.1}
+- {pair: CdCl_bridge, cn_cd: 4, cn_other: 4, r_A: 2.73, tol_A: 0.09}
+- {pair: CdCl_bridge, cn_cd: 4, cn_other: 5, r_A: 2.76, tol_A: 0.09}
+- {pair: CdCl_bridge, cn_cd: 5, cn_other: 2, r_A: 2.58, tol_A: 0.07}
+- {pair: CdCl_bridge, cn_cd: 5, cn_other: 3, r_A: 2.7, tol_A: 0.1}
+- {pair: CdCl_bridge, cn_cd: 5, cn_other: 4, r_A: 2.74, tol_A: 0.08}
+- {pair: CdSe, cn_cd: 2, cn_other: 2, r_A: 2.41, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 2, cn_other: 3, r_A: 2.47, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 2, cn_other: 4, r_A: 2.5, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 3, cn_other: 2, r_A: 2.44, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 3, cn_other: 3, r_A: 2.52, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 3, cn_other: 4, r_A: 2.57, tol_A: 0.06}
+- {pair: CdSe, cn_cd: 3, cn_other: 5, r_A: 2.6, tol_A: 0.07}
+- {pair: CdSe, cn_cd: 4, cn_other: 2, r_A: 2.46, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 4, cn_other: 3, r_A: 2.56, tol_A: 0.05}
+- {pair: CdSe, cn_cd: 4, cn_other: 4, r_A: 2.64, tol_A: 0.09}
+- {pair: CdSe, cn_cd: 4, cn_other: 5, r_A: 2.71, tol_A: 0.11}
+- {pair: CdSe, cn_cd: 4, cn_other: 6, r_A: 2.78, tol_A: 0.14}
+- {pair: CdSe, cn_cd: 5, cn_other: 3, r_A: 2.6, tol_A: 0.06}
+- {pair: CdSe, cn_cd: 5, cn_other: 4, r_A: 2.68, tol_A: 0.09}
+- {pair: CdSe, cn_cd: 5, cn_other: 5, r_A: 2.78, tol_A: 0.12}
+- {pair: CdSe, cn_cd: 5, cn_other: 6, r_A: 2.82, tol_A: 0.13}
+angles:
+  Se:
+    cn2:
+      default: {deg: 88, tol_deg: 8}
+    cn3:
+      default: {deg: 92, tol_deg: 12}
+    cn4:
+      default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}
+      modes:
+      - {deg: 91, tol_deg: 16}
+      - {deg: 145, tol_deg: 16}
+    cn5:
+      default: {deg: 90, tol_deg: 15, hard_min_deg: 75, hard_max_deg: 160}
+      modes:
+      - {deg: 83, tol_deg: 16}
+      - {deg: 145, tol_deg: 16}
+  Cl:
+    cn2:
+      default: {deg: 92, tol_deg: 11}
+    cn3:
+      default: {deg: 92, tol_deg: 15}
+      modes:
+      - {deg: 85, tol_deg: 12}
+      - {deg: 122, tol_deg: 15}
+  Cd:
+    cn2:
+      default: {deg: 175, tol_deg: 10}
+      by_pair:
+        Cl_t-Se: {deg: 175, tol_deg: 10}
+        Cl_b2s-Se: {deg: 173, tol_deg: 12}
+        Cl_b2n-Se: {deg: 173, tol_deg: 12}
+        Se-Se: {deg: 175, tol_deg: 12}
+    cn4:
+      default: {deg: 109.5, tol_deg: 12, hard_min_deg: 95, hard_max_deg: 125}
+      by_pair:
+        Cl_b2s-Se: {deg: 95, tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_b2n-Se: {deg: 100, tol_deg: 15, hard_min_deg: 90, hard_max_deg: 125}
+        Cl_b3-Se: {deg: 95, tol_deg: 15, hard_min_deg: 90, hard_max_deg: 120}
+        Cl_t-Se: {deg: 120, tol_deg: 12}
+        Cl_b2s-Cl_t: {deg: 120, tol_deg: 12}
+        Cl_b2n-Cl_t: {deg: 118, tol_deg: 12}
+        Cl_b3-Cl_t: {deg: 115, tol_deg: 15}
+        Cl_b2s-Cl_b2s: {deg: 112, tol_deg: 12}
+        Cl_b2n-Cl_b2n: {deg: 112, tol_deg: 15}
+        Cl_b2n-Cl_b2s: {deg: 112, tol_deg: 15}
+        Se-Se: {deg: 109.5, tol_deg: 12}
+    cn3:
+      by_role_signature:
+        Cl_t+Cl_t+Se:
+          Cl_t-Cl_t: {deg: 120, tol_deg: 15}
+          Cl_t-Se: {deg: 120, tol_deg: 15}
+        Cl_b2s+Cl_t+Se:
+          Cl_b2s-Cl_t: {deg: 122, tol_deg: 12}
+          Cl_b2s-Se: {deg: 94, tol_deg: 12}
+          Cl_t-Se: {deg: 144, tol_deg: 12}
+        Cl_b2n+Cl_t+Se:
+          Cl_b2n-Cl_t: {deg: 110, tol_deg: 15}
+          Cl_b2n-Se: {deg: 105, tol_deg: 15}
+          Cl_t-Se: {deg: 145, tol_deg: 15}
+        Cl_b3+Cl_t+Se:
+          Cl_b3-Cl_t: {deg: 112, tol_deg: 15}
+          Cl_b3-Se: {deg: 94, tol_deg: 12}
+          Cl_t-Se: {deg: 154, tol_deg: 15}
+        Cl_b2s+Cl_b2s+Se:
+          Cl_b2s-Cl_b2s: {deg: 138, tol_deg: 12}
+          Cl_b2s-Se: {deg: 111, tol_deg: 15}
+        Cl_b2n+Cl_b2s+Se:
+          Cl_b2n-Cl_b2s: {deg: 121, tol_deg: 12}
+          Cl_b2n-Se: {deg: 139, tol_deg: 15}
+          Cl_b2s-Se: {deg: 100, tol_deg: 12}
+        Cl_b2n+Cl_b2n+Se:
+          Cl_b2n-Cl_b2n: {deg: 104, tol_deg: 15}
+          Cl_b2n-Se: {deg: 128, tol_deg: 15}
+        Cl_b2n+Cl_b3+Se:
+          Cl_b2n-Cl_b3: {deg: 92, tol_deg: 15}
+          Cl_b2n-Se: {deg: 155, tol_deg: 15}
+          Cl_b3-Se: {deg: 113, tol_deg: 15}
+        Cl_t+Se+Se:
+          Cl_t-Se: {deg: 112, tol_deg: 12}
+          Se-Se: {deg: 136, tol_deg: 12}
+        Cl_b2s+Se+Se:
+          Cl_b2s-Se: {deg: 105, tol_deg: 15}
+          Se-Se: {deg: 150, tol_deg: 15}
+        Cl_b2n+Se+Se:
+          Cl_b2n-Se: {deg: 108, tol_deg: 15}
+          Se-Se: {deg: 144, tol_deg: 15}
+        Cl_b3+Se+Se:
+          Cl_b3-Se: {deg: 104, tol_deg: 15}
+          Se-Se: {deg: 152, tol_deg: 15}
+      by_signature:
+        Se3:
+          Se-Se: {deg: 120, tol_deg: 12}
+        Cl3:
+          Cl-Cl: {deg: 120, tol_deg: 15}
+      default: {deg: 120, tol_deg: 15}
+angle_sum_cn3:
+  Cd: {target_deg: 360, tol_deg: 8}
+  Se: {target_deg: 270, tol_deg: 15}
+  Cl: {target_deg: 270, tol_deg: 20}
+dihedrals:
+  improper:
+    Cd:
+      cn3:
+        default: {deg: 0.0, tol_deg: 12}
+    Se:
+      cn3:
+        Cd3: {deg: 82.0, tol_deg: 12}
+  proper:
+  - path: [Cd, Cl_b, Cd, Se]
+    when: {se_cn_min: 3}
+    phi_deg: 0
+    tol_deg: 25
+  - path: [Cd, Cl_b, Cd, Se]
+    when: {se_cn_max: 2}
+    phi_deg: 180
+    tol_deg: 30
+  - path: [Cd, Cl_b, Cd, Cl_t]
+    phi_deg: 180
+    tol_deg: 25
+nonbonded_1_4:
+  Cd-Cl: {min_A: 3.55, tol_A: 0.4}
+  Cd-Se: {min_A: 3.6, tol_A: 0.35}
+nonbonded:
+  Cd-Se: {min_A: 3.6, tol_A: 0.2}
+  Cd-Cl: {min_A: 3.5, tol_A: 0.2}
+  Cd-Cd: {min_A: 3.2, tol_A: 0.05}
+  Se-Se: {min_A: 3.8, tol_A: 0.1}
+  Cl-Se: {min_A: 3.3, tol_A: 0.1}
+  Cl-Cl: {min_A: 2.8, tol_A: 0.1}
+rings:
+  cdse_6:
+    conformations: [chair]
+    derive_from:
+      bond: {pair: CdSe, by_cn: true}
+      angle_at_cd: {element: Cd, by_cn_and_role_signature: true}
+      angle_at_se: {element: Se, by_cn: true}
+    dihedrals:
+      chair:
+        mode: derive_from_angles
+        phi_deg: [55, -55, 55, -55, 55, -55]
+        tol_deg: [15, 15, 15, 15, 15, 15]
+reconstruction: {method: motif_factor, audit: clashes_only, factor_starts_per_graph: 1, max_nfev: 8, layout_iterations: 40,
+  xtb_starts_per_graph: 1, overlap_min_A: 0.75, start_max_bond_error_A: 0.5}

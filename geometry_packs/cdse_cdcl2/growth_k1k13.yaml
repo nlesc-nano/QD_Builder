@@ -1,0 +1,237 @@
+# One-shot envelope: parent k = 1 … 13 (child k = 2 … 13).
+#
+# Tight parent filter + zinc-blende occupation growth (move Z).
+# Core genealogy is a zb site occupation, not the relaxed XYZ and not
+# combinatorial Move A.  Move B is off (it would carry Cd2Se2).
+# The wide k3→13 run (2 eV × cap 50 × every p) stored almost every
+# core, promoted k=4 p=1 8-rings / Cd CN=2, and B-carried diamonds.
+# This envelope:
+#
+#   * starts from the k=1 map (not a late B sausage)
+#   * move Z (zb_sites) for the whole range; A and B off
+#   * after opt, only zb-embeddable cores become parents
+#   * cuts the energy window and skeleton cap so ranking actually bites
+#   * min_p = 2 from parent k = 3: p=1 children may still be *written*
+#     (max_shed=2) but they are not used as parents (no 8-ring carry)
+#   * max_children_per_channel 20 at the last A step (was 80)
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir . --growth growth_k1k13.yaml \
+#     --parents ../runs/gxtb_cdse_target_k1k2_p1p5 \
+#     --k-from 1 --k-to 13 --p-parents all \
+#     --output runs/growth_k1_to_k13_tight
+#
+# Use a NEW --output.  Do not resume growth_k3_to_k13_graph_rules.
+#
+# Surface: p_surf(k) = floor(2.0 * k^(2/3)); p_slack 1 until k=12.
+# Soft rules OFF: parent cut is the energy window + cap + min_p only.
+# Ω is report-only.
+
+schema_version: 1
+name: cdse_growth_k1k13
+
+monomer_p_values: [1, 2, 3]     # k=1 default; by_k narrows later
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 1
+
+parents:
+  energy_window_eV: 0.80
+  rank_by: energy               # window is raw E; soft_rules re-rank inside it
+  max_skeletons_frac: 1.0       # cap below is the only limit
+  max_skeletons_cap: 10
+  decorations_per_skeleton: 2
+  min_p: 1                      # by_k raises this to 2 from parent k=3
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 2
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: false             # Z places 2p Cl on the zb core; no motif_factor
+  redecorate_slack: false
+  full_opt: g-xTB
+  full_opt_cycles: 150
+
+moves:
+  graph: false
+  coord: false
+  zb_sites: true                # occupation lineage; A/B off
+
+max_children_per_channel: 40
+selection_max_per_skeleton: 4
+
+lattice_switch:
+  enabled: true
+  from_k: 7
+  decoration_mode: tet_sites
+  require_any:
+    - min_cn4_fraction: 0.45
+    - min_six_rings: 2
+  fallback: motif_bridge_target
+
+# Parent k of each step.  First match wins.
+by_k:
+  # Molecule.  Few isomers; keep p=1; A+B both on.
+  - k_min: 1
+    k_max: 1
+    monomer_p_values: [1, 2, 3]
+    max_shed: 2
+    energy_window_eV: 1.00
+    max_skeletons_cap: 12
+    decorations_per_skeleton: 2
+    min_p: 1
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 40
+    selection_max_per_skeleton: 4
+    p_slack: 1
+  # Still a molecule.  Tighter than the old 2 eV / cap 50 dump.
+  - k_min: 2
+    k_max: 2
+    monomer_p_values: [1, 2, 3]
+    max_shed: 2
+    energy_window_eV: 0.80
+    max_skeletons_cap: 10
+    decorations_per_skeleton: 2
+    min_p: 1
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 30
+    selection_max_per_skeleton: 4
+    p_slack: 1
+  # Last A step.  Do not feed k=3 p=1 (open 8-rings) into k=4.
+  - k_min: 3
+    k_max: 3
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.60
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 20
+    selection_max_per_skeleton: 3
+    p_slack: 1
+  # B kinetic path.  max_shed=2 keeps a lean (p−1) channel.
+  - k_min: 4
+    k_max: 5
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.50
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 20
+    selection_max_per_skeleton: 3
+    p_slack: 1
+  - k_min: 6
+    k_max: 6
+    monomer_p_values: [1, 2]
+    max_shed: 1
+    energy_window_eV: 0.50
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    p_slack: 1
+  - k_min: 7
+    k_max: 10
+    monomer_p_values: [1]
+    max_shed: 1
+    energy_window_eV: 0.40
+    max_skeletons_cap: 6
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    selection_max_per_skeleton: 2
+    p_slack: 1
+  - k_min: 11
+    k_max: 11
+    monomer_p_values: [1]
+    max_shed: 1
+    energy_window_eV: 0.35
+    max_skeletons_cap: 5
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+  - k_min: 12
+    k_max: 13
+    monomer_p_values: [1]
+    max_shed: 0
+    energy_window_eV: 0.30
+    max_skeletons_cap: 4
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 0
+
+soft_rules:
+  enabled: false
+  diamond:
+    enabled: true
+    weight_eV: 0.15
+    fused_weight_eV: 0.30
+    from_k: 2
+  f6:
+    enabled: true
+    weight_eV: -0.04
+    dirty_weight_eV: 0.20
+    from_k: 3
+  terminal_se3cl:
+    enabled: true
+    weight_eV: 0.20
+    from_k: 4
+  se1cl3:
+    enabled: true
+    weight_eV: 0.05
+    from_k: 6
+  asphericity:
+    enabled: false
+    weight_eV: 1.0
+    only_if_dirty_f6: true
+    from_k: 6
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]

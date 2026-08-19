@@ -1,0 +1,34 @@
+# Motif vocabulary for zb occupation growth.
+# Used only as the allowed Se/Cl environments.  Cores are not built
+# from these motifs; they come from CdSe_zb.cif sites.
+#
+# Motif vocabulary: which local environments the builder is allowed to make.
+#
+# This block is read for `center` + `linker_count` only -- it defines the set
+# of coordination numbers each center may take, and a graph containing any
+# other environment is rejected as `unsupported_motif:<sym>-Cd<cn>`.
+#
+# Local geometry is NOT set here.  Bond lengths, angles and impropers live in
+# embed.yaml, which is the single source of truth for anything metric.  (A
+# motif may carry its own geometry, but only in a pack that declares no
+# `bonds:` table at all; with embed.yaml present those numbers would be dead.)
+#
+# Only anion and ligand centers are listed.  Adding a `Cd` motif here would
+# pin Cd to exactly the listed coordination numbers -- so census entries like
+# Cd4:Se1Cl3 belong in the embed.yaml angle table, not in this file.
+
+motifs:
+  Se-Cd2: {center: Se, linker: Cd, linker_count: 2}
+  Se-Cd3: {center: Se, linker: Cd, linker_count: 3}
+  Se-Cd4: {center: Se, linker: Cd, linker_count: 4}
+  Cl-Cd1: {center: Cl, linker: Cd, linker_count: 1}   # terminal
+  Cl-Cd2: {center: Cl, linker: Cd, linker_count: 2}   # mu2 bridge
+  Cl-Cd3: {center: Cl, linker: Cd, linker_count: 3}   # mu3 cap
+
+# Junction refinements applied during motif reconstruction: extra residual
+# terms where two motifs meet and neither one alone fixes the geometry.
+junctions:
+  coplanar_shared_pair:
+    - when: {anion: Se, anion_cn: 2, ligand: Cl, ligand_cn: 2}
+      tol_deg: 6.0
+      weight: 2.0

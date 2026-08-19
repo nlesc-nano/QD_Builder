@@ -1,0 +1,124 @@
+# zb occupation growth, parent k = 1 … 3 (child k = 2 … 4).
+#
+# Soft rules OFF.  Move A/B OFF.  lattice_switch OFF.
+# Parent cut is energy window + cap + min_p only.
+# After g-xTB a child is kept only if it still embeds on zb.
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2_zb \
+#     --growth growth.yaml \
+#     --parents /path/to/gxtb_cdse_target_k1k2_p1p5 \
+#     --k-from 1 --k-to 4 --p-parents all \
+#     --output /path/to/growth_zb_k1_to_k4
+#
+# NEW --output.  Do not resume an A/B tree.
+
+schema_version: 1
+name: cdse_growth_zb_k1k4
+
+monomer_p_values: [1, 2, 3]
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  beta: 2.0
+  alpha: 1.0
+  p_slack: 1
+
+parents:
+  energy_window_eV: 0.80
+  rank_by: energy
+  max_skeletons_frac: 1.0
+  max_skeletons_cap: 10
+  decorations_per_skeleton: 1
+  min_p: 1
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 2
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: false
+    method: g-xTB
+    max_cycles: 20
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: false
+  redecorate_slack: false
+  full_opt: g-xTB
+  full_opt_cycles: 150
+
+moves:
+  graph: false
+  coord: false
+  zb_sites: true
+
+max_children_per_channel: 20
+
+lattice_switch:
+  enabled: false
+
+soft_rules:
+  enabled: false
+
+by_k:
+  - k_min: 1
+    k_max: 1
+    monomer_p_values: [1, 2, 3]
+    max_shed: 2
+    energy_window_eV: 1.00
+    max_skeletons_cap: 12
+    decorations_per_skeleton: 1
+    min_p: 1
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 20
+    p_slack: 1
+  - k_min: 2
+    k_max: 2
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.80
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 1
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+  - k_min: 3
+    k_max: 3
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.60
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 2
+    redecorate: false
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
