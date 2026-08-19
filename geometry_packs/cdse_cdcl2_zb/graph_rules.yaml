@@ -1,15 +1,9 @@
-# Zinc-blende occupation growth — legal connectivity only.
+# Zinc-blende occupation growth — legal connectivity + 2p Cl decorate.
 #
-# Cores are grown by filling CdSe_zb.cif tet sites, not by enumerating
-# Cd–Se graphs.  So this file does NOT:
-#   * forbid/score Cd2Se2 4-rings (zb attach cannot make them;
-#     zb_embeddable drops them after opt)
-#   * rank cores by fusion / construction_score
-#   * run the combinatorial decoration enumerator
-#
-# 2p Cl placement is done in code around the fixed zb core
-# (bridges on Cd pairs that share a Se).  The keys below are the
-# chemistry that placement still respects.
+# Cores (Cd–Se) come from CdSe_zb.cif tet sites, not from a free-graph
+# enumerator.  Cl decoration and 3D placement use the *same* pack path
+# as the molecular map: motif_bridge_* then embed.yaml (bonds/angles).
+# This file does NOT score or rank Cd2Se2 4-rings.
 
 graph_rules:
 
@@ -37,3 +31,13 @@ graph_rules:
   max_shared_ligands_per_host_pair: 1
   forbid_mono_se_dual_terminal: true
   forbid_mu3_host_bridge_overlap: true
+
+  # Cl decorate (2p).  Not a core enumerator.
+  decoration_mode: motif_bridge_first
+  decoration_mode_from_k: 3
+  decoration_mode_at_or_above: motif_bridge_target
+  bridge_first_hard_max_bridges_per_cd: 3
+  selection_max_per_skeleton: 3
+  selection_per_skeleton_from_k: 1
+  bridge_target_max_emissions_per_skeleton: 40
+  bridge_target_max_nodes_per_skeleton: 2000

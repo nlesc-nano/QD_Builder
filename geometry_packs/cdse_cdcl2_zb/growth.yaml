@@ -63,7 +63,7 @@ geometry:
   require_charge_neutral_for_cleanup: true
 
 child:
-  redecorate: false
+  redecorate: true              # pack decorate + embed.yaml on Z cores
   redecorate_slack: false
   full_opt: g-xTB
   full_opt_cycles: 150
@@ -90,7 +90,7 @@ by_k:
     max_skeletons_cap: 12
     decorations_per_skeleton: 1
     min_p: 1
-    redecorate: false
+    redecorate: true
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 20
     p_slack: 1
@@ -102,7 +102,7 @@ by_k:
     max_skeletons_cap: 8
     decorations_per_skeleton: 1
     min_p: 1
-    redecorate: false
+    redecorate: true
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 16
     p_slack: 1
@@ -114,7 +114,7 @@ by_k:
     max_skeletons_cap: 8
     decorations_per_skeleton: 1
     min_p: 2
-    redecorate: false
+    redecorate: true
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 16
     p_slack: 1
