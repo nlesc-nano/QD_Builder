@@ -2,8 +2,9 @@
 
 Parent identity is a Cd–Se occupation on the CIF tet lattice, not the
 relaxed XYZ.  Children are made by vacating precursor Cd and filling
-vacant cation+anion pairs.  After g-xTB the new core is kept only if it
-still snaps onto zb (no Cd2Se2 diamonds).
+vacant cation+anion pairs.  After g-xTB the endpoint is retained in the
+growth lineage only when its Cd–Se topology is preserved; changed minima
+are recorded off path rather than snapped onto a new lattice fragment.
 
 Cl is placed from the 2p graph law around the *fixed* zb core; Cl does
 not occupy CIF virtual sites.
@@ -12,7 +13,10 @@ not occupy CIF virtual sites.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from itertools import combinations
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -45,10 +49,303 @@ class ZbOccupation:
     symbols: Tuple[str, ...]
     coordinates: FloatArray
     core_edges: EdgeList
+    site_ids: Tuple[str, ...] = ()
+    occupation_id: str = ""
+    parent_occupation_ids: Tuple[str, ...] = ()
+    parent_structure_ids: Tuple[str, ...] = ()
     parent_id: str = ""
     shed: int = 0
     p_m: int = 0
     notes: str = ""
+
+
+def _site_id(symbol: str, point: Sequence[float], tolerance: float) -> str:
+    key = _position_key(np.asarray(point, dtype=float), tolerance)
+    return f"{symbol}:{key[0]}:{key[1]}:{key[2]}"
+
+
+def _occupation_shape_certificate(
+    symbols: Sequence[str], coordinates: np.ndarray, tolerance: float
+) -> str:
+    """Rigid-motion and atom-order invariant certificate for a lattice site set.
+
+    The complete, element-labelled distance graph distinguishes spatial lattice
+    occupations that share the same nearest-neighbour Cd--Se graph.  It also
+    merges translated, rotated, and reflected copies of the same finite ZB
+    fragment, which is the symmetry reduction Move Z needs.
+    """
+
+    from itertools import permutations, product
+
+    points = np.asarray(coordinates, dtype=float)
+    scale = max(float(tolerance), 1.0e-6)
+    quantized = np.rint(points / scale).astype(np.int64)
+    canonical: Optional[Tuple[Tuple[Any, ...], ...]] = None
+    # Cubic ZB symmetry is a subset of signed axis permutations.  Including
+    # all 48 also merges mirror partners, which are energetically equivalent
+    # in this achiral composition.  A deterministic occupied anchor removes
+    # translation without throwing away the actual site arrangement.
+    for axes in permutations(range(3)):
+        permuted = quantized[:, axes]
+        for signs in product((-1, 1), repeat=3):
+            transformed = permuted * np.asarray(signs, dtype=np.int64)
+            anchor_index = min(
+                range(len(symbols)),
+                key=lambda index: (
+                    str(symbols[index]),
+                    int(transformed[index, 0]),
+                    int(transformed[index, 1]),
+                    int(transformed[index, 2]),
+                ),
+            )
+            anchor = transformed[anchor_index]
+            rows = tuple(
+                sorted(
+                    (
+                        str(symbol),
+                        int(point[0] - anchor[0]),
+                        int(point[1] - anchor[1]),
+                        int(point[2] - anchor[2]),
+                    )
+                    for symbol, point in zip(symbols, transformed)
+                )
+            )
+            if canonical is None or rows < canonical:
+                canonical = rows
+    payload = repr(canonical or ()).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
+def ensure_occupation_identity(
+    occupation: ZbOccupation,
+    model: _LatticeModel,
+) -> ZbOccupation:
+    """Populate stable site and shape identities on an occupation in place."""
+
+    if not occupation.site_ids:
+        occupation.site_ids = tuple(
+            _site_id(symbol, point, model.site_tolerance)
+            for symbol, point in zip(occupation.symbols, occupation.coordinates)
+        )
+    if not occupation.occupation_id:
+        cert = _occupation_shape_certificate(
+            occupation.symbols, occupation.coordinates, model.site_tolerance
+        )
+        occupation.occupation_id = (
+            f"zb_k{occupation.k:03d}_p{occupation.p:03d}_{cert}"
+        )
+    return occupation
+
+
+def occupation_to_record(occupation: ZbOccupation) -> Dict[str, Any]:
+    return {
+        "occupation_id": occupation.occupation_id,
+        "parent_occupation_ids": list(occupation.parent_occupation_ids),
+        "parent_structure_ids": list(occupation.parent_structure_ids),
+        "k": int(occupation.k),
+        "p": int(occupation.p),
+        "symbols": list(occupation.symbols),
+        "lattice_coordinates": np.asarray(
+            occupation.coordinates, dtype=float
+        ).tolist(),
+        "core_edges": [list(edge) for edge in occupation.core_edges],
+        "site_ids": list(occupation.site_ids),
+        "parent_id": occupation.parent_id,
+        "shed": int(occupation.shed),
+        "p_m": int(occupation.p_m),
+        "notes": occupation.notes,
+    }
+
+
+def occupation_from_record(record: Dict[str, Any]) -> ZbOccupation:
+    return ZbOccupation(
+        k=int(record["k"]),
+        p=int(record["p"]),
+        symbols=tuple(str(value) for value in record["symbols"]),
+        coordinates=np.asarray(record["lattice_coordinates"], dtype=float),
+        core_edges=tuple(
+            sorted((min(int(a), int(b)), max(int(a), int(b)))
+                   for a, b in record["core_edges"])
+        ),
+        site_ids=tuple(str(value) for value in record.get("site_ids", ())),
+        occupation_id=str(record.get("occupation_id") or ""),
+        parent_occupation_ids=tuple(
+            str(value) for value in record.get("parent_occupation_ids", ())
+        ),
+        parent_structure_ids=tuple(
+            str(value) for value in record.get("parent_structure_ids", ())
+        ),
+        parent_id=str(record.get("parent_id") or ""),
+        shed=int(record.get("shed", 0)),
+        p_m=int(record.get("p_m", 0)),
+        notes=str(record.get("notes") or ""),
+    )
+
+
+def load_occupation_manifest(path: Path) -> Dict[str, ZbOccupation]:
+    """Return propagation-eligible structure id -> stored lattice occupation."""
+
+    manifest = Path(path)
+    if manifest.is_dir():
+        manifest = manifest / "zb_occupations.jsonl"
+    out: Dict[str, ZbOccupation] = {}
+    if not manifest.is_file():
+        return out
+    for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        structure_id = str(record.get("structure_id") or "")
+        if not structure_id or not bool(record.get("propagation_eligible", False)):
+            continue
+        occupation_raw = record.get("occupation")
+        if isinstance(occupation_raw, dict):
+            out[structure_id] = occupation_from_record(occupation_raw)
+    return out
+
+
+def load_reference_occupation(
+    path: Path,
+    spec: NucleationSpec,
+    model: _LatticeModel,
+) -> ZbOccupation:
+    """Load a core-only lattice reference used for endpoint diagnostics."""
+
+    import yaml
+
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    symbols = tuple(str(value) for value in raw.get("symbols", ()))
+    coordinates = np.asarray(raw.get("coordinates", ()), dtype=float)
+    if not symbols or coordinates.shape != (len(symbols), 3):
+        raise ValueError(f"invalid ZB endpoint reference: {path}")
+    atoms = [
+        AtomRecord(
+            index,
+            symbol,
+            tuple(float(value) for value in coordinates[index]),
+            "core_anion" if symbol == spec.core.anion else "core_cation",
+        )
+        for index, symbol in enumerate(symbols)
+    ]
+    state = _make_core_graph(atoms, model, spec)
+    k = symbols.count(spec.core.anion)
+    p = symbols.count(spec.core.cation) - k
+    occupation = occupation_from_state(
+        state,
+        spec,
+        model=model,
+        k=k,
+        p=p,
+        notes="endpoint_reference",
+    )
+    if occupation is None:
+        raise ValueError(f"disconnected or invalid ZB endpoint reference: {path}")
+    return occupation
+
+
+def endpoint_similarity_diagnostic(
+    occupation: ZbOccupation,
+    reference: ZbOccupation,
+    *,
+    match_tolerance_A: float = 0.35,
+) -> Dict[str, Any]:
+    """Rotation-invariant shape comparison; never used as a growth filter.
+
+    The best element-preserving assignment is evaluated over the 48 signed
+    axis permutations of the cubic lattice.  This reports whether a k=13
+    occupation approaches the known minimum Wulff-like Cd16Se13 core while
+    leaving energetic selection entirely to g-xTB.
+    """
+
+    from itertools import permutations, product
+    from scipy.optimize import linear_sum_assignment
+
+    candidate_points = np.asarray(occupation.coordinates, dtype=float)
+    reference_points = np.asarray(reference.coordinates, dtype=float)
+    candidate_centered = candidate_points - candidate_points.mean(axis=0)
+    reference_centered = reference_points - reference_points.mean(axis=0)
+    candidate_symbols = np.asarray(occupation.symbols, dtype=object)
+    reference_symbols = np.asarray(reference.symbols, dtype=object)
+
+    best_matched = -1
+    best_rmsd = float("inf")
+    best_assignment_distances: List[float] = []
+    for axes in permutations(range(3)):
+        base = np.eye(3, dtype=float)[:, list(axes)]
+        for signs in product((-1.0, 1.0), repeat=3):
+            rotation = base @ np.diag(signs)
+            rotated = candidate_centered @ rotation
+            distances: List[float] = []
+            for symbol in sorted(set(occupation.symbols) | set(reference.symbols)):
+                ci = np.flatnonzero(candidate_symbols == symbol)
+                ri = np.flatnonzero(reference_symbols == symbol)
+                if not len(ci) or not len(ri):
+                    continue
+                matrix = np.linalg.norm(
+                    rotated[ci, None, :] - reference_centered[None, ri, :],
+                    axis=2,
+                )
+                rows, cols = linear_sum_assignment(matrix)
+                distances.extend(float(matrix[row, col]) for row, col in zip(rows, cols))
+            matched = sum(value <= float(match_tolerance_A) for value in distances)
+            rmsd = (
+                float(np.sqrt(np.mean(np.square(distances))))
+                if distances
+                else float("inf")
+            )
+            if matched > best_matched or (matched == best_matched and rmsd < best_rmsd):
+                best_matched = matched
+                best_rmsd = rmsd
+                best_assignment_distances = distances
+
+    def _degree_histogram(item: ZbOccupation) -> Dict[str, List[int]]:
+        degrees = [0] * len(item.symbols)
+        for left, right in item.core_edges:
+            degrees[left] += 1
+            degrees[right] += 1
+        return {
+            symbol: sorted(
+                degrees[index]
+                for index, value in enumerate(item.symbols)
+                if value == symbol
+            )
+            for symbol in sorted(set(item.symbols))
+        }
+
+    def _extents(points: np.ndarray) -> List[float]:
+        centered = points - points.mean(axis=0)
+        return sorted(float(value) for value in np.ptp(centered, axis=0))
+
+    denominator = max(len(occupation.symbols), len(reference.symbols), 1)
+    return {
+        "occupation_id": occupation.occupation_id,
+        "k": int(occupation.k),
+        "p": int(occupation.p),
+        "reference_occupation_id": reference.occupation_id,
+        "reference_k": int(reference.k),
+        "reference_p": int(reference.p),
+        "site_match_tolerance_A": float(match_tolerance_A),
+        "matched_sites": int(max(0, best_matched)),
+        "site_overlap_fraction": float(max(0, best_matched) / denominator),
+        "assignment_rmsd_A": (
+            None if not np.isfinite(best_rmsd) else float(best_rmsd)
+        ),
+        "assignment_max_A": (
+            None
+            if not best_assignment_distances
+            else float(max(best_assignment_distances))
+        ),
+        "radius_gyration_A": _occupation_radius_of_gyration(occupation),
+        "reference_radius_gyration_A": _occupation_radius_of_gyration(reference),
+        "axis_extents_A": _extents(candidate_points),
+        "reference_axis_extents_A": _extents(reference_points),
+        "coordination_histogram": _degree_histogram(occupation),
+        "reference_coordination_histogram": _degree_histogram(reference),
+        "ranking_or_filtering_effect": "none",
+    }
 
 
 @dataclass
@@ -68,11 +365,11 @@ class ZbGrowStats:
 
     def as_log(self) -> str:
         return (
-            f"Z snap={self.snapped}/{self.parents} "
-            f"snap_fail={self.snap_fail} n4_reject={self.n4_reject} "
+            f"Z lineage={self.snapped}/{self.parents} "
+            f"missing={self.snap_fail} n4_reject={self.n4_reject} "
             f"children={self.children} attach_try={self.attach_attempts} "
             f"clash_skip={self.clash_skip} "
-            f"opt_keep={self.opt_keep} opt_not_zb={self.opt_reject_embed} "
+            f"opt_keep={self.opt_keep} topology_changed={self.opt_reject_embed} "
             f"opt_fail={self.opt_fail}"
         )
 
@@ -89,7 +386,9 @@ def seed_occupation(spec: NucleationSpec, model: _LatticeModel) -> ZbOccupation:
     """k=1 p=0 Cd–Se on zb."""
 
     state = _seed_state(model)
-    occ = occupation_from_state(state, spec, k=1, p=0, parent_id="zb_seed")
+    occ = occupation_from_state(
+        state, spec, model=model, k=1, p=0, parent_id="zb_seed"
+    )
     if occ is None:
         raise RuntimeError("zb seed is not a connected Cd–Se pair")
     return occ
@@ -99,12 +398,15 @@ def occupation_from_state(
     state: _State,
     spec: NucleationSpec,
     *,
+    model: _LatticeModel,
     k: int,
     p: int,
     parent_id: str = "",
     shed: int = 0,
     p_m: int = 0,
     notes: str = "",
+    parent_occupation_ids: Sequence[str] = (),
+    parent_structure_ids: Sequence[str] = (),
 ) -> Optional[ZbOccupation]:
     cation, anion, _ = _species(spec)
     se = [a for a in state.atoms if a.symbol == anion]
@@ -133,17 +435,20 @@ def occupation_from_state(
     if not edges:
         return None
     pts = np.asarray(coords, dtype=float)
-    return ZbOccupation(
+    occupation = ZbOccupation(
         k=int(k),
         p=int(p),
         symbols=tuple(symbols),
         coordinates=pts,
         core_edges=tuple(sorted(set(edges))),
+        parent_occupation_ids=tuple(str(value) for value in parent_occupation_ids),
+        parent_structure_ids=tuple(str(value) for value in parent_structure_ids),
         parent_id=parent_id,
         shed=int(shed),
         p_m=int(p_m),
         notes=notes,
     )
+    return ensure_occupation_identity(occupation, model)
 
 
 def state_from_occupation(
@@ -384,7 +689,7 @@ def zb_embeddable(
     if not inorg or not nx.is_connected(sub):
         return False, None, "disconnected"
     occ = occupation_from_state(
-        state, spec, k=k, p=p, parent_id=parent_id, notes="snap"
+        state, spec, model=model, k=k, p=p, parent_id=parent_id, notes="snap"
     )
     if occ is None:
         return False, None, "canon"
@@ -469,12 +774,77 @@ def shed_occupation(
     return occupation_from_state(
         state,
         spec,
+        model=model,
         k=occ.k,
         p=occ.p - s,
         parent_id=occ.parent_id,
         shed=s,
         notes="shed",
+        parent_occupation_ids=(occ.occupation_id,),
     )
+
+
+def shed_occupations(
+    occ: ZbOccupation,
+    s: int,
+    spec: NucleationSpec,
+    model: _LatticeModel,
+) -> List[ZbOccupation]:
+    """Enumerate every unique connected removal of ``s`` excess Cd sites.
+
+    Cd atoms are chemically indistinguishable after relaxation.  Treating one
+    degree-ranked subset as the precursor silently discards valid ZB lineages,
+    so Move Z enumerates all Cd removals and lets symmetry canonicalization
+    merge equivalent occupations.
+    """
+
+    if s <= 0:
+        return [ensure_occupation_identity(occ, model)]
+    if s > occ.p:
+        return []
+    cation = spec.core.cation
+    cd_ids = [i for i, symbol in enumerate(occ.symbols) if symbol == cation]
+    unique: Dict[str, ZbOccupation] = {}
+    for removed in combinations(cd_ids, int(s)):
+        drop = set(removed)
+        keep = [i for i in range(len(occ.symbols)) if i not in drop]
+        mapping = {old: new for new, old in enumerate(keep)}
+        atoms = [
+            AtomRecord(
+                mapping[i],
+                occ.symbols[i],
+                tuple(float(x) for x in occ.coordinates[i]),
+                "core_anion"
+                if occ.symbols[i] == spec.core.anion
+                else "core_cation",
+            )
+            for i in keep
+        ]
+        state = _make_core_graph(atoms, model, spec)
+        candidate = occupation_from_state(
+            state,
+            spec,
+            model=model,
+            k=occ.k,
+            p=occ.p - int(s),
+            parent_id=occ.parent_id,
+            shed=int(s),
+            notes="shed_all",
+            parent_occupation_ids=(occ.occupation_id,),
+        )
+        if candidate is None:
+            continue
+        # occupation_from_state requires at least one edge; explicitly require
+        # the complete inorganic fragment to remain connected as well.
+        import networkx as nx
+
+        graph = nx.Graph()
+        graph.add_nodes_from(range(len(candidate.symbols)))
+        graph.add_edges_from(candidate.core_edges)
+        if not nx.is_connected(graph):
+            continue
+        unique.setdefault(candidate.occupation_id, candidate)
+    return list(unique.values())
 
 
 def _monomer_pairs(
@@ -573,15 +943,17 @@ def attach_cdse(
         new = occupation_from_state(
             child,
             spec,
+            model=model,
             k=occ.k + 1,
             p=occ.p,
             parent_id=occ.parent_id,
             shed=occ.shed,
             notes="attach",
+            parent_occupation_ids=(occ.occupation_id,),
         )
         if new is None:
             continue
-        key = tuple(sorted(new.core_edges))
+        key = new.occupation_id
         if key in seen:
             continue
         seen.add(key)
@@ -641,23 +1013,25 @@ def _add_precursor_cd(
                 nxt.append(child)
         if not nxt:
             return []
-        frontier = nxt[: max(1, cap)]
+        frontier = nxt if cap <= 0 else nxt[: max(1, cap)]
     out: List[ZbOccupation] = []
     seen_e: set = set()
     for st in frontier:
         new = occupation_from_state(
             st,
             spec,
+            model=model,
             k=occ.k,
             p=occ.p + int(p_m),
             parent_id=occ.parent_id,
             shed=occ.shed,
             p_m=int(p_m),
             notes="pm",
+            parent_occupation_ids=(occ.occupation_id,),
         )
         if new is None:
             continue
-        key = tuple(sorted(new.core_edges))
+        key = new.occupation_id
         if key in seen_e:
             continue
         seen_e.add(key)
@@ -676,27 +1050,158 @@ def grow_zb_children(
     model: _LatticeModel,
     cap: int,
     stats: Optional[ZbGrowStats] = None,
+    relaxed_parent_coordinates: Optional[np.ndarray] = None,
+    parent_wbo: Optional[Dict[Tuple[int, int], float]] = None,
 ) -> List[ZbOccupation]:
     """Shed s extra Cd, attach one CdSe, add p_m precursor Cd."""
 
-    after = shed_occupation(occ, s, spec, model)
-    if after is None:
+    after_all = shed_occupations(occ, s, spec, model)
+    if not after_all:
         return []
-    attached = attach_cdse(after, spec, model, cap=max(cap, 1))
     if stats is not None:
-        stats.attach_attempts += 1
-    out: List[ZbOccupation] = []
-    for core in attached:
-        core.shed = s
-        packed = _add_precursor_cd(core, p_m, spec, model, cap=cap)
-        for child in packed:
-            child.shed = s
-            child.p_m = p_m
-            child.parent_id = occ.parent_id
-            out.append(child)
-            if cap > 0 and len(out) >= cap:
-                return out
-    return out
+        stats.attach_attempts += len(after_all)
+    unique: Dict[str, ZbOccupation] = {}
+    for after in after_all:
+        attached = attach_cdse(after, spec, model, cap=0)
+        for core in attached:
+            core.shed = s
+            packed = _add_precursor_cd(core, p_m, spec, model, cap=0)
+            for child in packed:
+                child.shed = s
+                child.p_m = p_m
+                child.parent_id = occ.parent_id
+                child.parent_occupation_ids = (occ.occupation_id,)
+                child.parent_structure_ids = (occ.parent_id,) if occ.parent_id else ()
+                unique.setdefault(child.occupation_id, child)
+    ordered = sorted(
+        unique.values(),
+        key=lambda child: _growth_site_priority(
+            child,
+            occ,
+            relaxed_parent_coordinates=relaxed_parent_coordinates,
+            parent_wbo=parent_wbo,
+        ),
+    )
+    return ordered if cap <= 0 else ordered[: int(cap)]
+
+
+def _occupation_radius_of_gyration(occupation: ZbOccupation) -> float:
+    points = np.asarray(occupation.coordinates, dtype=float)
+    if not len(points):
+        return 0.0
+    centered = points - points.mean(axis=0)
+    return float(np.sqrt(np.mean(np.sum(centered * centered, axis=1))))
+
+
+def _growth_site_priority(
+    child: ZbOccupation,
+    parent: ZbOccupation,
+    *,
+    relaxed_parent_coordinates: Optional[np.ndarray],
+    parent_wbo: Optional[Dict[Tuple[int, int], float]],
+) -> Tuple[Any, ...]:
+    """Soft ordering for a post-dedup child cap; never a legality filter."""
+
+    parent_sites = set(parent.site_ids)
+    added = {
+        index
+        for index, site_id in enumerate(child.site_ids)
+        if site_id not in parent_sites
+    }
+    parent_index = {site_id: i for i, site_id in enumerate(parent.site_ids)}
+    child_sites = set(child.site_ids)
+    removed_parent_indices = {
+        index
+        for index, site_id in enumerate(parent.site_ids)
+        if site_id not in child_sites
+    }
+    host_parent_indices: set[int] = set()
+    for left, right in child.core_edges:
+        if left in added and child.site_ids[right] in parent_index:
+            host_parent_indices.add(parent_index[child.site_ids[right]])
+        if right in added and child.site_ids[left] in parent_index:
+            host_parent_indices.add(parent_index[child.site_ids[left]])
+
+    parent_degrees = [0] * len(parent.symbols)
+    for left, right in parent.core_edges:
+        parent_degrees[left] += 1
+        parent_degrees[right] += 1
+    host_deficit = sum(max(0, 4 - parent_degrees[index]) for index in host_parent_indices)
+
+    displacement = 0.0
+    if relaxed_parent_coordinates is not None:
+        relaxed = np.asarray(relaxed_parent_coordinates, dtype=float)
+        reference = np.asarray(parent.coordinates, dtype=float)
+        if relaxed.shape == reference.shape and len(reference) >= 2:
+            rc = relaxed - relaxed.mean(axis=0)
+            lc = reference - reference.mean(axis=0)
+            u, _singular, vt = np.linalg.svd(rc.T @ lc)
+            rotation = u @ vt
+            if np.linalg.det(rotation) < 0.0:
+                u[:, -1] *= -1.0
+                rotation = u @ vt
+            aligned = rc @ rotation + reference.mean(axis=0)
+            displacement = sum(
+                float(np.linalg.norm(aligned[index] - reference[index]))
+                for index in host_parent_indices
+            )
+    # If the backend produced Wiberg orders, removal of a weakly bound excess
+    # Cd is preferred.  This remains an ordering term after exhaustive child
+    # generation; it can never make a legal occupation disappear by itself.
+    removal_wbo = 0.0
+    if parent_wbo and removed_parent_indices:
+        removal_wbo = sum(
+            abs(float(order))
+            for (left, right), order in parent_wbo.items()
+            if left in removed_parent_indices or right in removed_parent_indices
+        )
+    # Prefer undercoordinated/strained frontier sites, then compact children.
+    return (
+        round(removal_wbo, 6),
+        -host_deficit,
+        -round(displacement, 6),
+        _occupation_radius_of_gyration(child),
+        -len(child.core_edges),
+        child.occupation_id,
+    )
+
+
+def occupation_diversity_signature(
+    occupation: ZbOccupation,
+) -> Tuple[Any, ...]:
+    """Coarse shape/coordination class used only for diversity retention."""
+
+    graph_degrees = [0] * len(occupation.symbols)
+    for left, right in occupation.core_edges:
+        graph_degrees[left] += 1
+        graph_degrees[right] += 1
+    by_species = tuple(
+        (
+            symbol,
+            tuple(
+                sorted(
+                    graph_degrees[index]
+                    for index, candidate in enumerate(occupation.symbols)
+                    if candidate == symbol
+                )
+            ),
+        )
+        for symbol in sorted(set(occupation.symbols))
+    )
+    points = np.asarray(occupation.coordinates, dtype=float)
+    diameter = max(
+        (
+            float(np.linalg.norm(points[left] - points[right]))
+            for left in range(len(points))
+            for right in range(left + 1, len(points))
+        ),
+        default=0.0,
+    )
+    return (
+        by_species,
+        round(_occupation_radius_of_gyration(occupation) / 0.25),
+        round(diameter / 0.25),
+    )
 
 
 def _cdcl_bond(pack: Any) -> float:
