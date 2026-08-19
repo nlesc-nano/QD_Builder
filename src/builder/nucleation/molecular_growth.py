@@ -18,12 +18,13 @@ Chemical-potential / grand-potential numbers are report-only
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
 from typing import (
@@ -170,6 +171,54 @@ class LatticeSwitch:
 
 
 @dataclass(frozen=True)
+class MinimumConsolidation:
+    """Composite definition of one relaxed structural basin.
+
+    Cartesian RMSD is evaluated only after graph-constrained permutation and
+    optimal proper rotation.  Internal distances, final topology, energy, and
+    optional WBO similarity are independent guards against false merging.
+    """
+
+    enabled: bool = False
+    energy_tolerance_eV: float = 0.01
+    pair_distance_rms_A: float = 0.05
+    core_rmsd_A: float = 0.10
+    full_rmsd_A: float = 0.15
+    max_displacement_A: float = 0.25
+    wbo_rms_tolerance: float = 0.15
+    require_wbo_when_available: bool = False
+    allow_reflection: bool = False
+    max_graph_mappings: int = 256
+    max_minima_per_occupation: int = 2
+    max_occupations_per_minimum: int = 0
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "MinimumConsolidation":
+        if not isinstance(raw, dict) or not raw:
+            return cls()
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            energy_tolerance_eV=float(raw.get("energy_tolerance_eV", 0.01)),
+            pair_distance_rms_A=float(raw.get("pair_distance_rms_A", 0.05)),
+            core_rmsd_A=float(raw.get("core_rmsd_A", 0.10)),
+            full_rmsd_A=float(raw.get("full_rmsd_A", 0.15)),
+            max_displacement_A=float(raw.get("max_displacement_A", 0.25)),
+            wbo_rms_tolerance=float(raw.get("wbo_rms_tolerance", 0.15)),
+            require_wbo_when_available=bool(
+                raw.get("require_wbo_when_available", False)
+            ),
+            allow_reflection=bool(raw.get("allow_reflection", False)),
+            max_graph_mappings=max(1, int(raw.get("max_graph_mappings", 256))),
+            max_minima_per_occupation=max(
+                1, int(raw.get("max_minima_per_occupation", 2))
+            ),
+            max_occupations_per_minimum=max(
+                0, int(raw.get("max_occupations_per_minimum", 0))
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class GrowthWindow:
     """Resolved envelope for one parent k (top-level YAML + matching ``by_k``)."""
 
@@ -293,6 +342,9 @@ class GrowthConfig:
     endpoint_diagnostic_k: int = 0
     endpoint_reference: Optional[Path] = None
     endpoint_match_tolerance_A: float = 0.35
+    minimum_consolidation: MinimumConsolidation = field(
+        default_factory=MinimumConsolidation
+    )
 
     @property
     def use_coord_carry(self) -> bool:
@@ -432,6 +484,9 @@ class GrowthConfig:
         endpoint = raw.get("endpoint_diagnostic") or {}
         if not isinstance(endpoint, dict):
             endpoint = {}
+        consolidation = MinimumConsolidation.from_raw(
+            raw.get("minimum_consolidation")
+        )
         endpoint_reference = None
         if endpoint.get("enabled", False) and endpoint.get("reference"):
             endpoint_reference = Path(str(endpoint["reference"]))
@@ -525,6 +580,7 @@ class GrowthConfig:
             endpoint_match_tolerance_A=float(
                 endpoint.get("site_match_tolerance_A", 0.35)
             ),
+            minimum_consolidation=consolidation,
         )
 
 
@@ -551,6 +607,14 @@ class ParentStructure:
     # Move-Z dual representation.  The relaxed XYZ supplies energy/feedback;
     # this stored occupation is the sole source of lattice lineage.
     zb_occupation: Optional[Any] = None
+    # Relaxed-basin consolidation metadata.  A selected basin may yield more
+    # than one ParentStructure when distinct ZB occupations reached the same
+    # minimum; each route keeps its own atom correspondence and WBO matrix.
+    minimum_id: str = ""
+    minimum_representative_id: str = ""
+    minimum_member_ids: Tuple[str, ...] = ()
+    minimum_occupation_ids: Tuple[str, ...] = ()
+    minimum_multiplicity: int = 1
 
     @property
     def n_atoms(self) -> int:
@@ -594,13 +658,15 @@ class CoordSeed:
 
 @dataclass
 class RankedIsomer:
-    """Lightweight energy row for merged A+B bin rankings."""
+    """Lightweight energy row for raw or consolidated bin rankings."""
 
     structure_id: str
     xtb_energy_eV: float
     seed_skeleton: str = "------"
     growth_move: str = "?"  # A | B
     parent_id: str = ""
+    minimum_id: str = ""
+    minimum_multiplicity: int = 1
 
 
 @dataclass
@@ -1136,12 +1202,560 @@ def _core_fingerprint(
     return (tuple(labels), edge_sig, parent.k, parent.p)
 
 
+@dataclass(frozen=True)
+class MinimumSimilarity:
+    """Invariant comparison metrics for two relaxed endpoints."""
+
+    pair_distance_rms_A: float
+    core_rmsd_A: float
+    full_rmsd_A: float
+    max_displacement_A: float
+    energy_delta_eV: float
+    wbo_rms: Optional[float]
+    graph_mapping: Tuple[Tuple[int, int], ...]
+
+
+@dataclass
+class RelaxedMinimumCluster:
+    """One relaxed basin and every raw endpoint/lineage route reaching it."""
+
+    minimum_id: str
+    representative: ParentStructure
+    members: List[ParentStructure]
+    member_metrics: Dict[str, MinimumSimilarity]
+
+    @property
+    def occupation_ids(self) -> Tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    str(member.zb_occupation.occupation_id)
+                    for member in self.members
+                    if getattr(member, "zb_occupation", None) is not None
+                    and str(member.zb_occupation.occupation_id)
+                }
+            )
+        )
+
+    def route_representatives(
+        self,
+        *,
+        max_occupations: int = 0,
+    ) -> List[ParentStructure]:
+        """Lowest-energy endpoint for every distinct ZB occupation route."""
+
+        by_occupation: Dict[str, ParentStructure] = {}
+        ordered_members = sorted(
+            self.members, key=lambda item: (item.energy_eV, item.structure_id)
+        )
+        has_lattice_routes = any(
+            getattr(member, "zb_occupation", None) is not None
+            for member in ordered_members
+        )
+        for member in ordered_members:
+            occupation = getattr(member, "zb_occupation", None)
+            occupation_id = str(getattr(occupation, "occupation_id", "") or "")
+            # Before Move Z is initialized (normally k=1), every relaxed
+            # endpoint maps to the same composition-defined lattice seed.
+            # Keep one basin representative rather than recreating duplicate
+            # identical routes.  Once manifests exist, every distinct stored
+            # occupation is preserved.
+            key = occupation_id or (
+                f"endpoint:{member.structure_id}"
+                if has_lattice_routes
+                else "uninitialized_zb_route"
+            )
+            by_occupation.setdefault(key, member)
+        routes = list(by_occupation.values())
+        if max_occupations > 0:
+            routes = routes[: int(max_occupations)]
+        member_ids = tuple(sorted(member.structure_id for member in self.members))
+        occupation_ids = self.occupation_ids
+        return [
+            replace(
+                member,
+                minimum_id=self.minimum_id,
+                minimum_representative_id=self.representative.structure_id,
+                minimum_member_ids=member_ids,
+                minimum_occupation_ids=occupation_ids,
+                minimum_multiplicity=len(self.members),
+            )
+            for member in routes
+        ]
+
+
+def _parent_coloured_graph(parent: ParentStructure) -> nx.Graph:
+    graph = nx.Graph()
+    graph.add_nodes_from(
+        (index, {"element": str(symbol)})
+        for index, symbol in enumerate(parent.symbols)
+    )
+    graph.add_edges_from(
+        (int(left), int(right)) for left, right in parent.edges
+    )
+    return graph
+
+
+def _node_environment_signature(
+    graph: nx.Graph,
+    symbols: Sequence[str],
+    node: int,
+) -> Tuple[Any, ...]:
+    distances = nx.single_source_shortest_path_length(graph, int(node))
+    shells = tuple(
+        sorted(
+            (
+                int(distance),
+                str(symbols[index]),
+                int(graph.degree[index]),
+            )
+            for index, distance in distances.items()
+        )
+    )
+    neighbours = tuple(
+        sorted(str(symbols[index]) for index in graph.neighbors(int(node)))
+    )
+    return (
+        str(symbols[node]),
+        int(graph.degree[node]),
+        neighbours,
+        shells,
+    )
+
+
+def _internal_atom_features(parent: ParentStructure) -> np.ndarray:
+    """Rotation/translation-invariant distance environment of every atom."""
+
+    coordinates = np.asarray(parent.coordinates, dtype=float)
+    elements = sorted(set(parent.symbols))
+    rows: List[List[float]] = []
+    for index in range(len(parent.symbols)):
+        feature: List[float] = []
+        for element in elements:
+            feature.extend(
+                sorted(
+                    float(np.linalg.norm(coordinates[index] - coordinates[other]))
+                    for other, symbol in enumerate(parent.symbols)
+                    if symbol == element
+                )
+            )
+        rows.append(feature)
+    return np.asarray(rows, dtype=float)
+
+
+def _mapping_preserves_graph(
+    left: nx.Graph,
+    right: nx.Graph,
+    mapping: Mapping[int, int],
+) -> bool:
+    if len(mapping) != left.number_of_nodes():
+        return False
+    mapped_edges = {
+        tuple(sorted((int(mapping[a]), int(mapping[b]))))
+        for a, b in left.edges
+    }
+    right_edges = {tuple(sorted((int(a), int(b)))) for a, b in right.edges}
+    return mapped_edges == right_edges
+
+
+def _candidate_graph_mappings(
+    left: ParentStructure,
+    right: ParentStructure,
+    *,
+    max_mappings: int,
+) -> List[Dict[int, int]]:
+    """Graph-constrained permutations, with an internal-distance fast path."""
+
+    from scipy.optimize import linear_sum_assignment
+
+    left_graph = _parent_coloured_graph(left)
+    right_graph = _parent_coloured_graph(right)
+    node_match = lambda a, b: a.get("element") == b.get("element")
+    matcher = nx.algorithms.isomorphism.GraphMatcher(
+        left_graph, right_graph, node_match=node_match
+    )
+    if not matcher.is_isomorphic():
+        return []
+
+    left_features = _internal_atom_features(left)
+    right_features = _internal_atom_features(right)
+    left_groups: Dict[Tuple[Any, ...], List[int]] = defaultdict(list)
+    right_groups: Dict[Tuple[Any, ...], List[int]] = defaultdict(list)
+    for index in left_graph.nodes:
+        left_groups[
+            _node_environment_signature(left_graph, left.symbols, int(index))
+        ].append(int(index))
+    for index in right_graph.nodes:
+        right_groups[
+            _node_environment_signature(right_graph, right.symbols, int(index))
+        ].append(int(index))
+
+    proposed: Dict[int, int] = {}
+    if set(left_groups) == set(right_groups):
+        for signature in sorted(left_groups, key=repr):
+            left_ids = left_groups[signature]
+            right_ids = right_groups[signature]
+            if len(left_ids) != len(right_ids):
+                proposed = {}
+                break
+            cost = np.linalg.norm(
+                left_features[left_ids, None, :]
+                - right_features[None, right_ids, :],
+                axis=2,
+            )
+            rows, columns = linear_sum_assignment(cost)
+            proposed.update(
+                {
+                    left_ids[int(row)]: right_ids[int(column)]
+                    for row, column in zip(rows, columns)
+                }
+            )
+    mappings: List[Dict[int, int]] = []
+    if proposed and _mapping_preserves_graph(left_graph, right_graph, proposed):
+        mappings.append(proposed)
+
+    # Symmetric graphs can defeat an independent Hungarian assignment.  VF2
+    # supplies exact graph permutations; the cap bounds highly symmetric Cl
+    # shells, while the internal-distance fast path handles the common case.
+    for mapping in matcher.isomorphisms_iter():
+        candidate = {int(a): int(b) for a, b in mapping.items()}
+        if proposed and candidate == proposed:
+            continue
+        mappings.append(candidate)
+        if len(mappings) >= max(1, int(max_mappings)):
+            break
+    return mappings
+
+
+def _proper_aligned_displacements(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    allow_reflection: bool,
+) -> np.ndarray:
+    left = np.asarray(reference, dtype=float)
+    right = np.asarray(candidate, dtype=float)
+    left_centered = left - left.mean(axis=0)
+    right_centered = right - right.mean(axis=0)
+    u, _singular, vt = np.linalg.svd(right_centered.T @ left_centered)
+    rotation = u @ vt
+    if not allow_reflection and np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    aligned = right_centered @ rotation
+    return np.linalg.norm(aligned - left_centered, axis=1)
+
+
+def _wbo_mapping_rms(
+    left: ParentStructure,
+    right: ParentStructure,
+    mapping: Mapping[int, int],
+) -> Optional[float]:
+    if not left.wbo or not right.wbo:
+        return None
+    pairs = {
+        tuple(sorted((int(a), int(b)))) for a, b in left.edges
+    }
+    if not pairs:
+        return 0.0
+    delta = []
+    for a, b in sorted(pairs):
+        mapped = tuple(sorted((int(mapping[a]), int(mapping[b]))))
+        delta.append(
+            float(left.wbo.get((a, b), 0.0))
+            - float(right.wbo.get(mapped, 0.0))
+        )
+    return float(np.sqrt(np.mean(np.square(delta))))
+
+
+def relaxed_minimum_similarity(
+    left: ParentStructure,
+    right: ParentStructure,
+    config: MinimumConsolidation,
+    spec: NucleationSpec,
+) -> Optional[MinimumSimilarity]:
+    """Composite invariant same-basin test; return best metrics or ``None``."""
+
+    if (left.k, left.p, tuple(sorted(left.symbols))) != (
+        right.k,
+        right.p,
+        tuple(sorted(right.symbols)),
+    ):
+        return None
+    energy_delta = abs(float(left.energy_eV) - float(right.energy_eV))
+    if energy_delta > float(config.energy_tolerance_eV):
+        return None
+
+    mappings = _candidate_graph_mappings(
+        left, right, max_mappings=config.max_graph_mappings
+    )
+    if not mappings:
+        return None
+    left_coordinates = np.asarray(left.coordinates, dtype=float)
+    right_coordinates = np.asarray(right.coordinates, dtype=float)
+    left_distances = np.linalg.norm(
+        left_coordinates[:, None, :] - left_coordinates[None, :, :], axis=2
+    )
+    core_ids = [
+        index
+        for index, symbol in enumerate(left.symbols)
+        if symbol in {spec.core.cation, spec.core.anion}
+    ]
+    best: Optional[MinimumSimilarity] = None
+    for mapping in mappings:
+        order = [int(mapping[index]) for index in range(len(left.symbols))]
+        ordered = right_coordinates[order]
+        ordered_distances = np.linalg.norm(
+            ordered[:, None, :] - ordered[None, :, :], axis=2
+        )
+        triangle = np.triu_indices(len(left.symbols), k=1)
+        pair_rms = float(
+            np.sqrt(
+                np.mean(
+                    np.square(
+                        left_distances[triangle] - ordered_distances[triangle]
+                    )
+                )
+            )
+        )
+        if pair_rms > float(config.pair_distance_rms_A):
+            continue
+        full_displacements = _proper_aligned_displacements(
+            left_coordinates,
+            ordered,
+            allow_reflection=config.allow_reflection,
+        )
+        core_displacements = _proper_aligned_displacements(
+            left_coordinates[core_ids],
+            ordered[core_ids],
+            allow_reflection=config.allow_reflection,
+        )
+        full_rms = float(np.sqrt(np.mean(np.square(full_displacements))))
+        core_rms = float(np.sqrt(np.mean(np.square(core_displacements))))
+        max_displacement = float(max(full_displacements, default=0.0))
+        if full_rms > float(config.full_rmsd_A):
+            continue
+        if core_rms > float(config.core_rmsd_A):
+            continue
+        if max_displacement > float(config.max_displacement_A):
+            continue
+        wbo_rms = _wbo_mapping_rms(left, right, mapping)
+        if (
+            config.require_wbo_when_available
+            and wbo_rms is not None
+            and wbo_rms > float(config.wbo_rms_tolerance)
+        ):
+            continue
+        metrics = MinimumSimilarity(
+            pair_distance_rms_A=pair_rms,
+            core_rmsd_A=core_rms,
+            full_rmsd_A=full_rms,
+            max_displacement_A=max_displacement,
+            energy_delta_eV=energy_delta,
+            wbo_rms=wbo_rms,
+            graph_mapping=tuple(sorted(mapping.items())),
+        )
+        if best is None or (
+            metrics.full_rmsd_A,
+            metrics.pair_distance_rms_A,
+            metrics.max_displacement_A,
+        ) < (
+            best.full_rmsd_A,
+            best.pair_distance_rms_A,
+            best.max_displacement_A,
+        ):
+            best = metrics
+    return best
+
+
+def _minimum_geometry_id(parent: ParentStructure) -> str:
+    graph = _parent_coloured_graph(parent)
+    graph_hash = nx.weisfeiler_lehman_graph_hash(
+        graph, node_attr="element", iterations=6
+    )
+    coordinates = np.asarray(parent.coordinates, dtype=float)
+    distances: List[Tuple[str, str, int]] = []
+    for left in range(len(parent.symbols)):
+        for right in range(left + 1, len(parent.symbols)):
+            a, b = sorted((parent.symbols[left], parent.symbols[right]))
+            distance = float(np.linalg.norm(coordinates[left] - coordinates[right]))
+            distances.append((a, b, int(round(distance / 0.01))))
+    payload = repr((graph_hash, tuple(sorted(distances)))).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    return f"min_k{parent.k:03d}_p{parent.p:03d}_{digest}"
+
+
+def consolidate_relaxed_minima(
+    parents: Sequence[ParentStructure],
+    config: MinimumConsolidation,
+    spec: NucleationSpec,
+) -> List[RelaxedMinimumCluster]:
+    """Complete-linkage relaxed-basin clustering, lowest energy first."""
+
+    ordered = sorted(
+        parents, key=lambda item: (float(item.energy_eV), item.structure_id)
+    )
+    clusters: List[RelaxedMinimumCluster] = []
+    for candidate in ordered:
+        best_cluster = None
+        best_metrics: Optional[MinimumSimilarity] = None
+        for cluster in clusters:
+            comparisons: List[MinimumSimilarity] = []
+            for member in cluster.members:
+                metrics = relaxed_minimum_similarity(
+                    member, candidate, config, spec
+                )
+                if metrics is None:
+                    comparisons = []
+                    break
+                comparisons.append(metrics)
+            if not comparisons:
+                continue
+            representative_metrics = relaxed_minimum_similarity(
+                cluster.representative, candidate, config, spec
+            )
+            if representative_metrics is None:
+                continue
+            if (
+                best_metrics is None
+                or representative_metrics.full_rmsd_A
+                < best_metrics.full_rmsd_A
+            ):
+                best_cluster = cluster
+                best_metrics = representative_metrics
+        if best_cluster is None or best_metrics is None:
+            minimum_id = _minimum_geometry_id(candidate)
+            zero_mapping = tuple((index, index) for index in range(len(candidate.symbols)))
+            zero = MinimumSimilarity(
+                pair_distance_rms_A=0.0,
+                core_rmsd_A=0.0,
+                full_rmsd_A=0.0,
+                max_displacement_A=0.0,
+                energy_delta_eV=0.0,
+                wbo_rms=0.0 if candidate.wbo else None,
+                graph_mapping=zero_mapping,
+            )
+            clusters.append(
+                RelaxedMinimumCluster(
+                    minimum_id=minimum_id,
+                    representative=candidate,
+                    members=[candidate],
+                    member_metrics={candidate.structure_id: zero},
+                )
+            )
+            continue
+        best_cluster.members.append(candidate)
+        best_cluster.member_metrics[candidate.structure_id] = best_metrics
+    return clusters
+
+
+def _minimum_cluster_record(
+    cluster: RelaxedMinimumCluster,
+) -> Dict[str, Any]:
+    representative = cluster.representative
+    members = []
+    for member in sorted(
+        cluster.members, key=lambda item: (item.energy_eV, item.structure_id)
+    ):
+        metrics = cluster.member_metrics[member.structure_id]
+        occupation = getattr(member, "zb_occupation", None)
+        members.append(
+            {
+                "structure_id": member.structure_id,
+                "energy_eV": float(member.energy_eV),
+                "occupation_id": str(
+                    getattr(occupation, "occupation_id", "") or ""
+                ),
+                "pair_distance_rms_A": metrics.pair_distance_rms_A,
+                "core_rmsd_A": metrics.core_rmsd_A,
+                "full_rmsd_A": metrics.full_rmsd_A,
+                "max_displacement_A": metrics.max_displacement_A,
+                "energy_delta_eV": metrics.energy_delta_eV,
+                "wbo_rms": metrics.wbo_rms,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "minimum_id": cluster.minimum_id,
+        "k": int(representative.k),
+        "p": int(representative.p),
+        "representative_structure_id": representative.structure_id,
+        "representative_energy_eV": float(representative.energy_eV),
+        "multiplicity": len(cluster.members),
+        "occupation_ids": list(cluster.occupation_ids),
+        "members": members,
+    }
+
+
+def write_minimum_clusters(
+    output_dir: Path,
+    k: int,
+    p: int,
+    clusters: Sequence[RelaxedMinimumCluster],
+    *,
+    config: Optional[MinimumConsolidation] = None,
+) -> Path:
+    """Write one restart-inspectable basin inventory without deleting XYZ."""
+
+    directory = Path(output_dir) / f"k{int(k):03d}" / f"p{int(p):03d}"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "minimum_clusters.json"
+    payload = {
+        "schema_version": 1,
+        "algorithm": "coloured_graph+internal_distances+permuted_kabsch",
+        "k": int(k),
+        "p": int(p),
+        "raw_endpoint_count": sum(len(cluster.members) for cluster in clusters),
+        "minimum_count": len(clusters),
+        "clusters": [_minimum_cluster_record(cluster) for cluster in clusters],
+    }
+    if config is not None:
+        payload["criteria"] = {
+            "energy_tolerance_eV": config.energy_tolerance_eV,
+            "pair_distance_rms_A": config.pair_distance_rms_A,
+            "core_rmsd_A": config.core_rmsd_A,
+            "full_rmsd_A": config.full_rmsd_A,
+            "max_displacement_A": config.max_displacement_A,
+            "wbo_rms_tolerance": config.wbo_rms_tolerance,
+            "require_wbo_when_available": config.require_wbo_when_available,
+            "allow_reflection": config.allow_reflection,
+            "max_graph_mappings": config.max_graph_mappings,
+        }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _relaxed_minimum_diversity_signature(
+    cluster: RelaxedMinimumCluster,
+) -> Tuple[Any, ...]:
+    representative = cluster.representative
+    graph = _parent_coloured_graph(representative)
+    degree_signature = tuple(
+        (
+            element,
+            tuple(
+                sorted(
+                    int(graph.degree[index])
+                    for index, symbol in enumerate(representative.symbols)
+                    if symbol == element
+                )
+            ),
+        )
+        for element in sorted(set(representative.symbols))
+    )
+    coordinates = np.asarray(representative.coordinates, dtype=float)
+    centered = coordinates - coordinates.mean(axis=0)
+    moments = np.linalg.eigvalsh(centered.T @ centered / max(len(centered), 1))
+    shape = tuple(int(round(float(value) / 0.10)) for value in moments)
+    return degree_signature, shape
+
+
 def select_parents(
     parents: Sequence[ParentStructure],
     growth: GrowthConfig,
     spec: NucleationSpec,
 ) -> List[ParentStructure]:
-    """Energy window + skeleton diversity + decorations per skeleton."""
+    """Energy-window and diversity selection over relaxed minima or cores."""
 
     if not parents:
         return []
@@ -1155,6 +1769,107 @@ def select_parents(
         win = growth.window_for(k)
         if int(p) < int(win.min_p_parent):
             continue
+        consolidation = growth.minimum_consolidation
+
+        if consolidation.enabled:
+            clusters = consolidate_relaxed_minima(group, consolidation, spec)
+
+            def _cluster_score(cluster: RelaxedMinimumCluster) -> float:
+                representative = cluster.representative
+                if not win.soft_rules.enabled:
+                    return float(representative.energy_eV)
+                desc = describe_structure(
+                    representative.symbols, representative.coordinates, spec
+                )
+                return win.soft_rules.rank_score_eV(
+                    representative.energy_eV, desc, k
+                )
+
+            minimum_energy = min(
+                float(cluster.representative.energy_eV) for cluster in clusters
+            )
+            clusters = [
+                cluster
+                for cluster in clusters
+                if float(cluster.representative.energy_eV)
+                <= minimum_energy + win.energy_window_eV
+            ]
+            clusters.sort(
+                key=lambda cluster: (
+                    _cluster_score(cluster),
+                    cluster.minimum_id,
+                )
+            )
+            n_keep = max(
+                1,
+                min(
+                    win.max_skeletons_cap,
+                    int(
+                        math.ceil(
+                            win.max_skeletons_frac * max(1, len(clusters))
+                        )
+                    ),
+                ),
+            )
+            n_keep = min(n_keep, len(clusters))
+
+            retained: List[RelaxedMinimumCluster] = []
+            retained_ids: set[str] = set()
+            seen_shapes: set[Tuple[Any, ...]] = set()
+            occupation_counts: Counter[str] = Counter()
+
+            def _occupation_quota_allows(
+                cluster: RelaxedMinimumCluster,
+            ) -> bool:
+                occupation_ids = cluster.occupation_ids
+                if not occupation_ids:
+                    return True
+                limit = int(consolidation.max_minima_per_occupation)
+                return any(occupation_counts[value] < limit for value in occupation_ids)
+
+            def _retain(cluster: RelaxedMinimumCluster) -> None:
+                retained.append(cluster)
+                retained_ids.add(cluster.minimum_id)
+                seen_shapes.add(_relaxed_minimum_diversity_signature(cluster))
+                occupation_counts.update(cluster.occupation_ids)
+
+            if clusters:
+                _retain(clusters[0])
+            # First spend the basin budget on distinct relaxed shapes.
+            for cluster in clusters[1:]:
+                if len(retained) >= n_keep:
+                    break
+                signature = _relaxed_minimum_diversity_signature(cluster)
+                if signature in seen_shapes or not _occupation_quota_allows(cluster):
+                    continue
+                _retain(cluster)
+            # Then fill by energy while respecting per-occupation basin caps.
+            for cluster in clusters:
+                if len(retained) >= n_keep:
+                    break
+                if cluster.minimum_id in retained_ids:
+                    continue
+                if not _occupation_quota_allows(cluster):
+                    continue
+                _retain(cluster)
+            # Do not leave capacity empty merely because every route reached
+            # its soft quota; the global energy/diversity cap remains primary.
+            for cluster in clusters:
+                if len(retained) >= n_keep:
+                    break
+                if cluster.minimum_id not in retained_ids:
+                    _retain(cluster)
+
+            for cluster in retained:
+                selected.extend(
+                    cluster.route_representatives(
+                        max_occupations=(
+                            consolidation.max_occupations_per_minimum
+                        )
+                    )
+                )
+            continue
+
         emin = min(x.energy_eV for x in group)
         windowed = [
             x
@@ -2379,6 +3094,11 @@ def grow_cores_from_parents(
                 "has_wbo": parent.wbo is not None,
                 "wbo_source": parent.wbo_source,
                 "source": parent.source_path,
+                "minimum_id": parent.minimum_id,
+                "minimum_representative_id": parent.minimum_representative_id,
+                "minimum_member_ids": list(parent.minimum_member_ids),
+                "minimum_occupation_ids": list(parent.minimum_occupation_ids),
+                "minimum_multiplicity": int(parent.minimum_multiplicity),
             }
         )
 
@@ -3474,9 +4194,16 @@ def run_growth_step(
                 log.line(hint)
         raise FileNotFoundError(msg + (("\n" + hint) if hint else ""))
     if log:
+        selected_minima = len(
+            {
+                parent.minimum_id or f"endpoint:{parent.structure_id}"
+                for parent in parents
+            }
+        )
         log.line(
             f"loaded {len(parents_all)} converged parents → "
-            f"selected {len(parents)} "
+            f"selected {selected_minima} relaxed minima / "
+            f"{len(parents)} ZB routes "
             f"(window={window.energy_window_eV} eV, "
             f"cap={window.max_skeletons_cap} skel, "
             f"≤{window.decorations_per_skeleton} dec/core, "
@@ -3569,7 +4296,7 @@ def run_growth_step(
         log.block(prior)
 
     child_minima: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    # Merged A+B energy rows per (k,p); ranked once after all bins finish
+    # Raw A/B/Z energy rows per (k,p); optionally consolidated before ranking.
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
     do_redecorate = bool(decorate and window.child_redecorate)
     if window.move_zb_sites and decorate:
@@ -3869,13 +4596,82 @@ def run_growth_step(
                     encoding="utf-8",
                 )
 
-        # ---- Final merged rankings for every child (k,p) ----
+        # ---- Consolidate relaxed basins before ranking / next-k selection ----
+        consolidation_counts: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        if (
+            growth.minimum_consolidation.enabled
+            and out is not None
+            and bin_ranks
+        ):
+            loaded_by_k: Dict[int, List[ParentStructure]] = {}
+            for k, p in sorted(bin_ranks):
+                if k not in loaded_by_k:
+                    loaded_by_k[k] = load_parents_from_run(
+                        out, k=k, spec=map_spec
+                    )
+                endpoints = [
+                    parent for parent in loaded_by_k[k] if parent.p == p
+                ]
+                if not endpoints:
+                    continue
+                clusters = consolidate_relaxed_minima(
+                    endpoints,
+                    growth.minimum_consolidation,
+                    map_spec,
+                )
+                write_minimum_clusters(
+                    out,
+                    k,
+                    p,
+                    clusters,
+                    config=growth.minimum_consolidation,
+                )
+                raw_moves = {
+                    row.structure_id: row.growth_move
+                    for row in bin_ranks[(k, p)]
+                }
+                consolidated_rows: List[RankedIsomer] = []
+                for cluster in clusters:
+                    representative = cluster.representative
+                    occupation = getattr(
+                        representative, "zb_occupation", None
+                    )
+                    occupation_id = str(
+                        getattr(occupation, "occupation_id", "") or ""
+                    )
+                    consolidated_rows.append(
+                        RankedIsomer(
+                            structure_id=representative.structure_id,
+                            xtb_energy_eV=float(representative.energy_eV),
+                            seed_skeleton=(
+                                occupation_id[-6:]
+                                if occupation_id
+                                else cluster.minimum_id[-6:]
+                            ),
+                            growth_move=raw_moves.get(
+                                representative.structure_id, "Z"
+                            ),
+                            parent_id="",
+                            minimum_id=cluster.minimum_id,
+                            minimum_multiplicity=len(cluster.members),
+                        )
+                    )
+                consolidation_counts[(k, p)] = (
+                    len(endpoints),
+                    len(consolidated_rows),
+                )
+                bin_ranks[(k, p)] = consolidated_rows
+
+        # ---- Final rankings for every child (k,p) ----
         if log and bin_ranks:
             log.stage(
                 4,
                 n_stages,
-                "merged rankings A+B per (k,p)",
-                note="all sheddings/packages/moves for each composition",
+                "consolidated relaxed-minimum rankings per (k,p)",
+                note=(
+                    "same coloured graph + internal distances + invariant "
+                    "core/full RMSD; raw endpoints retained"
+                ),
             )
             for (k, p) in sorted(bin_ranks):
                 rows = bin_ranks[(k, p)]
@@ -3883,6 +4679,10 @@ def run_growth_step(
                     continue
                 n_a = sum(1 for r in rows if r.growth_move == "A")
                 n_b = sum(1 for r in rows if r.growth_move == "B")
+                n_z = sum(1 for r in rows if r.growth_move == "Z")
+                raw_count, minimum_count = consolidation_counts.get(
+                    (k, p), (len(rows), len(rows))
+                )
                 ranking = format_bin_ranking(
                     rows,
                     k=k,
@@ -3891,7 +4691,10 @@ def run_growth_step(
                     package_p_m=tuple(growth.monomer_p_values) or (1, 2, 3),
                     delta_mu=tuple(growth.delta_mu_cdcl2_eV)
                     or (-1.0, 0.0, 1.0),
-                    title_note=f"merged A={n_a} B={n_b}",
+                    title_note=(
+                        f"minima={minimum_count} from raw={raw_count}; "
+                        f"A={n_a} B={n_b} Z={n_z}"
+                    ),
                 )
                 log.block(ranking)
                 # refresh child_minima from merged pool

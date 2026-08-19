@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,9 +13,14 @@ import yaml
 
 from builder.nucleation.molecular_growth import (
     GrowthConfig,
+    MinimumConsolidation,
     ParentStructure,
     _opt_zb_occupations,
+    consolidate_relaxed_minima,
     grow_cores_from_parents,
+    relaxed_minimum_similarity,
+    select_parents,
+    write_minimum_clusters,
 )
 from builder.nucleation.geometry_pack import load_geometry_pack
 from builder.nucleation.molecular_zb_growth import (
@@ -181,6 +187,166 @@ def test_k13_wulff_endpoint_is_diagnostic_only(map_spec) -> None:
     assert diagnostic["ranking_or_filtering_effect"] == "none"
 
 
+def _similarity_parent(
+    structure_id: str,
+    *,
+    coordinates: np.ndarray,
+    symbols=("Se", "Cd", "Cd", "Cl", "Cl"),
+    edges=((0, 1), (0, 2), (1, 3), (2, 4)),
+    occupation_id: str = "occ-a",
+) -> ParentStructure:
+    return ParentStructure(
+        k=1,
+        p=1,
+        structure_id=structure_id,
+        symbols=tuple(symbols),
+        coordinates=np.asarray(coordinates, dtype=float),
+        energy_eV=-10.0,
+        edges=tuple(edges),
+        core_edges=((0, 1), (0, 2)),
+        zb_occupation=SimpleNamespace(occupation_id=occupation_id),
+    )
+
+
+def test_minimum_similarity_is_rigid_motion_and_permutation_invariant(
+    map_spec,
+) -> None:
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.8, 1.2, 1.0],
+            [-1.7, -1.3, 1.1],
+            [3.1, 1.0, 0.2],
+            [-3.0, -1.1, 0.1],
+        ]
+    )
+    left = _similarity_parent("left", coordinates=coordinates)
+    # new index -> old index; simultaneously exchange both equivalent arms
+    permutation = [0, 2, 1, 4, 3]
+    old_to_new = {old: new for new, old in enumerate(permutation)}
+    rotation = np.asarray(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    transformed = coordinates[permutation] @ rotation + np.array([8.0, -3.0, 5.0])
+    right = _similarity_parent(
+        "right",
+        coordinates=transformed,
+        symbols=tuple(left.symbols[index] for index in permutation),
+        edges=tuple(
+            sorted(
+                tuple(sorted((old_to_new[a], old_to_new[b])))
+                for a, b in left.edges
+            )
+        ),
+    )
+    config = MinimumConsolidation(enabled=True)
+    metrics = relaxed_minimum_similarity(left, right, config, map_spec)
+    assert metrics is not None
+    assert metrics.pair_distance_rms_A == pytest.approx(0.0, abs=1.0e-10)
+    assert metrics.core_rmsd_A == pytest.approx(0.0, abs=1.0e-10)
+    assert metrics.full_rmsd_A == pytest.approx(0.0, abs=1.0e-10)
+
+
+def test_internal_geometry_prevents_equal_energy_false_merge(map_spec) -> None:
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.8, 1.2, 1.0],
+            [-1.7, -1.3, 1.1],
+            [3.1, 1.0, 0.2],
+            [-3.0, -1.1, 0.1],
+        ]
+    )
+    left = _similarity_parent("left", coordinates=coordinates)
+    deformed = coordinates.copy()
+    deformed[4] += np.array([0.8, -0.5, 0.4])
+    right = _similarity_parent("right", coordinates=deformed)
+    assert (
+        relaxed_minimum_similarity(
+            left, right, MinimumConsolidation(enabled=True), map_spec
+        )
+        is None
+    )
+
+
+def test_minimum_similarity_does_not_treat_reflection_as_rotation(map_spec) -> None:
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+        ]
+    )
+    symbols = ("Cd", "Se", "Cl", "X", "Y")
+    edges = ((0, 1), (0, 2), (0, 3), (0, 4))
+    left = _similarity_parent(
+        "left", coordinates=coordinates, symbols=symbols, edges=edges
+    )
+    mirrored = coordinates.copy()
+    mirrored[:, 0] *= -1.0
+    right = _similarity_parent(
+        "right", coordinates=mirrored, symbols=symbols, edges=edges
+    )
+    proper_only = MinimumConsolidation(enabled=True)
+    assert relaxed_minimum_similarity(left, right, proper_only, map_spec) is None
+    reflection_allowed = replace(proper_only, allow_reflection=True)
+    metrics = relaxed_minimum_similarity(
+        left, right, reflection_allowed, map_spec
+    )
+    assert metrics is not None
+    assert metrics.full_rmsd_A == pytest.approx(0.0, abs=1.0e-10)
+
+
+def test_minimum_cluster_merges_endpoints_but_preserves_zb_routes(
+    map_spec, tmp_path: Path
+) -> None:
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.8, 1.2, 1.0],
+            [-1.7, -1.3, 1.1],
+            [3.1, 1.0, 0.2],
+            [-3.0, -1.1, 0.1],
+        ]
+    )
+    endpoints = [
+        _similarity_parent("a-start0", coordinates=coordinates, occupation_id="occ-a"),
+        _similarity_parent("a-start1", coordinates=coordinates, occupation_id="occ-a"),
+        _similarity_parent("b-start0", coordinates=coordinates, occupation_id="occ-b"),
+    ]
+    endpoints[1].energy_eV = -9.9999
+    endpoints[2].energy_eV = -9.9998
+    clusters = consolidate_relaxed_minima(
+        endpoints, MinimumConsolidation(enabled=True), map_spec
+    )
+    assert len(clusters) == 1
+    assert len(clusters[0].members) == 3
+    routes = clusters[0].route_representatives()
+    assert [route.structure_id for route in routes] == ["a-start0", "b-start0"]
+    assert all(route.minimum_multiplicity == 3 for route in routes)
+    assert all(route.minimum_occupation_ids == ("occ-a", "occ-b") for route in routes)
+
+    inventory = write_minimum_clusters(
+        tmp_path,
+        1,
+        1,
+        clusters,
+        config=MinimumConsolidation(enabled=True),
+    )
+    persisted = json.loads(inventory.read_text())
+    assert persisted["raw_endpoint_count"] == 3
+    assert persisted["minimum_count"] == 1
+    assert persisted["clusters"][0]["occupation_ids"] == ["occ-a", "occ-b"]
+    assert persisted["criteria"]["allow_reflection"] is False
+
+    growth = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    selected = select_parents(endpoints, growth, map_spec)
+    assert [route.structure_id for route in selected] == ["a-start0", "b-start0"]
+    assert len({route.minimum_id for route in selected}) == 1
+
+
 def test_diamond_is_not_zb_embeddable(map_spec) -> None:
     model = lattice_model(map_spec)
     symbols = ["Se", "Se", "Cd", "Cd"]
@@ -263,6 +429,12 @@ def test_zb_pack_is_clean() -> None:
     assert w12.move_zb_sites is True
     assert cfg.endpoint_diagnostic_k == 13
     assert cfg.endpoint_reference == (PACK_ZB / "k13_wulff_core.yaml").resolve()
+    assert cfg.minimum_consolidation.enabled is True
+    assert cfg.minimum_consolidation.allow_reflection is False
+    assert cfg.minimum_consolidation.pair_distance_rms_A == pytest.approx(0.05)
+    assert cfg.minimum_consolidation.core_rmsd_A == pytest.approx(0.10)
+    assert cfg.minimum_consolidation.full_rmsd_A == pytest.approx(0.15)
+    assert cfg.minimum_consolidation.max_occupations_per_minimum == 0
 
 
 def test_grow_cores_zb_move(map_spec) -> None:

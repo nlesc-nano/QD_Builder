@@ -30,6 +30,19 @@ known Cd16Se13 Wulff-like core.  Site overlap, assignment RMSD, coordination,
 radius of gyration, and axis extents are diagnostics only; g-xTB energy and
 structural diversity still control parent retention.
 
+Before the next k, propagation-eligible endpoints are consolidated into
+relaxed basins.  Equality requires the same final element-labelled graph,
+compatible optional WBO values, similar internal pair distances, and small
+core/full RMSD after graph-constrained atom permutation and optimal proper
+rotation.  Reflection is not allowed.  The lowest-energy endpoint represents
+the basin for ranking, while every distinct stored ZB occupation reaching it
+remains available as a lattice-growth route.  Thus rotations, translations,
+atom renumberings, and duplicate starts do not consume multiple parent-minimum
+slots, but distinct ligand conformers or lattice routes are not silently lost.
+Each bin writes `minimum_clusters.json` with the exact thresholds, basin
+representatives, raw members, invariant comparison metrics, and occupation
+routes used for that decision.
+
 ```bash
 python tools/run_molecular_growth.py \
   --pack-dir geometry_packs/cdse_cdcl2_zb \
