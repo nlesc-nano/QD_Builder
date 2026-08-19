@@ -10,7 +10,8 @@ Dedicated pack for move Z.  Do not mix with `cdse_cdcl2/` (combinatorial A + kin
 | `embed.yaml` | bond tables for placing Cl on the fixed zb core |
 | `growth.yaml` | parent k = 1…3, child k = 2…4; A/B off; soft rules off |
 
-Not in this pack: diamond scores, `reject_new_cdse_4rings`, fusion ranking, motif_factor core rebuild, Move B.
+Cores from zb sites.  Cl + 3D from the pack (`motif_bridge_*` then
+`embed.yaml`).  Soft rules off.  No diamond scores, no Move B.
 
 ```bash
 python tools/run_molecular_growth.py \

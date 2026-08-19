@@ -110,12 +110,43 @@ def test_diamond_is_not_zb_embeddable(map_spec) -> None:
 
 
 def test_place_cl_2p_count(map_spec) -> None:
+    from builder.nucleation.molecular_zb_growth import construction_clash
+
     model = lattice_model(map_spec)
     occ = lattice_k1_occupation(map_spec, model, p=2)
     assert occ is not None
-    symbols, coords, edges = place_cl_2p(occ, map_spec)
+    placed = place_cl_2p(occ, map_spec, model=model)
+    assert placed is not None
+    symbols, coords, edges = placed
     assert symbols.count("Cl") == 4
     assert coords.shape[0] == len(symbols)
+    assert not construction_clash(symbols, coords, map_spec, bonded=edges)
+    se_idx = [i for i, s in enumerate(symbols) if s == "Se"]
+    cl_idx = [i for i, s in enumerate(symbols) if s == "Cl"]
+    for i in se_idx:
+        for j in cl_idx:
+            assert float(np.linalg.norm(coords[i] - coords[j])) > 2.20
+
+
+def test_place_cl_on_k2_attach_does_not_clash(map_spec) -> None:
+    from builder.nucleation.molecular_zb_growth import construction_clash
+
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=1)
+    assert parent is not None
+    kids = grow_zb_children(
+        parent, s=0, p_m=1, spec=map_spec, model=model, cap=8
+    )
+    assert kids
+    ok = 0
+    for kid in kids:
+        placed = place_cl_2p(kid, map_spec, model=model)
+        if placed is None:
+            continue
+        symbols, coords, edges = placed
+        if not construction_clash(symbols, coords, map_spec, bonded=edges):
+            ok += 1
+    assert ok >= 1
 
 
 def test_zb_pack_is_clean() -> None:
@@ -133,9 +164,11 @@ def test_zb_pack_is_clean() -> None:
     w1 = cfg.window_for(1)
     w3 = cfg.window_for(3)
     assert w1.move_zb_sites is True
+    assert w1.child_redecorate is True
     assert w1.soft_rules.enabled is False
     assert w3.min_p_parent == 2
     assert w3.energy_window_eV == 0.60
+    assert spec.graph_rules.decoration_mode == "motif_bridge_first"
     # this pack only grows through parent k=3 (child k=4)
     w4 = cfg.window_for(4)
     assert w4.move_zb_sites is True

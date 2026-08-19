@@ -710,15 +710,49 @@ def _cdcl_bond(pack: Any) -> float:
         return 2.50
 
 
+def _perp_away_from(axis: np.ndarray, away: np.ndarray) -> np.ndarray:
+    """Unit vector in the plane of ``away``, perpendicular to ``axis``."""
+
+    a = axis / (float(np.linalg.norm(axis)) + 1e-15)
+    v = away - a * float(np.dot(away, a))
+    n = float(np.linalg.norm(v))
+    if n < 1e-8:
+        tmp = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(tmp, a))) > 0.9:
+            tmp = np.array([1.0, 0.0, 0.0])
+        v = np.cross(a, tmp)
+        n = float(np.linalg.norm(v))
+    return v / (n + 1e-15)
+
+
+def _too_close(
+    pos: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    floor: float,
+    ignore: Sequence[int] = (),
+) -> bool:
+    skip = set(ignore)
+    for i, pt in enumerate(xyz):
+        if i in skip:
+            continue
+        if float(np.linalg.norm(pos - pt)) < floor:
+            return True
+    return False
+
+
 def place_cl_2p(
     occ: ZbOccupation,
     spec: NucleationSpec,
     pack: Any = None,
-) -> Tuple[Tuple[str, ...], np.ndarray, EdgeList]:
+    model: Any = None,
+) -> Optional[Tuple[Tuple[str, ...], np.ndarray, EdgeList]]:
     """Put 2p Cl on the fixed zb core (bridges first, then terminals).
 
-    Bridge Cl sit off the Cd–Cd axis of a pair that already shares a Se
-    (Cd–Se–Cd–Cl rhombus).  Terminals go outward from leftover low-CN Cd.
+    A bridge Cl sits *opposite* the shared Se of a Cd–Cd pair (Cd–Se–Cd–Cl
+    rhombus).  A random lift used to land on that Se and trip the clash
+    gate before g-xTB.  Terminals go along an unused tet hole of the host
+    Cd (away from existing neighbours), not through the core COM.
     """
 
     cation, anion, ligand = _species(spec)
@@ -736,7 +770,7 @@ def place_cl_2p(
         neigh[b].append(a)
     se_ids = [i for i, s in enumerate(symbols) if s == anion]
     cd_ids = [i for i, s in enumerate(symbols) if s == cation]
-    pairs: List[Tuple[float, int, int]] = []
+    pairs: List[Tuple[float, int, int, int]] = []
     seen_pair = set()
     for se in se_ids:
         cds = [j for j in neigh[se] if symbols[j] == cation]
@@ -746,53 +780,68 @@ def place_cl_2p(
                 continue
             seen_pair.add(key)
             d = float(np.linalg.norm(xyz[a] - xyz[b]))
-            pairs.append((d, a, b))
+            pairs.append((d, a, b, se))
     pairs.sort()
-    n_bridge = min(n_cl, len(pairs))
-    used_cd_bridge = set()
-    for _d, a, b in pairs[:n_bridge]:
+
+    placed = 0
+    for _d, a, b, se in pairs:
+        if placed >= n_cl:
+            break
         mid = 0.5 * (xyz[a] + xyz[b])
         axis = xyz[b] - xyz[a]
         nrm = float(np.linalg.norm(axis))
         if nrm < 1e-6:
             continue
-        axis = axis / nrm
-        # off-axis so the Cl is not collinear (rhombus)
-        tmp = np.array([0.0, 0.0, 1.0])
-        if abs(float(np.dot(tmp, axis))) > 0.9:
-            tmp = np.array([1.0, 0.0, 0.0])
-        lift = np.cross(axis, tmp)
-        ln = float(np.linalg.norm(lift))
-        if ln < 1e-6:
+        half = 0.5 * nrm
+        # height so |Cd–Cl| ≈ r, Cl opposite Se
+        if half >= r - 0.05:
+            h = 0.80
+        else:
+            h = float(np.sqrt(max(r * r - half * half, 0.25)))
+        away = _perp_away_from(axis, mid - xyz[se])
+        pos = mid + away * h
+        if _too_close(pos, xyz, floor=2.20, ignore=(a, b)):
+            pos = mid - away * h
+        if _too_close(pos, xyz, floor=2.20, ignore=(a, b)):
             continue
-        lift = lift / ln
-        pos = mid + lift * (0.55 * r)
         idx = len(symbols)
         symbols.append(ligand)
         xyz = np.vstack([xyz, pos])
         edges.append((min(a, idx), max(a, idx)))
         edges.append((min(b, idx), max(b, idx)))
-        used_cd_bridge.add(a)
-        used_cd_bridge.add(b)
-    n_term = n_cl - n_bridge
-    cd_rank = sorted(
-        cd_ids, key=lambda i: (len(neigh[i]), i)
-    )
-    com = xyz[: len(occ.symbols)].mean(axis=0)
-    for cd in cd_rank:
-        if n_term <= 0:
-            break
-        outward = xyz[cd] - com
-        n = float(np.linalg.norm(outward))
-        if n < 1e-6:
-            outward = np.array([1.0, 0.0, 0.0])
-            n = 1.0
-        pos = xyz[cd] + (outward / n) * r
-        idx = len(symbols)
-        symbols.append(ligand)
-        xyz = np.vstack([xyz, pos])
-        edges.append((min(cd, idx), max(cd, idx)))
-        n_term -= 1
+        neigh.append([a, b])
+        neigh[a].append(idx)
+        neigh[b].append(idx)
+        placed += 1
+
+    if placed < n_cl:
+        cd_rank = sorted(cd_ids, key=lambda i: (len(neigh[i]), i))
+        for cd in cd_rank:
+            if placed >= n_cl:
+                break
+            # unused tet hole: away from current neighbours
+            push = np.zeros(3)
+            for nb in neigh[cd]:
+                v = xyz[cd] - xyz[nb]
+                n = float(np.linalg.norm(v))
+                if n > 1e-8:
+                    push += v / n
+            n = float(np.linalg.norm(push))
+            if n < 1e-8:
+                continue
+            pos = xyz[cd] + (push / n) * r
+            if _too_close(pos, xyz, floor=2.20, ignore=(cd,)):
+                continue
+            idx = len(symbols)
+            symbols.append(ligand)
+            xyz = np.vstack([xyz, pos])
+            edges.append((min(cd, idx), max(cd, idx)))
+            neigh.append([cd])
+            neigh[cd].append(idx)
+            placed += 1
+
+    if placed < n_cl:
+        return None
     return tuple(symbols), xyz, tuple(sorted(set(edges)))
 
 
@@ -801,23 +850,27 @@ def construction_clash(
     coords: np.ndarray,
     spec: NucleationSpec,
     *,
-    floor: float = 2.40,
+    floor: float = 2.20,
+    bonded: Optional[Sequence[Edge]] = None,
 ) -> bool:
-    """True if any non-bonded pair is closer than ``floor`` Å."""
+    """True if a pair that is not a Cd–Se / Cd–Cl contact is closer than floor."""
 
     pts = np.asarray(coords, dtype=float)
     n = len(symbols)
+    allow = {
+        tuple(sorted((spec.core.cation, spec.core.anion))),
+        tuple(sorted((spec.precursor.center, spec.precursor.ligand))),
+    }
+    bonded_set = {tuple(sorted(e)) for e in (bonded or ())}
     for i in range(n):
         for j in range(i + 1, n):
             d = float(np.linalg.norm(pts[i] - pts[j]))
-            if d < floor:
-                # allow bonded Cd–Se / Cd–Cl
-                pair = tuple(sorted((symbols[i], symbols[j])))
-                if pair in {
-                    tuple(sorted((spec.core.cation, spec.core.anion))),
-                    tuple(sorted((spec.precursor.center, spec.precursor.ligand))),
-                }:
-                    if d >= 2.00:
-                        continue
-                return True
+            if d >= floor:
+                continue
+            pair = tuple(sorted((symbols[i], symbols[j])))
+            if pair in allow and d >= 2.00:
+                continue
+            if bonded_set and (i, j) in bonded_set and d >= 2.00:
+                continue
+            return True
     return False

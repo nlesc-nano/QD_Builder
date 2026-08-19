@@ -2865,11 +2865,11 @@ class GrowthLog:
             self.line("  B coord: OFF")
         if getattr(growth, "move_zb_sites", False):
             self.line(
-                "  Z zb_sites: snap parent core onto zinc-blende -> "
+                "  Z zb_sites: snap parent onto zinc-blende -> "
                 "shed extra Cd -> fill vacant CdSe pair + p_m Cd -> "
-                "2p Cl on that core -> clash check -> full g-xTB -> "
-                "keep only if relaxed core still embeds on zb.  "
-                "Genealogy is the occupation, not the XYZ."
+                "pack decorate (graph_rules 2p) -> embed.yaml 3D -> "
+                "full g-xTB -> keep only if the relaxed core still "
+                "embeds on zb.  Genealogy is the occupation, not the XYZ."
             )
         else:
             self.line("  Z zb_sites: OFF")
@@ -3470,10 +3470,10 @@ def run_growth_step(
     # Merged A+B energy rows per (k,p); ranked once after all bins finish
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]] = defaultdict(list)
     do_redecorate = bool(decorate and window.child_redecorate)
-    if window.move_zb_sites:
-        # Z owns decorate+opt from CIF core coords; motif_factor would
-        # throw the occupation away.
-        do_redecorate = False
+    if window.move_zb_sites and decorate:
+        # Z built the Cd–Se occupation.  Cl and 3D come from the pack
+        # (graph_rules decorate + embed.yaml), not a homemade Cl placer.
+        do_redecorate = True
     if window.max_opts_per_k > 0:
         result = _apply_opt_budget(result, window.max_opts_per_k)
         n_cores = sum(len(v) for v in result.skeleton_catalog.values())
@@ -3542,28 +3542,10 @@ def run_growth_step(
                 bin_ranks=bin_ranks,
             )
 
-        if result.zb_seeds and embed:
-            if log:
-                log.set_block_plan(n_z_blocks)
-                log.stage(
-                    3,
-                    n_stages,
-                    "move Z: 2p Cl on zb core + full opt",
-                    n_occupations=sum(
-                        len(v) for v in result.zb_seeds.values()
-                    ),
-                    note="keep only zb-embeddable endpoints; no energy=None XYZ",
-                )
-            _opt_zb_seeds(
-                result.zb_seeds,
-                growth=growth,
-                map_spec=map_spec,
-                pack=pack,
-                output_dir=out,
-                progress=log if log else progress,
-                child_minima=child_minima,
-                bin_ranks=bin_ranks,
-                zb_stats=result.zb_stats,
+        if log and window.move_zb_sites:
+            log.line(
+                "move Z cores -> pack decorate (2p / bridge-target) -> "
+                "embed.yaml motif_factor -> g-xTB; keep only zb-embeddable"
             )
 
         if log and result.skeleton_catalog and do_redecorate:
@@ -3634,9 +3616,14 @@ def run_growth_step(
                     jobs=len(cores),
                 )
                 log.line(
-                    f"  bin: A_graph_cores={len(cores)}  "
-                    f"B_coord_seeds={n_coord} (B already opted; "
-                    f"rank merged at end)"
+                    f"  bin: Z_zb_cores={len(cores)}  "
+                    f"(decorate+embed via pack; rank after bin)"
+                    if window.move_zb_sites
+                    else (
+                        f"  bin: A_graph_cores={len(cores)}  "
+                        f"B_coord_seeds={n_coord} (B already opted; "
+                        f"rank merged at end)"
+                    )
                 )
             elif progress:
                 progress(
@@ -3694,6 +3681,16 @@ def run_growth_step(
                 precomputed_skeletons=cores,
                 progress=progress,
             )
+            if window.move_zb_sites:
+                n_before = len(bin_res.isomers)
+                bin_res = _filter_bin_zb_embeddable(
+                    bin_res, map_spec, zb_stats=result.zb_stats
+                )
+                if log:
+                    log.line(
+                        f"  zb filter k={k} p={p}: "
+                        f"{len(bin_res.isomers)}/{n_before} still embed on zb"
+                    )
             done_cores += len(cores)
             # track bin minimum for package profile
             with_e = [
@@ -3786,14 +3783,23 @@ def run_growth_step(
 
         # mark whole k->k+1 step complete for multi-step / resubmit
         if out is not None and decorate:
-            step_complete_marker(out, k_from).write_text(
-                f"k_from={k_from} k_to={k_from + 1} complete\n",
-                encoding="utf-8",
-            )
-            if log:
-                log.line(
-                    f"checkpoint: wrote {step_complete_marker(out, k_from).name}"
+            if not child_minima and not bin_ranks:
+                if log:
+                    log.line(
+                        "no kept children with energy; "
+                        "not writing step-complete marker "
+                        f"(delete {step_complete_marker(out, k_from).name} "
+                        "if a previous empty run wrote one)"
+                    )
+            else:
+                step_complete_marker(out, k_from).write_text(
+                    f"k_from={k_from} k_to={k_from + 1} complete\n",
+                    encoding="utf-8",
                 )
+                if log:
+                    log.line(
+                        f"checkpoint: wrote {step_complete_marker(out, k_from).name}"
+                    )
 
     # Package growth profile: k=1…k_child along p = k·p_m for each package
     if log:
@@ -4400,12 +4406,23 @@ def _opt_zb_seeds(
             serial += 1
             sid = compact_growth_id(occ.k, occ.p, "Z", serial)
             try:
-                symbols, coords, _edges = place_cl_2p(occ, map_spec, pack)
+                placed = place_cl_2p(occ, map_spec, pack, model=model)
             except Exception:
+                placed = None
+            if placed is None:
                 if zb_stats is not None:
                     zb_stats.clash_skip += 1
+                if progress is not None:
+                    progress(
+                        f"[growth-job] k={occ.k} p={occ.p} move=Z "
+                        f"id={sid} E_eV=n/a relax=clash "
+                        f"parent={occ.parent_id}"
+                    )
                 continue
-            if construction_clash(symbols, coords, map_spec):
+            symbols, coords, cl_edges = placed
+            if construction_clash(
+                symbols, coords, map_spec, bonded=cl_edges
+            ):
                 if zb_stats is not None:
                     zb_stats.clash_skip += 1
                 if progress is not None:
@@ -4530,6 +4547,46 @@ def _opt_zb_seeds(
 
     if log and zb_stats is not None:
         log.line(zb_stats.as_log())
+
+
+def _filter_bin_zb_embeddable(
+    bin_res: Any,
+    spec: NucleationSpec,
+    *,
+    zb_stats: Any = None,
+) -> Any:
+    """Drop decorated/opted isomers whose Cd–Se core is not a zb fragment."""
+
+    from .molecular_zb_growth import lattice_model, zb_embeddable
+
+    try:
+        model = lattice_model(spec)
+    except Exception:
+        return bin_res
+    kept = []
+    for iso in bin_res.isomers:
+        coords = iso.xtb_coordinates or iso.coordinates
+        if coords is None or iso.xtb_energy_eV is None:
+            if zb_stats is not None:
+                zb_stats.opt_fail += 1
+            continue
+        symbols = [a.symbol for a in iso.atoms]
+        ok, _occ, _why = zb_embeddable(
+            symbols,
+            np.asarray(coords, dtype=float),
+            spec,
+            model,
+            parent_id=getattr(iso, "structure_id", ""),
+        )
+        if not ok:
+            if zb_stats is not None:
+                zb_stats.opt_reject_embed += 1
+            continue
+        if zb_stats is not None:
+            zb_stats.opt_keep += 1
+        kept.append(iso)
+    bin_res.isomers = kept
+    return bin_res
 
 
 def _growth_index_fields(growth: GrowthConfig) -> List[str]:
