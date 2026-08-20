@@ -219,6 +219,67 @@ class MinimumConsolidation:
 
 
 @dataclass(frozen=True)
+class BasinHopStage:
+    """Optional basin-hopping refinement of the parents of one growth step.
+
+    This never adds a lineage.  It runs *after* ``select_parents``, so the
+    ranking that chose those parents is already fixed and cannot be biased by
+    refining a subset; the improvement feeds the relaxed coordinates that
+    ``_growth_site_priority`` uses to order the growth frontier, and is
+    recorded as a better representative of that lattice route.
+
+    A refinement is only taken when the new minimum keeps the parent's Cd-Se
+    core and passes the same audits move Z applies -- otherwise it would be a
+    different lattice route wearing the parent's occupation id.
+    """
+
+    enabled: bool = False
+    #: k=2 bins sample every shell already; refinement only pays where the
+    #: shell budget is the binding constraint.
+    min_k: int = 3
+    max_seeds_per_bin: int = 8
+    steps: int = 50
+    #: surface_swap measured 433 attempts, 1 clean core-preserving outcome and
+    #: 0 improvements, so it is off by default.
+    moves: Tuple[str, ...] = ("shake", "single_atom")
+    amplitude_A: float = 0.45
+    temperature_eV: float = 0.15
+    workers: int = 1
+    #: "minimum" seeds one walker per distinct relaxed basin.  Seeding by
+    #: energy instead picks near-degenerate copies: measured, 6 energy-ranked
+    #: seeds spanned only 3 distinct minima at both k3p3 and k4p3.
+    seed_by: str = "minimum"
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "BasinHopStage":
+        if not isinstance(raw, dict) or not raw:
+            return cls()
+        moves = raw.get("moves") or ["shake", "single_atom"]
+        if isinstance(moves, str):
+            moves = [m.strip() for m in moves.split(",") if m.strip()]
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            min_k=int(raw.get("min_k", 3)),
+            max_seeds_per_bin=int(raw.get("max_seeds_per_bin", 8)),
+            steps=int(raw.get("steps", 50)),
+            moves=tuple(str(m) for m in moves),
+            amplitude_A=float(raw.get("amplitude_A", 0.45)),
+            temperature_eV=float(raw.get("temperature_eV", 0.15)),
+            workers=int(raw.get("workers", 1)),
+            seed_by=str(raw.get("seed_by", "minimum")).strip().lower(),
+        )
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "basin hop: OFF"
+        return (
+            f"basin hop: {self.steps} steps x <={self.max_seeds_per_bin} seeds/bin "
+            f"from k={self.min_k}, moves={list(self.moves)} amp={self.amplitude_A} "
+            f"kT={self.temperature_eV} seed_by={self.seed_by} workers={self.workers}"
+        )
+
+
+@dataclass(frozen=True)
 class GrowthWindow:
     """Resolved envelope for one parent k (top-level YAML + matching ``by_k``)."""
 
@@ -349,6 +410,7 @@ class GrowthConfig:
     child_redecorate_slack: bool = True
     child_full_opt: str = "g-xTB"
     child_full_opt_cycles: int = 150
+    basin_hop: BasinHopStage = field(default_factory=BasinHopStage)
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
     min_p_parent: int = 1
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
@@ -597,6 +659,7 @@ class GrowthConfig:
                 endpoint.get("site_match_tolerance_A", 0.35)
             ),
             minimum_consolidation=consolidation,
+            basin_hop=BasinHopStage.from_raw(raw.get("basin_hop")),
         )
 
 
@@ -1764,6 +1827,224 @@ def _relaxed_minimum_diversity_signature(
     moments = np.linalg.eigvalsh(centered.T @ centered / max(len(centered), 1))
     shape = tuple(int(round(float(value) / 0.10)) for value in moments)
     return degree_signature, shape
+
+
+def _basin_hop_parent_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """One walker over one parent, in its own process."""
+
+    from .basin_hop import basin_hop
+    from .molecular_zb_growth import lattice_model
+
+    parent = job["parent"]
+    spec = job["spec"]
+    settings = job["settings"]
+    stage: BasinHopStage = job["stage"]
+    label = f"k{parent.k}p{parent.p} {parent.structure_id[-14:]}"
+    try:
+        zb_model = lattice_model(spec)
+    except Exception:  # noqa: BLE001 — the zb label is a diagnostic
+        zb_model = None
+
+    def progress(line: str) -> None:
+        print(f"[bh] [{label}] {line}", flush=True)
+
+    result = basin_hop(
+        {
+            "id": parent.structure_id,
+            "symbols": list(parent.symbols),
+            "positions": np.asarray(parent.coordinates, dtype=float),
+            "energy_eV": float(parent.energy_eV),
+        },
+        settings,
+        spec,
+        k=parent.k,
+        p=parent.p,
+        steps=stage.steps,
+        temperature_eV=stage.temperature_eV,
+        moves=tuple(stage.moves),
+        amplitude_A=stage.amplitude_A,
+        rng_seed=job["rng_seed"],
+        zb_model=zb_model,
+        overlap_min_A=float(job["overlap_min_A"]),
+        motif_definitions=job["motif_definitions"],
+        progress=progress,
+    )
+    # Only a minimum that keeps the core *and* passes the audits may stand in
+    # for this parent; anything else is a different route, not a better
+    # representative of this one.
+    usable = [
+        m
+        for m in result.minima
+        if m.step > 0 and m.core_preserved and m.clean
+        and m.energy_eV < float(parent.energy_eV) - 1.0e-3
+    ]
+    best = min(usable, key=lambda m: m.energy_eV) if usable else None
+    return {
+        "structure_id": parent.structure_id,
+        "k": parent.k,
+        "p": parent.p,
+        "seed_energy_eV": float(parent.energy_eV),
+        "n_relaxations": result.n_relaxations,
+        "n_basins": max(0, len(result.minima) - 1),
+        "improved": best is not None,
+        "energy_eV": None if best is None else float(best.energy_eV),
+        "gain_eV": 0.0 if best is None else float(best.energy_eV - parent.energy_eV),
+        "step": None if best is None else int(best.step),
+        "coordinates": (
+            None if best is None else [list(map(float, x)) for x in best.coordinates]
+        ),
+        "edges": None if best is None else [list(e) for e in best.edges],
+    }
+
+
+def refine_parents_with_basin_hop(
+    parents: Sequence[ParentStructure],
+    *,
+    growth: GrowthConfig,
+    map_spec: NucleationSpec,
+    pack: Optional[GeometryPack],
+    output_dir: Optional[Path],
+    log: Optional[Any] = None,
+) -> List[ParentStructure]:
+    """Replace selected parents by a lower relaxed minimum of the same route.
+
+    Returns a new parent list; the input is never mutated.  Nothing under the
+    parents directory is rewritten -- refinements are recorded under
+    ``<output>/basin_hop/`` so a re-run can see them without the input run
+    being touched.
+    """
+
+    stage = growth.basin_hop
+    out = list(parents)
+    if not stage.enabled or pack is None or not parents:
+        return out
+
+    from .xtb_relax import XtbSettings
+
+    settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
+    recon = (pack.raw or {}).get("reconstruction") or {}
+    overlap_min_A = float(recon.get("overlap_min_A", 0.75))
+    cutoffs = bond_cutoffs_from_spec(map_spec)
+    consolidation = MinimumConsolidation(enabled=True, allow_reflection=True)
+
+    by_bin: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for index, parent in enumerate(out):
+        if parent.k >= stage.min_k:
+            by_bin[(parent.k, parent.p)].append(index)
+
+    jobs: List[Dict[str, Any]] = []
+    for (k, p), indices in sorted(by_bin.items()):
+        group = [out[i] for i in indices]
+        if stage.seed_by == "minimum" and len(group) > 1:
+            clusters = consolidate_relaxed_minima(group, consolidation, map_spec)
+            keep_ids = {c.representative.structure_id for c in clusters}
+            indices = [i for i in indices if out[i].structure_id in keep_ids]
+        indices.sort(key=lambda i: float(out[i].energy_eV))
+        if stage.max_seeds_per_bin > 0:
+            indices = indices[: stage.max_seeds_per_bin]
+        for serial, index in enumerate(indices):
+            jobs.append(
+                {
+                    "index": index,
+                    "parent": out[index],
+                    "spec": map_spec,
+                    "settings": settings,
+                    "stage": stage,
+                    "rng_seed": 1729 + 7 * index + serial,
+                    "overlap_min_A": overlap_min_A,
+                    "motif_definitions": (pack.raw or {}).get("motifs"),
+                }
+            )
+    if not jobs:
+        return out
+
+    if log:
+        log.line(
+            f"--- basin hop: {len(jobs)} parents over {len(by_bin)} bin(s), "
+            f"{stage.steps} steps each (<={len(jobs) * stage.steps} g-xTB) ---"
+        )
+
+    results: List[Tuple[int, Dict[str, Any]]] = []
+    if stage.workers > 1 and len(jobs) > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(max_workers=stage.workers) as pool:
+            futures = {
+                pool.submit(_basin_hop_parent_job, job): job["index"] for job in jobs
+            }
+            for future in as_completed(futures):
+                results.append((futures[future], future.result()))
+    else:
+        for job in jobs:
+            results.append((job["index"], _basin_hop_parent_job(job)))
+
+    records: List[Dict[str, Any]] = []
+    improved = 0
+    total_gain = 0.0
+    for index, record in sorted(results, key=lambda item: item[0]):
+        records.append({key: value for key, value in record.items() if key != "coordinates"})
+        if not record["improved"]:
+            continue
+        improved += 1
+        total_gain += record["gain_eV"]
+        points = np.asarray(record["coordinates"], dtype=float)
+        parent = out[index]
+        edges = tuple(
+            sorted(
+                (min(int(a), int(b)), max(int(a), int(b)))
+                for a, b in relaxed_edges(parent.symbols, points, cutoffs)
+            )
+        )
+        core_pair = {map_spec.core.cation, map_spec.core.anion}
+        out[index] = replace(
+            parent,
+            coordinates=points,
+            energy_eV=float(record["energy_eV"]),
+            edges=list(edges),
+            core_edges=[
+                list(edge)
+                for edge in edges
+                if {parent.symbols[edge[0]], parent.symbols[edge[1]]} == core_pair
+            ],
+        )
+        if log:
+            log.line(
+                f"  refined {parent.structure_id}: {record['seed_energy_eV']:.6f} -> "
+                f"{record['energy_eV']:.6f} eV ({record['gain_eV']:+.3f}) "
+                f"at step {record['step']}"
+            )
+
+    if log:
+        spent = sum(int(r["n_relaxations"]) for _i, r in results)
+        log.line(
+            f"  basin hop: {improved}/{len(jobs)} parents improved, "
+            f"total {total_gain:+.3f} eV, {spent} g-xTB optimisations"
+        )
+
+    if output_dir is not None and records:
+        directory = Path(output_dir) / "basin_hop"
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "refinements.jsonl").open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        for index, record in sorted(results, key=lambda item: item[0]):
+            if not record["improved"]:
+                continue
+            parent = out[index]
+            lines = [
+                str(len(parent.symbols)),
+                f"{parent.structure_id} energy_eV={record['energy_eV']} "
+                f"basin_hop_gain_eV={record['gain_eV']:.6f} step={record['step']}",
+            ]
+            lines.extend(
+                f"{symbol} {point[0]:.8f} {point[1]:.8f} {point[2]:.8f}"
+                for symbol, point in zip(parent.symbols, parent.coordinates)
+            )
+            (directory / f"{parent.structure_id}_bh.xyz").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8"
+            )
+
+    return out
 
 
 def select_parents(
@@ -3711,6 +3992,9 @@ class GrowthLog:
             )
         else:
             self.line("  Z zb_sites: OFF")
+        stage = getattr(growth, "basin_hop", None)
+        if stage is not None:
+            self.line("  " + stage.describe())
         self.line(
             f"  shed: mode={growth.shed_mode} max_shed={growth.max_shed} "
             f"prefer_low_shed={growth.prefer_low_shed} "
@@ -4182,6 +4466,16 @@ def run_growth_step(
         run_dir, k=k_from, spec=map_spec, p_values=p_parents
     )
     parents = select_parents(parents_all, growth, map_spec)
+    # Refinement, not selection: this runs *after* the ranking above so a
+    # partially refined bin cannot bias which parents were chosen.
+    parents = refine_parents_with_basin_hop(
+        parents,
+        growth=growth,
+        map_spec=map_spec,
+        pack=pack,
+        output_dir=out_path,
+        log=log,
+    )
     window = growth.window_for(k_from)
     if not parents_all:
         have = parent_k_inventory(run_dir)

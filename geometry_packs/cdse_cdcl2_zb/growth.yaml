@@ -104,6 +104,31 @@ max_children_per_channel: 20
 # bridge_target_count_window now generates are never sampled.
 zb_max_shells_per_bin: 250
 
+# Optional basin-hopping refinement of the parents of each growth step.
+#
+# It runs AFTER select_parents, so the ranking that chose those parents is
+# already fixed and refining a subset cannot bias it.  A walker may replace a
+# parent only with a minimum that keeps its Cd-Se core and passes the same
+# audits move Z applies -- otherwise it is a different lattice route, not a
+# better representative of this one.  Nothing under --parents is rewritten;
+# refinements land in <output>/basin_hop/.
+#
+# Measured on growth_k1_to_k4_zb3: from the k4p3 parents a walker reached
+# -368485.4973 eV, 0.181 eV below that bin's best and 0.071 eV below what the
+# wide-decoration run found with 3x the relaxations.  Cost is real -- roughly
+# max_seeds_per_bin x steps g-xTB per bin, so 8 x 50 = 400 against a bin's own
+# ~425 -- which is why it is opt-in.
+basin_hop:
+  enabled: false
+  min_k: 3              # k=2 bins already sample every shell
+  max_seeds_per_bin: 8
+  steps: 50             # first gains land at steps 4-21, nothing past ~45
+  moves: [shake, single_atom]   # surface_swap: 433 tries, 0 improvements
+  amplitude_A: 0.45
+  temperature_eV: 0.15
+  seed_by: minimum      # one walker per distinct basin, not per lowest energy
+  workers: 1
+
 lattice_switch:
   enabled: false
 
