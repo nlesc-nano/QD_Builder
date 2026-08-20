@@ -635,6 +635,9 @@ def load_nucleation_spec(
                 bridge_first_prefer_bridges_per_cd=int(
                     graph_rules_raw.get("bridge_first_prefer_bridges_per_cd", 2)
                 ),
+                max_saturated_host_bridges=int(
+                    graph_rules_raw.get("max_saturated_host_bridges", -1)
+                ),
                 bridge_target_ring_closing_only=bool(
                     graph_rules_raw.get(
                         "bridge_target_ring_closing_only", True

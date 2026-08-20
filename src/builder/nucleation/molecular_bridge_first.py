@@ -35,6 +35,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -850,6 +851,33 @@ def sequential_passivate(
     return list(uniq.values())
 
 
+def _saturated_host_bridges(
+    bridges: Sequence[Tuple[int, int]],
+    cn: Sequence[int],
+    position: Mapping[int, int],
+    max_cation_cn: int,
+) -> int:
+    """Count mu2 bridges whose *two* hosts both finish at the maximum CN.
+
+    Measured over the k1-k4 zb run: a shell carrying one of these yields 3.0%
+    propagation-eligible endpoints against 13.5% without, because a Cd already
+    saturated by the core has no room to relax around the bridge.  The count is
+    over final CN (skeleton + ligand load), not skeleton CN -- which is what
+    ``bridge_target_min_host_cn_cap`` filters and why that knob does not
+    subsume this one.
+    """
+
+    total = 0
+    for left, right in bridges:
+        a_slot = position.get(int(left))
+        b_slot = position.get(int(right))
+        if a_slot is None or b_slot is None:
+            continue
+        if cn[a_slot] >= max_cation_cn and cn[b_slot] >= max_cation_cn:
+            total += 1
+    return total
+
+
 def _emit_edges(
     st: _PlaceState,
     cd_list: Sequence[int],
@@ -996,12 +1024,23 @@ def iter_cl_attachments_bridge_first(
         strict_bridge_first=strict_bridge_first,
         se_shared_pairs=tuple(sorted(core_shared_pairs)),
     )
+    max_saturated_host_bridges = int(
+        getattr(spec.graph_rules, "max_saturated_host_bridges", -1)
+    )
     emitted = 0
     for completed in states:
         if profiles and not any(
             all(completed.cn[i] >= profile[i] for i in range(len(cd_list)))
             for profile in profiles
         ):
+            status.infeasible += 1
+            continue
+        if max_saturated_host_bridges >= 0 and _saturated_host_bridges(
+            completed.bridges,
+            completed.cn,
+            position,
+            int(spec.graph_rules.max_cn[spec.core.cation]),
+        ) > max_saturated_host_bridges:
             status.infeasible += 1
             continue
         if max_assignments > 0 and emitted >= max_assignments:
@@ -1053,7 +1092,9 @@ def iter_cl_attachments_bridge_target(
     ``max_emissions`` / ``max_walk_nodes`` (or the pack knobs
     ``bridge_target_max_emissions_per_skeleton`` /
     ``bridge_target_max_nodes_per_skeleton``) hard-stop the walk so high-p
-    bins cannot stream millions of graphs before the reservoir.  0 = unlimited.
+    bins cannot stream millions of graphs before the reservoir.  Both are
+    counted *per productive bridge count*, so the total for one skeleton is
+    bounded by ``max_emissions * (count_window + 1)``.  0 = unlimited.
     """
 
     if status is None:
@@ -1101,6 +1142,9 @@ def iter_cl_attachments_bridge_target(
             )
             or 0
         )
+    max_saturated_host_bridges = int(
+        getattr(spec.graph_rules, "max_saturated_host_bridges", -1)
+    )
     # Global assignment cap (bin-level safety guard) is separate.
     assignment_cap = int(max_assignments) if max_assignments > 0 else 0
 
@@ -1230,12 +1274,19 @@ def iter_cl_attachments_bridge_target(
     if ceiling == 0 and n_cl > 0 and total_room < n_cl:
         return
 
+    # ``emitted`` is the whole-skeleton total the bin-level assignment guard
+    # counts.  The per-skeleton emission and node caps are *per productive
+    # bridge count*: they used to be global, so with ``count_window`` open the
+    # top tier spent the entire budget and the walk returned before it could
+    # step down -- and a tier whose every emission is filtered out (by the
+    # saturated-host cap, say) burned the node budget producing nothing.
     emitted = 0
+    window_emitted = 0
     walk_nodes = 0
     seen_keys: Set[Tuple] = set()
 
     def _hit_skel_emission_cap() -> bool:
-        return max_emissions > 0 and emitted >= max_emissions
+        return max_emissions > 0 and window_emitted >= max_emissions
 
     def _hit_assignment_cap() -> bool:
         return assignment_cap > 0 and emitted >= assignment_cap
@@ -1277,7 +1328,7 @@ def iter_cl_attachments_bridge_target(
 
     def finish(chosen: List[Tuple[int, int]], load: List[int],
                group: Sequence[Tuple[int, ...]] = ()):
-        nonlocal emitted
+        nonlocal emitted, window_emitted
         budget = n_cl - len(chosen)
         for terms in terminal_fills(load, budget):
             if _hit_any_emission_cap():
@@ -1295,6 +1346,13 @@ def iter_cl_attachments_bridge_target(
             if min_bridge_cn > 0 and any(
                 load[i] > 0 and cn[i] < min_bridge_cn for i in range(n_cd)
             ):
+                continue
+            # Cap bridges between two hosts that finish saturated.  Applied
+            # here rather than in walk_bridges because the terminal fill is
+            # what settles the final CN of each host.
+            if max_saturated_host_bridges >= 0 and _saturated_host_bridges(
+                chosen, cn, position, max_cd
+            ) > max_saturated_host_bridges:
                 continue
             # Same rule as mono_se_dual_terminal_violations: a mono-Se Cd with
             # two terminal Cl and no bridge is illegal.  Enforce here so the
@@ -1334,6 +1392,7 @@ def iter_cl_attachments_bridge_target(
             seen_keys.add(key)
             yield _emit_edges(st, cd_list, cl_list)
             emitted += 1
+            window_emitted += 1
 
     def _closes_triangle(chosen: Sequence[Tuple[int, int]], a: int, b: int) -> bool:
         """Whether bridging (a, b) makes three Cd mutually bridged.
@@ -1397,6 +1456,22 @@ def iter_cl_attachments_bridge_target(
             load[s2] += 1
             used[(a, b)] = used.get((a, b), 0) + 1
             chosen.append((a, b))
+            # Lower bound on the saturated-host bridge count: a host already
+            # at max CN from core + bridges can only gain from terminals, so
+            # this pair is committed to finishing saturated on both sides.
+            # Pruning in the tree rather than at finish() is what stops a
+            # fully rejected tier from consuming the node budget.
+            if max_saturated_host_bridges >= 0 and sum(
+                1
+                for left, right in chosen
+                if skel[position[left]] + load[position[left]] >= max_cd
+                and skel[position[right]] + load[position[right]] >= max_cd
+            ) > max_saturated_host_bridges:
+                chosen.pop()
+                used[(a, b)] -= 1
+                load[s1] -= 1
+                load[s2] -= 1
+                continue
             # A pair may be revisited only when doubles are open, so the walk
             # restarts at idx rather than idx+1 in that case.
             nxt = idx if share_cap > 1 else idx + 1
@@ -1434,9 +1509,11 @@ def iter_cl_attachments_bridge_target(
     # the descent.
     windows = 0
     for target in range(ceiling, -1, -1):
-        if _hit_any_emission_cap() or _hit_node_cap():
+        if _hit_assignment_cap():
             _stop_walk()
             return
+        window_emitted = 0
+        walk_nodes = 0
         produced = False
         for share_cap, no_tri in tiers:
             for edges in walk_bridges(0, [0] * n_cd, [], target, {},
