@@ -28,9 +28,11 @@ finished run already wrote and reports what it finds.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -205,6 +207,8 @@ def describe_minimum(
     cutoffs: Mapping[Tuple[str, str], float],
     zb_model: Optional[Any] = None,
     reference_core_edges: Optional[Sequence[Tuple[int, int]]] = None,
+    motif_definitions: Optional[Mapping[str, Any]] = None,
+    artifact_floors: Optional[Mapping[str, float]] = None,
 ) -> BasinHopMinimum:
     """Label a relaxed geometry with the same audits the growth path applies."""
 
@@ -214,6 +218,8 @@ def describe_minimum(
         molecular_decoration_rule_violations,
         molecular_graph_violations,
     )
+    from .molecular_motif_reconstruct import motif_vocabulary_violations
+    from .molecular_rules import forbidden_pair_contact_violations
 
     points = np.asarray(coordinates, dtype=float)
     edges = tuple(
@@ -235,6 +241,23 @@ def describe_minimum(
     try:
         violations.extend(molecular_graph_violations(state, spec))
         violations.extend(molecular_decoration_rule_violations(state, spec))
+        # The two below are what move Z also checks before it calls an
+        # endpoint propagation-eligible.  Without them a structure can look
+        # "clean" here and still be rejected by the growth pipeline.
+        violations.extend(
+            motif_vocabulary_violations(
+                state,
+                cation=spec.core.cation,
+                anion=spec.core.anion,
+                ligand=spec.precursor.ligand,
+                motif_definitions=motif_definitions,
+            )
+        )
+        violations.extend(
+            forbidden_pair_contact_violations(
+                list(symbols), points, spec, floors=artifact_floors or None
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — a label, never a control path
         violations.append(f"audit_failed:{type(exc).__name__}")
 
@@ -323,7 +346,9 @@ def basin_hop(
     zb_model: Optional[Any] = None,
     consolidation: Optional[Any] = None,
     overlap_min_A: float = 0.75,
-    progress: Optional[Any] = None,
+    motif_definitions: Optional[Mapping[str, Any]] = None,
+    progress: Optional[Callable[[str], None]] = None,
+    on_minimum: Optional[Callable[[BasinHopMinimum], None]] = None,
 ) -> BasinHopResult:
     """Run one basin-hopping walker from an already-relaxed structure.
 
@@ -389,9 +414,19 @@ def basin_hop(
         spec=spec,
         cutoffs=cutoffs,
         zb_model=zb_model,
+        motif_definitions=motif_definitions,
+        artifact_floors=settings.artifact_min_distance,
     )
     result.minima.append(seed_minimum)
     reference_core = seed_minimum.core_edges
+    if on_minimum is not None:
+        on_minimum(seed_minimum)
+    if progress is not None:
+        progress(
+            f"start  E={current_energy:.6f}  {len(symbols)} atoms  "
+            f"{steps} steps  kT={temperature_eV} amp={amplitude_A}"
+        )
+    started = time.perf_counter()
     known: List[Any] = [_as_parent(seed_minimum, k, p)]
 
     for step in range(1, int(steps) + 1):
@@ -428,7 +463,10 @@ def basin_hop(
         if not relaxed.ok or relaxed.coordinates is None or relaxed.energy_eV is None:
             result.n_failed += 1
             if progress is not None:
-                progress(f"{structure_id} {move}: failed ({relaxed.error or 'no energy'})")
+                progress(
+                    f"{step:4d}/{steps} {move:12s} FAILED "
+                    f"({relaxed.error or 'no energy'})"
+                )
             continue
 
         energy = float(relaxed.energy_eV)
@@ -454,6 +492,8 @@ def basin_hop(
             cutoffs=cutoffs,
             zb_model=zb_model,
             reference_core_edges=reference_core,
+            motif_definitions=motif_definitions,
+            artifact_floors=settings.artifact_min_distance,
         )
         parent = _as_parent(candidate, k, p)
         is_new = all(
@@ -463,6 +503,8 @@ def basin_hop(
         if is_new:
             result.minima.append(candidate)
             known.append(parent)
+            if on_minimum is not None:
+                on_minimum(candidate)
 
         result.trajectory.append((step, energy, accepted))
         if accepted:
@@ -471,11 +513,16 @@ def basin_hop(
             current_energy = energy
 
         if progress is not None:
+            best = result.best
             progress(
-                f"{structure_id} {move:12s} E={energy:.6f} "
-                f"dE={delta:+.3f} {'accept' if accepted else 'reject'}"
-                f"{' NEW' if is_new else ''}"
-                f"{'' if candidate.core_preserved else ' core-changed'}"
+                f"{step:4d}/{steps} {move:12s} E={energy:.6f} "
+                f"dE={delta:+7.3f} {'acc' if accepted else 'rej'}"
+                f"{' NEW' if is_new else '    '}"
+                f"{'' if candidate.core_preserved else ' core!'}"
+                f"{'' if candidate.clean else ' dirty'}"
+                f"  best={0.0 if best is None else best.energy_eV:.6f}"
+                f"  esc={len(result.minima) - 1}"
+                f"  {time.perf_counter() - started:.0f}s"
             )
 
     result.minima.sort(key=lambda item: item.energy_eV)

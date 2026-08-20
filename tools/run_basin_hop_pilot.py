@@ -160,7 +160,12 @@ def _serialise(minimum: Any) -> Dict[str, Any]:
 
 
 def _walk(job: Dict[str, Any]) -> Dict[str, Any]:
-    """One walker, in its own process; re-loads the pack so args stay picklable."""
+    """One walker, in its own process; re-loads the pack so args stay picklable.
+
+    Streams every step to stdout and to ``walkers/<seed>.log``, and appends each
+    new basin to ``walkers/<seed>.jsonl`` as it is found, so a long run is
+    followable with ``tail -f`` instead of going silent for half an hour.
+    """
 
     from builder.nucleation.molecular_zb_growth import lattice_model
 
@@ -181,6 +186,22 @@ def _walk(job: Dict[str, Any]) -> Dict[str, Any]:
     seed = dict(job["seed"])
     seed["positions"] = np.asarray(seed["positions"], dtype=float)
 
+    tag = str(seed["id"])[-14:]
+    label = f"k{job['k']}p{job['p']} {tag}"
+    walk_dir = Path(job["out_dir"]) / "walkers"
+    walk_dir.mkdir(parents=True, exist_ok=True)
+    log_path = walk_dir / f"{seed['id']}.log"
+    min_path = walk_dir / f"{seed['id']}.jsonl"
+    log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+    min_handle = min_path.open("w", encoding="utf-8", buffering=1)
+
+    def progress(line: str) -> None:
+        print(f"[{label}] {line}", flush=True)
+        log_handle.write(line + "\n")
+
+    def on_minimum(minimum: Any) -> None:
+        min_handle.write(json.dumps(_serialise(minimum)) + "\n")
+
     started = time.perf_counter()
     result = basin_hop(
         seed,
@@ -195,7 +216,12 @@ def _walk(job: Dict[str, Any]) -> Dict[str, Any]:
         rng_seed=int(job["rng_seed"]),
         zb_model=zb_model,
         overlap_min_A=overlap_min_A,
+        motif_definitions=(pack.raw or {}).get("motifs"),
+        progress=progress,
+        on_minimum=on_minimum,
     )
+    log_handle.close()
+    min_handle.close()
     return {
         "seed_id": result.seed_id,
         "origin": seed.get("origin", "?"),
@@ -489,7 +515,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit(f"no seeds found for k={args.k} p={args.p} in {args.run}")
 
     args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "seeds.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": s["id"],
+                    "origin": s["origin"],
+                    "energy_eV": s["energy_eV"],
+                    "n_atoms": len(s["symbols"]),
+                }
+                for s in seeds
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"[bh] {len(seeds)} seeds, {args.steps} steps each, {args.workers} worker(s)")
+    print(f"[bh] live: tail -f {args.output}/walkers/*.log")
     for seed in seeds:
         print(f"[bh]   {seed['origin']:8s} {seed['id']:34s} E={seed['energy_eV']:.6f}")
 
@@ -504,6 +546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "moves": list(moves),
             "amplitude_A": args.amplitude,
             "rng_seed": args.rng_seed + index,
+            "out_dir": str(args.output),
         }
         for index, seed in enumerate(seeds)
     ]
