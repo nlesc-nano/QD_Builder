@@ -15,12 +15,23 @@ per batch.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 __all__ = ["XtbSettings", "XtbResult", "relax_structures"]
 
@@ -86,6 +97,18 @@ class XtbSettings:
     #: formal convergence.  g-xTB often plateaus sub-kcal/mol well before the
     #: force threshold; those endpoints are usable if artifact-pruned later.
     accept_maxcycle: bool = True
+    #: How many g-xTB processes to run at once.  1 keeps the historical
+    #: serial behaviour.  Benchmarked on a 24-core Rocky node over 10-26 atom
+    #: clusters (``tools/bench_gxtb_parallel.py``): 24 concurrent
+    #: single-threaded jobs beat one job at every core budget and every size,
+    #: by 8.5-15.7x over a single job, and throughput was still rising at 24.
+    workers: int = 1
+    #: OpenMP threads handed to each g-xTB process.  0 means "decide": 1 when
+    #: ``workers > 1``, otherwise leave whatever the environment has.  Setting
+    #: this above 1 is almost always wrong here -- at a fixed core budget
+    #: ``N x 1`` beat ``N/2 x 2`` and ``N/4 x 4`` at every size measured,
+    #: because a 10-26 atom SCF is too small to thread.
+    threads_per_worker: int = 0
     #: Post-relax bond-like artifact floors (Å) by element pair key
     #: (``"Cd-Cd"``, ``"Se-Se"``, ``"Cl-Se"``, ``"Cl-Cl"``, …).  Mid-gap between
     #: covalent collapses and ordinary non-bonded contacts — **not** the same
@@ -133,6 +156,18 @@ class XtbSettings:
             ),
             charge=int(raw.get("charge", 0)),
             check_connectivity=bool(raw.get("check_connectivity", True)),
+            # QD_XTB_WORKERS lets the batch script own the core count
+            # (export QD_XTB_WORKERS=$SLURM_CPUS_PER_TASK) so the pack stays
+            # portable across machines with different node sizes.
+            workers=int(
+                os.environ.get("QD_XTB_WORKERS", raw.get("workers", 1)) or 1
+            ),
+            threads_per_worker=int(
+                os.environ.get(
+                    "QD_XTB_THREADS", raw.get("threads_per_worker", 0)
+                )
+                or 0
+            ),
             timeout_s=float(raw.get("timeout_s", 0.0)),
             accept_maxcycle=accept_maxcycle,
             artifact_min_distance=artifact_min_distance,
@@ -234,14 +269,29 @@ def describe_backend(settings: "XtbSettings") -> List[str]:
 
 
 def _cli_env(settings: "XtbSettings") -> Dict[str, str]:
-    """Environment handed to the backend, with XTBPATH from the pack."""
+    """Environment handed to the backend, with XTBPATH from the pack.
+
+    Thread control matters more than it looks.  ``setdefault`` only applies
+    when the variable is absent, so a job script exporting
+    ``OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`` is *inherited*: every g-xTB call
+    then runs with that many threads, one at a time.  Once ``workers > 1``
+    that would oversubscribe the node catastrophically (24 processes x 16
+    threads), so the thread count is set explicitly rather than defaulted.
+    """
 
     import os
 
     env = dict(os.environ)
     if settings.xtb_path:
         env["XTBPATH"] = settings.xtb_path
-    env.setdefault("OMP_NUM_THREADS", "1")
+    threads = int(settings.threads_per_worker)
+    if threads <= 0:
+        threads = 1 if int(settings.workers) > 1 else 0
+    if threads > 0:
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            env[key] = str(threads)
+    else:
+        env.setdefault("OMP_NUM_THREADS", "1")
     return env
 
 
@@ -310,7 +360,7 @@ def _parse_cli_opt_status(log: str, max_steps: int) -> Tuple[bool, int, str]:
     return False, steps, "not_converged"
 
 
-def _run_cli(structures, settings) -> List[Dict[str, Any]]:
+def _run_cli(structures, settings, on_result=None) -> List[Dict[str, Any]]:
     """Drive a standalone xtb/g-xTB binary, one optimisation per structure.
 
     g-xTB has no Python binding, so it is run as ``<binary> in.xyz --gxtb
@@ -324,13 +374,11 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
     contacts) are rejected later by the post-relax artifact prune.
     """
 
-    import shutil
-    import tempfile
-
     global _BACKEND_BANNER_DONE
 
     binary = settings.binary or "gxtb"
     env = _cli_env(settings)
+    workers = max(1, int(settings.workers))
     if not _BACKEND_BANNER_DONE:
         _BACKEND_BANNER_DONE = True
         print("\n".join(describe_backend(settings)), flush=True)
@@ -339,107 +387,145 @@ def _run_cli(structures, settings) -> List[Dict[str, Any]]:
             f"accept_maxcycle: {bool(settings.accept_maxcycle)}",
             flush=True,
         )
+        print(
+            f"[relax] workers   : {workers}  "
+            f"OMP_NUM_THREADS={env.get('OMP_NUM_THREADS', 'inherited')}",
+            flush=True,
+        )
 
-    out: List[Dict[str, Any]] = []
-    for entry in structures:
-        work = tempfile.mkdtemp(prefix="gxtb_")
+    if workers <= 1 or len(structures) <= 1:
+        done: List[Dict[str, Any]] = []
+        for index, entry in enumerate(structures):
+            record = _run_cli_one(entry, settings, binary, env)
+            done.append(record)
+            if on_result is not None:
+                on_result(index, record)
+        return done
+    # subprocess.run releases the GIL while it waits and every call already
+    # gets its own tempfile.mkdtemp with no shared state, so threads are enough
+    # and avoid pickling the settings into worker processes.  Results are
+    # placed back by index, so the return order is the input order however the
+    # jobs happen to finish; ``on_result`` fires in completion order so a
+    # caller can report progress while the batch is still running.
+    out: List[Optional[Dict[str, Any]]] = [None] * len(structures)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_run_cli_one, entry, settings, binary, env): index
+            for index, entry in enumerate(structures)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            record = future.result()
+            out[index] = record
+            if on_result is not None:
+                on_result(index, record)
+    return [r for r in out if r is not None]
+
+
+def _run_cli_one(
+    entry: Mapping[str, Any],
+    settings: "XtbSettings",
+    binary: str,
+    env: Mapping[str, str],
+) -> Dict[str, Any]:
+    """One g-xTB optimisation in its own scratch directory."""
+
+    import shutil
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="gxtb_")
+    try:
+        xyz = Path(work) / "in.xyz"
+        lines = [str(len(entry["symbols"])), entry["id"]]
+        for sym, pos in zip(entry["symbols"], entry["positions"]):
+            lines.append(
+                f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
+            )
+        xyz.write_text("\n".join(lines) + "\n")
+        _write_cli_xcontrol(Path(work), settings)
+        cmd = _cli_command(binary, settings)
         try:
-            xyz = Path(work) / "in.xyz"
-            lines = [str(len(entry["symbols"])), entry["id"]]
-            for sym, pos in zip(entry["symbols"], entry["positions"]):
-                lines.append(
-                    f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
-                )
-            xyz.write_text("\n".join(lines) + "\n")
-            _write_cli_xcontrol(Path(work), settings)
-            cmd = _cli_command(binary, settings)
-            try:
-                proc = subprocess.run(
-                    cmd, cwd=work, capture_output=True, text=True, env=env,
-                    check=False,
-                    timeout=(
-                        None if settings.timeout_s <= 0.0 else settings.timeout_s
-                    ),
-                )
-            except subprocess.TimeoutExpired:
-                out.append({
-                    "id": entry["id"], "ok": False,
-                    "error": f"timeout after {settings.timeout_s:g} s",
-                })
-                continue
-            except OSError as exc:
-                out.append({"id": entry["id"], "ok": False, "error": str(exc)})
-                continue
-            log = (proc.stdout or "") + (proc.stderr or "")
-            opt = Path(work) / "xtbopt.xyz"
-            if not opt.exists():
-                tail = [ln for ln in log.splitlines() if ln.strip()]
-                out.append({
-                    "id": entry["id"], "ok": False,
-                    "error": tail[-1][:200] if tail else "no xtbopt.xyz",
-                })
-                continue
-            body = opt.read_text().splitlines()
-            n = int(body[0].split()[0])
-            comment = body[1]
-            positions = []
-            for row in body[2:2 + n]:
-                parts = row.split()
-                positions.append([float(v) for v in parts[1:4]])
-            energy_eh = None
-            m = re.search(r"energy:\s*(-?\d+\.\d+)", comment)
+            proc = subprocess.run(
+                cmd, cwd=work, capture_output=True, text=True, env=env,
+                check=False,
+                timeout=(
+                    None if settings.timeout_s <= 0.0 else settings.timeout_s
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "id": entry["id"], "ok": False,
+                "error": f"timeout after {settings.timeout_s:g} s",
+            }
+        except OSError as exc:
+            return {"id": entry["id"], "ok": False, "error": str(exc)}
+        log = (proc.stdout or "") + (proc.stderr or "")
+        opt = Path(work) / "xtbopt.xyz"
+        if not opt.exists():
+            tail = [ln for ln in log.splitlines() if ln.strip()]
+            return {
+                "id": entry["id"], "ok": False,
+                "error": tail[-1][:200] if tail else "no xtbopt.xyz",
+            }
+        body = opt.read_text().splitlines()
+        n = int(body[0].split()[0])
+        comment = body[1]
+        positions = []
+        for row in body[2:2 + n]:
+            parts = row.split()
+            positions.append([float(v) for v in parts[1:4]])
+        energy_eh = None
+        m = re.search(r"energy:\s*(-?\d+\.\d+)", comment)
+        if m:
+            energy_eh = float(m.group(1))
+        else:
+            m = re.search(r"TOTAL ENERGY\s+(-?\d+\.\d+)", log)
             if m:
                 energy_eh = float(m.group(1))
-            else:
-                m = re.search(r"TOTAL ENERGY\s+(-?\d+\.\d+)", log)
-                if m:
-                    energy_eh = float(m.group(1))
-            gap = None
-            gaps = re.findall(r"HOMO-LUMO gap\s+(-?\d+\.\d+)\s*eV", log)
-            if gaps:
-                gap = float(gaps[-1])
-            converged, steps, status = _parse_cli_opt_status(
-                log, int(settings.max_steps)
-            )
-            bond_orders = None
-            wbo = Path(work) / "wbo"
-            if wbo.exists():
-                bond_orders = [[0.0] * n for _ in range(n)]
-                for row in wbo.read_text().splitlines():
-                    parts = row.split()
-                    if len(parts) != 3:
-                        continue
-                    i, j, w = int(parts[0]) - 1, int(parts[1]) - 1, float(parts[2])
-                    if 0 <= i < n and 0 <= j < n:
-                        bond_orders[i][j] = bond_orders[j][i] = w
-            has_energy = energy_eh is not None
-            # Accept maxcycle endpoints when geometry + energy exist.
-            if has_energy and not converged and not settings.accept_maxcycle:
-                out.append({
-                    "id": entry["id"], "ok": False,
-                    "energy_eV": energy_eh * _HARTREE_EV,
-                    "gap_eV": gap, "steps": steps, "converged": False,
-                    "positions": positions, "bond_orders": bond_orders,
-                    "error": f"not_converged:{status or 'fail'}",
-                    "status": status or "not_converged",
-                })
-                continue
-            err = ""
-            if not has_energy:
-                err = "no energy in output"
-            elif not converged:
-                err = ""  # usable endpoint; status carries maxcycle tag
-            out.append({
-                "id": entry["id"], "ok": has_energy,
-                "energy_eV": None if energy_eh is None else energy_eh * _HARTREE_EV,
-                "gap_eV": gap, "steps": steps, "converged": converged,
+        gap = None
+        gaps = re.findall(r"HOMO-LUMO gap\s+(-?\d+\.\d+)\s*eV", log)
+        if gaps:
+            gap = float(gaps[-1])
+        converged, steps, status = _parse_cli_opt_status(
+            log, int(settings.max_steps)
+        )
+        bond_orders = None
+        wbo = Path(work) / "wbo"
+        if wbo.exists():
+            bond_orders = [[0.0] * n for _ in range(n)]
+            for row in wbo.read_text().splitlines():
+                parts = row.split()
+                if len(parts) != 3:
+                    continue
+                i, j, w = int(parts[0]) - 1, int(parts[1]) - 1, float(parts[2])
+                if 0 <= i < n and 0 <= j < n:
+                    bond_orders[i][j] = bond_orders[j][i] = w
+        has_energy = energy_eh is not None
+        # Accept maxcycle endpoints when geometry + energy exist.
+        if has_energy and not converged and not settings.accept_maxcycle:
+            return {
+                "id": entry["id"], "ok": False,
+                "energy_eV": energy_eh * _HARTREE_EV,
+                "gap_eV": gap, "steps": steps, "converged": False,
                 "positions": positions, "bond_orders": bond_orders,
-                "error": err,
-                "status": ("converged" if converged else (status or "not_converged")),
-            })
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-    return out
+                "error": f"not_converged:{status or 'fail'}",
+                "status": status or "not_converged",
+            }
+        err = ""
+        if not has_energy:
+            err = "no energy in output"
+        elif not converged:
+            err = ""  # usable endpoint; status carries maxcycle tag
+        return {
+            "id": entry["id"], "ok": has_energy,
+            "energy_eV": None if energy_eh is None else energy_eh * _HARTREE_EV,
+            "gap_eV": gap, "steps": steps, "converged": converged,
+            "positions": positions, "bond_orders": bond_orders,
+            "error": err,
+            "status": ("converged" if converged else (status or "not_converged")),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _run_in_process(structures, settings) -> Optional[List[Dict[str, Any]]]:
@@ -556,6 +642,7 @@ def relax_structures(
     structures: Sequence[Mapping[str, Any]],
     settings: XtbSettings,
     bond_cutoffs: Optional[Mapping[Tuple[str, str], float]] = None,
+    on_result: Optional[Callable[[int, Mapping[str, Any]], None]] = None,
 ) -> List[XtbResult]:
     """Relax a batch.  ``structures`` need ``id``, ``symbols``, ``positions``
     and -- when connectivity is checked -- ``edges``."""
@@ -571,7 +658,7 @@ def relax_structures(
         for entry in structures
     ]
     if _is_gxtb(settings.method):
-        raw = _run_cli(payload, settings)
+        raw = _run_cli(payload, settings, on_result=on_result)
     else:
         raw = _run_in_process(payload, settings)
         if raw is None:
