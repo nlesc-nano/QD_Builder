@@ -82,8 +82,9 @@ def collect_seeds(
     n_eligible: int,
     n_offpath: int,
     spec: Any,
+    seed_by: str = "minimum",
 ) -> List[Dict[str, Any]]:
-    """Lowest-energy propagation-eligible and off-path endpoints of one bin."""
+    """Seeds for one bin: distinct relaxed basins (default) or lowest energy."""
 
     from builder.nucleation.molecular_growth import load_parents_from_run
 
@@ -94,6 +95,26 @@ def collect_seeds(
         for parent in load_parents_from_run(run_dir, k=k, spec=spec, p_values=[p])
         if parent.p == p
     ]
+    if seed_by == "minimum" and parents:
+        # One seed per *distinct relaxed basin*, not per lowest energy.  Picking
+        # by energy picks near-degenerate copies of the same minimum: measured
+        # on this run, 6 energy-ranked seeds spanned only 3 distinct minima at
+        # both k3p3 and k4p3, so half the walkers re-searched ground already
+        # covered.  consolidate_relaxed_minima is the pipeline's own definition
+        # of "same basin", and its representative is the lowest-energy member,
+        # so this keeps the energy ordering *between* basins while removing the
+        # duplication within them.
+        from builder.nucleation.molecular_growth import (
+            MinimumConsolidation,
+            consolidate_relaxed_minima,
+        )
+
+        clusters = consolidate_relaxed_minima(
+            parents,
+            MinimumConsolidation(enabled=True, allow_reflection=True),
+            spec,
+        )
+        parents = [cluster.representative for cluster in clusters]
     parents.sort(key=lambda item: float(item.energy_eV))
     for parent in parents[: max(0, n_eligible)]:
         seeds.append(
@@ -483,11 +504,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--k", type=int, required=True)
     ap.add_argument("--p", type=int, required=True)
     ap.add_argument("--n-eligible", type=int, default=6, help="lowest-energy eligible seeds")
-    ap.add_argument("--n-offpath", type=int, default=3, help="lowest-energy off-path seeds")
-    ap.add_argument("--steps", type=int, default=200)
+    ap.add_argument("--n-offpath", type=int, default=0, help="lowest-energy off-path seeds")
+    ap.add_argument(
+        "--seed-by",
+        choices=("minimum", "energy"),
+        default="minimum",
+        help=(
+            "minimum: one seed per distinct relaxed basin (default); "
+            "energy: the N lowest-energy endpoints, which duplicates basins"
+        ),
+    )
+    ap.add_argument(
+        "--steps",
+        type=int,
+        default=50,
+        help="first gains land at steps 4-21 and nothing improved past ~45",
+    )
     ap.add_argument("--temperature", type=float, default=0.15, help="Metropolis kT in eV")
-    ap.add_argument("--amplitude", type=float, default=0.35, help="shake sigma in A")
-    ap.add_argument("--moves", default=",".join(MOVES))
+    ap.add_argument("--amplitude", type=float, default=0.45, help="shake sigma in A")
+    ap.add_argument(
+        "--moves",
+        default="shake,single_atom",
+        help=(
+            "surface_swap is available but off by default: measured 433 "
+            "attempts, 1 clean core-preserving outcome, 0 improvements"
+        ),
+    )
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--rng-seed", type=int, default=1729)
     ap.add_argument("--output", type=Path, required=True)
@@ -510,6 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_eligible=args.n_eligible,
         n_offpath=args.n_offpath,
         spec=spec,
+        seed_by=args.seed_by,
     )
     if not seeds:
         raise SystemExit(f"no seeds found for k={args.k} p={args.p} in {args.run}")
