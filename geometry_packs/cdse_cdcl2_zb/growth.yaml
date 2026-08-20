@@ -34,10 +34,18 @@ surface:
   beta: 2.0
   alpha: 1.0
   p_slack: 1
-  # Hard ceiling on child p, on top of the p_surf envelope.  Measured over
-  # k1-k4: k2p4 0.0% eligible, k3p4 1.5%, k3p5 0.6%, k4p4 0.8% -- 1875 of
-  # 4215 relaxations for 19 endpoints.  Overridden per k-block below.
-  max_p_child: 4
+  # Hard ceiling on child p, on top of the p_surf envelope.
+  #
+  # The k1-k4 yields that motivated a tight cap (k3p4 1.5%, k3p5 0.6%, k4p4
+  # 0.8%) were measured with bridge_target_count_window: 0, and at high Cl/Cd
+  # that generator could only emit all-bridge shells: 0 of 178 shells at k3p4,
+  # 0 of 240 at k4p5, 0 of 209 at k4p6 carried a terminal Cl.  All-bridge
+  # shells yield 3.7% propagation-eligible against 25.6% for terminal-carrying
+  # ones, so those bins were being fed nothing but the worst-surviving family.
+  # With the window open the same cores now offer 366-480 terminal-carrying
+  # shells out of ~500-720.  The high-p bins are therefore *unmeasured* under
+  # the current generator and the cap is lifted to let them be measured.
+  max_p_child: 6
 
 parents:
   energy_window_eV: 0.80
@@ -136,7 +144,7 @@ by_k:
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 20
     p_slack: 1
-    max_p_child: 3   # k2p4 gave 0 eligible endpoints from 72 relaxations
+    max_p_child: 3   # child k=2; k2p4 gave 0 of 72, and p_surf(2)+slack is 4 anyway
   - k_min: 2
     k_max: 2
     monomer_p_values: [1, 2]
@@ -149,7 +157,7 @@ by_k:
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 16
     p_slack: 1
-    max_p_child: 3   # k3p4 1.5% and k3p5 0.6% eligible, 1330 relaxations for 15
+    max_p_child: 6   # was 3; k3p4/k3p5 never tried with the bridge window open
   - k_min: 3
     k_max: 3
     monomer_p_values: [1, 2]
@@ -162,7 +170,7 @@ by_k:
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 16
     p_slack: 1
-    max_p_child: 3   # k4p4 0.8% eligible from 473 relaxations
+    max_p_child: 6   # was 3; k4p4/p5/p6 never tried with the bridge window open
   - k_min: 4
     k_max: 12
     monomer_p_values: [1, 2]
@@ -175,7 +183,7 @@ by_k:
     moves: {graph: false, coord: false, zb_sites: true}
     max_children_per_channel: 16
     p_slack: 1
-    max_p_child: 4   # not measured above k=4; 4 keeps a margin over the Cd16Se13 p=3 target
+    max_p_child: 6   # p_surf still governs above this; 6 spans the Cd16Se13 p=3 target
 
 chemical_potential:
   enabled: true

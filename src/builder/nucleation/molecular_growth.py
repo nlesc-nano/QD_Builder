@@ -5585,13 +5585,34 @@ def _select_zb_decorations(isomers: Sequence[Any], limit: int) -> List[Any]:
     # Sorting the bucket keys by repr happened to favour mixed shells; this
     # makes it the rule rather than a property of the string order.
     families: Dict[int, List[Tuple[Any, ...]]] = defaultdict(list)
+    family_terminals: Dict[int, int] = {}
     for key in sorted(buckets, key=repr):
-        families[
-            sum(count for degree, count in key[0] if int(degree) >= 2)
-        ].append(key)
+        degrees = dict(key[0])
+        bridges = sum(
+            count for degree, count in key[0] if int(degree) >= 2
+        )
+        families[bridges].append(key)
+        # A built shell has no mu3, so within one bridge-count family the
+        # terminal count is fixed; taking it from any member is exact.
+        family_terminals.setdefault(bridges, int(degrees.get(1, 0)))
     ordered_keys: List[Tuple[Any, ...]] = []
     family_depth = 0
-    family_order = sorted(families, reverse=True)
+    # Terminal-carrying families first, and among those the *highest* bridge
+    # count.  Both halves are measured: a shell with at least one terminal Cl
+    # yields 25.6% propagation-eligible endpoints against 3.7% for all-bridge
+    # ones, while the best structure of a bin sits near maximal bridging
+    # (n_bridges(best) = 0.96*2p).  So the right single pick is "as bridged as
+    # possible while still leaving a terminal".
+    #
+    # This only bites when the budget is smaller than the number of families:
+    # at ``selection_max_per_skeleton: 3`` every family gets a representative
+    # anyway and ``_zb_shell_rank_key`` settles the order downstream.  It makes
+    # a *small* budget safe -- with the previous descending order a budget of 1
+    # picked the all-bridge family for 12 of 12 occupations at k3p3 and k4p3.
+    family_order = sorted(
+        families,
+        key=lambda bridges: (0 if family_terminals[bridges] else 1, -bridges),
+    )
     while any(family_depth < len(families[f]) for f in family_order):
         for family in family_order:
             if family_depth < len(families[family]):
