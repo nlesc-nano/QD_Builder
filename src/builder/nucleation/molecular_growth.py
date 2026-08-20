@@ -245,6 +245,11 @@ class GrowthWindow:
     prefer_low_shed: bool
     max_opts_per_k: int
     min_p_parent: int = 1
+    #: Hard ceiling on the child p of any channel.  0 = only the p_surf
+    #: envelope applies.  Measured over the k1-k4 zb run: yield collapses
+    #: once p exceeds 3 -- k3p4 1.5%, k3p5 0.6%, k4p4 0.8%, k2p4 0.0%, which
+    #: together burned 1875 of 4215 relaxations for 19 endpoints.
+    max_p_child: int = 0
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
 
@@ -261,6 +266,8 @@ class GrowthWindow:
         )
 
     def allow_p_child(self, k_child: int, p_child: int) -> bool:
+        if self.max_p_child > 0 and int(p_child) > int(self.max_p_child):
+            return False
         if self.surface_beta <= 0.0:
             return True
         return int(p_child) <= self.p_surf(k_child) + int(self.p_slack)
@@ -286,6 +293,7 @@ class GrowthWindow:
             f"k={self.k_from}: p_m={list(self.monomer_p_values)} "
             f"max_shed={self.max_shed} attach={self.attach} "
             f"β={self.surface_beta} α={self.surface_alpha} {cap} "
+            f"{'' if self.max_p_child <= 0 else f'max_p_child={self.max_p_child} '}"
             f"moves A={self.move_graph} B={self.move_coord} "
             f"Z={self.move_zb_sites} "
             f"redecorate={self.child_redecorate} "
@@ -320,6 +328,11 @@ class GrowthConfig:
     surface_beta: float = 0.0
     surface_alpha: float = 1.0
     p_slack: int = 1
+    max_p_child: int = 0
+    #: Per-(k, p) ceiling on how many (occupation, ligand shell) pairs move Z
+    #: sends to geometry + g-xTB.  0 = no ceiling (previous behaviour).  The
+    #: g-xTB ceiling for the bin is this times ``xtb_starts_per_graph``.
+    zb_max_shells_per_bin: int = 0
     selection_max_per_skeleton: int = 0
     max_opts_per_k: int = 0
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
@@ -439,6 +452,7 @@ class GrowthConfig:
                 overlay.get("surface_alpha", self.surface_alpha)
             ),
             p_slack=int(overlay.get("p_slack", self.p_slack)),
+            max_p_child=int(overlay.get("max_p_child", self.max_p_child)),
             persist_wbo=bool(overlay.get("persist_wbo", self.persist_wbo)),
             shed_mode=str(overlay.get("shed_mode", self.shed_mode)).lower(),
             prefer_low_shed=bool(
@@ -545,6 +559,8 @@ class GrowthConfig:
             surface_beta=float(surface.get("beta", 0.0)),
             surface_alpha=float(surface.get("alpha", 1.0)),
             p_slack=int(surface.get("p_slack", 1)),
+            max_p_child=int(surface.get("max_p_child", 0)),
+            zb_max_shells_per_bin=int(raw.get("zb_max_shells_per_bin", 0)),
             selection_max_per_skeleton=int(
                 raw.get("selection_max_per_skeleton", 0)
             ),
@@ -5561,7 +5577,26 @@ def _select_zb_decorations(isomers: Sequence[Any], limit: int) -> List[Any]:
             int(isomer.graph.number_of_edges()),
         )
         buckets[signature].append(isomer)
-    ordered_keys = sorted(buckets, key=repr)
+    # Spread the budget over distinct bridge counts before spending it twice
+    # inside one.  With ``bridge_target_count_window`` open the generator now
+    # offers several bridge-count families per core, and the surviving fraction
+    # differs sharply between them: all-bridge shells yield 3.7% propagation-
+    # eligible endpoints against 25.6% for shells carrying one terminal Cl.
+    # Sorting the bucket keys by repr happened to favour mixed shells; this
+    # makes it the rule rather than a property of the string order.
+    families: Dict[int, List[Tuple[Any, ...]]] = defaultdict(list)
+    for key in sorted(buckets, key=repr):
+        families[
+            sum(count for degree, count in key[0] if int(degree) >= 2)
+        ].append(key)
+    ordered_keys: List[Tuple[Any, ...]] = []
+    family_depth = 0
+    family_order = sorted(families, reverse=True)
+    while any(family_depth < len(families[f]) for f in family_order):
+        for family in family_order:
+            if family_depth < len(families[family]):
+                ordered_keys.append(families[family][family_depth])
+        family_depth += 1
     selected: List[Any] = []
     depth = 0
     while len(selected) < limit:
@@ -5576,6 +5611,100 @@ def _select_zb_decorations(isomers: Sequence[Any], limit: int) -> List[Any]:
             break
         depth += 1
     return selected
+
+
+def _zb_shell_rank_key(
+    isomer: Any,
+    spec: NucleationSpec,
+) -> Tuple[int, int, int, int]:
+    """Order (occupation, shell) jobs best-first for the per-bin budget.
+
+    Every level is a feature of the *built* graph measured on the k1-k4 zb
+    run, ranked by the distinct relaxed basins it returns per 1000 g-xTB
+    relaxations (baseline 29.7):
+
+      1. mu2 bridges whose two hosts both finish at the maximum cation CN --
+         61.1 basins/1k with none, 50.8 with at most one.
+      2. a shell with no terminal ligand at all -- 3.7% of those become
+         propagation-eligible against 25.6% for shells carrying one.
+      3. anions already at maximum coordination -- 46.7 basins/1k, and
+         P(topology preserved) is 0.052 against a 0.143 baseline.
+      4. cations already at maximum coordination -- 44.4 basins/1k.
+
+    Lexicographic rather than a weighted sum: each level has a measured
+    effect size, none of them has a measured exchange rate against another.
+    """
+
+    cation = spec.core.cation
+    anion = spec.core.anion
+    ligand = spec.precursor.ligand
+    graph = isomer.graph
+    symbols = list(isomer.symbols)
+    max_cation_cn = int(spec.graph_rules.max_cn.get(cation, 4))
+    max_anion_cn = int(spec.graph_rules.max_cn.get(anion, 4))
+    saturated_bridges = 0
+    terminals = 0
+    saturated_anions = 0
+    saturated_cations = 0
+    for node in graph.nodes:
+        symbol = symbols[node]
+        degree = int(graph.degree(node))
+        if symbol == ligand:
+            hosts = [n for n in graph[node] if symbols[n] == cation]
+            if len(hosts) == 1:
+                terminals += 1
+            elif len(hosts) == 2 and all(
+                int(graph.degree(host)) >= max_cation_cn for host in hosts
+            ):
+                saturated_bridges += 1
+        elif symbol == anion and degree >= max_anion_cn:
+            saturated_anions += 1
+        elif symbol == cation and degree >= max_cation_cn:
+            saturated_cations += 1
+    return (
+        saturated_bridges,
+        0 if terminals else 1,
+        saturated_anions,
+        saturated_cations,
+    )
+
+
+def _plan_zb_relax_jobs(
+    jobs: Sequence[Tuple[Any, List[Tuple[int, Any]]]],
+    budget: int,
+) -> List[Tuple[Any, List[Tuple[int, Any]]]]:
+    """Spend a per-bin shell budget round-robin over occupations.
+
+    Truncating a bin in generation order loses survivors in proportion:
+    measured over the k1-k4 zb run the productive occupations are spread
+    uniformly through each bin (about half in the first half, and the last
+    productive one sits at position 114/114, 175/177, 93/93).  So the budget
+    goes to the best-ranked shells, and round-robin across occupations so a
+    few occupations cannot consume the bin -- distinct lattice routes are
+    what the next k grows from.  ``jobs`` and each shell list must already be
+    ordered best-first.
+    """
+
+    total = sum(len(shells) for _occupation, shells in jobs)
+    if budget <= 0 or total <= budget:
+        return list(jobs)
+    keep: Dict[int, List[Tuple[int, Any]]] = defaultdict(list)
+    taken = 0
+    depth = 0
+    while taken < budget:
+        progressed = False
+        for index, (_occupation, shells) in enumerate(jobs):
+            if depth >= len(shells):
+                continue
+            keep[index].append(shells[depth])
+            taken += 1
+            progressed = True
+            if taken >= budget:
+                break
+        if not progressed:
+            break
+        depth += 1
+    return [(jobs[index][0], keep[index]) for index in sorted(keep)]
 
 
 def _append_zb_manifest(output_dir: Path, record: Mapping[str, Any]) -> None:
@@ -5668,6 +5797,7 @@ def _opt_zb_occupations(
     decoration_limit = int(
         getattr(map_spec.graph_rules, "selection_max_per_skeleton", 3) or 3
     )
+    shell_budget = int(getattr(growth, "zb_max_shells_per_bin", 0) or 0)
     log = progress if isinstance(progress, GrowthLog) else None
     endpoint_reference = None
     if growth.endpoint_diagnostic_k > 0 and growth.endpoint_reference is not None:
@@ -5677,12 +5807,8 @@ def _opt_zb_occupations(
             lattice_model(map_spec),
         )
     for (k, p), occupations in sorted(zb_seeds.items()):
-        if log:
-            log.begin_block(len(occupations), label=f"Z k={k} p={p}")
-            log.line(
-                f"--- move Z k={k} p={p}: occupations={len(occupations)} "
-                f"decorations<={decoration_limit} embed={factor_starts}->{xtb_starts} ---"
-            )
+        # ---- pass 1: rank ligand shells for the whole bin, no geometry ----
+        planned: List[Tuple[Any, List[Tuple[int, Any]]]] = []
         for occupation in occupations:
             if (
                 endpoint_reference is not None
@@ -5724,12 +5850,43 @@ def _opt_zb_occupations(
                     zb_stats.clash_skip += 1
                 continue
 
+            n_core = len(occupation.symbols)
+            shells: List[Tuple[int, Any]] = []
             for decoration_index, isomer in enumerate(decorations, start=1):
-                n_core = len(occupation.symbols)
                 if tuple(isomer.symbols[:n_core]) != tuple(occupation.symbols):
                     if zb_stats is not None:
                         zb_stats.opt_fail += 1
                     continue
+                shells.append((decoration_index, isomer))
+            if not shells:
+                continue
+            shells.sort(key=lambda item: _zb_shell_rank_key(item[1], map_spec))
+            planned.append((occupation, shells))
+
+        planned.sort(
+            key=lambda item: (
+                _zb_shell_rank_key(item[1][0][1], map_spec),
+                str(item[0].occupation_id),
+            )
+        )
+        offered = sum(len(shells) for _occupation, shells in planned)
+        planned = _plan_zb_relax_jobs(planned, shell_budget)
+        kept = sum(len(shells) for _occupation, shells in planned)
+        if log:
+            log.begin_block(kept * max(1, xtb_starts), label=f"Z k={k} p={p}")
+            budget_note = (
+                "" if shell_budget <= 0 else f" budget={shell_budget}"
+            )
+            log.line(
+                f"--- move Z k={k} p={p}: occupations={len(occupations)}"
+                f"->{len(planned)} decorations<={decoration_limit} "
+                f"shells={offered}->{kept}{budget_note} "
+                f"embed={factor_starts}->{xtb_starts} ---"
+            )
+
+        # ---- pass 2: geometry + g-xTB on the shells that made the cut ----
+        for occupation, shells in planned:
+            for decoration_index, isomer in shells:
                 state = _State(atoms=isomer.atoms, graph=isomer.graph.copy())
                 anchored = {
                     index: np.asarray(occupation.coordinates[index], dtype=float)

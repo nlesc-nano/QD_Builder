@@ -37,6 +37,7 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "require_bridge_maximal",
     # --- how decorations are generated -----------------------------------
     "decoration_mode",
+    "max_saturated_host_bridges",
     "bridge_first_p1_terminal_policy",
     "bridge_first_hard_max_bridges_per_cd",
     "bridge_first_prefer_bridges_per_cd",
@@ -650,6 +651,9 @@ class GeometryPack:
             ),
             "bridge_first_max_automorphisms": int(
                 self.graph_rules.get("bridge_first_max_automorphisms", 64)
+            ),
+            "max_saturated_host_bridges": int(
+                self.graph_rules.get("max_saturated_host_bridges", -1)
             ),
             "bridge_target_ring_closing_only": bool(
                 self.graph_rules.get("bridge_target_ring_closing_only", True)

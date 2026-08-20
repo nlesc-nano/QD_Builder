@@ -433,6 +433,14 @@ class NucleationGraphRules:
     #: and cuts p9 from 1541 s to 123 s; 64 is 327x on p9 and drops ~7% of
     #: p7, which is the trade chosen here -- speed matters more at large k.
     bridge_first_max_automorphisms: int = 64
+    #: Cap on μ2 bridges whose *two* hosts both finish at the maximum cation
+    #: CN.  Applies to both bridge generators.  -1 = no cap (default, so no
+    #: existing pack changes behaviour).  Measured over the k1–k4 zb run
+    #: (4215 relaxations): 74% of built structures carry at least one such
+    #: bridge and they yield 3.0% propagation-eligible endpoints against
+    #: 13.5% for the rest; capping at 1 keeps 73% of the distinct relaxed
+    #: basins for 43% of the g-xTB cost, capping at 0 keeps 54% for 26%.
+    max_saturated_host_bridges: int = -1
     #: --- motif_bridge_target knobs -------------------------------------
     #: Restrict bridges to Cd pairs at core distance 2 or 4 (4-ring / 6-ring
     #: closure).  Measured: 54.2% of bridges close a 4-ring, 44.6% a 6-ring,
@@ -459,12 +467,16 @@ class NucleationGraphRules:
     #: n_bridges = 0.964*(2p) - 0.36 (r=0.993, 29 bins), but the population is
     #: broad: 5.7% of relaxed structures sit at exactly 2p, 51% within 2.
     bridge_target_count_window: int = 0
-    #: Hard stop on legal decorations yielded for one skeleton.  Without this
-    #: high-p bins can stream millions of max-bridge sets before the reservoir
-    #: samples (k4p7: ~4e6 raw, 0 isomers).  0 = unlimited.
+    #: Hard stop on legal decorations yielded, counted *per productive bridge
+    #: count* -- one skeleton is bounded by this times
+    #: ``bridge_target_count_window + 1``.  Without it high-p bins can stream
+    #: millions of max-bridge sets before the reservoir samples (k4p7: ~4e6
+    #: raw, 0 isomers).  0 = unlimited.
     bridge_target_max_emissions_per_skeleton: int = 2000
-    #: Hard stop on walk nodes (partial bridge sets visited) per skeleton.
-    #: Guards thrashing when few yields but a huge tree.  0 = unlimited.
+    #: Hard stop on walk nodes (partial bridge sets visited), also per
+    #: productive bridge count.  Guards thrashing when few yields but a huge
+    #: tree, and keeps a tier whose emissions are all filtered out from
+    #: starving the step down to the next bridge count.  0 = unlimited.
     bridge_target_max_nodes_per_skeleton: int = 50000
     #: --- per-skeleton decoration budget --------------------------------
     #: Keep at most this many decorations per skeleton (reservoir-sampled

@@ -29,6 +29,11 @@ graph_rules:
   # Rhombus / 2p Cl chemistry (not a diamond score).
   min_bridged_host_cn: 3
   max_shared_ligands_per_host_pair: 1
+  # A mu2 Cl whose *two* hosts both finish at Cd CN 4 has no room to relax:
+  # over the k1-k4 zb run 74% of built structures carried one and they gave
+  # 3.0% propagation-eligible endpoints against 13.5% without.  Capping at 1
+  # keeps 73% of the distinct relaxed basins for 43% of the g-xTB cost.
+  max_saturated_host_bridges: 1
   forbid_mono_se_dual_terminal: true
   forbid_mu3_host_bridge_overlap: true
 
@@ -39,5 +44,17 @@ graph_rules:
   bridge_first_hard_max_bridges_per_cd: 3
   selection_max_per_skeleton: 3
   selection_per_skeleton_from_k: 1
+  # Emit three productive bridge counts, not just the ceiling.  With the
+  # default 0 the walk returned after the maximum-bridge tier, so 98.0% of
+  # built Cl were mu2 and 90% of all relaxations went to all-bridge shells --
+  # which yield 3.7% propagation-eligible endpoints, against 25.6% for shells
+  # carrying one terminal Cl.  Measured on the k3p3/k4p3 occupations of the
+  # k1-k4 run: 0 of 1029 selected shells carried a terminal Cl before, 690 of
+  # 1029 after.
+  bridge_target_count_window: 2
+  # Emission and node caps are counted *per productive bridge count*, so this
+  # is 3 x 40 = 120 graphs per core here.  40 and 120 per window select the
+  # same terminal-Cl coverage (only which representative of a family is kept
+  # changes), and 40 is 3x cheaper: 63 vs 149 ms per occupation at k3p3.
   bridge_target_max_emissions_per_skeleton: 40
   bridge_target_max_nodes_per_skeleton: 2000
