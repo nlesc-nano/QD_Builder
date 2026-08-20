@@ -84,8 +84,14 @@ max_children_per_channel: 20
 # geometry + g-xTB, spent best-shell-first and round-robin over occupations.
 # This is the only cap that does not grow with k: the per-channel cap is
 # multiplied by a channel count that widens as the lattice offers more sites.
-# 150 shells x xtb_starts_per_graph (2) = 300 g-xTB per bin worst case.
-zb_max_shells_per_bin: 150
+# Replaying the complete k1-k4 run: 150 shells keeps 47% of eligible endpoints
+# and 54% of within-bin minima for 0.34x the relaxations, but it misses the bin
+# winner at k4p4 (+0.44 eV) and finds nothing at k4p6.  250 is the knee -- 64%
+# of eligible, 67% of minima, 0.54x cost.  It also matters that the budget be
+# comfortably above the occupation count (k4p3 has 177): at 150 the round-robin
+# never gets past one shell per core, so the three bridge-count families that
+# bridge_target_count_window now generates are never sampled.
+zb_max_shells_per_bin: 250
 
 lattice_switch:
   enabled: false
