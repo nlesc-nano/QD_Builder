@@ -29,11 +29,20 @@ graph_rules:
   # Rhombus / 2p Cl chemistry (not a diamond score).
   min_bridged_host_cn: 3
   max_shared_ligands_per_host_pair: 1
-  # A mu2 Cl whose *two* hosts both finish at Cd CN 4 has no room to relax:
-  # over the k1-k4 zb run 74% of built structures carried one and they gave
-  # 3.0% propagation-eligible endpoints against 13.5% without.  Capping at 1
-  # keeps 73% of the distinct relaxed basins for 43% of the g-xTB cost.
-  max_saturated_host_bridges: 1
+  # Cap on mu2 Cl whose *two* hosts both finish at Cd CN 4.  DISABLED.
+  #
+  # The 74%-carry / 3.0%-vs-13.5% signal this was built on is a between-bin
+  # artefact.  The minimum count a bin can even reach rises with Cl/Cd -- 0 up
+  # to Cl/Cd 1.0, then 2 at k3p4, 6 at k3p5, 2 at k4p4, 4 at k4p5, 8 at k4p6 --
+  # so a cap of 1 leaves those bins with no satisfiable shell and they emit
+  # nothing.  Stratified *within* each bin the correlation also reverses: the
+  # propagation-eligible structures carry a higher mean count than the bin
+  # average in 12 of 14 bins.  On the complete k1-k4 run at budget 250 the cap
+  # saves 14% of relaxations and costs 9 of 82 within-bin minima.
+  #
+  # Kept as a knob (-1 = off) rather than removed: it may still be the right
+  # rule expressed as an excess over the bin's achievable minimum.
+  max_saturated_host_bridges: -1
   forbid_mono_se_dual_terminal: true
   forbid_mu3_host_bridge_overlap: true
 
