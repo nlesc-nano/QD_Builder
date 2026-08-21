@@ -6060,6 +6060,58 @@ def _append_jsonl_unique(
 
 
 _EMBED_CTX: Dict[str, Any] = {}
+_ENUM_CTX: Dict[str, Any] = {}
+
+
+def _enum_init(pack: Any, spec: Any, limit: int) -> None:
+    """Per-process setup for shell enumeration."""
+
+    _ENUM_CTX["pack"] = pack
+    _ENUM_CTX["spec"] = spec
+    _ENUM_CTX["limit"] = int(limit)
+
+
+def _enum_one(
+    job: Tuple[int, int, List[Tuple[int, int]], Tuple[str, ...]]
+) -> Tuple[List[Tuple[int, Any]], int, bool]:
+    """Enumerate and select the ligand shells of one occupation.
+
+    Selection happens here rather than in the parent so only the kept shells
+    cross the process boundary: 4.4 KB for the three selected against 69.6 KB
+    for a whole bin's isomers.
+
+    Returns ``(shells, n_dropped, produced_any)`` -- ``n_dropped`` counts
+    decorations whose core block does not match the occupation, which the
+    caller books as ``opt_fail``, and ``produced_any`` distinguishes "no legal
+    decoration at all" from "decorations existed but none matched".
+    """
+
+    from .molecular import enumerate_molecular_bin
+
+    k, p, core_edges, symbols = job
+    spec = _ENUM_CTX["spec"]
+    graph_bin = enumerate_molecular_bin(
+        k,
+        p,
+        spec,
+        pack=_ENUM_CTX["pack"],
+        embed=False,
+        precomputed_skeletons=[list(core_edges)],
+        progress=None,
+    )
+    decorations = _select_zb_decorations(graph_bin.isomers, _ENUM_CTX["limit"])
+    if not decorations:
+        return [], 0, False
+    n_core = len(symbols)
+    shells: List[Tuple[int, Any]] = []
+    dropped = 0
+    for decoration_index, isomer in enumerate(decorations, start=1):
+        if tuple(isomer.symbols[:n_core]) != tuple(symbols):
+            dropped += 1
+            continue
+        shells.append((decoration_index, isomer))
+    shells.sort(key=lambda item: _zb_shell_rank_key(item[1], spec))
+    return shells, dropped, True
 
 
 def _embed_init(pack: Any, spec: Any, params: Mapping[str, Any]) -> None:
@@ -6204,34 +6256,42 @@ def _opt_zb_occupations(
                         f"assignment_rmsd_A={diagnostic['assignment_rmsd_A']} "
                         "(report only)"
                     )
-            graph_bin = enumerate_molecular_bin(
+
+        # Enumerating and selecting a bin's shells is 80 ms per occupation --
+        # 28 s for 350 of them, and 16% of a bin's wall once the embedding and
+        # the relaxations are parallel.  Same shape as those: independent per
+        # occupation, CPU-bound Python, so processes.
+        enum_jobs = [
+            (
                 k,
                 p,
-                map_spec,
-                pack=pack,
-                embed=False,
-                precomputed_skeletons=[occupation.core_edges],
-                progress=None,
+                [tuple(edge) for edge in occupation.core_edges],
+                tuple(occupation.symbols),
             )
-            decorations = _select_zb_decorations(
-                graph_bin.isomers, decoration_limit
-            )
-            if not decorations:
+            for occupation in occupations
+        ]
+        if embed_workers > 1 and len(enum_jobs) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(
+                max_workers=embed_workers,
+                initializer=_enum_init,
+                initargs=(pack, map_spec, decoration_limit),
+            ) as pool:
+                enumerated = list(pool.map(_enum_one, enum_jobs, chunksize=4))
+        else:
+            _enum_init(pack, map_spec, decoration_limit)
+            enumerated = [_enum_one(job) for job in enum_jobs]
+
+        for occupation, (shells, dropped, produced) in zip(occupations, enumerated):
+            if not produced:
                 if zb_stats is not None:
                     zb_stats.clash_skip += 1
                 continue
-
-            n_core = len(occupation.symbols)
-            shells: List[Tuple[int, Any]] = []
-            for decoration_index, isomer in enumerate(decorations, start=1):
-                if tuple(isomer.symbols[:n_core]) != tuple(occupation.symbols):
-                    if zb_stats is not None:
-                        zb_stats.opt_fail += 1
-                    continue
-                shells.append((decoration_index, isomer))
+            if dropped and zb_stats is not None:
+                zb_stats.opt_fail += dropped
             if not shells:
                 continue
-            shells.sort(key=lambda item: _zb_shell_rank_key(item[1], map_spec))
             planned.append((occupation, shells))
 
         planned.sort(
@@ -6265,6 +6325,7 @@ def _opt_zb_occupations(
         embed_jobs: List[Tuple[Any, Dict[int, Any]]] = []
         embed_meta: List[Tuple[Any, int, Any, Any, Tuple[Tuple[int, int], ...]]] = []
         for occupation, shells in planned:
+            n_core = len(occupation.symbols)
             for decoration_index, isomer in shells:
                 state = _State(atoms=isomer.atoms, graph=isomer.graph.copy())
                 anchored = {
@@ -6477,7 +6538,9 @@ def _opt_zb_occupations(
                 )
                 core_rmsd = _aligned_core_rmsd(
                     occupation.coordinates,
-                    np.asarray(xr.coordinates, dtype=float)[:n_core],
+                    np.asarray(xr.coordinates, dtype=float)[
+                        : len(occupation.symbols)
+                    ],
                 )
                 propagation_eligible = bool(
                     xr.converged
