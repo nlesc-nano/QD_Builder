@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import math
 import re
 import time
@@ -6156,6 +6157,18 @@ def _opt_zb_occupations(
     )
     shell_budget = int(getattr(growth, "zb_max_shells_per_bin", 0) or 0)
     workers = max(1, int(getattr(settings, "workers", 1)))
+    # Embedding is single-threaded Python, so it wants one process per *core*,
+    # not one per g-xTB job.  With workers=12 x threads=4 on a 48-core node,
+    # using `workers` here would leave 36 cores idle during phase 2a.
+    embed_workers = max(
+        1,
+        int(
+            os.environ.get(
+                "QD_EMBED_WORKERS",
+                workers * max(1, int(getattr(settings, "threads_per_worker", 1) or 1)),
+            )
+        ),
+    )
     log = progress if isinstance(progress, GrowthLog) else None
     endpoint_reference = None
     if growth.endpoint_diagnostic_k > 0 and growth.endpoint_reference is not None:
@@ -6275,7 +6288,7 @@ def _opt_zb_occupations(
         # embarrassingly parallel per shell, and unlike the relaxations it is
         # CPU-bound Python, so it needs processes rather than threads.
         embedded: List[List[Tuple[int, Any]]]
-        if workers > 1 and len(embed_jobs) > 1:
+        if embed_workers > 1 and len(embed_jobs) > 1:
             from concurrent.futures import ProcessPoolExecutor
 
             params = {
@@ -6288,7 +6301,7 @@ def _opt_zb_occupations(
                 ),
             }
             with ProcessPoolExecutor(
-                max_workers=workers,
+                max_workers=embed_workers,
                 initializer=_embed_init,
                 initargs=(pack, map_spec, params),
             ) as pool:
