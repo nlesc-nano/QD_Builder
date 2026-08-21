@@ -83,6 +83,56 @@ Vec3 = Tuple[float, float, float]
 # ---------------------------------------------------------------------------
 
 
+def zb_shell_budget(
+    k: int,
+    p: int,
+    *,
+    base: int,
+    p_max: int,
+    decay: float,
+    floor: int,
+    ceiling: int,
+) -> int:
+    """Yield-weighted per-bin ceiling on (occupation, ligand shell) pairs.
+
+    A flat budget spends the same wall on every p, but the propagation-eligible
+    yield is not flat: fitting log(yield) over the 22 bins of
+    ``growth_k1_to_k5_zb5`` (weighted by attempts) gives
+
+        log yield = 4.888 - 2.400 * p / k^(2/3) - 3.552 * log k    (R2 = 0.90)
+
+    The natural variable is ``p / k^(2/3)`` -- p measured against the surface
+    capacity, i.e. coverage -- which is why the same p costs less at larger k.
+    Normalising the weights within one k cancels the ``log k`` term, so only
+    the coverage decay survives and nothing has to be extrapolated in k (the
+    fitted k^-3.55 would read 0.002% at k=13 and starve the bin outright).
+
+    Weights are ``exp(-decay * p / k^(2/3))`` summed over p = 1..p_max, in
+    closed form as a geometric series, then scaled so the bin total matches
+    ``base * p_max`` -- the same wall a flat ``base`` would have spent.
+
+    ``decay`` folds the fitted 2.400 together with an exponent that softens
+    proportional-to-yield allocation; 1.20 is 2.400 at exponent 0.5.  Replayed
+    against the measured yields that is 91% of the cost of a flat 250 for 140%
+    of the eligible endpoints, because it also lifts the productive low-p bins
+    off the flat ceiling they were pinned to.
+    """
+
+    if base <= 0 or int(p_max) <= 0 or int(p) <= 0:
+        return 0
+    if float(decay) <= 0.0:
+        return int(base)
+    r = math.exp(-float(decay) / (float(k) ** (2.0 / 3.0)))
+    n = int(p_max)
+    # sum_{i=1..n} r^i, guarding r -> 1
+    total = float(n) if abs(1.0 - r) < 1e-12 else r * (1.0 - r ** n) / (1.0 - r)
+    share = (r ** int(p)) / total
+    value = int(round(float(base) * n * share))
+    if ceiling > 0:
+        value = min(value, int(ceiling))
+    return max(value, int(floor))
+
+
 def p_surf_capacity(k: int, beta: float) -> int:
     """Quasi-spherical surface excess: floor(β · k^{2/3}).
 
@@ -395,6 +445,12 @@ class GrowthConfig:
     #: sends to geometry + g-xTB.  0 = no ceiling (previous behaviour).  The
     #: g-xTB ceiling for the bin is this times ``xtb_starts_per_graph``.
     zb_max_shells_per_bin: int = 0
+    #: Yield weighting for that ceiling.  0 = flat (previous behaviour); the
+    #: budget then decays as exp(-decay * p / k^(2/3)) across a k's p bins,
+    #: renormalised so the total per k is unchanged.  See ``zb_shell_budget``.
+    zb_shell_budget_decay: float = 0.0
+    zb_min_shells_per_bin: int = 0
+    zb_shell_budget_ceiling: int = 0
     selection_max_per_skeleton: int = 0
     max_opts_per_k: int = 0
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
@@ -624,6 +680,13 @@ class GrowthConfig:
             p_slack=int(surface.get("p_slack", 1)),
             max_p_child=int(surface.get("max_p_child", 0)),
             zb_max_shells_per_bin=int(raw.get("zb_max_shells_per_bin", 0)),
+            zb_shell_budget_decay=float(
+                raw.get("zb_shell_budget_decay", 0.0)
+            ),
+            zb_min_shells_per_bin=int(raw.get("zb_min_shells_per_bin", 0)),
+            zb_shell_budget_ceiling=int(
+                raw.get("zb_shell_budget_ceiling", 0)
+            ),
             selection_max_per_skeleton=int(
                 raw.get("selection_max_per_skeleton", 0)
             ),
@@ -6208,6 +6271,7 @@ def _opt_zb_occupations(
         getattr(map_spec.graph_rules, "selection_max_per_skeleton", 3) or 3
     )
     shell_budget = int(getattr(growth, "zb_max_shells_per_bin", 0) or 0)
+    budget_decay = float(getattr(growth, "zb_shell_budget_decay", 0.0) or 0.0)
     workers = max(1, int(getattr(settings, "workers", 1)))
     # Embedding is single-threaded Python, so it wants one process per *core*,
     # not one per g-xTB job.  With workers=12 x threads=4 on a 48-core node,
@@ -6301,12 +6365,31 @@ def _opt_zb_occupations(
             )
         )
         offered = sum(len(shells) for _occupation, shells in planned)
-        planned = _plan_zb_relax_jobs(planned, shell_budget)
+        # Yield-weighted per-bin ceiling: flat unless a decay is configured.
+        bin_budget = shell_budget
+        if shell_budget > 0 and budget_decay > 0.0:
+            beta = float(getattr(growth, "surface_beta", 0.0) or 0.0)
+            p_max = (
+                p_surf_capacity(k, beta)
+                + int(getattr(growth, "p_slack", 0) or 0)
+                if beta > 0.0
+                else int(p)
+            )
+            bin_budget = zb_shell_budget(
+                k,
+                p,
+                base=shell_budget,
+                p_max=max(int(p_max), int(p)),
+                decay=budget_decay,
+                floor=int(getattr(growth, "zb_min_shells_per_bin", 0) or 0),
+                ceiling=int(getattr(growth, "zb_shell_budget_ceiling", 0) or 0),
+            )
+        planned = _plan_zb_relax_jobs(planned, bin_budget)
         kept = sum(len(shells) for _occupation, shells in planned)
         if log:
             log.begin_block(kept * max(1, xtb_starts), label=f"Z k={k} p={p}")
             budget_note = (
-                "" if shell_budget <= 0 else f" budget={shell_budget}"
+                "" if bin_budget <= 0 else f" budget={bin_budget}"
             )
             log.line(
                 f"--- move Z k={k} p={p}: occupations={len(occupations)}"
