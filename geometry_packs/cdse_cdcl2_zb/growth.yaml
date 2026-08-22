@@ -1,18 +1,33 @@
-# zb occupation growth, parent k = 1 … 12 (child k = 2 … 13).
+# PRODUCTION envelope for the zb CdSe/CdCl2 growth, k = 1 -> 13.
 #
-# Soft rules OFF.  Move A/B OFF.  lattice_switch OFF.
-# Parent cut is energy window + cap + min_p only.
-# After g-xTB a child is kept in the lineage only if its Cd-Se topology is
-# preserved.  Changed-topology endpoints remain on disk as off-path minima.
+# Frozen.  Settled against growth_k1_to_k5_zb5 (flat 250), zb6 (decay +1.20)
+# and bh_24c (basin hopping on).  Change this file only with a measurement
+# that says the current setting is wrong -- a run started under it should be
+# comparable end to end, which earlier runs were not.
+#
+# Quality target is Cd CN = 4 (Se may sit at CN 3 on the surface, as in the
+# Wulff construction).  Measured on zb6 eligible endpoints, Cd reaching CN 4
+# rises monotonically with p at every k:
+#     k=3   p1  0%   p2  2%   p3 21%   p4 43%   p5 50%   p6 78%
+#     k=4   p1 10%   p2 13%   p3 18%   p4 34%   p5 44%   p6 50%
+#     k=5   p2 14%   p3 25%   p4 36%   p5 45%   p6 55%
+# so the best structures are the ligand-saturated ones, and those bins are the
+# ones a yield-weighted budget starves -- hence the negative decay below.
+#
+# Known ceiling, not fixed here: with every Se at CN 4 the mean Cl denticity
+# needed for all-Cd-CN-4 is exactly 2.0; letting surface Se sit at CN 3 raises
+# it to (k + 4p) / 2p, which is 2.42 at k5p6 and needs mu3 chloride.  The k>=3
+# decorator (iter_cl_attachments_bridge_target) cannot emit mu3 at all, and
+# the observed denticity is 1.7-1.9.  That caps how far Cd CN = 4 can go.
 #
 #   python tools/run_molecular_growth.py \
 #     --pack-dir geometry_packs/cdse_cdcl2_zb \
 #     --growth growth.yaml \
 #     --parents /path/to/gxtb_cdse_target_k1k2_p1p5 \
-#     --k-from 1 --k-to 13 --p-parents all \
-#     --output /path/to/growth_zb_k1_to_k13
+#     --k-from 1 --k-to 8 --p-parents all \
+#     --output /path/to/growth_prod_k1_to_k8
 #
-# NEW --output.  Do not resume an A/B tree.
+# Resume is on by default: same command, same --output.
 
 schema_version: 1
 name: cdse_growth_zb_k1k13
