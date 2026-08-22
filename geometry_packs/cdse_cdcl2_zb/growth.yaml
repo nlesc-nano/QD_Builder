@@ -19,8 +19,8 @@
 #     --pack-dir geometry_packs/cdse_cdcl2_zb \
 #     --growth growth.yaml \
 #     --parents /path/to/gxtb_cdse_target_k1k2_p1p5 \
-#     --k-from 1 --k-to 8 --p-parents all \
-#     --output /path/to/growth_prod_k1_to_k8
+#     --k-from 1 --k-to 6 --p-parents all \
+#     --output /path/to/growth_prod_k1_to_k6
 #
 # Resume is on by default: same command, same --output.
 
