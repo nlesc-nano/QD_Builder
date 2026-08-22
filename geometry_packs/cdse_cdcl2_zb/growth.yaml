@@ -121,26 +121,25 @@ max_children_per_channel: 20
 # bridge_target_count_window now generates are never sampled.
 zb_max_shells_per_bin: 250
 
-# Yield weighting for that ceiling.  0 = flat.
+# Yield weighting for that ceiling.  0 = flat, positive = spend where the
+# yield is best, NEGATIVE = spend where it is worst.
 #
-# The propagation-eligible yield is not flat in p.  Fitting log(yield) over the
-# 22 bins of growth_k1_to_k5_zb5, weighted by attempts:
+# Negative is the right sign for "find the minimum of every bin".  A 1%-yield
+# bin returns one endpoint from a 60-shell budget, so its minimum is a sample
+# of one, while a 20% bin has its minimum pinned down many times over.
 #
-#     log yield = 4.888 - 2.400 * p / k^(2/3) - 3.552 * log k     (R2 = 0.90)
+# Measured: growth_k1_to_k5_zb6 (decay +1.20) against growth_k1_to_k5_zb5
+# (flat 250), same pipeline otherwise.  The bin minima tracked the shells --
+# better at k4p2 -0.241 eV, k5p3 -0.205, k5p4 -0.345 where the budget rose;
+# worse at k3p4 +0.473 (468 shells offered, 120 allowed), k4p5 +0.246, k5p2
+# +0.102 where it fell.  Four bins up, four down: a wash bought by starving
+# the least-determined bins.
 #
-# p / k^(2/3) is coverage -- p against the surface capacity -- and it beat p,
-# p/(k+p) and log p as the reduction variable.  The budget uses only the
-# coverage term: weights are normalised within one k, which cancels log k and
-# avoids extrapolating a k^-3.55 that would read 0.002% at k=13.  decay 1.20 is
-# the fitted 2.400 at exponent 0.5, i.e. sub-proportional to yield so high-p
-# bins are cheaper but never starved.
-#
-# Replayed against the measured yields: 91% of the cost of a flat 250 for 140%
-# of the eligible endpoints -- the gain is as much from lifting p=1,2 off the
-# flat ceiling as from cutting the tail.  Allocations:
-#     k=4  (p=1..7)   400 400 265 165 102  64  60
-#     k=13 (p=1..15)  400 400 400 397 319 257 207 167 134 108 87 70 60 60 60
-zb_shell_budget_decay: 1.20
+# -0.60 keeps every bin usable rather than inverting hard: at k=5 it gives
+# 109 133 165 203 249 305 375 400 across p=1..8, against 400 400 308 204 135
+# 90 60 60 at +1.20, for the same total.  Low p still gets ~110 shells, which
+# at 15-35% yield is dozens of endpoints -- ample for parent selection.
+zb_shell_budget_decay: -0.60
 zb_min_shells_per_bin: 60
 zb_shell_budget_ceiling: 400
 

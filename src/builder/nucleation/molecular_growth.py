@@ -116,11 +116,26 @@ def zb_shell_budget(
     against the measured yields that is 91% of the cost of a flat 250 for 140%
     of the eligible endpoints, because it also lifts the productive low-p bins
     off the flat ceiling they were pinned to.
+
+    A **negative** decay inverts the weighting, spending more where the yield
+    is worse, and that is the sign to use when the objective is the best
+    structure in *every* bin rather than the most structures overall.  A bin
+    whose yield is 1% returns one endpoint from a 60-shell budget, so its
+    minimum is a sample of one; a bin at 20% has its minimum pinned down many
+    times over.  Equalising confidence means spending against the yield.
+
+    growth_k1_to_k5_zb6 measured this directly against growth_k1_to_k5_zb5,
+    which was the same pipeline at a flat 250.  The bin minima moved in step
+    with where the shells moved: down at k4p2 (-0.241 eV), k5p3 (-0.205) and
+    k5p4 (-0.345), where the budget rose, and up at k3p4 (+0.473, 468 shells
+    offered but 120 allowed), k4p5 (+0.246) and k5p2 (+0.102), where it fell.
+    Four bins better, four worse -- a wash overall, bought by starving exactly
+    the bins that were least determined to begin with.
     """
 
     if base <= 0 or int(p_max) <= 0 or int(p) <= 0:
         return 0
-    if float(decay) <= 0.0:
+    if float(decay) == 0.0:
         return int(base)
     r = math.exp(-float(decay) / (float(k) ** (2.0 / 3.0)))
     n = int(p_max)
