@@ -5,14 +5,9 @@
 # that says the current setting is wrong -- a run started under it should be
 # comparable end to end, which earlier runs were not.
 #
-# Quality target is Cd CN = 4 (Se may sit at CN 3 on the surface, as in the
-# Wulff construction).  Measured on zb6 eligible endpoints, Cd reaching CN 4
-# rises monotonically with p at every k:
-#     k=3   p1  0%   p2  2%   p3 21%   p4 43%   p5 50%   p6 78%
-#     k=4   p1 10%   p2 13%   p3 18%   p4 34%   p5 44%   p6 50%
-#     k=5   p2 14%   p3 25%   p4 36%   p5 45%   p6 55%
-# so the best structures are the ligand-saturated ones, and those bins are the
-# ones a yield-weighted budget starves -- hence the negative decay below.
+# Cd CN = 4 rises with p (k=4 runs 10, 13, 18, 34, 44, 50% over p=1..6), but
+# that is mostly ligand decoration, not core quality, so it is not used as the
+# ranking target.  Within a bin, dE is.
 #
 # Known ceiling, not fixed here: with every Se at CN 4 the mean Cl denticity
 # needed for all-Cd-CN-4 is exactly 2.0; letting surface Se sit at CN 3 raises
@@ -134,30 +129,52 @@ max_children_per_channel: 20
 # comfortably above the occupation count (k4p3 has 177): at 150 the round-robin
 # never gets past one shell per core, so the three bridge-count families that
 # bridge_target_count_window now generates are never sampled.
-zb_max_shells_per_bin: 250
+zb_max_shells_per_bin: 400
 
-# Yield weighting for that ceiling.  0 = flat, positive = spend where the
-# yield is best, NEGATIVE = spend where it is worst.
+# Yield weighting: OFF.  Flat is the right shape, measured.
 #
-# Negative is the right sign for "find the minimum of every bin".  A 1%-yield
-# bin returns one endpoint from a 60-shell budget, so its minimum is a sample
-# of one, while a 20% bin has its minimum pinned down many times over.
+# The enumerator's own offer already tracks where the work is -- a bin with
+# many occupations offers many shells -- so a flat cap spends proportionally
+# and clamps only where there is genuinely too much.  Any p-dependent decay
+# fights that distribution and misallocates at both ends.  Measured over the
+# shells growth_k1_to_k5_zb6 offered:
+#     decay +1.20 gave k3p1 400 shells against an offer of 29, and k3p4 120
+#     against an offer of 468 -- waste at one end, starvation at the other.
+#     decay -0.60 makes the mirror error: 400 to k4p7, which offers 96, while
+#     k5p4 offers 1026 and gets 203.
+# zb5 (flat 250) beat zb6 (decay +1.20) on the bin minima for exactly this
+# reason, and those two runs differ in nothing else.
 #
-# Measured: growth_k1_to_k5_zb6 (decay +1.20) against growth_k1_to_k5_zb5
-# (flat 250), same pipeline otherwise.  The bin minima tracked the shells --
-# better at k4p2 -0.241 eV, k5p3 -0.205, k5p4 -0.345 where the budget rose;
-# worse at k3p4 +0.473 (468 shells offered, 120 allowed), k4p5 +0.246, k5p2
-# +0.102 where it fell.  Four bins up, four down: a wash bought by starving
-# the least-determined bins.
+# Sizing, against the 8083 shells offered over k=1..5:
+#     cap 250 -> 3870 shells, 48% covered   (this was zb5)
+#     cap 400 -> 5435 shells, 67% covered
+#     cap 500 -> 6294 shells, 78% covered
+#     no cap  -> 8083 shells, 100%
+# 400 is the production choice: k1..k5 cost about 5 h on 24 cores, and the cap
+# still binds at large k, which is what stops the bin count exploding there.
 #
-# -0.60 keeps every bin usable rather than inverting hard: at k=5 it gives
-# 109 133 165 203 249 305 375 400 across p=1..8, against 400 400 308 204 135
-# 90 60 60 at +1.20, for the same total.  Low p still gets ~110 shells, which
-# at 15-35% yield is dozens of endpoints -- ample for parent selection.
-zb_shell_budget_decay: -0.60
-zb_min_shells_per_bin: 60
-zb_shell_budget_ceiling: 400
+# Extra shells are also the most efficient thing to buy.  Bins that lost
+# shells between zb5 and zb6 lost 0.985 eV of bin minimum for 1094 relaxations
+# saved -- 0.90 meV per relaxation.  Basin hopping returned 0.04 meV per
+# relaxation on the same run.  Spend on shells, not on search.
+zb_shell_budget_decay: 0.0
+zb_min_shells_per_bin: 0
+zb_shell_budget_ceiling: 0
 
+# Basin hopping: OFF, and not worth enabling.  Measured on
+# growth_k1_to_k5_bh_24c: 1560 g-xTB optimisations returned 0.04 meV per
+# relaxation, against 0.90 meV per relaxation for simply buying more ligand
+# shells (bins that lost shells between zb5 and zb6 lost 0.985 eV of bin
+# minimum for 1094 relaxations saved).  Shells are ~20x the better buy, so the
+# budget belongs in zb_max_shells_per_bin above.
+#
+# Note also what this stage is and is not: it runs at the *start* of the next
+# step, on parents already chosen by select_parents, groups by relaxed-minimum
+# basin rather than by skeleton, is capped at max_seeds_per_bin, and writes to
+# <output>/basin_hop/ only -- so a refined minimum can never become a bin
+# minimum or enter the index.  It refines what propagates; it does not search
+# a bin.
+#
 # Optional basin-hopping refinement of the parents of each growth step.
 #
 # It runs AFTER select_parents, so the ranking that chose those parents is
