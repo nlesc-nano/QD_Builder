@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -J grow_zb_24c
-#SBATCH -t 24:00:00
+#SBATCH -J qd_prod
+#SBATCH -t 72:00:00
 #SBATCH -n 1
 #SBATCH -c 24
 #SBATCH --mem-per-cpu=2g
@@ -42,7 +42,7 @@ mkdir -p "$TMPDIR"
 
 ROOT=/scratch/iinfante/escience/QD_Builder
 PACK=/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb
-OUT=$PACK/growth_k1_to_k5_zb6
+OUT=$PACK/growth_prod_k1_to_k8
 
 mkdir -p "$PACK/logs"
 cd "$ROOT"
@@ -51,6 +51,6 @@ python -u "$ROOT/tools/run_molecular_growth.py" \
   --pack-dir "$PACK" \
   --growth   "$PACK/growth.yaml" \
   --parents  /scratch/iinfante/CP2K/Nucleation/xtb/CdSe/new_generator/runs/gxtb_cdse_target_k1k2_p1p5 \
-  --k-from 1 --k-to 5 --p-parents all \
+  --k-from 1 --k-to 8 --p-parents all \
   --output   "$OUT" \
   > "$PACK/logs/$(basename $OUT).log" 2>&1
