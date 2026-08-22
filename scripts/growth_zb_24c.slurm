@@ -42,7 +42,7 @@ mkdir -p "$TMPDIR"
 
 ROOT=/scratch/iinfante/escience/QD_Builder
 PACK=/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb
-OUT=$PACK/growth_prod_k1_to_k8
+OUT=$PACK/growth_prod_k1_to_k6
 
 mkdir -p "$PACK/logs"
 cd "$ROOT"
@@ -51,6 +51,6 @@ python -u "$ROOT/tools/run_molecular_growth.py" \
   --pack-dir "$PACK" \
   --growth   "$PACK/growth.yaml" \
   --parents  /scratch/iinfante/CP2K/Nucleation/xtb/CdSe/new_generator/runs/gxtb_cdse_target_k1k2_p1p5 \
-  --k-from 1 --k-to 8 --p-parents all \
+  --k-from 1 --k-to 6 --p-parents all \
   --output   "$OUT" \
   > "$PACK/logs/$(basename $OUT).log" 2>&1
