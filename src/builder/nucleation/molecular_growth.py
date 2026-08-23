@@ -3654,6 +3654,28 @@ def grow_cores_from_parents(
                             == tuple(zb_occ.symbols)
                             else None
                         ),
+                        # The occupation carries no Cl, but the relaxed parent
+                        # does, and the ranking needs it to tell an open
+                        # coordination slot from one a ligand already fills.
+                        parent_ligand_coordinates=np.asarray(
+                            [
+                                point
+                                for symbol, point in zip(
+                                    parent.symbols, parent.coordinates
+                                )
+                                if symbol == spec.precursor.ligand
+                            ],
+                            dtype=float,
+                        ).reshape(-1, 3),
+                        ligand_bond_length=float(
+                            cutoffs.get(
+                                (spec.core.cation, spec.precursor.ligand),
+                                cutoffs.get(
+                                    (spec.precursor.ligand, spec.core.cation),
+                                    0.0,
+                                ),
+                            )
+                        ),
                     )
                     kept_kids = []
                     for kid in kids:
