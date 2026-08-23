@@ -1052,8 +1052,16 @@ def grow_zb_children(
     stats: Optional[ZbGrowStats] = None,
     relaxed_parent_coordinates: Optional[np.ndarray] = None,
     parent_wbo: Optional[Dict[Tuple[int, int], float]] = None,
+    parent_ligand_coordinates: Optional[np.ndarray] = None,
+    ligand_bond_length: float = 0.0,
 ) -> List[ZbOccupation]:
-    """Shed s extra Cd, attach one CdSe, add p_m precursor Cd."""
+    """Shed s extra Cd, attach one CdSe, add p_m precursor Cd.
+
+    ``parent_ligand_coordinates`` are the relaxed positions of the parent's
+    Cl, which the occupation itself does not carry.  They are what makes the
+    ranking able to tell an open coordination slot from one a ligand already
+    fills; without them the ordering falls back to the core-only form.
+    """
 
     after_all = shed_occupations(occ, s, spec, model)
     if not after_all:
@@ -1080,6 +1088,8 @@ def grow_zb_children(
             occ,
             relaxed_parent_coordinates=relaxed_parent_coordinates,
             parent_wbo=parent_wbo,
+            parent_ligand_coordinates=parent_ligand_coordinates,
+            ligand_bond_length=ligand_bond_length,
         ),
     )
     return ordered if cap <= 0 else ordered[: int(cap)]
@@ -1099,8 +1109,29 @@ def _growth_site_priority(
     *,
     relaxed_parent_coordinates: Optional[np.ndarray],
     parent_wbo: Optional[Dict[Tuple[int, int], float]],
+    parent_ligand_coordinates: Optional[np.ndarray] = None,
+    ligand_bond_length: float = 0.0,
 ) -> Tuple[Any, ...]:
-    """Soft ordering for a post-dedup child cap; never a legality filter."""
+    """Soft ordering for a post-dedup child cap; never a legality filter.
+
+    Two terms decide where the next CdSe monomer goes.
+
+    ``shell_completion`` counts the host cations this child takes from three
+    Cd-Se bonds to four.  That is the nucleation event: a cation with four Se
+    is an interior atom, and it is the only move that makes one.  It ranks
+    first because ``host_deficit`` below actively buries it -- a cation with
+    three Se scores the *lowest* deficit precisely when it is one bond from
+    closing, so completions landed at rank 66-281 of ~500 and the cap of 16
+    discarded 726 of 726 of them over the 28 k=6 parents of growth_prod.
+
+    ``open_valence`` replaces the core-only deficit with 4 - CN_Se - CN_Cl.
+    A slot a chloride already fills is not a slot: measured on the relaxed
+    k=6/k=7 endpoints, cations scoring deficit 3 carry 2.33 Cl on average and
+    are coordinatively saturated, and the correlation between host_deficit
+    and the real free valence is +0.05 -- the old term carries essentially no
+    information about where a monomer can actually attach.  ``host_deficit``
+    is kept as a last-resort tiebreak for the no-ligand-data path.
+    """
 
     parent_sites = set(parent.site_ids)
     added = {
@@ -1127,6 +1158,42 @@ def _growth_site_priority(
         parent_degrees[left] += 1
         parent_degrees[right] += 1
     host_deficit = sum(max(0, 4 - parent_degrees[index]) for index in host_parent_indices)
+
+    # Cd-Se degree the hosts reach in the child, by site id.
+    child_index = {site_id: i for i, site_id in enumerate(child.site_ids)}
+    child_degrees: Dict[int, int] = {}
+    for left, right in child.core_edges:
+        child_degrees[left] = child_degrees.get(left, 0) + 1
+        child_degrees[right] = child_degrees.get(right, 0) + 1
+    shell_completion = 0
+    for index in host_parent_indices:
+        position = child_index.get(parent.site_ids[index])
+        if position is None:
+            continue
+        if parent_degrees[index] == 3 and child_degrees.get(position, 0) >= 4:
+            shell_completion += 1
+
+    # Free valence of the hosts, chloride included.
+    open_valence = 0
+    if (
+        parent_ligand_coordinates is not None
+        and len(parent_ligand_coordinates)
+        and float(ligand_bond_length) > 0.0
+    ):
+        ligands = np.asarray(parent_ligand_coordinates, dtype=float)
+        reference = np.asarray(parent.coordinates, dtype=float)
+        cutoff = float(ligand_bond_length)
+        for index in host_parent_indices:
+            if index >= len(reference):
+                continue
+            n_ligand = int(
+                np.count_nonzero(
+                    np.linalg.norm(ligands - reference[index], axis=1) <= cutoff
+                )
+            )
+            open_valence += max(0, 4 - parent_degrees[index] - n_ligand)
+    else:
+        open_valence = host_deficit
 
     displacement = 0.0
     if relaxed_parent_coordinates is not None:
@@ -1155,9 +1222,17 @@ def _growth_site_priority(
             for (left, right), order in parent_wbo.items()
             if left in removed_parent_indices or right in removed_parent_indices
         )
-    # Prefer undercoordinated/strained frontier sites, then compact children.
+    # Ascending sort, so each term is negated to mean "more is better".
+    #   removal_wbo       cheapest shed first (unchanged)
+    #   shell_completion  hosts going 3 -> 4 Cd-Se: the nucleation event
+    #   open_valence      free slots, 4 - CN_Se - CN_Cl, chloride included
+    #   host_deficit      old core-only 4 - CN_Se, now only a tiebreak
+    #   displacement      strain in the relaxed parent at the host
+    #   radius_of_gyration / n_edges / id   compactness, then determinism
     return (
         round(removal_wbo, 6),
+        -shell_completion,
+        -open_valence,
         -host_deficit,
         -round(displacement, 6),
         _occupation_radius_of_gyration(child),
