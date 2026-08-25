@@ -18,6 +18,7 @@ from builder.nc_types import (
 )
 from builder.nucleation.molecular_rules import (
     bridge_count_per_host_pair,
+    cl_on_cn4_cd_violations,
     inorganic_component_count,
     molecular_graph_ok,
     molecular_graph_violations,
@@ -241,6 +242,73 @@ def test_pair_geometry_detects_missing_edge_and_forbidden_contact() -> None:
     assert not ok
     assert any(reason.startswith("contact:Cl-Se") for reason in reasons)
     assert any(reason.startswith("missing_edge:Cd-Cl") for reason in reasons)
+
+
+def _cn4_core_state():
+    """Interior Cd with four Se; a second Cd holds the Cl in the graph."""
+
+    # 0 Cd (CN_Se=4), 1-4 Se, 5 Cd, 6 Cl bonded only to Cd 5
+    return _state(
+        (
+            ["Cd", "Se", "Se", "Se", "Se", "Cd", "Cl"],
+            [
+                "core_cation",
+                "core_anion",
+                "core_anion",
+                "core_anion",
+                "core_anion",
+                "precursor_center",
+                "precursor_ligand",
+            ],
+            [(0, 1), (0, 2), (0, 3), (0, 4), (5, 6)],
+        )
+    )
+
+
+def test_graph_cl_edge_on_cn4_cd_is_illegal() -> None:
+    spec = _spec(enforce_min_cn=False)
+    state = _state(
+        (
+            ["Cd", "Se", "Se", "Se", "Se", "Cl"],
+            ["core_cation"] + ["core_anion"] * 4 + ["precursor_ligand"],
+            [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)],
+        )
+    )
+    codes = molecular_graph_violations(state, spec)
+    assert any(code.startswith("cl_on_cn4_cd:0:5") for code in codes)
+
+
+def test_spatial_cl_on_cn4_cd_is_illegal_without_graph_edge() -> None:
+    spec = _spec(enforce_min_cn=False)
+    state = _cn4_core_state()
+    assert cl_on_cn4_cd_violations(state, spec) == []
+    # Cl is graph-bonded to Cd 5 but sits on the interior Cd (0.9 Å).
+    coords = [
+        (0.0, 0.0, 0.0),
+        (1.5, 1.5, 1.5),
+        (1.5, -1.5, -1.5),
+        (-1.5, 1.5, -1.5),
+        (-1.5, -1.5, 1.5),
+        (4.0, 0.0, 0.0),
+        (0.9, 0.0, 0.0),
+    ]
+    codes = cl_on_cn4_cd_violations(state, spec, coords)
+    assert any(code.startswith("cl_on_cn4_cd:0:6:") for code in codes)
+
+
+def test_distant_cl_on_cn4_core_is_allowed() -> None:
+    spec = _spec(enforce_min_cn=False)
+    state = _cn4_core_state()
+    coords = [
+        (0.0, 0.0, 0.0),
+        (1.5, 1.5, 1.5),
+        (1.5, -1.5, -1.5),
+        (-1.5, 1.5, -1.5),
+        (-1.5, -1.5, 1.5),
+        (4.0, 0.0, 0.0),
+        (6.4, 0.0, 0.0),
+    ]
+    assert cl_on_cn4_cd_violations(state, spec, coords) == []
 
 
 def test_geometry_pack_file_exists() -> None:

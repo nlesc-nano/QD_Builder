@@ -477,6 +477,8 @@ class GrowthConfig:
     local_cleanup_enabled: bool = True
     local_cleanup_method: str = "g-xTB"
     local_cleanup_cycles: int = 20
+    local_cleanup_freeze_core: bool = False
+    local_cleanup_opt_level: str = "crude"
     require_charge_neutral_for_cleanup: bool = True
     child_redecorate: bool = True
     child_redecorate_slack: bool = True
@@ -714,6 +716,8 @@ class GrowthConfig:
             local_cleanup_enabled=bool(cleanup.get("enabled", True)),
             local_cleanup_method=str(cleanup.get("method", "g-xTB")),
             local_cleanup_cycles=int(cleanup.get("max_cycles", 20)),
+            local_cleanup_freeze_core=bool(cleanup.get("freeze_core", False)),
+            local_cleanup_opt_level=str(cleanup.get("opt_level", "crude")),
             require_charge_neutral_for_cleanup=bool(
                 geom.get("require_charge_neutral_for_cleanup", True)
             ),
@@ -6172,7 +6176,7 @@ def _enum_init(pack: Any, spec: Any, limit: int) -> None:
 
 
 def _enum_one(
-    job: Tuple[int, int, List[Tuple[int, int]], Tuple[str, ...]]
+    job: Tuple[int, int, List[Tuple[int, int]], Tuple[str, ...], List[List[float]]]
 ) -> Tuple[List[Tuple[int, Any]], int, bool]:
     """Enumerate and select the ligand shells of one occupation.
 
@@ -6188,7 +6192,7 @@ def _enum_one(
 
     from .molecular import enumerate_molecular_bin
 
-    k, p, core_edges, symbols = job
+    k, p, core_edges, symbols, core_xyz = job
     spec = _ENUM_CTX["spec"]
     graph_bin = enumerate_molecular_bin(
         k,
@@ -6197,6 +6201,7 @@ def _enum_one(
         pack=_ENUM_CTX["pack"],
         embed=False,
         precomputed_skeletons=[list(core_edges)],
+        skeleton_coordinates=core_xyz,
         progress=None,
     )
     decorations = _select_zb_decorations(graph_bin.isomers, _ENUM_CTX["limit"])
@@ -6230,10 +6235,31 @@ def _embed_one(job: Tuple[Any, Dict[int, Any]]) -> List[Tuple[int, Any]]:
     would triple the pickling cost.
     """
 
-    from .molecular_motif_reconstruct import reconstruct_motif_state
+    from .molecular_motif_reconstruct import (
+        adapt_to_embed_table,
+        reconstruct_motif_state,
+    )
+    from .molecular_zb_growth import place_cl_on_zb_core
 
     state, anchored = job
     params = _EMBED_CTX["params"]
+    if anchored:
+        xyz = place_cl_on_zb_core(
+            state, anchored, _EMBED_CTX["spec"], _EMBED_CTX["pack"]
+        )
+        if xyz is None:
+            return []
+        adapted = adapt_to_embed_table(
+            state,
+            xyz,
+            _EMBED_CTX["pack"],
+            _EMBED_CTX["spec"],
+            max_nfev=int(params.get("table_adapt_nfev", 16)),
+            overlap_min_A=float(params["overlap_min_A"]),
+        )
+        if adapted is None:
+            return []
+        return [(0, adapted)]
     rebuilt = reconstruct_motif_state(
         state,
         _EMBED_CTX["pack"],
@@ -6368,6 +6394,7 @@ def _opt_zb_occupations(
                 p,
                 [tuple(edge) for edge in occupation.core_edges],
                 tuple(occupation.symbols),
+                np.asarray(occupation.coordinates, dtype=float).tolist(),
             )
             for occupation in occupations
         ]
@@ -6432,7 +6459,8 @@ def _opt_zb_occupations(
                 f"--- move Z k={k} p={p}: occupations={len(occupations)}"
                 f"->{len(planned)} decorations<={decoration_limit} "
                 f"shells={offered}->{kept}{budget_note} "
-                f"embed={factor_starts}->{xtb_starts} ---"
+                f"embed=geom freeze_core="
+                f"{int(bool(growth.local_cleanup_freeze_core))} ---"
             )
 
         # ---- pass 2a: embed every shell, collecting one job per candidate ----
@@ -6476,6 +6504,7 @@ def _opt_zb_occupations(
                 "starts": max(1, factor_starts),
                 "keep": max(1, xtb_starts),
                 "max_nfev": max_nfev,
+                "table_adapt_nfev": int(recon.get("table_adapt_nfev", 16)),
                 "overlap_min_A": float(recon.get("overlap_min_A", 0.75)),
                 "start_max_bond_error_A": float(
                     recon.get("start_max_bond_error_A", 0.50)
@@ -6495,6 +6524,7 @@ def _opt_zb_occupations(
                     "starts": max(1, factor_starts),
                     "keep": max(1, xtb_starts),
                     "max_nfev": max_nfev,
+                    "table_adapt_nfev": int(recon.get("table_adapt_nfev", 16)),
                     "overlap_min_A": float(recon.get("overlap_min_A", 0.75)),
                     "start_max_bond_error_A": float(
                         recon.get("start_max_bond_error_A", 0.50)
@@ -6554,6 +6584,88 @@ def _opt_zb_occupations(
         tick_kwargs = (
             {"on_result": _tick} if int(getattr(settings, "workers", 1)) > 1 else {}
         )
+        if (
+            jobs
+            and growth.local_cleanup_enabled
+            and growth.local_cleanup_freeze_core
+        ):
+            from .molecular_rules import cl_on_cn4_cd_violations
+            from .molecular_zb_growth import construction_clash
+
+            freeze_settings = dc_replace(
+                settings,
+                max_steps=int(growth.local_cleanup_cycles),
+                accept_maxcycle=True,
+                check_connectivity=False,
+                timeout_s=min(
+                    float(getattr(settings, "timeout_s", 60.0) or 60.0),
+                    60.0,
+                ),
+                opt_level=str(growth.local_cleanup_opt_level or "crude"),
+            )
+            if log is not None:
+                log.line(
+                    f"    frozen-core Cl refine maxcycle={freeze_settings.max_steps} "
+                    f"opt={freeze_settings.opt_level} jobs={len(jobs)}"
+                )
+            for job in jobs:
+                n_core = len(job["occupation"].symbols)
+                job["payload"]["freeze_atoms"] = list(range(n_core))
+                job["payload"]["opt_level"] = freeze_settings.opt_level
+            refined = relax_structures(
+                [job["payload"] for job in jobs],
+                freeze_settings,
+                None,
+                **tick_kwargs,
+            )
+            kept_jobs: List[Dict[str, Any]] = []
+            ligand = map_spec.precursor.ligand
+            for job, xr in zip(jobs, refined):
+                n_core = len(job["occupation"].symbols)
+                if not xr.ok or xr.coordinates is None:
+                    if zb_stats is not None:
+                        zb_stats.clash_skip += 1
+                    continue
+                coords = np.asarray(xr.coordinates, dtype=float)
+                symbols = list(job["payload"]["symbols"])
+                if coords.shape != (len(symbols), 3):
+                    if zb_stats is not None:
+                        zb_stats.clash_skip += 1
+                    continue
+                lattice = np.asarray(
+                    job["occupation"].coordinates, dtype=float
+                )
+                core_shift = float(
+                    np.sqrt(
+                        np.mean(np.sum((coords[:n_core] - lattice) ** 2, axis=1))
+                    )
+                )
+                if core_shift > 0.15:
+                    # $fix was ignored; keep the geometric Cl seed.
+                    coords = np.asarray(
+                        job["payload"]["positions"], dtype=float
+                    )
+                coords[:n_core] = lattice
+                cl_edges = [
+                    (int(a), int(b))
+                    for a, b in job["source_edges"]
+                    if symbols[int(a)] == ligand or symbols[int(b)] == ligand
+                ]
+                if construction_clash(
+                    symbols, coords, map_spec, bonded=cl_edges
+                ) or cl_on_cn4_cd_violations(job["state"], map_spec, coords):
+                    if zb_stats is not None:
+                        zb_stats.clash_skip += 1
+                    continue
+                job["payload"]["positions"] = [list(point) for point in coords]
+                job["payload"].pop("freeze_atoms", None)
+                job["payload"].pop("opt_level", None)
+                kept_jobs.append(job)
+            jobs = kept_jobs
+            started = time.perf_counter()
+            elapsed_by_index.clear()
+            completed[0] = 0
+
         relaxed = (
             relax_structures(
                 [job["payload"] for job in jobs], settings, cutoffs, **tick_kwargs

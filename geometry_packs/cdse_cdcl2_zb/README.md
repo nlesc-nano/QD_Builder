@@ -18,9 +18,12 @@ relaxed parent contributes only soft frontier ordering (optional WBO, local
 coordination, and displacement), never new lattice coordinates.
 
 For each child occupation the graph rules generate valid 2p Cl decorations.
-The geometry pack makes three ligand-placement starts while anchoring the core
-to its ZB sites, rejects only catastrophic pre-g-xTB overlaps, and sends at
-most two distinct starts to unconstrained g-xTB.  A converged endpoint enters
+μ2 host pairs are restricted to lattice Cd–Cd within 4.75 Å that do not pass
+through an occupied cation.  Cl is seeded at the outward sphere intersection
+(or an unused tet direction for terminals) on the CIF core, then a short
+clash-aware least-squares fit morphs **core + Cl** onto `embed.yaml` (core is
+not snapped back to CIF).  An optional frozen-core g-xTB refine can follow;
+unconstrained g-xTB is the minimiser.  A converged endpoint enters
 `index.csv` only when the Cd-Se topology is unchanged and all post-relaxation
 graph/artifact audits pass.  Other relaxed endpoints are retained as
 `*_offpath.xyz` but cannot propagate.

@@ -504,6 +504,80 @@ def required_ring_violations(
     return violations
 
 
+DEFAULT_CD_CL_BOND_MAX = 2.90
+DEFAULT_CD_SE_BOND_MAX = 3.25
+
+
+def _pair_bond_max(spec: NucleationSpec, a: str, b: str, default: float) -> float:
+    rule = spec.graph_rules.pair_rules.get(pair_key(a, b))
+    if rule is not None and rule.bond_max_distance:
+        return float(rule.bond_max_distance)
+    return float(default)
+
+
+def cn4_cd_indices(state: _State, spec: NucleationSpec) -> List[int]:
+    """Cation indices with four or more anion (Cd–Se) graph neighbours."""
+
+    cation = spec.core.cation
+    anion = spec.core.anion
+    out: List[int] = []
+    for atom in state.atoms:
+        if atom.symbol != cation:
+            continue
+        se_n = sum(
+            1
+            for neighbor in state.graph.neighbors(atom.atom_id)
+            if state.atoms[neighbor].symbol == anion
+        )
+        if se_n >= 4:
+            out.append(atom.atom_id)
+    return out
+
+
+def cl_on_cn4_cd_violations(
+    state: _State,
+    spec: NucleationSpec,
+    coordinates: Optional[Sequence[Sequence[float]]] = None,
+) -> List[str]:
+    """Hard: a Cd with four Se cannot carry Cl, on the graph or in space.
+
+    Graph decoration already sets ``room = 0`` on a 4-Se cation, so a Cl
+    *edge* would also trip ``max_cn`` (total CN 5).  The geometry branch is
+    the one that fires in growth: Cl bonded to a *different* host can still
+    sit inside the Cd–Cl bond of the interior cation.  That is not CN = 5
+    on the graph; it is an embedding clash.  Distance cutoff is the pack
+    Cd–Cl ``bond_max_distance`` (2.90 Å): close enough to count as a bond.
+    """
+
+    hosts = cn4_cd_indices(state, spec)
+    if not hosts:
+        return []
+    ligand = spec.precursor.ligand
+    violations: List[str] = []
+    for cd in hosts:
+        for neighbor in state.graph.neighbors(cd):
+            if state.atoms[neighbor].symbol == ligand:
+                violations.append(f"cl_on_cn4_cd:{cd}:{neighbor}")
+    if coordinates is None:
+        return violations
+    coords = np.asarray(coordinates, dtype=float)
+    if coords.shape != (len(state.atoms), 3):
+        return violations
+    cutoff = _pair_bond_max(
+        spec, spec.core.cation, ligand, DEFAULT_CD_CL_BOND_MAX
+    )
+    for cd in hosts:
+        for atom in state.atoms:
+            if atom.symbol != ligand:
+                continue
+            dist = float(np.linalg.norm(coords[cd] - coords[atom.atom_id]))
+            if dist <= cutoff:
+                violations.append(
+                    f"cl_on_cn4_cd:{cd}:{atom.atom_id}:{dist:.3f}<={cutoff:.3f}"
+                )
+    return list(dict.fromkeys(violations))
+
+
 def molecular_graph_violations(
     state: _State,
     spec: NucleationSpec,
@@ -581,6 +655,8 @@ def molecular_graph_violations(
             violations.append(
                 f"bridges_per_cd_pair:{peak}>{bridge_cap}"
             )
+
+    violations.extend(cl_on_cn4_cd_violations(state, spec))
 
     return violations
 

@@ -11,6 +11,14 @@ graph_rules:
     Cd: {min: 2, max: 4}
     Se: {min: 2, max: 4}
     Cl: {min: 1, max: 3}
+  # A Cd with four Se has no Cl valence.  The decorator already sets room=0,
+  # so this is not a fifth graph edge.  Embed rejects any Cl that sits within
+  # the Cd-Cl bond of that cation (cl_on_cn4_cd), even if the graph bonded
+  # the Cl to a different host.
+  #
+  # μ2 host pairs are chosen from the ZB lattice, not graph hop 4: two 2.4 Å
+  # Cd-Cl spheres meet only for Cd-Cd ≲ 4.8 Å (ZB NN = 4.34 Å).
+  bridge_cd_cd_max_distance: 4.75
 
   pair_rules:
     Cd-Se: {bond: allowed,   bond_max_distance: 3.25}

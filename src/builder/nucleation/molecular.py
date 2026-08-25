@@ -6513,6 +6513,7 @@ def enumerate_molecular_bin(
     min_structure_level: int = 0,
     _ring_fallback_depth: int = 0,
     _structure_mode_queue: Optional[Sequence[str]] = None,
+    skeleton_coordinates: Optional[Sequence[Sequence[float]]] = None,
 ) -> MolecularBinResult:
     """Enumerate unique legal molecular graphs for one (k, p).
 
@@ -6594,6 +6595,20 @@ def enumerate_molecular_bin(
     symbols = _symbols_for_composition(spec, k, p)
     roles = _roles_for_composition(spec, k, p)
     atoms = _atoms_for_composition(symbols, roles)
+    if skeleton_coordinates is not None:
+        stamped: List[AtomRecord] = []
+        for atom in atoms:
+            if atom.atom_id < len(skeleton_coordinates):
+                point = skeleton_coordinates[atom.atom_id]
+                stamped.append(
+                    replace(
+                        atom,
+                        coordinates=(float(point[0]), float(point[1]), float(point[2])),
+                    )
+                )
+            else:
+                stamped.append(atom)
+        atoms = tuple(stamped)
     bin_result = MolecularBinResult(k=k, p=p)
     bin_result.ring_min_pattern_cd = tuple(
         int(value) for value in check_spec.graph_rules.ring_min_pattern_cd

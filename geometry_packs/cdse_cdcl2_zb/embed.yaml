@@ -1,7 +1,7 @@
 # Metric tables for zb occupation growth.
-# Move Z places Cl on a *fixed* zb Cd–Se core using these Cd–Cl lengths.
-# `reconstruction.method: motif_factor` is unused on this path (cores are
-# CIF coordinates, not rebuilt).  Artifact floors live in run_gxtb.yaml.
+# After Cl is seeded on the CIF core, a short least_squares morphs core+Cl
+# onto these g-xTB-median lengths/angles (core is not snapped back to CIF).
+# Artifact floors live in run_gxtb.yaml.
 #
 # 3D embedding: the executable geometry the motif reconstruction targets.
 #
@@ -183,4 +183,9 @@ rings:
         phi_deg: [55, -55, 55, -55, 55, -55]
         tol_deg: [15, 15, 15, 15, 15, 15]
 reconstruction: {method: motif_factor, audit: clashes_only, factor_starts_per_graph: 3, max_nfev: 40, layout_iterations: 40,
-  xtb_starts_per_graph: 2, overlap_min_A: 0.75, start_max_bond_error_A: 0.5}
+  xtb_starts_per_graph: 2, overlap_min_A: 0.75, start_max_bond_error_A: 0.5,
+  table_adapt_nfev: 16}
+  # Geometric Cl seed on the CIF core, then a short clash-aware least_squares
+  # onto this table (core free, no CIF snap).  table_adapt_nfev is a start for
+  # g-xTB, not a geometry optimisation.  overlap_min_A is nuclear overlap;
+  # Cl on a 4-Se Cd is cl_on_cn4_cd.
