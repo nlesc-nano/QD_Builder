@@ -122,6 +122,11 @@ class XtbSettings:
     #:       Cl-Se: 2.80
     #:       Cl-Cl: 2.80
     artifact_min_distance: Mapping[str, float] = field(default_factory=dict)
+    #: 0-based atom indices whose Cartesian positions are frozen (xtb ``$fix``).
+    freeze_atoms: Tuple[int, ...] = ()
+    #: ``xtb --opt`` level (``crude``, ``loose``, ``normal``, …).  Empty keeps
+    #: the binary default (normal).
+    opt_level: str = ""
 
     @classmethod
     def from_pack(cls, raw: Optional[Mapping[str, Any]]) -> "XtbSettings":
@@ -171,6 +176,10 @@ class XtbSettings:
             timeout_s=float(raw.get("timeout_s", 0.0)),
             accept_maxcycle=accept_maxcycle,
             artifact_min_distance=artifact_min_distance,
+            freeze_atoms=tuple(
+                int(i) for i in (raw.get("freeze_atoms") or ())
+            ),
+            opt_level=str(raw.get("opt_level") or ""),
         )
 
     def payload(self) -> Dict[str, Any]:
@@ -183,6 +192,8 @@ class XtbSettings:
             "max_steps": self.max_steps,
             "accept_maxcycle": self.accept_maxcycle,
             "artifact_min_distance": dict(self.artifact_min_distance or {}),
+            "freeze_atoms": list(self.freeze_atoms),
+            "opt_level": self.opt_level,
         }
 
 
@@ -295,30 +306,60 @@ def _cli_env(settings: "XtbSettings") -> Dict[str, str]:
     return env
 
 
-def _cli_command(binary: str, settings: "XtbSettings") -> List[str]:
+def _cli_command(
+    binary: str,
+    settings: "XtbSettings",
+    *,
+    opt_level: Optional[str] = None,
+    need_input: bool = False,
+) -> List[str]:
     """The argv used for every structure (input file is always ``in.xyz``)."""
 
+    level = str(opt_level if opt_level is not None else settings.opt_level or "")
     cmd = [binary, "in.xyz", "--gxtb", "--opt"]
+    if level:
+        cmd.append(level)
     if settings.charge:
         cmd += ["--chrg", str(int(settings.charge))]
-    # xcontrol carries $opt maxcycle — gxtb CLI ignores max_steps alone.
-    if int(settings.max_steps) > 0:
+    # xcontrol carries $opt maxcycle and optional $fix — gxtb CLI ignores
+    # max_steps alone.
+    if int(settings.max_steps) > 0 or need_input or settings.freeze_atoms:
         cmd += ["--input", "xcontrol"]
     return cmd
 
 
-def _write_cli_xcontrol(work: Path, settings: "XtbSettings") -> None:
-    """Write xtb/gxtb ``$opt maxcycle=…`` so ``max_steps`` is enforced."""
+def _write_cli_xcontrol(
+    work: Path,
+    settings: "XtbSettings",
+    *,
+    freeze_atoms: Optional[Sequence[int]] = None,
+) -> None:
+    """Write xtb/gxtb ``$opt maxcycle=…`` and optional ``$fix``."""
 
     max_steps = int(settings.max_steps)
-    if max_steps <= 0:
+    frozen = [
+        int(i) + 1
+        for i in (
+            freeze_atoms if freeze_atoms is not None else settings.freeze_atoms
+        )
+        if int(i) >= 0
+    ]
+    if max_steps <= 0 and not frozen:
         return
-    (work / "xcontrol").write_text(
-        "$opt\n"
-        f"  maxcycle={max_steps}\n"
-        "$end\n",
-        encoding="utf-8",
-    )
+    lines = ["$opt"]
+    if max_steps > 0:
+        lines.append(f"  maxcycle={max_steps}")
+    if frozen:
+        lines.append("  engine=rf")
+    lines.append("$end")
+    if frozen:
+        # 1-based xtb indices.  $fix zeros the Cartesian gradient so the
+        # core stays on the CIF sites while Cl moves.
+        atoms = ",".join(str(i) for i in frozen)
+        if len(frozen) > 1 and frozen == list(range(frozen[0], frozen[-1] + 1)):
+            atoms = f"{frozen[0]}-{frozen[-1]}"
+        lines.extend(["$fix", f"  atoms: {atoms}", "$end"])
+    (work / "xcontrol").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _parse_cli_opt_status(log: str, max_steps: int) -> Tuple[bool, int, str]:
@@ -442,8 +483,18 @@ def _run_cli_one(
                 f"{sym} {pos[0]:.10f} {pos[1]:.10f} {pos[2]:.10f}"
             )
         xyz.write_text("\n".join(lines) + "\n")
-        _write_cli_xcontrol(Path(work), settings)
-        cmd = _cli_command(binary, settings)
+        freeze = entry.get("freeze_atoms")
+        if freeze is None:
+            freeze = settings.freeze_atoms
+        freeze_idx = tuple(int(i) for i in freeze)
+        opt_level = str(entry.get("opt_level") or settings.opt_level or "")
+        _write_cli_xcontrol(Path(work), settings, freeze_atoms=freeze_idx)
+        cmd = _cli_command(
+            binary,
+            settings,
+            opt_level=opt_level,
+            need_input=bool(freeze_idx),
+        )
         try:
             proc = subprocess.run(
                 cmd, cwd=work, capture_output=True, text=True, env=env,
@@ -654,6 +705,11 @@ def relax_structures(
             "id": str(entry["id"]),
             "symbols": list(entry["symbols"]),
             "positions": [list(map(float, p)) for p in entry["positions"]],
+            "freeze_atoms": list(
+                entry.get("freeze_atoms", settings.freeze_atoms) or ()
+            ),
+            "opt_level": str(entry.get("opt_level") or settings.opt_level or ""),
+            "edges": list(entry.get("edges") or ()),
         }
         for entry in structures
     ]

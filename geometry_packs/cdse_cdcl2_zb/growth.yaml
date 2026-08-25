@@ -100,9 +100,11 @@ geometry:
   place_monomer: embed_tables
   clash_policy: soft
   local_cleanup:
-    enabled: false
+    enabled: true
     method: g-xTB
-    max_cycles: 20
+    max_cycles: 25
+    freeze_core: true
+    opt_level: crude
   require_charge_neutral_for_cleanup: true
 
 child:

@@ -384,6 +384,134 @@ def test_place_cl_2p_count(map_spec) -> None:
             assert float(np.linalg.norm(coords[i] - coords[j])) > 2.20
 
 
+def test_zb_metric_bridge_pairs_drops_long_and_occupied_segment(map_spec) -> None:
+    from dataclasses import replace
+
+    from builder.nucleation.molecular_zb_growth import zb_metric_bridge_pairs
+    from builder.nc_types import NucleationGraphRules
+
+    spec = replace(
+        map_spec,
+        graph_rules=replace(map_spec.graph_rules, bridge_cd_cd_max_distance=4.75),
+    )
+    # Three collinear Cd: 0 --4.34-- 1 --4.34-- 2 (midpoint of 0-2 is 1).
+    coords = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [4.342, 0.00, 0.00],
+            [8.684, 0.00, 0.00],
+            [2.171, 3.760, 0.00],
+        ]
+    )
+    pairs = [(0, 1), (1, 2), (0, 2), (0, 3)]
+    kept = set(zb_metric_bridge_pairs(pairs, coords, [0, 1, 2, 3], spec))
+    assert (0, 1) in kept
+    assert (1, 2) in kept
+    assert (0, 3) in kept
+    assert (0, 2) not in kept
+
+
+def test_place_cl_mu2_prefers_outward_site(map_spec) -> None:
+    import networkx as nx
+
+    from builder.nucleation.molecular_zb_growth import place_cl_on_zb_core
+    from builder.nucleation.types import AtomRecord, _State
+
+    # Interior Cd 0 at origin; surface Cd 1 and 2 form an equilateral 4.342 Å
+    # triangle with it.  A μ2 on 1-2 must not land on Cd 0.
+    a = 4.342
+    c1 = np.array([a, 0.0, 0.0])
+    c2 = np.array([0.5 * a, a * np.sqrt(3) / 2.0, 0.0])
+    atoms = (
+        AtomRecord(0, "Cd", (0.0, 0.0, 0.0), "core_cation"),
+        AtomRecord(1, "Cd", tuple(c1), "core_cation"),
+        AtomRecord(2, "Cd", tuple(c2), "core_cation"),
+        AtomRecord(3, "Cl", (0.0, 0.0, 0.0), "precursor_ligand"),
+    )
+    graph = nx.Graph()
+    graph.add_nodes_from(range(4))
+    graph.add_edges_from([(1, 3), (2, 3)])
+    state = _State(atoms=atoms, graph=graph)
+    anchored = {0: (0.0, 0.0, 0.0), 1: tuple(c1), 2: tuple(c2)}
+    xyz = place_cl_on_zb_core(state, anchored, map_spec)
+    assert xyz is not None
+    assert float(np.linalg.norm(xyz[3] - xyz[0])) > 2.90
+    assert float(np.linalg.norm(xyz[3] - xyz[1])) < 3.10
+    assert float(np.linalg.norm(xyz[3] - xyz[2])) < 3.10
+
+
+def test_adapt_to_embed_table_is_a_start_not_a_relax() -> None:
+    import networkx as nx
+
+    from builder.nucleation.geometry_pack import load_geometry_pack
+    from builder.nucleation.molecular_motif_reconstruct import adapt_to_embed_table
+    from builder.nucleation.types import AtomRecord, _State
+
+    spec = load_nucleation_spec(str(PACK_ZB / "run_gxtb.yaml"))
+    pack = load_geometry_pack(PACK_ZB / "run_gxtb.yaml")
+    atoms = (
+        AtomRecord(0, "Cd", (0.0, 0.0, 0.0), "core_cation"),
+        AtomRecord(1, "Se", (3.40, 0.0, 0.0), "core_anion"),
+    )
+    graph = nx.Graph()
+    graph.add_nodes_from((0, 1))
+    graph.add_edges_from([(0, 1)])
+    state = _State(atoms=atoms, graph=graph)
+    start = np.array([[0.0, 0.0, 0.0], [3.40, 0.0, 0.0]])
+    out = adapt_to_embed_table(state, start, pack, spec, max_nfev=16)
+    assert out is not None
+    stretched = float(np.linalg.norm(out[1] - out[0]))
+    # Table CdSe is ~2.4–2.6 Å; a 16-step start should move toward it, not
+    # stay at the 3.40 Å lattice-like guess, and must not collapse.
+    assert 2.20 < stretched < 3.20
+
+
+def test_adapt_to_embed_table_keeps_clash_free_start_if_fit_clashes() -> None:
+    import networkx as nx
+
+    from builder.nucleation.geometry_pack import load_geometry_pack
+    from builder.nucleation.molecular_motif_reconstruct import adapt_to_embed_table
+    from builder.nucleation.types import AtomRecord, _State
+
+    spec = load_nucleation_spec(str(PACK_ZB / "run_gxtb.yaml"))
+    pack = load_geometry_pack(PACK_ZB / "run_gxtb.yaml")
+    # Two non-bonded Cd already legal; a Cl far from both.
+    atoms = (
+        AtomRecord(0, "Cd", (0.0, 0.0, 0.0), "core_cation"),
+        AtomRecord(1, "Cd", (4.34, 0.0, 0.0), "core_cation"),
+        AtomRecord(2, "Cl", (4.34, 2.45, 0.0), "precursor_ligand"),
+    )
+    graph = nx.Graph()
+    graph.add_nodes_from(range(3))
+    graph.add_edges_from([(1, 2)])
+    state = _State(atoms=atoms, graph=graph)
+    start = np.array([a.coordinates for a in atoms], dtype=float)
+    out = adapt_to_embed_table(state, start, pack, spec, max_nfev=16)
+    assert out is not None
+    assert float(np.linalg.norm(out[0] - out[2])) >= 2.90
+
+
+def test_construction_clash_rejects_cl_on_cn4_cd(map_spec) -> None:
+    from builder.nucleation.molecular_zb_growth import construction_clash
+
+    # Interior Cd at origin with four Se. Cl is outside the generic 2.20 Å
+    # floor but inside the Cd-Cl bond of the 4-Se cation.
+    symbols = ["Cd", "Se", "Se", "Se", "Se", "Cd", "Cl"]
+    coords = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [1.50, 1.50, 1.50],
+            [1.50, -1.50, -1.50],
+            [-1.50, 1.50, -1.50],
+            [-1.50, -1.50, 1.50],
+            [4.00, 0.00, 0.00],
+            [2.40, 0.00, 0.00],
+        ]
+    )
+    bonded = [(5, 6)]
+    assert construction_clash(symbols, coords, map_spec, bonded=bonded)
+
+
 def test_place_cl_on_k2_attach_does_not_clash(map_spec) -> None:
     from builder.nucleation.molecular_zb_growth import construction_clash
 
@@ -425,6 +553,9 @@ def test_zb_pack_is_clean() -> None:
     assert w3.min_p_parent == 2
     assert w3.energy_window_eV == 0.60
     assert spec.graph_rules.decoration_mode == "motif_bridge_first"
+    assert spec.graph_rules.bridge_cd_cd_max_distance == pytest.approx(4.75)
+    assert cfg.local_cleanup_enabled is True
+    assert cfg.local_cleanup_freeze_core is True
     w12 = cfg.window_for(12)
     assert w12.move_zb_sites is True
     assert cfg.endpoint_diagnostic_k == 13
@@ -530,13 +661,17 @@ def test_zb_opt_indexes_only_topology_preserving_endpoints(
     assert occupation is not None
     occupation.parent_id = "parent-structure"
     occupation.parent_structure_ids = ("parent-structure",)
-    growth = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    growth = replace(
+        GrowthConfig.from_yaml(PACK_ZB / "growth.yaml"),
+        local_cleanup_enabled=False,
+        local_cleanup_freeze_core=False,
+    )
     pack = load_geometry_pack(PACK_ZB / "run_gxtb.yaml")
 
     def run_fake(output: Path, *, preserve: bool):
         calls = []
 
-        def fake_relax(entries, _settings, _cutoffs):
+        def fake_relax(entries, _settings, _cutoffs=None, **_kwargs):
             calls.extend(entries)
             results = []
             for entry in entries:
@@ -581,7 +716,7 @@ def test_zb_opt_indexes_only_topology_preserving_endpoints(
     assert minima and ranks
     assert records[0]["propagation_eligible"] is True
     assert records[0]["topology_status"] == "preserved"
-    assert records[0]["core_rmsd_A"] == pytest.approx(0.0, abs=1.0e-10)
+    # Core may leave CIF in the embed.yaml morph; g-xTB sees that start.
 
     _calls, minima, ranks, records = run_fake(tmp_path / "changed", preserve=False)
     assert not minima and not ranks

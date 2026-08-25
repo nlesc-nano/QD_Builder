@@ -17,7 +17,7 @@ import hashlib
 import json
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1321,6 +1321,188 @@ def _too_close(
     return False
 
 
+DEFAULT_BRIDGE_CD_CD_MIN_A = 3.20
+DEFAULT_BRIDGE_CD_CD_MAX_A = 4.75
+_SEGMENT_TOL_A = 0.40
+
+
+def cation_on_segment(
+    start: np.ndarray,
+    end: np.ndarray,
+    points: np.ndarray,
+    *,
+    tol_A: float = _SEGMENT_TOL_A,
+) -> bool:
+    """True if any point lies on the open segment start–end (occupied midpoint)."""
+
+    axis = np.asarray(end, dtype=float) - np.asarray(start, dtype=float)
+    length2 = float(np.dot(axis, axis))
+    if length2 < 1.0e-12 or len(points) == 0:
+        return False
+    origin = np.asarray(start, dtype=float)
+    for point in np.asarray(points, dtype=float):
+        t = float(np.dot(point - origin, axis) / length2)
+        if t <= 0.05 or t >= 0.95:
+            continue
+        if float(np.linalg.norm(point - (origin + t * axis))) <= float(tol_A):
+            return True
+    return False
+
+
+def zb_metric_bridge_pairs(
+    pair_list: Sequence[Edge],
+    coordinates: np.ndarray,
+    cd_indices: Sequence[int],
+    spec: NucleationSpec,
+    *,
+    min_distance: float = DEFAULT_BRIDGE_CD_CD_MIN_A,
+) -> List[Edge]:
+    """Keep Cd–Cd pairs whose lattice length can host a μ2 Cl.
+
+    Graph hop 2/4 is a chemical prefilter; this is the metric gate.  Pairs
+    longer than ``bridge_cd_cd_max_distance`` (ZB NN is 4.34 Å; two 2.4 Å
+    spheres stop meeting near 4.8 Å) or whose segment contains another
+    occupied cation (collinear 8.68 Å through an interior Cd) are dropped.
+    With no configured max, the list is unchanged so molecular growth is
+    untouched.
+    """
+
+    configured = spec.graph_rules.bridge_cd_cd_max_distance
+    if configured is None:
+        return [tuple(sorted((int(a), int(b)))) for a, b in pair_list]
+    max_d = float(configured)
+    min_d = float(min_distance)
+    pts = np.asarray(coordinates, dtype=float)
+    cd = [int(i) for i in cd_indices]
+    kept: List[Edge] = []
+    for left, right in pair_list:
+        a, b = int(left), int(right)
+        if a >= len(pts) or b >= len(pts):
+            continue
+        distance = float(np.linalg.norm(pts[a] - pts[b]))
+        if distance < min_d or distance > max_d:
+            continue
+        others = np.asarray(
+            [pts[i] for i in cd if i not in (a, b) and i < len(pts)],
+            dtype=float,
+        )
+        if len(others) and cation_on_segment(pts[a], pts[b], others):
+            continue
+        kept.append((min(a, b), max(a, b)))
+    return kept
+
+
+def _mu2_sites(
+    host_a: np.ndarray,
+    host_b: np.ndarray,
+    radius: float,
+) -> List[np.ndarray]:
+    """Sphere-intersection points for a μ2 Cl, or empty if the hosts are too far."""
+
+    a = np.asarray(host_a, dtype=float)
+    b = np.asarray(host_b, dtype=float)
+    axis = b - a
+    length = float(np.linalg.norm(axis))
+    if length < 1.0e-6 or length >= 2.0 * float(radius) - 0.02:
+        return []
+    unit = axis / length
+    mid = a + 0.5 * axis
+    height2 = float(radius) ** 2 - (0.5 * length) ** 2
+    height = float(np.sqrt(max(height2, 0.25)))
+    tmp = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(tmp, unit))) > 0.9:
+        tmp = np.array([1.0, 0.0, 0.0])
+    perp = np.cross(unit, tmp)
+    norm = float(np.linalg.norm(perp))
+    if norm < 1.0e-8:
+        return []
+    perp = perp / norm
+    return [mid + perp * height, mid - perp * height]
+
+
+def place_cl_on_zb_core(
+    state: _State,
+    anchored: Mapping[int, Sequence[float]],
+    spec: NucleationSpec,
+    pack: Any = None,
+    *,
+    clash_floor: float = 2.20,
+) -> Optional[np.ndarray]:
+    """Put each graph Cl at a lattice-feasible 3D site on the frozen ZB core.
+
+    μ2 Cl starts at the *outward* sphere intersection of its two hosts (away
+    from the core COM, not on an occupied cation).  Terminals go along an
+    unused tet direction of the host.  Returns None if a Cl has no legal site.
+    """
+
+    n_atoms = len(state.atoms)
+    if n_atoms == 0 or not anchored:
+        return None
+    xyz = np.zeros((n_atoms, 3), dtype=float)
+    for index, point in anchored.items():
+        if 0 <= int(index) < n_atoms:
+            xyz[int(index)] = np.asarray(point, dtype=float)
+    cation, anion, ligand = _species(spec)
+    radius = _cdcl_bond(pack)
+    core_idx = [i for i in range(n_atoms) if state.atoms[i].symbol != ligand]
+    if not core_idx:
+        return xyz
+    core_com = xyz[core_idx].mean(axis=0)
+    cl_ids = [i for i, atom in enumerate(state.atoms) if atom.symbol == ligand]
+    for cl in cl_ids:
+        hosts = [
+            int(j)
+            for j in state.graph.neighbors(cl)
+            if state.atoms[int(j)].symbol == cation
+        ]
+        pos: Optional[np.ndarray] = None
+        ignore = tuple(hosts)
+        if len(hosts) == 2:
+            sites = _mu2_sites(xyz[hosts[0]], xyz[hosts[1]], radius)
+            sites.sort(
+                key=lambda p: -float(np.linalg.norm(p - core_com))
+            )
+            for candidate in sites:
+                if not _too_close(candidate, xyz, floor=clash_floor, ignore=ignore):
+                    pos = candidate
+                    break
+        elif len(hosts) == 1:
+            host = hosts[0]
+            push = np.zeros(3)
+            for nb in state.graph.neighbors(host):
+                if int(nb) == cl:
+                    continue
+                vec = xyz[host] - xyz[int(nb)]
+                norm = float(np.linalg.norm(vec))
+                if norm > 1.0e-8:
+                    push += vec / norm
+            norm = float(np.linalg.norm(push))
+            if norm > 1.0e-8:
+                candidate = xyz[host] + (push / norm) * radius
+                if not _too_close(candidate, xyz, floor=clash_floor, ignore=(host,)):
+                    pos = candidate
+        elif len(hosts) >= 3:
+            triangle = xyz[list(hosts[:3])]
+            center = triangle.mean(axis=0)
+            normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+            nrm = float(np.linalg.norm(normal))
+            if nrm > 1.0e-8:
+                normal = normal / nrm
+                if float(np.dot(center + normal - core_com, normal)) < 0.0:
+                    normal = -normal
+                candidate = center + normal * 1.10
+                if not _too_close(candidate, xyz, floor=clash_floor, ignore=ignore):
+                    pos = candidate
+        if pos is None:
+            return None
+        xyz[cl] = pos
+    from .molecular_rules import cl_on_cn4_cd_violations
+
+    if cl_on_cn4_cd_violations(state, spec, xyz):
+        return None
+    return xyz
+
+
 def place_cl_2p(
     occ: ZbOccupation,
     spec: NucleationSpec,
@@ -1433,7 +1615,12 @@ def construction_clash(
     floor: float = 2.20,
     bonded: Optional[Sequence[Edge]] = None,
 ) -> bool:
-    """True if a pair that is not a Cd–Se / Cd–Cl contact is closer than floor."""
+    """True if a pair that is not a Cd–Se / Cd–Cl contact is closer than floor.
+
+    Also true if any Cl sits within the Cd–Cl bond of a cation that already
+    has four Se neighbours — that is a fifth ligand in space, not a graph
+    CN = 5.
+    """
 
     pts = np.asarray(coords, dtype=float)
     n = len(symbols)
@@ -1453,4 +1640,27 @@ def construction_clash(
             if bonded_set and (i, j) in bonded_set and d >= 2.00:
                 continue
             return True
+    from .molecular_rules import (
+        DEFAULT_CD_CL_BOND_MAX,
+        DEFAULT_CD_SE_BOND_MAX,
+        _pair_bond_max,
+    )
+
+    cation = spec.core.cation
+    anion = spec.core.anion
+    ligand = spec.precursor.ligand
+    se_cut = _pair_bond_max(spec, cation, anion, DEFAULT_CD_SE_BOND_MAX)
+    cl_cut = _pair_bond_max(spec, cation, ligand, DEFAULT_CD_CL_BOND_MAX)
+    cd = [i for i, s in enumerate(symbols) if s == cation]
+    se = [i for i, s in enumerate(symbols) if s == anion]
+    cl = [i for i, s in enumerate(symbols) if s == ligand]
+    for i in cd:
+        n_se = sum(
+            1 for j in se if float(np.linalg.norm(pts[i] - pts[j])) <= se_cut
+        )
+        if n_se < 4:
+            continue
+        for j in cl:
+            if float(np.linalg.norm(pts[i] - pts[j])) <= cl_cut:
+                return True
     return False

@@ -16,7 +16,11 @@ import networkx as nx
 import numpy as np
 from scipy.optimize import least_squares
 
-from .molecular_rules import molecular_geometry_ok, pair_key
+from .molecular_rules import (
+    cl_on_cn4_cd_violations,
+    molecular_geometry_ok,
+    pair_key,
+)
 from .types import FloatArray, _State
 
 
@@ -237,6 +241,120 @@ def _aligned_rmsd(left: FloatArray, right: FloatArray) -> float:
     return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
 
 
+def adapt_to_embed_table(
+    state: _State,
+    coordinates: np.ndarray,
+    pack: Any,
+    spec: Any,
+    *,
+    max_nfev: int = 16,
+    overlap_min_A: float = 0.75,
+) -> Optional[np.ndarray]:
+    """Cheap clash-aware morph of a lattice+Cl start onto ``embed.yaml``.
+
+    The core is **not** held on CIF sites.  Bond and angle residuals pull
+    toward the g-xTB median table so the start is molecular rather than bulk;
+    they are weak, so a low-CN Cd–Se can open without failing the fit.
+    Clash floors (forbidden-pair ``min_distance``, non-bonded Cd–Cl, overlap,
+    Cl on a 4-Se Cd) are stronger and are the only hard reject.
+
+    ``max_nfev`` is kept small: this is a starting guess for g-xTB, not a
+    geometry optimisation.  If the fit introduces a clash, the input
+    coordinates are kept when they were already clash-free.
+    """
+
+    from . import molecular as M
+
+    initial = np.asarray(coordinates, dtype=float)
+    n_atoms = len(state.atoms)
+    if initial.shape != (n_atoms, 3) or not np.all(np.isfinite(initial)):
+        return None
+
+    degrees = [int(state.graph.degree[i]) for i in range(n_atoms)]
+    bonds = [
+        (int(a), int(b), float(M._molecular_bond_length(state, pack, spec, a, b, degrees)))
+        for a, b in state.graph.edges
+    ]
+    _impropers, audited_angles = M._audited_local_terms(state, pack, spec)
+    bonded = {tuple(sorted((int(a), int(b)))) for a, b in state.graph.edges}
+    pair_bands: List[Tuple[int, int, float]] = []
+    for left in range(n_atoms):
+        for right in range(left + 1, n_atoms):
+            if (left, right) in bonded:
+                continue
+            rule = spec.graph_rules.pair_rules.get(
+                pair_key(state.atoms[left].symbol, state.atoms[right].symbol)
+            )
+            if rule is None:
+                continue
+            floor = (
+                float(rule.min_distance or 0.0)
+                if not rule.bond_allowed
+                else float(rule.bond_max_distance or 0.0)
+            )
+            if floor > 0.0:
+                pair_bands.append((left, right, floor))
+
+    def residual(flat: FloatArray) -> FloatArray:
+        xyz = np.asarray(flat, dtype=float).reshape((n_atoms, 3))
+        values: List[float] = []
+        # Weak table pull: a start, not an exact match.
+        for left, right, target in bonds:
+            values.append(
+                (float(np.linalg.norm(xyz[left] - xyz[right])) - target) / 0.12
+            )
+        by_group: dict = {}
+        for left, center, right, target, band, group in audited_angles:
+            dev = (
+                _periodic_delta(_angle_deg(xyz, left, center, right), target)
+                / max(6.0, float(band))
+            )
+            prev = by_group.get(group)
+            if prev is None or abs(dev) < abs(prev):
+                by_group[group] = dev
+        values.extend(by_group[g] for g in sorted(by_group))
+        # Clash floors dominate.
+        for left, right, floor in pair_bands:
+            distance = float(np.linalg.norm(xyz[left] - xyz[right]))
+            values.append(min(0.0, distance - floor) / 0.025)
+        values.extend((np.mean(xyz, axis=0) / 0.15).tolist())
+        return np.asarray(values, dtype=float)
+
+    def _clashes(xyz: np.ndarray) -> bool:
+        if M._motif_clash_violations(
+            state, xyz, overlap_min_A=overlap_min_A
+        ):
+            return True
+        if cl_on_cn4_cd_violations(state, spec, xyz):
+            return True
+        for left, right, floor in pair_bands:
+            if float(np.linalg.norm(xyz[left] - xyz[right])) < floor:
+                return True
+        return False
+
+    start_ok = not _clashes(initial)
+    try:
+        residual_count = len(residual(initial.reshape(-1)))
+        method = "lm" if residual_count >= initial.size else "trf"
+        fitted = least_squares(
+            residual,
+            initial.reshape(-1),
+            method=method,
+            max_nfev=max(1, int(max_nfev)),
+            ftol=1.0e-4,
+            xtol=1.0e-4,
+            gtol=1.0e-4,
+        )
+        xyz = np.asarray(fitted.x, dtype=float).reshape((n_atoms, 3))
+    except Exception:
+        return initial if start_ok else None
+    if not np.all(np.isfinite(xyz)):
+        return initial if start_ok else None
+    if _clashes(xyz):
+        return initial if start_ok else None
+    return xyz
+
+
 def reconstruct_motif_state(
     state: _State,
     pack: Any,
@@ -445,6 +563,10 @@ def reconstruct_motif_state(
             if not violations:
                 _ok, contact = molecular_geometry_ok(state, xyz, spec)
                 violations += contact
+        # Hard: Cl sitting on a 4-Se Cd is a fifth ligand in space even when
+        # the graph bonded that Cl to a different host. overlap_min_A (0.75 Å)
+        # does not catch Cd-Cl at ~0.8-1.0 Å.
+        violations += cl_on_cn4_cd_violations(state, spec, xyz)
         candidate = MotifReconstructionCandidate(
             coordinates=tuple(tuple(float(v) for v in row) for row in xyz),
             audit_violations=tuple(violations),

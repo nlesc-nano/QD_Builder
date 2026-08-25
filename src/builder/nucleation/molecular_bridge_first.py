@@ -1257,6 +1257,24 @@ def iter_cl_attachments_bridge_target(
             (a, b) for a, b in pair_list
             if dist.get(a, {}).get(b, 99) in (2, 4)
         ]
+    # On a metric skeleton (Move Z) hop 4 can be 8.68 Å through an occupied
+    # cation.  Drop those pairs when lattice coordinates are present.
+    if state is not None and spec.graph_rules.bridge_cd_cd_max_distance is not None:
+        host_xyz = np.asarray(
+            [atom.coordinates for atom in state.atoms], dtype=float
+        )
+        n_need = max(cd_list) + 1 if cd_list else 0
+        if (
+            host_xyz.shape[0] >= n_need
+            and n_need > 0
+            and np.all(np.isfinite(host_xyz[:n_need]))
+            and not np.allclose(host_xyz[:n_need], 0.0)
+        ):
+            from .molecular_zb_growth import zb_metric_bridge_pairs
+
+            pair_list = zb_metric_bridge_pairs(
+                pair_list, host_xyz, cd_list, spec
+            )
     # Ceiling on bridges: every bridge consumes two host slots, and there are
     # only ``sum(bridge_room)`` of them; it also cannot exceed the Cl budget or
     # the number of distinct pairs available at max_shared per pair.

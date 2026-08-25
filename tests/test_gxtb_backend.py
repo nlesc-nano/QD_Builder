@@ -73,6 +73,22 @@ def test_xcontrol_always_written_for_positive_max_steps(tmp_path):
     assert "--input" in cmd and "xcontrol" in cmd
 
 
+def test_xcontrol_writes_fix_block(tmp_path):
+    from builder.nucleation.xtb_relax import _cli_command, _write_cli_xcontrol
+
+    st = XtbSettings.from_pack(
+        {"enabled": True, "method": "g-xTB", "max_steps": 25, "opt_level": "crude"}
+    )
+    _write_cli_xcontrol(tmp_path, st, freeze_atoms=range(5))
+    text = (tmp_path / "xcontrol").read_text()
+    assert "maxcycle=25" in text
+    assert "$fix" in text
+    assert "atoms: 1-5" in text
+    assert "engine=rf" in text
+    cmd = _cli_command("gxtb", st, opt_level="crude", need_input=True)
+    assert "--opt" in cmd and "crude" in cmd
+
+
 def test_parse_cli_opt_status_maxcycle():
     from builder.nucleation.xtb_relax import _parse_cli_opt_status
 
