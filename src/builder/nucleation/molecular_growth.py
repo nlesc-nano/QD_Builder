@@ -3408,10 +3408,12 @@ def grow_cores_from_parents(
     cleanup → seed frames for full opt (and core added to catalog).
 
     **Move Z (zb_sites):** load the persistent zinc-blende occupation,
-    shed extra Cd, and fill a vacant CdSe pair (+ p_m precursor Cd).  The
-    relaxed parent supplies only soft local feedback.  Pack graph rules place
-    Cl, anchored multi-start reconstruction builds the 3D starts, and only a
-    topology-preserving converged g-xTB endpoint can propagate.
+    displace s Z-type CdCl2 units (geminal Cl-Cd-Cl first; Cl-free Cd
+    never leave), and fill a vacant CdSe pair (+ p_m precursor Cd).  The
+    relaxed parent supplies the Cl inventory and soft local feedback.
+    Pack graph rules place Cl, anchored multi-start reconstruction builds
+    the 3D starts, and only a topology-preserving converged g-xTB endpoint
+    can propagate.
     """
 
     if not parents:
@@ -3445,44 +3447,40 @@ def grow_cores_from_parents(
             grow_zb_children,
             lattice_k1_occupation,
             lattice_model,
+            ztype_census,
+            ztype_shed_units,
         )
 
         zb_model = lattice_model(spec)
         zb_stats = ZbGrowStats()
 
+    ligand_bond = float(
+        cutoffs.get(
+            (spec.core.cation, spec.precursor.ligand),
+            cutoffs.get((spec.precursor.ligand, spec.core.cation), 2.90),
+        )
+    )
+
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
         packages = identify_packages(parent, spec)
         n_pkg = len(packages) if packages else parent.p
-        max_s = min(
+        max_s_ab = min(
             window.s_max_for(parent.k, parent.p),
             parent.p,
             n_pkg,
         )
-        if window.prefer_low_shed:
-            s_order = list(range(0, max_s + 1))
-        else:
-            s_order = list(range(max_s, -1, -1))
-
-        parent_records.append(
-            {
-                "structure_id": parent.structure_id,
-                "k": parent.k,
-                "p": parent.p,
-                "energy_eV": parent.energy_eV,
-                "n_packages": len(packages),
-                "has_wbo": parent.wbo is not None,
-                "wbo_source": parent.wbo_source,
-                "source": parent.source_path,
-                "minimum_id": parent.minimum_id,
-                "minimum_representative_id": parent.minimum_representative_id,
-                "minimum_member_ids": list(parent.minimum_member_ids),
-                "minimum_occupation_ids": list(parent.minimum_occupation_ids),
-                "minimum_multiplicity": int(parent.minimum_multiplicity),
-            }
-        )
 
         zb_occ = None
+        ztype_units = None
+        max_s_z = 0
+        ztype_info: Dict[str, int] = {
+            "geminal_terminal": 0,
+            "geminal_bridge": 0,
+            "borrowed": 0,
+            "cl_free": 0,
+            "disjoint": 0,
+        }
         if use_zb and zb_model is not None and zb_stats is not None:
             zb_stats.parents += 1
             stored = getattr(parent, "zb_occupation", None)
@@ -3511,6 +3509,73 @@ def grow_cores_from_parents(
                     zb_stats.n4_reject += 1
             else:
                 zb_stats.snapped += 1
+                if spec.precursor.ligand in parent.symbols:
+                    ztype_units = ztype_shed_units(
+                        zb_occ,
+                        spec,
+                        parent_symbols=parent.symbols,
+                        parent_coordinates=np.asarray(
+                            parent.coordinates, dtype=float
+                        ),
+                        parent_edges=parent.edges,
+                        parent_wbo=parent.wbo,
+                        ligand_bond_length=ligand_bond,
+                    )
+                    ztype_info = ztype_census(zb_occ, ztype_units, spec)
+                    max_s_z = min(
+                        window.s_max_for(parent.k, parent.p),
+                        parent.p,
+                        int(ztype_info["disjoint"]),
+                    )
+                    zb_stats.ztype_geminal_terminal += ztype_info[
+                        "geminal_terminal"
+                    ]
+                    zb_stats.ztype_geminal_bridge += ztype_info[
+                        "geminal_bridge"
+                    ]
+                    zb_stats.ztype_borrowed += ztype_info["borrowed"]
+                    zb_stats.ztype_cl_free_cd += ztype_info["cl_free"]
+                    zb_stats.ztype_disjoint += max_s_z
+                else:
+                    # Core-only fixture: no Z-type leaving group to inspect.
+                    ztype_units = None
+                    max_s_z = min(
+                        window.s_max_for(parent.k, parent.p),
+                        parent.p,
+                    )
+
+        max_s = 0
+        if use_graph or use_coord:
+            max_s = max(max_s, max_s_ab)
+        if use_zb:
+            max_s = max(max_s, max_s_z)
+        if window.prefer_low_shed:
+            s_order = list(range(0, max_s + 1))
+        else:
+            s_order = list(range(max_s, -1, -1))
+
+        parent_records.append(
+            {
+                "structure_id": parent.structure_id,
+                "k": parent.k,
+                "p": parent.p,
+                "energy_eV": parent.energy_eV,
+                "n_packages": len(packages),
+                "n_ztype_geminal_terminal": ztype_info["geminal_terminal"],
+                "n_ztype_geminal_bridge": ztype_info["geminal_bridge"],
+                "n_ztype_borrowed": ztype_info["borrowed"],
+                "n_ztype_cl_free": ztype_info["cl_free"],
+                "n_ztype_disjoint": ztype_info["disjoint"],
+                "has_wbo": parent.wbo is not None,
+                "wbo_source": parent.wbo_source,
+                "source": parent.source_path,
+                "minimum_id": parent.minimum_id,
+                "minimum_representative_id": parent.minimum_representative_id,
+                "minimum_member_ids": list(parent.minimum_member_ids),
+                "minimum_occupation_ids": list(parent.minimum_occupation_ids),
+                "minimum_multiplicity": int(parent.minimum_multiplicity),
+            }
+        )
 
         for s in s_order:
             p_out = parent.p - s
@@ -3641,6 +3706,8 @@ def grow_cores_from_parents(
                             )
 
                 if use_zb and zb_occ is not None and zb_model is not None:
+                    if s > max_s_z:
+                        continue
                     kids = grow_zb_children(
                         zb_occ,
                         s=s,
@@ -3671,15 +3738,8 @@ def grow_cores_from_parents(
                             ],
                             dtype=float,
                         ).reshape(-1, 3),
-                        ligand_bond_length=float(
-                            cutoffs.get(
-                                (spec.core.cation, spec.precursor.ligand),
-                                cutoffs.get(
-                                    (spec.precursor.ligand, spec.core.cation),
-                                    0.0,
-                                ),
-                            )
-                        ),
+                        ligand_bond_length=ligand_bond,
+                        ztype_units=ztype_units,
                     )
                     kept_kids = []
                     for kid in kids:
@@ -4089,11 +4149,13 @@ class GrowthLog:
             self.line("  B coord: OFF")
         if getattr(growth, "move_zb_sites", False):
             self.line(
-                "  Z zb_sites: snap parent onto zinc-blende -> "
-                "shed extra Cd -> fill vacant CdSe pair + p_m Cd -> "
+                "  Z zb_sites: lattice occupation -> Z-type CdCl2 shed "
+                "(geminal Cl-Cd-Cl first, then CdCl + borrowed Cl; "
+                "Cl-free Cd never leave) -> vacant CdSe + p_m Cd -> "
                 "pack decorate (graph_rules 2p) -> embed.yaml 3D -> "
                 "full g-xTB -> keep only if the relaxed core still "
-                "embeds on zb.  Genealogy is the occupation, not the XYZ."
+                "embeds on zb.  Genealogy is the occupation, not the XYZ. "
+                "Shed is combinatorial in STAGE 2, not a g-xTB step."
             )
         else:
             self.line("  Z zb_sites: OFF")
@@ -4214,7 +4276,9 @@ class GrowthLog:
             by_move[getattr(ch, "move", "graph")] += 1
         self.line(
             f"channels: {n_ch}  "
-            f"(graph={by_move.get('graph', 0)}  coord={by_move.get('coord', 0)})"
+            f"(graph={by_move.get('graph', 0)}  "
+            f"coord={by_move.get('coord', 0)}  "
+            f"zb_sites={by_move.get('zb_sites', 0)})"
         )
         s_bits = [
             f"s={s}: ch={by_s[s]} cores+={by_s_cores[s]}"
@@ -4232,15 +4296,41 @@ class GrowthLog:
             str(r.get("wbo_source") or "none") for r in parent_records
         )
         src_txt = ", ".join(f"{k}={v}" for k, v in sorted(sources.items()))
+        geminal_t = sum(
+            int(r.get("n_ztype_geminal_terminal") or 0) for r in parent_records
+        )
+        geminal_b = sum(
+            int(r.get("n_ztype_geminal_bridge") or 0) for r in parent_records
+        )
+        borrowed = sum(
+            int(r.get("n_ztype_borrowed") or 0) for r in parent_records
+        )
+        cl_free = sum(int(r.get("n_ztype_cl_free") or 0) for r in parent_records)
+        if by_move.get("zb_sites"):
+            self.line(
+                "  Z-type shed (STAGE 2, on the parent occupation): "
+                f"geminal_terminal={geminal_t} geminal_bridge={geminal_b} "
+                f"borrowed={borrowed} cl_free_blocked={cl_free}"
+            )
+            self.line(
+                "  Cl-free Cd (including Cd-Se CN=3) never leave. "
+                "Ranking inside a kind is Cd-Se WBO of the leaving Cd, "
+                "not Cd-Cl."
+            )
         self.line(
-            f"  parent packages: {n_pkg} total; "
+            f"  parent B-packages: {n_pkg} total; "
             f"{n_wbo}/{len(parent_records)} parents have WBO "
             f"({src_txt})"
         )
-        if n_wbo == 0 and parent_records:
+        if (
+            n_wbo == 0
+            and parent_records
+            and by_move.get("coord")
+            and not by_move.get("zb_sites")
+        ):
             self.line(
                 "  NOTE: no Wiberg files on parents (typical for g-xTB). "
-                "Package ranking falls back to Cd–Cl distance "
+                "Move B package ranking falls back to Cd–Cl distance "
                 "(longer = weaker = shed first)."
             )
 
@@ -4649,6 +4739,11 @@ def run_growth_step(
                 else "off"
             ),
             move_Z="zb_sites" if window.move_zb_sites else "off",
+            note=(
+                "Z-type CdCl2 shed happens here, on the occupation"
+                if window.move_zb_sites
+                else ""
+            ),
         )
     # load pack early so move B can use embed distances / cleanup settings
     if pack is None and map_spec.geometry_pack:
@@ -6807,7 +6902,9 @@ def _opt_zb_occupations(
                     f"start={job['start_index']} "
                     f"E_eV={'n/a' if energy is None else f'{energy:.6f}'} "
                     f"t_s={elapsed:.1f} topology={topology_status} "
-                    f"status={status} parent={occupation.parent_id}"
+                    f"status={status} parent={occupation.parent_id} "
+                    f"shed={occupation.shed} p_m={occupation.p_m}"
+                    f"{(' ztype=' + occupation.shed_kind) if occupation.shed_kind else ''}"
                 )
 
             if output_dir is not None:
@@ -6890,6 +6987,7 @@ def _opt_zb_occupations(
                     "move": "Z",
                     "shed": occupation.shed,
                     "p_m": occupation.p_m,
+                    "shed_kind": occupation.shed_kind,
                     "parent_id": occupation.parent_id,
                     "occupation_id": occupation.occupation_id,
                     "parent_occupation_ids": "|".join(
@@ -6933,6 +7031,7 @@ def _growth_index_fields(growth: GrowthConfig) -> List[str]:
         "move",
         "shed",
         "p_m",
+        "shed_kind",
         "parent_id",
         "occupation_id",
         "parent_occupation_ids",
@@ -7037,6 +7136,7 @@ def write_growth_summary(result: GrowthStepResult, path: Path) -> None:
                 "k_child",
                 "p_child",
                 "n_cores",
+                "move",
             ],
         )
         writer.writeheader()
@@ -7051,6 +7151,7 @@ def write_growth_summary(result: GrowthStepResult, path: Path) -> None:
                     "k_child": ch.k_child,
                     "p_child": ch.p_child,
                     "n_cores": ch.n_cores,
+                    "move": ch.move,
                 }
             )
 

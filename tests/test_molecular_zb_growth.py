@@ -24,6 +24,7 @@ from builder.nucleation.molecular_growth import (
 )
 from builder.nucleation.geometry_pack import load_geometry_pack
 from builder.nucleation.molecular_zb_growth import (
+    ZbOccupation,
     attach_cdse,
     endpoint_similarity_diagnostic,
     ensure_occupation_identity,
@@ -37,6 +38,8 @@ from builder.nucleation.molecular_zb_growth import (
     seed_occupation,
     shed_occupations,
     zb_embeddable,
+    ztype_removal_sets,
+    ztype_shed_units,
 )
 from builder.nucleation.soft_rules import describe_structure
 from builder.nucleation.spec import load_nucleation_spec
@@ -135,6 +138,190 @@ def test_shedding_is_exhaustive_before_soft_priority(map_spec) -> None:
     assert {item.occupation_id for item in baseline} == {
         item.occupation_id for item in biased
     }
+
+
+def _ztype_parent_xyz(occupation: ZbOccupation, cl_of: dict) -> tuple:
+    """Build a decorated XYZ: occupation core plus Cl listed per Cd index."""
+
+    symbols = list(occupation.symbols)
+    coords = [list(point) for point in occupation.coordinates]
+    edges = list(occupation.core_edges)
+    cl_index = {}
+    for cd, n_cl in cl_of.items():
+        origin = np.asarray(occupation.coordinates[cd], dtype=float)
+        for k in range(n_cl):
+            idx = len(symbols)
+            symbols.append("Cl")
+            offset = np.array([2.3, 0.0, 0.0]) if k == 0 else np.array([-2.3, 0.0, 0.0])
+            if n_cl == 1:
+                offset = np.array([0.0, 2.3, 0.0])
+            coords.append(list(origin + offset))
+            edges.append((cd, idx))
+            cl_index.setdefault(cd, []).append(idx)
+    return tuple(symbols), np.asarray(coords, dtype=float), tuple(edges)
+
+
+def test_ztype_units_skip_cl_free_even_at_cn3(map_spec) -> None:
+    occupation = ZbOccupation(
+        k=1,
+        p=2,
+        symbols=("Se", "Cd", "Cd", "Cd"),
+        coordinates=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [2.5, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+                [0.0, 2.5, 0.0],
+            ],
+            dtype=float,
+        ),
+        core_edges=((0, 1), (0, 3)),
+    )
+    # Cd1: CN_Se=1, no Cl (must not shed). Cd2: geminal CdCl2. Cd3: CN_Se=1, one Cl.
+    symbols, coords, edges = _ztype_parent_xyz(occupation, {2: 2, 3: 1})
+    units = ztype_shed_units(
+        occupation,
+        map_spec,
+        parent_symbols=symbols,
+        parent_coordinates=coords,
+        parent_edges=edges,
+    )
+    best = {}
+    for unit in units:
+        if unit.cd not in best or unit.kind_rank < best[unit.cd][1]:
+            best[unit.cd] = (unit.kind, unit.kind_rank)
+    assert 1 not in best
+    assert best[2][0].startswith("geminal")
+    assert best[3][0] == "borrowed"
+    sets, _meta = ztype_removal_sets(units, 1)
+    assert {combo[0] for combo in sets} == {2, 3}
+
+
+def test_ztype_grow_only_removes_chlorinated_cd(map_spec) -> None:
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=2)
+    assert parent is not None
+    ensure_occupation_identity(parent, model)
+    degrees = [0] * len(parent.symbols)
+    for left, right in parent.core_edges:
+        degrees[left] += 1
+        degrees[right] += 1
+    cd_ids = [i for i, symbol in enumerate(parent.symbols) if symbol == "Cd"]
+    geminal = min(cd_ids, key=lambda i: (degrees[i], i))
+    cl_free = max(cd_ids, key=lambda i: (degrees[i], i))
+    assert geminal != cl_free
+    symbols, coords, edges = _ztype_parent_xyz(parent, {geminal: 2})
+    units = ztype_shed_units(
+        parent,
+        map_spec,
+        parent_symbols=symbols,
+        parent_coordinates=coords,
+        parent_edges=edges,
+    )
+    assert {unit.cd for unit in units} == {geminal}
+    sets, _meta = ztype_removal_sets(units, 1)
+    assert sets == [(geminal,)]
+    after = shed_occupations(
+        parent, 1, map_spec, model, remove_sets=sets
+    )
+    assert after
+    geminal_site = parent.site_ids[geminal]
+    cl_free_site = parent.site_ids[cl_free]
+    for occ in after:
+        assert geminal_site not in occ.site_ids
+        assert cl_free_site in occ.site_ids
+    kids = grow_zb_children(
+        parent,
+        s=1,
+        p_m=1,
+        spec=map_spec,
+        model=model,
+        cap=0,
+        ztype_units=units,
+    )
+    assert kids
+    assert all(kid.shed_kind.startswith("geminal") for kid in kids)
+
+
+def test_ztype_shared_cl_blocks_double_shed(map_spec) -> None:
+    occupation = ZbOccupation(
+        k=1,
+        p=2,
+        symbols=("Se", "Cd", "Cd", "Cd"),
+        coordinates=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [2.5, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+                [5.0, 3.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        core_edges=((0, 1),),
+    )
+    symbols = occupation.symbols + ("Cl", "Cl", "Cl")
+    coords = np.vstack(
+        [
+            occupation.coordinates,
+            np.array(
+                [
+                    [5.0, -2.3, 0.0],
+                    [5.0, 1.5, 0.0],
+                    [5.0, 5.3, 0.0],
+                ],
+                dtype=float,
+            ),
+        ]
+    )
+    # Cd2 uses Cl4+Cl5, Cd3 uses Cl5+Cl6 — one shared ligand.
+    edges = occupation.core_edges + ((2, 4), (2, 5), (3, 5), (3, 6))
+    units = ztype_shed_units(
+        occupation,
+        map_spec,
+        parent_symbols=symbols,
+        parent_coordinates=coords,
+        parent_edges=edges,
+    )
+    singles, _ = ztype_removal_sets(units, 1)
+    pairs, _ = ztype_removal_sets(units, 2)
+    assert {combo[0] for combo in singles} == {2, 3}
+    assert pairs == []
+
+
+def test_grow_cores_ztype_uses_parent_cl(map_spec) -> None:
+    model = lattice_model(map_spec)
+    occ = lattice_k1_occupation(map_spec, model, p=2)
+    assert occ is not None
+    ensure_occupation_identity(occ, model)
+    degrees = [0] * len(occ.symbols)
+    for left, right in occ.core_edges:
+        degrees[left] += 1
+        degrees[right] += 1
+    cd_ids = [i for i, symbol in enumerate(occ.symbols) if symbol == "Cd"]
+    geminal = min(cd_ids, key=lambda i: (degrees[i], i))
+    symbols, coords, edges = _ztype_parent_xyz(occ, {geminal: 2})
+    parent = ParentStructure(
+        k=occ.k,
+        p=occ.p,
+        structure_id="k001_p002_ztype",
+        symbols=symbols,
+        coordinates=coords,
+        energy_eV=-1.0,
+        edges=edges,
+        core_edges=occ.core_edges,
+        zb_occupation=occ,
+    )
+    cfg = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    result = grow_cores_from_parents([parent], growth=cfg, spec=map_spec)
+    assert result.zb_stats is not None
+    assert result.zb_stats.ztype_geminal_terminal + result.zb_stats.ztype_geminal_bridge >= 1
+    assert result.zb_stats.ztype_cl_free_cd >= 1
+    s_values = {ch.shed for ch in result.channels if ch.move == "zb_sites"}
+    assert 0 in s_values
+    assert 1 in s_values
+    rec = result.parent_records[0]
+    assert rec["n_ztype_cl_free"] >= 1
+    assert rec["n_ztype_disjoint"] == 1
 
 
 def test_occupation_manifest_round_trip(map_spec) -> None:

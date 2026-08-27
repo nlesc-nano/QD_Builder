@@ -1,13 +1,14 @@
 """Zinc-blende occupation growth (move Z).
 
 Parent identity is a Cd–Se occupation on the CIF tet lattice, not the
-relaxed XYZ.  Children are made by vacating precursor Cd and filling
-vacant cation+anion pairs.  After g-xTB the endpoint is retained in the
-growth lineage only when its Cd–Se topology is preserved; changed minima
-are recorded off path rather than snapped onto a new lattice fragment.
+relaxed XYZ.  Children are made by Z-type CdCl2 displacement on the
+decorated parent, then filling a vacant cation+anion pair.  After g-xTB
+the endpoint is retained in the growth lineage only when its Cd–Se
+topology is preserved; changed minima are recorded off path rather than
+snapped onto a new lattice fragment.
 
 Cl is placed from the 2p graph law around the *fixed* zb core; Cl does
-not occupy CIF virtual sites.
+not occupy CIF virtual sites.  Shedding never removes a Cl-free Cd.
 """
 
 from __future__ import annotations
@@ -57,6 +58,10 @@ class ZbOccupation:
     shed: int = 0
     p_m: int = 0
     notes: str = ""
+    #: Z-type leaving group that produced this child: geminal_terminal,
+    #: geminal_bridge, borrowed, or empty when s = 0 / unrestricted.
+    shed_kind: str = ""
+    shed_se_wbo: float = 0.0
 
 
 def _site_id(symbol: str, point: Sequence[float], tolerance: float) -> str:
@@ -154,6 +159,8 @@ def occupation_to_record(occupation: ZbOccupation) -> Dict[str, Any]:
         "shed": int(occupation.shed),
         "p_m": int(occupation.p_m),
         "notes": occupation.notes,
+        "shed_kind": occupation.shed_kind,
+        "shed_se_wbo": float(occupation.shed_se_wbo),
     }
 
 
@@ -179,6 +186,8 @@ def occupation_from_record(record: Dict[str, Any]) -> ZbOccupation:
         shed=int(record.get("shed", 0)),
         p_m=int(record.get("p_m", 0)),
         notes=str(record.get("notes") or ""),
+        shed_kind=str(record.get("shed_kind") or ""),
+        shed_se_wbo=float(record.get("shed_se_wbo") or 0.0),
     )
 
 
@@ -362,6 +371,11 @@ class ZbGrowStats:
     opt_keep: int = 0
     opt_reject_embed: int = 0
     opt_fail: int = 0
+    ztype_geminal_terminal: int = 0
+    ztype_geminal_bridge: int = 0
+    ztype_borrowed: int = 0
+    ztype_cl_free_cd: int = 0
+    ztype_disjoint: int = 0
 
     def as_log(self) -> str:
         return (
@@ -370,7 +384,12 @@ class ZbGrowStats:
             f"children={self.children} attach_try={self.attach_attempts} "
             f"clash_skip={self.clash_skip} "
             f"opt_keep={self.opt_keep} topology_changed={self.opt_reject_embed} "
-            f"opt_fail={self.opt_fail}"
+            f"opt_fail={self.opt_fail} "
+            f"ztype geminal_t={self.ztype_geminal_terminal} "
+            f"geminal_b={self.ztype_geminal_bridge} "
+            f"borrowed={self.ztype_borrowed} "
+            f"cl_free={self.ztype_cl_free_cd} "
+            f"disjoint_smax={self.ztype_disjoint}"
         )
 
 
@@ -784,18 +803,66 @@ def shed_occupation(
     )
 
 
+def _occupation_without_cd(
+    occ: ZbOccupation,
+    drop: Sequence[int],
+    spec: NucleationSpec,
+    model: _LatticeModel,
+    *,
+    s: int,
+    notes: str,
+) -> Optional[ZbOccupation]:
+    import networkx as nx
+
+    drop_set = {int(i) for i in drop}
+    keep = [i for i in range(len(occ.symbols)) if i not in drop_set]
+    mapping = {old: new for new, old in enumerate(keep)}
+    atoms = [
+        AtomRecord(
+            mapping[i],
+            occ.symbols[i],
+            tuple(float(x) for x in occ.coordinates[i]),
+            "core_anion"
+            if occ.symbols[i] == spec.core.anion
+            else "core_cation",
+        )
+        for i in keep
+    ]
+    state = _make_core_graph(atoms, model, spec)
+    candidate = occupation_from_state(
+        state,
+        spec,
+        model=model,
+        k=occ.k,
+        p=occ.p - int(s),
+        parent_id=occ.parent_id,
+        shed=int(s),
+        notes=notes,
+        parent_occupation_ids=(occ.occupation_id,),
+    )
+    if candidate is None:
+        return None
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(candidate.symbols)))
+    graph.add_edges_from(candidate.core_edges)
+    if not nx.is_connected(graph):
+        return None
+    return candidate
+
+
 def shed_occupations(
     occ: ZbOccupation,
     s: int,
     spec: NucleationSpec,
     model: _LatticeModel,
+    *,
+    remove_sets: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[ZbOccupation]:
-    """Enumerate every unique connected removal of ``s`` excess Cd sites.
+    """Enumerate unique connected removals of ``s`` excess Cd sites.
 
-    Cd atoms are chemically indistinguishable after relaxation.  Treating one
-    degree-ranked subset as the precursor silently discards valid ZB lineages,
-    so Move Z enumerates all Cd removals and lets symmetry canonicalization
-    merge equivalent occupations.
+    By default every combination of cation sites is tried and symmetry
+    canonicalization merges equivalent occupations.  Pass ``remove_sets``
+    (Move Z Z-type displacement) to restrict the Cd that may leave.
     """
 
     if s <= 0:
@@ -803,48 +870,314 @@ def shed_occupations(
     if s > occ.p:
         return []
     cation = spec.core.cation
-    cd_ids = [i for i, symbol in enumerate(occ.symbols) if symbol == cation]
-    unique: Dict[str, ZbOccupation] = {}
-    for removed in combinations(cd_ids, int(s)):
-        drop = set(removed)
-        keep = [i for i in range(len(occ.symbols)) if i not in drop]
-        mapping = {old: new for new, old in enumerate(keep)}
-        atoms = [
-            AtomRecord(
-                mapping[i],
-                occ.symbols[i],
-                tuple(float(x) for x in occ.coordinates[i]),
-                "core_anion"
-                if occ.symbols[i] == spec.core.anion
-                else "core_cation",
-            )
-            for i in keep
+    if remove_sets is None:
+        cd_ids = [i for i, symbol in enumerate(occ.symbols) if symbol == cation]
+        trials: Sequence[Sequence[int]] = list(combinations(cd_ids, int(s)))
+        notes = "shed_all"
+    else:
+        trials = [
+            tuple(int(i) for i in combo)
+            for combo in remove_sets
+            if len(combo) == int(s)
         ]
-        state = _make_core_graph(atoms, model, spec)
-        candidate = occupation_from_state(
-            state,
-            spec,
-            model=model,
-            k=occ.k,
-            p=occ.p - int(s),
-            parent_id=occ.parent_id,
-            shed=int(s),
-            notes="shed_all",
-            parent_occupation_ids=(occ.occupation_id,),
+        notes = "shed_ztype"
+    unique: Dict[str, ZbOccupation] = {}
+    for removed in trials:
+        candidate = _occupation_without_cd(
+            occ, removed, spec, model, s=int(s), notes=notes
         )
         if candidate is None:
             continue
-        # occupation_from_state requires at least one edge; explicitly require
-        # the complete inorganic fragment to remain connected as well.
-        import networkx as nx
-
-        graph = nx.Graph()
-        graph.add_nodes_from(range(len(candidate.symbols)))
-        graph.add_edges_from(candidate.core_edges)
-        if not nx.is_connected(graph):
-            continue
         unique.setdefault(candidate.occupation_id, candidate)
     return list(unique.values())
+
+
+ZTYPE_KIND_RANK = {
+    "geminal_terminal": 0,
+    "geminal_bridge": 1,
+    "borrowed": 2,
+}
+
+
+@dataclass(frozen=True)
+class ZtypeShedUnit:
+    """One Z-type CdCl2 leaving group on a decorated parent.
+
+    ``cd`` is an occupation index.  ``cl`` are indices into the parent XYZ.
+    """
+
+    cd: int
+    cl: Tuple[int, int]
+    kind: str
+    kind_rank: int
+    n_se: int
+    se_wbo: float
+    score: Tuple[Any, ...]
+
+
+def _wbo_pair(
+    wbo: Optional[Mapping[Tuple[int, int], float]], left: int, right: int
+) -> float:
+    if not wbo:
+        return 0.0
+    return abs(float(wbo.get((min(int(left), int(right)), max(int(left), int(right))), 0.0)))
+
+
+def _map_occupation_to_parent(
+    occupation: ZbOccupation, parent_symbols: Sequence[str]
+) -> Optional[List[int]]:
+    """Occupation index → parent XYZ index, or None if the cores differ."""
+
+    n = len(occupation.symbols)
+    if tuple(parent_symbols[:n]) == tuple(occupation.symbols):
+        return list(range(n))
+    used: set = set()
+    mapping = [-1] * n
+    for i, symbol in enumerate(occupation.symbols):
+        for j, parent_symbol in enumerate(parent_symbols):
+            if j in used or parent_symbol != symbol:
+                continue
+            mapping[i] = j
+            used.add(j)
+            break
+        if mapping[i] < 0:
+            return None
+    return mapping
+
+
+def ztype_shed_units(
+    occupation: ZbOccupation,
+    spec: NucleationSpec,
+    *,
+    parent_symbols: Sequence[str],
+    parent_coordinates: np.ndarray,
+    parent_edges: Sequence[Edge] = (),
+    parent_wbo: Optional[Mapping[Tuple[int, int], float]] = None,
+    ligand_bond_length: float = 0.0,
+) -> List[ZtypeShedUnit]:
+    """Legal Z-type CdCl2 units on a decorated parent.
+
+    A Cd with no Cl is never a unit, including Cd–Se CN = 3.  Geminal
+    Cl–Cd–Cl (two Cl already on the Cd) is preferred over CdCl plus a
+    Cl borrowed from elsewhere.  Two terminal Cl outrank a pair that
+    includes a μ2 bridge.  Ranking inside a kind is the Cd–Se Wiberg
+    sum of the leaving cation (the bonds that break); without WBO it
+    is the Cd–Se degree.
+    """
+
+    cation, anion, ligand = _species(spec)
+    if ligand not in parent_symbols:
+        return []
+    cd_ids = [
+        i for i, symbol in enumerate(occupation.symbols) if symbol == cation
+    ]
+    n_se = [0] * len(occupation.symbols)
+    for left, right in occupation.core_edges:
+        if occupation.symbols[left] == anion:
+            n_se[right] += 1
+        if occupation.symbols[right] == anion:
+            n_se[left] += 1
+    parent_xyz = np.asarray(parent_coordinates, dtype=float)
+    cl_ids = [
+        i for i, symbol in enumerate(parent_symbols) if symbol == ligand
+    ]
+    if not cl_ids:
+        return []
+    core_map = _map_occupation_to_parent(occupation, parent_symbols)
+    neigh: Dict[int, List[int]] = {i: [] for i in range(len(parent_symbols))}
+    for left, right in parent_edges or ():
+        a, b = int(left), int(right)
+        if a < len(parent_symbols) and b < len(parent_symbols):
+            neigh[a].append(b)
+            neigh[b].append(a)
+    cutoff = float(ligand_bond_length) if ligand_bond_length > 0.0 else 2.90
+    cl_of: Dict[int, List[int]] = {i: [] for i in cd_ids}
+    cl_dent: Dict[int, int] = {j: 0 for j in cl_ids}
+    aligned = core_map is not None
+    has_cdcl = any(
+        a < len(parent_symbols)
+        and b < len(parent_symbols)
+        and {parent_symbols[a], parent_symbols[b]} == {cation, ligand}
+        for a, b in (parent_edges or ())
+    )
+    if aligned and has_cdcl:
+        parent_of = {occ: parent for occ, parent in enumerate(core_map or [])}
+        for occ_cd in cd_ids:
+            parent_cd = parent_of[occ_cd]
+            for j in neigh[parent_cd]:
+                if parent_symbols[j] == ligand:
+                    cl_of[occ_cd].append(j)
+        for j in cl_ids:
+            cl_dent[j] = sum(
+                1 for n in neigh[j] if parent_symbols[n] == cation
+            )
+    else:
+        for occ_cd in cd_ids:
+            point = np.asarray(occupation.coordinates[occ_cd], dtype=float)
+            if (
+                aligned
+                and core_map is not None
+                and core_map[occ_cd] < len(parent_xyz)
+            ):
+                point = parent_xyz[core_map[occ_cd]]
+            for j in cl_ids:
+                if j >= len(parent_xyz):
+                    continue
+                if float(np.linalg.norm(parent_xyz[j] - point)) <= cutoff:
+                    cl_of[occ_cd].append(j)
+        for j in cl_ids:
+            cl_dent[j] = sum(1 for occ_cd in cd_ids if j in cl_of[occ_cd])
+
+    def se_wbo_of(occ_cd: int) -> float:
+        if parent_wbo and aligned and core_map is not None:
+            parent_cd = core_map[occ_cd]
+            total = 0.0
+            for left, right in occupation.core_edges:
+                other = right if left == occ_cd else left if right == occ_cd else None
+                if other is None:
+                    continue
+                if occupation.symbols[other] != anion:
+                    continue
+                total += _wbo_pair(parent_wbo, parent_cd, core_map[other])
+            if total > 0.0:
+                return total
+        return float(n_se[occ_cd])
+
+    def make_unit(occ_cd: int, cl_a: int, cl_b: int, kind: str) -> ZtypeShedUnit:
+        pair = (min(int(cl_a), int(cl_b)), max(int(cl_a), int(cl_b)))
+        rank = int(ZTYPE_KIND_RANK[kind])
+        se = se_wbo_of(occ_cd)
+        return ZtypeShedUnit(
+            cd=int(occ_cd),
+            cl=pair,
+            kind=kind,
+            kind_rank=rank,
+            n_se=int(n_se[occ_cd]),
+            se_wbo=float(se),
+            score=(rank, round(float(se), 6), int(n_se[occ_cd]), int(occ_cd), pair),
+        )
+
+    units: List[ZtypeShedUnit] = []
+    seen: set = set()
+    for occ_cd in cd_ids:
+        chlorides = sorted(set(cl_of[occ_cd]))
+        if len(chlorides) >= 2:
+            for cl_a, cl_b in combinations(chlorides, 2):
+                terminal = cl_dent.get(cl_a, 1) <= 1 and cl_dent.get(cl_b, 1) <= 1
+                kind = "geminal_terminal" if terminal else "geminal_bridge"
+                unit = make_unit(occ_cd, cl_a, cl_b, kind)
+                key = (unit.cd, unit.cl, unit.kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                units.append(unit)
+        elif len(chlorides) == 1:
+            own = chlorides[0]
+            for other in cl_ids:
+                if other == own:
+                    continue
+                unit = make_unit(occ_cd, own, other, "borrowed")
+                key = (unit.cd, unit.cl, unit.kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                units.append(unit)
+    units.sort(key=lambda unit: unit.score)
+    return units
+
+
+def _best_ztype_assignment(
+    cds: Sequence[int],
+    by_cd: Mapping[int, Sequence[ZtypeShedUnit]],
+) -> Optional[List[ZtypeShedUnit]]:
+    """Disjoint Cl assignment, one unit per Cd.  ``s`` is at most 2."""
+
+    ordered = [int(cd) for cd in cds]
+    best: Optional[List[ZtypeShedUnit]] = None
+    best_key: Optional[Tuple[Any, ...]] = None
+
+    def rec(index: int, used: set, picked: List[ZtypeShedUnit]) -> None:
+        nonlocal best, best_key
+        if index == len(ordered):
+            key = (
+                sum(unit.kind_rank for unit in picked),
+                round(sum(unit.se_wbo for unit in picked), 6),
+            )
+            if best_key is None or key < best_key:
+                best = list(picked)
+                best_key = key
+            return
+        for unit in by_cd.get(ordered[index], ()):
+            if unit.cl[0] in used or unit.cl[1] in used:
+                continue
+            rec(index + 1, used | {unit.cl[0], unit.cl[1]}, picked + [unit])
+
+    rec(0, set(), [])
+    return best
+
+
+def ztype_removal_sets(
+    units: Sequence[ZtypeShedUnit],
+    s: int,
+) -> Tuple[List[Tuple[int, ...]], Dict[Tuple[int, ...], List[ZtypeShedUnit]]]:
+    """Combinations of ``s`` Cd that can leave as disjoint CdCl2 units."""
+
+    if s <= 0 or not units:
+        return [], {}
+    by_cd: Dict[int, List[ZtypeShedUnit]] = {}
+    for unit in units:
+        by_cd.setdefault(int(unit.cd), []).append(unit)
+    cds = sorted(by_cd)
+    if len(cds) < int(s):
+        return [], {}
+    sets: List[Tuple[int, ...]] = []
+    meta: Dict[Tuple[int, ...], List[ZtypeShedUnit]] = {}
+    for combo in combinations(cds, int(s)):
+        assigned = _best_ztype_assignment(combo, by_cd)
+        if assigned is None:
+            continue
+        key = tuple(sorted(combo))
+        sets.append(key)
+        meta[key] = assigned
+    return sets, meta
+
+
+def max_ztype_shed(units: Sequence[ZtypeShedUnit], *, cap: int) -> int:
+    """Largest number of disjoint Z-type units, limited by ``cap``."""
+
+    limit = min(int(cap), len({unit.cd for unit in units}))
+    for s in range(limit, 0, -1):
+        sets, _meta = ztype_removal_sets(units, s)
+        if sets:
+            return s
+    return 0
+
+
+def ztype_census(
+    occupation: ZbOccupation,
+    units: Sequence[ZtypeShedUnit],
+    spec: NucleationSpec,
+) -> Dict[str, int]:
+    cation = spec.core.cation
+    cd_ids = [
+        i for i, symbol in enumerate(occupation.symbols) if symbol == cation
+    ]
+    with_cl = {unit.cd for unit in units}
+    best: Dict[int, str] = {}
+    for unit in units:
+        prev = best.get(unit.cd)
+        if prev is None or unit.kind_rank < ZTYPE_KIND_RANK.get(prev, 9):
+            best[unit.cd] = unit.kind
+    geminal_t = sum(1 for kind in best.values() if kind == "geminal_terminal")
+    geminal_b = sum(1 for kind in best.values() if kind == "geminal_bridge")
+    borrowed = sum(1 for kind in best.values() if kind == "borrowed")
+    return {
+        "geminal_terminal": geminal_t,
+        "geminal_bridge": geminal_b,
+        "borrowed": borrowed,
+        "cl_free": int(len(cd_ids) - len(with_cl)),
+        "disjoint": max_ztype_shed(units, cap=max(0, occupation.p)),
+    }
 
 
 def _monomer_pairs(
@@ -1054,8 +1387,14 @@ def grow_zb_children(
     parent_wbo: Optional[Dict[Tuple[int, int], float]] = None,
     parent_ligand_coordinates: Optional[np.ndarray] = None,
     ligand_bond_length: float = 0.0,
+    ztype_units: Optional[Sequence[ZtypeShedUnit]] = None,
 ) -> List[ZbOccupation]:
-    """Shed s extra Cd, attach one CdSe, add p_m precursor Cd.
+    """Z-type shed s CdCl2, attach one CdSe, add p_m precursor Cd.
+
+    When ``ztype_units`` is provided (decorated parent), only Cl-bearing Cd
+    leave, as disjoint CdCl2 packages.  ``None`` keeps the lattice-wide
+    enumeration used by core-only tests.  An empty list means no legal
+    Z-type unit and ``s > 0`` yields nothing.
 
     ``parent_ligand_coordinates`` are the relaxed positions of the parent's
     Cl, which the occupation itself does not carry.  They are what makes the
@@ -1063,11 +1402,44 @@ def grow_zb_children(
     fills; without them the ordering falls back to the core-only form.
     """
 
-    after_all = shed_occupations(occ, s, spec, model)
+    combo_meta: Dict[Tuple[int, ...], List[ZtypeShedUnit]] = {}
+    remove_sets: Optional[List[Tuple[int, ...]]] = None
+    if int(s) > 0 and ztype_units is not None:
+        remove_sets, combo_meta = ztype_removal_sets(ztype_units, int(s))
+        if not remove_sets:
+            return []
+    after_all = shed_occupations(
+        occ, s, spec, model, remove_sets=remove_sets
+    )
     if not after_all:
         return []
     if stats is not None:
         stats.attach_attempts += len(after_all)
+    parent_index = {site_id: i for i, site_id in enumerate(occ.site_ids)}
+
+    def _annotate(child: ZbOccupation, after: ZbOccupation) -> None:
+        child.shed = s
+        child.p_m = p_m
+        child.parent_id = occ.parent_id
+        child.parent_occupation_ids = (occ.occupation_id,)
+        child.parent_structure_ids = (occ.parent_id,) if occ.parent_id else ()
+        if not combo_meta or not occ.site_ids or not after.site_ids:
+            return
+        after_sites = set(after.site_ids)
+        removed = tuple(
+            sorted(
+                parent_index[site_id]
+                for site_id in occ.site_ids
+                if site_id not in after_sites and site_id in parent_index
+            )
+        )
+        assigned = combo_meta.get(removed)
+        if not assigned:
+            return
+        worst = max(assigned, key=lambda unit: unit.kind_rank)
+        child.shed_kind = worst.kind
+        child.shed_se_wbo = float(sum(unit.se_wbo for unit in assigned))
+
     unique: Dict[str, ZbOccupation] = {}
     for after in after_all:
         attached = attach_cdse(after, spec, model, cap=0)
@@ -1075,12 +1447,16 @@ def grow_zb_children(
             core.shed = s
             packed = _add_precursor_cd(core, p_m, spec, model, cap=0)
             for child in packed:
-                child.shed = s
-                child.p_m = p_m
-                child.parent_id = occ.parent_id
-                child.parent_occupation_ids = (occ.occupation_id,)
-                child.parent_structure_ids = (occ.parent_id,) if occ.parent_id else ()
-                unique.setdefault(child.occupation_id, child)
+                _annotate(child, after)
+                existing = unique.get(child.occupation_id)
+                if existing is None:
+                    unique[child.occupation_id] = child
+                    continue
+                # Same lattice child from two Z-type removals: keep the easier one.
+                old_rank = ZTYPE_KIND_RANK.get(existing.shed_kind, 9)
+                new_rank = ZTYPE_KIND_RANK.get(child.shed_kind, 9)
+                if (new_rank, child.shed_se_wbo) < (old_rank, existing.shed_se_wbo):
+                    unique[child.occupation_id] = child
     ordered = sorted(
         unique.values(),
         key=lambda child: _growth_site_priority(
@@ -1212,24 +1588,32 @@ def _growth_site_priority(
                 float(np.linalg.norm(aligned[index] - reference[index]))
                 for index in host_parent_indices
             )
-    # If the backend produced Wiberg orders, removal of a weakly bound excess
-    # Cd is preferred.  This remains an ordering term after exhaustive child
-    # generation; it can never make a legal occupation disappear by itself.
-    removal_wbo = 0.0
-    if parent_wbo and removed_parent_indices:
+    # Z-type desorption coordinate: geminal CdCl2 before borrowed Cl, then
+    # the Cd–Se Wiberg sum of the leaving cation (the bonds that break).
+    # Cd–Cl WBO is not the reaction coordinate.  Ranking only; legality is
+    # decided by ztype_shed_units.
+    kind_rank = int(ZTYPE_KIND_RANK.get(getattr(child, "shed_kind", ""), 3))
+    removal_wbo = float(getattr(child, "shed_se_wbo", 0.0) or 0.0)
+    if removal_wbo <= 0.0 and parent_wbo and removed_parent_indices:
+        n_core = len(parent.symbols)
         removal_wbo = sum(
             abs(float(order))
             for (left, right), order in parent_wbo.items()
-            if left in removed_parent_indices or right in removed_parent_indices
+            if (left in removed_parent_indices or right in removed_parent_indices)
+            and left < n_core
+            and right < n_core
+            and parent.symbols[left] != parent.symbols[right]
         )
     # Ascending sort, so each term is negated to mean "more is better".
-    #   removal_wbo       cheapest shed first (unchanged)
+    #   kind_rank         geminal terminal, geminal bridge, borrowed
+    #   removal_wbo       Cd–Se WBO of the leaving Cd (weaker first)
     #   shell_completion  hosts going 3 -> 4 Cd-Se: the nucleation event
     #   open_valence      free slots, 4 - CN_Se - CN_Cl, chloride included
     #   host_deficit      old core-only 4 - CN_Se, now only a tiebreak
     #   displacement      strain in the relaxed parent at the host
     #   radius_of_gyration / n_edges / id   compactness, then determinism
     return (
+        kind_rank,
         round(removal_wbo, 6),
         -shell_completion,
         -open_valence,
