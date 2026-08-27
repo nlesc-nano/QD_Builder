@@ -18,6 +18,7 @@ from builder.nucleation.molecular_growth import (
     _opt_zb_occupations,
     consolidate_relaxed_minima,
     grow_cores_from_parents,
+    load_parents_from_run,
     relaxed_minimum_similarity,
     select_parents,
     write_minimum_clusters,
@@ -862,9 +863,11 @@ def test_zb_opt_indexes_only_topology_preserving_endpoints(
             calls.extend(entries)
             results = []
             for entry in entries:
-                edges = list(entry["edges"])
+                edges = [tuple(sorted((int(a), int(b)))) for a, b in entry["edges"]]
                 if not preserve:
-                    edges.remove(tuple(occupation.core_edges[0]))
+                    core = tuple(occupation.core_edges[0])
+                    if core in edges:
+                        edges.remove(core)
                 results.append(
                     XtbResult(
                         ok=True,
@@ -880,10 +883,34 @@ def test_zb_opt_indexes_only_topology_preserving_endpoints(
             return results
 
         monkeypatch.setattr(xtb_relax, "relax_structures", fake_relax)
+        if not preserve:
+            import builder.nucleation.molecular as molecular
+            import builder.nucleation.molecular_rules as molecular_rules
+            import builder.nucleation.molecular_motif_reconstruct as reconstruct
+
+            monkeypatch.setattr(
+                molecular, "molecular_graph_violations", lambda *a, **k: []
+            )
+            monkeypatch.setattr(
+                molecular,
+                "molecular_decoration_rule_violations",
+                lambda *a, **k: [],
+            )
+            monkeypatch.setattr(
+                reconstruct, "motif_vocabulary_violations", lambda *a, **k: []
+            )
+            monkeypatch.setattr(
+                molecular_rules,
+                "forbidden_pair_contact_violations",
+                lambda *a, **k: [],
+            )
+            monkeypatch.setattr(
+                molecular_rules, "cl_on_cn4_cd_violations", lambda *a, **k: []
+            )
         minima = {}
         ranks = {}
         _opt_zb_occupations(
-            {(1, 1): [occupation]},
+            {(occupation.k, occupation.p): [occupation]},
             growth=growth,
             map_spec=map_spec,
             pack=pack,
@@ -906,8 +933,129 @@ def test_zb_opt_indexes_only_topology_preserving_endpoints(
     # Core may leave CIF in the embed.yaml morph; g-xTB sees that start.
 
     _calls, minima, ranks, records = run_fake(tmp_path / "changed", preserve=False)
-    assert not minima and not ranks
+    assert minima and ranks
     assert records[0]["propagation_eligible"] is False
     assert records[0]["topology_status"] == "changed"
     assert list((tmp_path / "changed").rglob("*_offpath.xyz"))
-    assert not (tmp_path / "changed" / "index.csv").exists()
+    index_rows = (tmp_path / "changed" / "index.csv").read_text()
+    assert "lattice_route" in index_rows
+    assert "False" in index_rows
+
+    def fake_se_cl(entries, _settings, _cutoffs=None, **_kwargs):
+        results = []
+        for entry in entries:
+            symbols = list(entry.get("symbols") or [])
+            edges = [tuple(sorted((int(a), int(b)))) for a, b in entry["edges"]]
+            se = next(i for i, s in enumerate(symbols) if s == "Se")
+            cl = next(i for i, s in enumerate(symbols) if s == "Cl")
+            edges.append((min(se, cl), max(se, cl)))
+            results.append(
+                XtbResult(
+                    ok=True,
+                    energy_eV=-12.5,
+                    converged=True,
+                    coordinates=tuple(
+                        tuple(float(value) for value in point)
+                        for point in entry["positions"]
+                    ),
+                    relaxed_edges=tuple(edges),
+                )
+            )
+        return results
+
+    monkeypatch.setattr(xtb_relax, "relax_structures", fake_se_cl)
+    dirty = tmp_path / "secl"
+    _opt_zb_occupations(
+        {(occupation.k, occupation.p): [occupation]},
+        growth=growth,
+        map_spec=map_spec,
+        pack=pack,
+        output_dir=dirty,
+        progress=None,
+        child_minima={},
+        bin_ranks={},
+    )
+    secl_index = dirty / "index.csv"
+    assert (not secl_index.is_file()) or "lattice_route" not in secl_index.read_text()
+
+
+def test_select_zb_parents_keeps_preserved_and_lattice_routes(map_spec) -> None:
+    model = lattice_model(map_spec)
+    seed = lattice_k1_occupation(map_spec, model, p=1)
+    assert seed is not None
+    kids = grow_zb_children(
+        seed, s=0, p_m=1, spec=map_spec, model=model, cap=0
+    )
+    assert len(kids) >= 2
+    cfg = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+
+    def as_parent(occ, *, energy: float, eligible: bool, tag: str) -> ParentStructure:
+        ensure_occupation_identity(occ, model)
+        return ParentStructure(
+            k=occ.k,
+            p=occ.p,
+            structure_id=tag,
+            symbols=occ.symbols,
+            coordinates=occ.coordinates,
+            energy_eV=energy,
+            edges=occ.core_edges,
+            core_edges=occ.core_edges,
+            zb_occupation=occ,
+            topology_status="preserved" if eligible else "changed",
+            propagation_eligible=eligible,
+        )
+
+    preserved = as_parent(kids[0], energy=0.0, eligible=True, tag="zb-min")
+    collapsed = [
+        as_parent(occ, energy=-10.0 - i, eligible=False, tag=f"lat-{i}")
+        for i, occ in enumerate(kids[1:4])
+    ]
+    selected = select_parents([preserved, *collapsed], cfg, map_spec)
+    ids = {item.structure_id for item in selected}
+    assert "zb-min" in ids
+    assert any(item.structure_id.startswith("lat-") for item in selected)
+
+
+def test_load_parents_includes_offpath_lattice_occupation(
+    map_spec, tmp_path: Path
+) -> None:
+    from builder.nucleation.molecular_zb_growth import occupation_to_record
+
+    model = lattice_model(map_spec)
+    occ = lattice_k1_occupation(map_spec, model, p=1)
+    assert occ is not None
+    ensure_occupation_identity(occ, model)
+    sid = "k001_p001_Zdeadbeefd01s00"
+    bdir = tmp_path / "k001" / "p001"
+    bdir.mkdir(parents=True)
+    xyz = bdir / f"{sid}_offpath.xyz"
+    lines = [str(len(occ.symbols)), f"{sid} energy_eV=-12.5 topology=changed"]
+    lines.extend(
+        f"{sym} {pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}"
+        for sym, pt in zip(occ.symbols, occ.coordinates)
+    )
+    xyz.write_text("\n".join(lines) + "\n")
+    (tmp_path / "zb_occupations.jsonl").write_text(
+        json.dumps(
+            {
+                "structure_id": sid,
+                "energy_eV": -12.5,
+                "propagation_eligible": False,
+                "chemically_ok": True,
+                "topology_status": "changed",
+                "occupation": occupation_to_record(occ),
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "index.csv").write_text(
+        "k,p,structure_id,xtb_energy_eV,xtb_converged,topology_status,"
+        "propagation_eligible,chemically_ok,occupation_id\n"
+        f"1,1,{sid},-12.5,True,changed,False,True,{occ.occupation_id}\n"
+    )
+    loaded = load_parents_from_run(tmp_path, k=1, spec=map_spec)
+    assert len(loaded) == 1
+    assert loaded[0].propagation_eligible is False
+    assert loaded[0].zb_occupation is not None
+    assert loaded[0].zb_occupation.occupation_id == occ.occupation_id
+    assert loaded[0].energy_eV == pytest.approx(-12.5)

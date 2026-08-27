@@ -777,6 +777,11 @@ class ParentStructure:
     minimum_member_ids: Tuple[str, ...] = ()
     minimum_occupation_ids: Tuple[str, ...] = ()
     minimum_multiplicity: int = 1
+    #: Move Z: unconstrained g-xTB topology vs the stored lattice occupation.
+    #: ``preserved`` means the relaxed XYZ is a ZB minimum; ``changed`` means
+    #: a molecular well (often a 4-ring) whose energy is still reported.
+    topology_status: str = ""
+    propagation_eligible: bool = True
 
     @property
     def n_atoms(self) -> int:
@@ -1164,8 +1169,22 @@ def parent_k_inventory(run_dir: Path) -> Dict[int, int]:
                     rk = int(row["k"])
                 except (KeyError, ValueError):
                     continue
+                try:
+                    energy = float(row.get("xtb_energy_eV") or "")
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(energy):
+                    continue
+                chem = str(row.get("chemically_ok") or "").lower()
+                if chem in {"false", "0", "no"}:
+                    continue
                 conv = str(row.get("xtb_converged", "true")).lower().strip()
-                if conv in ("false", "0", "no"):
+                role = str(row.get("lineage_role") or "").lower()
+                if conv in ("false", "0", "no") and chem not in {
+                    "true",
+                    "1",
+                    "yes",
+                } and role != "lattice_route":
                     continue
                 counts[rk] = counts.get(rk, 0) + 1
         if counts:
@@ -1188,7 +1207,11 @@ def load_parents_from_run(
     spec: NucleationSpec,
     p_values: Optional[Sequence[int]] = None,
 ) -> List[ParentStructure]:
-    """Load converged relaxed parents for fixed k from a map run directory."""
+    """Load parents with a finite energy at fixed k.
+
+    Move Z also loads topology-changed (off-path) rows so the stored
+    lattice occupation can grow; the relaxed XYZ is energetics only.
+    """
 
     run_dir = Path(run_dir)
     cutoffs = bond_cutoffs_from_spec(spec)
@@ -1218,21 +1241,38 @@ def load_parents_from_run(
                 continue
             if p_values is not None and rp not in set(p_values):
                 continue
-            if str(row.get("xtb_converged", "")).lower() != "true":
-                continue
             try:
                 energy = float(row["xtb_energy_eV"])
             except (KeyError, ValueError):
                 continue
+            if not math.isfinite(energy):
+                continue
             sid = row.get("structure_id") or ""
+            eligible = str(
+                row.get("propagation_eligible", "true")
+            ).lower() in {"true", "1", "yes"}
+            topology = str(row.get("topology_status") or "") or (
+                "preserved" if eligible else "changed"
+            )
+            chem_raw = str(row.get("chemically_ok") or "").lower()
+            if chem_raw in {"false", "0", "no"}:
+                continue
+            converged = str(row.get("xtb_converged", "")).lower() == "true"
+            sid_use = sid
+            has_occupation = bool(sid_use) and sid_use in zb_by_structure
+            # ZB lattice routes may be off-path molecular minima: still load
+            # them so the occupation can grow.  Non-ZB parents stay converged-only.
+            if not has_occupation and not converged:
+                continue
             xyz_rel = row.get("xtb_xyz") or row.get("xyz") or ""
             candidates = []
             if xyz_rel:
                 candidates.append(run_dir / xyz_rel)
                 candidates.append(Path(xyz_rel))
-            candidates.append(
-                run_dir / f"k{k:03d}" / f"p{rp:03d}" / f"{sid}_xtb.xyz"
-            )
+            if sid:
+                bdir = run_dir / f"k{k:03d}" / f"p{rp:03d}"
+                candidates.append(bdir / f"{sid}_xtb.xyz")
+                candidates.append(bdir / f"{sid}_offpath.xyz")
             xyz_path = next((p for p in candidates if p.is_file()), None)
             if xyz_path is None:
                 continue
@@ -1246,7 +1286,9 @@ def load_parents_from_run(
             core = core_edges_from_full(
                 symbols, edges, cation=cation, anion=anion
             )
-            sid_use = sid or xyz_path.stem
+            sid_use = sid or xyz_path.stem.replace("_xtb", "").replace(
+                "_offpath", ""
+            )
             wbo, wbo_src = load_parent_wbo(
                 xyz_path, structure_id=sid_use, run_dir=run_dir
             )
@@ -1264,11 +1306,13 @@ def load_parents_from_run(
                     wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
                     zb_occupation=zb_by_structure.get(sid_use),
+                    topology_status=topology,
+                    propagation_eligible=eligible,
                 )
             )
         return parents
 
-    # Fallback: scan k###/p###/*_xtb.xyz
+    # Fallback: scan k###/p###/*_xtb.xyz and *_offpath.xyz
     kdir = run_dir / f"k{k:03d}"
     if not kdir.is_dir():
         return []
@@ -1279,9 +1323,16 @@ def load_parents_from_run(
             continue
         if p_values is not None and rp not in set(p_values):
             continue
-        for xyz_path in sorted(pdir.glob("*_xtb.xyz")):
+        xyz_files = sorted(pdir.glob("*_xtb.xyz")) + sorted(
+            pdir.glob("*_offpath.xyz")
+        )
+        for xyz_path in xyz_files:
             symbols, coords, meta = parse_xyz(xyz_path)
-            if meta.get("xtb_converged", "true").lower() == "false":
+            offpath = xyz_path.name.endswith("_offpath.xyz")
+            if (
+                not offpath
+                and meta.get("xtb_converged", "true").lower() == "false"
+            ):
                 continue
             try:
                 energy = float(meta.get("energy_eV", "nan"))
@@ -1298,9 +1349,16 @@ def load_parents_from_run(
             core = core_edges_from_full(
                 symbols, edges, cation=cation, anion=anion
             )
-            sid_use = xyz_path.stem.replace("_xtb", "")
+            sid_use = xyz_path.stem.replace("_xtb", "").replace("_offpath", "")
             wbo, wbo_src = load_parent_wbo(
                 xyz_path, structure_id=sid_use, run_dir=run_dir
+            )
+            eligible = (not offpath) and (
+                str(meta.get("propagation_eligible", "true")).lower()
+                != "false"
+            )
+            topology = str(meta.get("topology", "") or "") or (
+                "preserved" if eligible else "changed"
             )
             parents.append(
                 ParentStructure(
@@ -1316,6 +1374,8 @@ def load_parents_from_run(
                     wbo_source=wbo_src if wbo else "none",
                     source_path=str(xyz_path),
                     zb_occupation=zb_by_structure.get(sid_use),
+                    topology_status=topology,
+                    propagation_eligible=eligible,
                 )
             )
     return parents
@@ -2130,6 +2190,101 @@ def refine_parents_with_basin_hop(
     return out
 
 
+def _select_zb_occupation_parents(
+    group: Sequence[ParentStructure],
+    win: "GrowthWindow",
+) -> List[ParentStructure]:
+    """Select Move Z parents: lattice occupations, not rhombus XYZ.
+
+    Topology-preserved endpoints are real ZB minima and are ranked by
+    unconstrained g-xTB energy inside the bin window.  Occupations whose
+    opt collapsed (4-rings, topology=changed) still propagate as CIF
+    routes: they are *not* energy-windowed on the molecular well, and
+    they fill the remaining cap by compact ZB cuts (6-rings, branching).
+    One representative per ``occupation_id``.  Collapsed energies stay
+    on the parent for grand-potential reporting.
+    """
+
+    from .molecular_zb_growth import (
+        occupation_compactness_key,
+        occupation_diversity_signature,
+    )
+
+    by_occupation: Dict[str, List[ParentStructure]] = {}
+    for parent in group:
+        occ = parent.zb_occupation
+        occ_id = str(getattr(occ, "occupation_id", "") or parent.structure_id)
+        by_occupation.setdefault(occ_id, []).append(parent)
+
+    def _rep(members: Sequence[ParentStructure]) -> ParentStructure:
+        preserved = [
+            item
+            for item in members
+            if item.propagation_eligible
+            or str(item.topology_status).lower() == "preserved"
+        ]
+        pool = preserved or list(members)
+        return min(pool, key=lambda item: (float(item.energy_eV), item.structure_id))
+
+    reps = [_rep(members) for members in by_occupation.values()]
+    preserved_reps = [
+        item
+        for item in reps
+        if item.propagation_eligible
+        or str(item.topology_status).lower() == "preserved"
+    ]
+    lattice_reps = [item for item in reps if item not in preserved_reps]
+
+    n_keep = max(
+        1,
+        min(
+            win.max_skeletons_cap,
+            int(math.ceil(win.max_skeletons_frac * max(1, len(reps)))),
+        ),
+    )
+    n_keep = min(n_keep, len(reps))
+    selected: List[ParentStructure] = []
+    seen_shapes: set[Tuple[Any, ...]] = set()
+
+    if preserved_reps:
+        emin = min(float(item.energy_eV) for item in preserved_reps)
+        windowed = [
+            item
+            for item in preserved_reps
+            if float(item.energy_eV) <= emin + win.energy_window_eV
+        ] or [min(preserved_reps, key=lambda item: float(item.energy_eV))]
+        windowed.sort(key=lambda item: (float(item.energy_eV), item.structure_id))
+        for item in windowed:
+            if len(selected) >= n_keep:
+                break
+            selected.append(item)
+            occ = item.zb_occupation
+            if occ is not None:
+                seen_shapes.add(occupation_diversity_signature(occ))
+
+    lattice_reps.sort(
+        key=lambda item: occupation_compactness_key(item.zb_occupation)
+    )
+    for item in lattice_reps:
+        if len(selected) >= n_keep:
+            break
+        occ = item.zb_occupation
+        signature = (
+            occupation_diversity_signature(occ) if occ is not None else ()
+        )
+        if signature in seen_shapes:
+            continue
+        selected.append(item)
+        seen_shapes.add(signature)
+    if len(selected) < n_keep:
+        for item in lattice_reps:
+            if len(selected) >= n_keep:
+                break
+            if item not in selected:
+                selected.append(item)
+    return selected
+
+
 def select_parents(
     parents: Sequence[ParentStructure],
     growth: GrowthConfig,
@@ -2148,6 +2303,12 @@ def select_parents(
     for (k, p), group in sorted(by_bin.items()):
         win = growth.window_for(k)
         if int(p) < int(win.min_p_parent):
+            continue
+        if group and all(
+            getattr(getattr(member, "zb_occupation", None), "symbols", None)
+            for member in group
+        ):
+            selected.extend(_select_zb_occupation_parents(group, win))
             continue
         consolidation = growth.minimum_consolidation
 
@@ -3708,6 +3869,18 @@ def grow_cores_from_parents(
                 if use_zb and zb_occ is not None and zb_model is not None:
                     if s > max_s_z:
                         continue
+                    core_feedback = np.asarray(
+                        parent.coordinates, dtype=float
+                    )[: len(zb_occ.symbols)]
+                    if (
+                        not parent.propagation_eligible
+                        or str(parent.topology_status).lower() == "changed"
+                    ):
+                        # Off-path XYZ is a molecular well; attach ranking
+                        # uses the CIF occupation, Cl still from the formed shell.
+                        core_feedback = np.asarray(
+                            zb_occ.coordinates, dtype=float
+                        )
                     kids = grow_zb_children(
                         zb_occ,
                         s=s,
@@ -3716,9 +3889,7 @@ def grow_cores_from_parents(
                         model=zb_model,
                         cap=int(window.max_children_per_channel),
                         stats=zb_stats,
-                        relaxed_parent_coordinates=np.asarray(
-                            parent.coordinates, dtype=float
-                        )[: len(zb_occ.symbols)],
+                        relaxed_parent_coordinates=core_feedback,
                         parent_wbo=(
                             parent.wbo
                             if tuple(parent.symbols[: len(zb_occ.symbols)])
@@ -4690,7 +4861,7 @@ def run_growth_step(
                 f"(e.g. --k-from {last} --k-to {last + 2})."
             )
         msg = (
-            f"no converged parents at k={k_from} in {run_dir} "
+            f"no parents with energy at k={k_from} in {run_dir} "
             f"(available: {have_txt})"
         )
         if log:
@@ -4705,11 +4876,19 @@ def run_growth_step(
                 for parent in parents
             }
         )
+        n_zb_min = sum(
+            1
+            for parent in parents
+            if parent.propagation_eligible
+            or str(parent.topology_status).lower() == "preserved"
+        )
+        n_lattice = len(parents) - n_zb_min
         log.line(
-            f"loaded {len(parents_all)} converged parents → "
+            f"loaded {len(parents_all)} parents with energy → "
             f"selected {selected_minima} relaxed minima / "
             f"{len(parents)} ZB routes "
-            f"(window={window.energy_window_eV} eV, "
+            f"(zb_minimum={n_zb_min} lattice_route={n_lattice}; "
+            f"window={window.energy_window_eV} eV, "
             f"cap={window.max_skeletons_cap} skel, "
             f"≤{window.decorations_per_skeleton} dec/core, "
             f"min_p={window.min_p_parent}"
@@ -6409,7 +6588,10 @@ def _opt_zb_occupations(
         motif_vocabulary_violations,
         reconstruct_motif_state,
     )
-    from .molecular_rules import forbidden_pair_contact_violations
+    from .molecular_rules import (
+        cl_on_cn4_cd_violations,
+        forbidden_pair_contact_violations,
+    )
     from .molecular_zb_growth import (
         endpoint_similarity_diagnostic,
         lattice_model,
@@ -6810,6 +6992,7 @@ def _opt_zb_occupations(
             core_rmsd = float("nan")
             final_edges: Tuple[Tuple[int, int], ...] = ()
             propagation_eligible = False
+            chemically_ok = False
             if xr.ok and xr.coordinates is not None:
                 final_edges = tuple(
                     sorted(
@@ -6848,6 +7031,11 @@ def _opt_zb_occupations(
                         floors=settings.artifact_min_distance or None,
                     )
                 )
+                violations.extend(
+                    cl_on_cn4_cd_violations(
+                        final_state, map_spec, xr.coordinates
+                    )
+                )
                 final_core = tuple(
                     edge
                     for edge in final_edges
@@ -6869,27 +7057,30 @@ def _opt_zb_occupations(
                         : len(occupation.symbols)
                     ],
                 )
+                chemically_ok = bool(
+                    xr.energy_eV is not None and not violations
+                )
                 propagation_eligible = bool(
-                    xr.converged
-                    and xr.energy_eV is not None
+                    chemically_ok
+                    and xr.converged
                     and topology_status == "preserved"
-                    and not violations
                 )
             else:
                 violations.append(str(xr.error or "gxtb_failed"))
+                chemically_ok = False
 
             status = (
                 "propagate"
                 if propagation_eligible
                 else (
-                    "off_path"
-                    if topology_status == "changed" and xr.energy_eV is not None
+                    "lattice_route"
+                    if chemically_ok
                     else "failed"
                 )
             )
             if propagation_eligible and zb_stats is not None:
                 zb_stats.opt_keep += 1
-            elif topology_status == "changed" and zb_stats is not None:
+            elif chemically_ok and zb_stats is not None:
                 zb_stats.opt_reject_embed += 1
             elif zb_stats is not None:
                 zb_stats.opt_fail += 1
@@ -6952,13 +7143,14 @@ def _opt_zb_occupations(
                     "xtb_converged": bool(xr.converged),
                     "topology_status": topology_status,
                     "propagation_eligible": propagation_eligible,
+                    "chemically_ok": chemically_ok,
                     "core_rmsd_A": core_rmsd,
                     "violations": list(dict.fromkeys(str(v) for v in violations)),
                     "xyz": str(xyz_path.relative_to(output_dir)),
                 }
                 _append_zb_manifest(Path(output_dir), manifest_record)
 
-            if not propagation_eligible or energy is None:
+            if energy is None or not chemically_ok:
                 continue
             previous = child_minima.get((k, p))
             if previous is None or energy < float(previous["energy_eV"]):
@@ -6981,7 +7173,7 @@ def _opt_zb_occupations(
                     "p": p,
                     "structure_id": sid,
                     "xtb_energy_eV": f"{energy:.8f}",
-                    "xtb_converged": True,
+                    "xtb_converged": bool(xr.converged),
                     "dE_f_eV": "",
                     "growth": "1",
                     "move": "Z",
@@ -6999,7 +7191,13 @@ def _opt_zb_occupations(
                     "decoration_id": f"dec{decoration_index:03d}",
                     "embedding_start": job["start_index"],
                     "topology_status": topology_status,
-                    "propagation_eligible": True,
+                    "propagation_eligible": bool(propagation_eligible),
+                    "chemically_ok": True,
+                    "lineage_role": (
+                        "zb_minimum"
+                        if propagation_eligible
+                        else "lattice_route"
+                    ),
                     "core_rmsd_A": f"{core_rmsd:.8f}",
                 }
                 if growth.references is not None:
@@ -7040,6 +7238,8 @@ def _growth_index_fields(growth: GrowthConfig) -> List[str]:
         "embedding_start",
         "topology_status",
         "propagation_eligible",
+        "chemically_ok",
+        "lineage_role",
         "core_rmsd_A",
     ]
     for dmu in growth.delta_mu_cdcl2_eV:

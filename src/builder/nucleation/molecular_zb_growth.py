@@ -192,7 +192,13 @@ def occupation_from_record(record: Dict[str, Any]) -> ZbOccupation:
 
 
 def load_occupation_manifest(path: Path) -> Dict[str, ZbOccupation]:
-    """Return propagation-eligible structure id -> stored lattice occupation."""
+    """Return structure id -> stored lattice occupation.
+
+    Occupations are the Move Z lineage, including routes whose unconstrained
+    g-xTB minimum left the CIF (4-rings, topology=changed).  Those relaxed
+    XYZ files are energetics only; the next k still grows from this lattice
+    record.  Rows with no occupation payload are skipped.
+    """
 
     manifest = Path(path)
     if manifest.is_dir():
@@ -208,11 +214,22 @@ def load_occupation_manifest(path: Path) -> Dict[str, ZbOccupation]:
         except json.JSONDecodeError:
             continue
         structure_id = str(record.get("structure_id") or "")
-        if not structure_id or not bool(record.get("propagation_eligible", False)):
-            continue
         occupation_raw = record.get("occupation")
-        if isinstance(occupation_raw, dict):
-            out[structure_id] = occupation_from_record(occupation_raw)
+        if not structure_id or not isinstance(occupation_raw, dict):
+            continue
+        energy = record.get("energy_eV")
+        chem = record.get("chemically_ok")
+        if chem is False:
+            continue
+        if chem is None:
+            violations = record.get("violations") or []
+            if violations:
+                continue
+            if energy is None and not bool(
+                record.get("propagation_eligible", False)
+            ):
+                continue
+        out[structure_id] = occupation_from_record(occupation_raw)
     return out
 
 
@@ -1660,6 +1677,33 @@ def occupation_diversity_signature(
         by_species,
         round(_occupation_radius_of_gyration(occupation) / 0.25),
         round(diameter / 0.25),
+    )
+
+
+def occupation_compactness_key(occupation: ZbOccupation) -> Tuple[Any, ...]:
+    """Sort key for filling the parent cap with lattice-only routes.
+
+    More 6-rings and branching first (compact ZB cuts), then smaller
+    radius of gyration.  Collapsed g-xTB energy is not used.
+    """
+
+    import networkx as nx
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(occupation.symbols)))
+    graph.add_edges_from(occupation.core_edges)
+    n6 = sum(1 for cycle in nx.cycle_basis(graph) if len(cycle) == 6)
+    degrees = [0] * len(occupation.symbols)
+    for left, right in occupation.core_edges:
+        degrees[left] += 1
+        degrees[right] += 1
+    n_cn3 = sum(1 for degree in degrees if degree >= 3)
+    return (
+        -int(n6),
+        -int(n_cn3),
+        round(_occupation_radius_of_gyration(occupation), 3),
+        -len(occupation.core_edges),
+        occupation.occupation_id,
     )
 
 
