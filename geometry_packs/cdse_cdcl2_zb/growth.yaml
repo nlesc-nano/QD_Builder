@@ -133,6 +133,17 @@ max_children_per_channel: 20
 # bridge_target_count_window now generates are never sampled.
 zb_max_shells_per_bin: 400
 
+# After every (k, p) bin: log chairs / adamantane / T1 / T3 / two-cage on the
+# CIF occupations (not the relaxed XYZ).  Writes zb_motifs.jsonl and a
+# [growth] zb-motifs ... line.  STATUS missing:* means Channel B should have
+# injected that cut if the builder could construct it.
+zb_motif_log: true
+
+# Channel B: if a bin's generated occupations do not contain an expected ZB
+# unit (T1, chair, adamantane Cd6Se4, T3 Cd10Se4, two fused cages), inject
+# that CIF cut (padded with extra Cd to the bin p) before decorate/opt.
+zb_channel_b: true
+
 # Yield weighting: OFF.  Flat is the right shape, measured.
 #
 # The enumerator's own offer already tracks where the work is -- a bin with
