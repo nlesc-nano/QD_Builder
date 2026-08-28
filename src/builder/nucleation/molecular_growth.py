@@ -466,6 +466,11 @@ class GrowthConfig:
     zb_shell_budget_decay: float = 0.0
     zb_min_shells_per_bin: int = 0
     zb_shell_budget_ceiling: int = 0
+    #: After each (k, p) bin, log chairs / adamantane / T_n on occupations.
+    zb_motif_log: bool = True
+    #: Inject named ZB cuts (T1, chair, adamantane, T3, two-cage) when the
+    #: generated occupations of a bin do not already contain them.
+    zb_channel_b: bool = True
     selection_max_per_skeleton: int = 0
     max_opts_per_k: int = 0
     lattice: LatticeSwitch = field(default_factory=LatticeSwitch)
@@ -704,6 +709,8 @@ class GrowthConfig:
             zb_shell_budget_ceiling=int(
                 raw.get("zb_shell_budget_ceiling", 0)
             ),
+            zb_motif_log=bool(raw.get("zb_motif_log", True)),
+            zb_channel_b=bool(raw.get("zb_channel_b", True)),
             selection_max_per_skeleton=int(
                 raw.get("selection_max_per_skeleton", 0)
             ),
@@ -4633,7 +4640,13 @@ class GrowthLog:
             e = kv.get("E_eV", "n/a")
             t = kv.get("t_s", "0")
             recon = kv.get("recon_s", "0")
-            rel = kv.get("relax", "?")
+            rel = kv.get("relax") or kv.get("status") or "?"
+            if rel in {"propagate", "ok"}:
+                rel = "in-path"
+            elif rel in {"lattice_route", "not_zb"}:
+                rel = "off-path"
+            elif rel in {"fail", "clash"}:
+                rel = "failed"
             k = kv.get("k", "?")
             p = kv.get("p", "?")
             err = kv.get("err", "")
@@ -4701,10 +4714,12 @@ class GrowthLog:
             self._sum_recon_s += recon_s
             self._bin_opt_s += opt_s
             self._bin_recon_s += recon_s
-            if rel == "fail":
+            if rel in {"fail", "failed"}:
                 self.n_fail += 1
                 self._bin_fail += 1
-            extra = f" ({err})" if err and rel == "fail" else ""
+            extra = ""
+            if err and rel in {"failed", "off-path", "fail"}:
+                extra = f":{err}"
             recon_lab = "clean" if move in ("B", "coord", "b") else "recon"
             child_f = self._formula_kp(k, p)
             steps = kv.get("steps", "")
@@ -6643,14 +6658,29 @@ def _opt_zb_occupations(
         ),
     )
     log = progress if isinstance(progress, GrowthLog) else None
+    zb_model = lattice_model(map_spec)
     endpoint_reference = None
     if growth.endpoint_diagnostic_k > 0 and growth.endpoint_reference is not None:
         endpoint_reference = load_reference_occupation(
             growth.endpoint_reference,
             map_spec,
-            lattice_model(map_spec),
+            zb_model,
         )
-    for (k, p), occupations in sorted(zb_seeds.items()):
+    zb_bins: Dict[Tuple[int, int], List[Any]] = {
+        key: list(value) for key, value in zb_seeds.items()
+    }
+    for (k, p), occupations in sorted(zb_bins.items()):
+        injected: List[str] = []
+        if getattr(growth, "zb_channel_b", True):
+            from .zb_motifs import inject_missing_motifs
+
+            occupations, injected = inject_missing_motifs(
+                occupations, k, p, map_spec, zb_model
+            )
+            if injected and log:
+                log.line(
+                    f"channel B k={k} p={p}: injected {','.join(injected)}"
+                )
         # ---- pass 1: rank ligand shells for the whole bin, no geometry ----
         planned: List[Tuple[Any, List[Tuple[int, Any]]]] = []
         for occupation in occupations:
@@ -7010,6 +7040,10 @@ def _opt_zb_occupations(
                     relaxed[index] = retry
 
         # ---- pass 2c: audit and write, in deterministic input order ----
+        accepted_role: Dict[str, str] = {}
+        n_jobs_inpath = 0
+        n_jobs_offpath = 0
+        n_jobs_failed = 0
         for job_index, job in enumerate(jobs):
             occupation = job["occupation"]
             decoration_index = job["decoration_index"]
@@ -7119,14 +7153,38 @@ def _opt_zb_occupations(
                 zb_stats.opt_fail += 1
 
             energy = None if xr.energy_eV is None else float(xr.energy_eV)
+            from .zb_motifs import job_status_label
+
+            kind, cause = job_status_label(
+                chemically_ok=chemically_ok,
+                propagation_eligible=propagation_eligible,
+                topology_status=topology_status,
+                violations=violations,
+                error=str(xr.error or ""),
+            )
+            if kind == "in-path":
+                n_jobs_inpath += 1
+            elif kind == "off-path":
+                n_jobs_offpath += 1
+            else:
+                n_jobs_failed += 1
+            oid = str(occupation.occupation_id or sid)
+            if chemically_ok:
+                prev = accepted_role.get(oid)
+                if prev != "zb_minimum":
+                    accepted_role[oid] = (
+                        "zb_minimum" if propagation_eligible else "lattice_route"
+                    )
             if progress is not None:
+                err_bit = f" err={cause}" if cause else ""
                 progress(
                     f"[growth-job] k={k} p={p} move=Z id={sid} "
                     f"occ={occupation.occupation_id} dec={decoration_index} "
                     f"start={job['start_index']} "
                     f"E_eV={'n/a' if energy is None else f'{energy:.6f}'} "
                     f"t_s={elapsed:.1f} topology={topology_status} "
-                    f"status={status} parent={occupation.parent_id} "
+                    f"relax={kind}{err_bit} status={status} "
+                    f"parent={occupation.parent_id} "
                     f"shed={occupation.shed} p_m={occupation.p_m}"
                     f"{(' ztype=' + occupation.shed_kind) if occupation.shed_kind else ''}"
                 )
@@ -7241,6 +7299,53 @@ def _opt_zb_occupations(
                         )
                 _append_index_row_unique(
                     Path(output_dir), row, _growth_index_fields(growth)
+                )
+
+        if getattr(growth, "zb_motif_log", True):
+            from .zb_motifs import (
+                census_occupations,
+                expected_motifs,
+                format_motif_log_line,
+                motif_status,
+            )
+
+            occ_census = census_occupations(occupations)
+            inpath_occs = [
+                item
+                for item in occupations
+                if accepted_role.get(str(item.occupation_id or ""))
+                == "zb_minimum"
+            ]
+            inpath_census = census_occupations(inpath_occs)
+            line = format_motif_log_line(
+                k,
+                p,
+                n_occ=int(occ_census.get("n_unique", 0)),
+                census=occ_census,
+                inpath=inpath_census,
+                injected=injected,
+                n_inpath=n_jobs_inpath,
+                n_offpath=n_jobs_offpath,
+            )
+            if log:
+                log.line(line.replace("[zb-motifs] ", "zb-motifs "))
+            if output_dir is not None:
+                _append_jsonl_unique(
+                    Path(output_dir) / "zb_motifs.jsonl",
+                    {
+                        "bin": f"k{k:03d}_p{p:03d}",
+                        "k": k,
+                        "p": p,
+                        "expected": list(expected_motifs(k, p)),
+                        "status": motif_status(k, p, occ_census),
+                        "occupation_census": occ_census,
+                        "inpath_census": inpath_census,
+                        "injected": list(injected),
+                        "n_jobs_inpath": n_jobs_inpath,
+                        "n_jobs_offpath": n_jobs_offpath,
+                        "n_jobs_failed": n_jobs_failed,
+                    },
+                    key="bin",
                 )
 
 
