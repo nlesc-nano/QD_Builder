@@ -1739,12 +1739,14 @@ def _too_close(
     *,
     floor: float,
     ignore: Sequence[int] = (),
+    only: Optional[Sequence[int]] = None,
 ) -> bool:
     skip = set(ignore)
-    for i, pt in enumerate(xyz):
-        if i in skip:
+    indices = range(len(xyz)) if only is None else only
+    for i in indices:
+        if int(i) in skip:
             continue
-        if float(np.linalg.norm(pos - pt)) < floor:
+        if float(np.linalg.norm(pos - xyz[int(i)])) < floor:
             return True
     return False
 
@@ -1877,23 +1879,22 @@ def place_cl_on_zb_core(
         return xyz
     core_com = xyz[core_idx].mean(axis=0)
     cl_ids = [i for i, atom in enumerate(state.atoms) if atom.symbol == ligand]
+    placed = set(core_idx)
     for cl in cl_ids:
         hosts = [
             int(j)
             for j in state.graph.neighbors(cl)
             if state.atoms[int(j)].symbol == cation
         ]
-        pos: Optional[np.ndarray] = None
+        if not hosts:
+            return None
+        candidates: List[np.ndarray] = []
         ignore = tuple(hosts)
         if len(hosts) == 2:
-            sites = _mu2_sites(xyz[hosts[0]], xyz[hosts[1]], radius)
-            sites.sort(
+            candidates.extend(_mu2_sites(xyz[hosts[0]], xyz[hosts[1]], radius))
+            candidates.sort(
                 key=lambda p: -float(np.linalg.norm(p - core_com))
             )
-            for candidate in sites:
-                if not _too_close(candidate, xyz, floor=clash_floor, ignore=ignore):
-                    pos = candidate
-                    break
         elif len(hosts) == 1:
             host = hosts[0]
             push = np.zeros(3)
@@ -1906,10 +1907,8 @@ def place_cl_on_zb_core(
                     push += vec / norm
             norm = float(np.linalg.norm(push))
             if norm > 1.0e-8:
-                candidate = xyz[host] + (push / norm) * radius
-                if not _too_close(candidate, xyz, floor=clash_floor, ignore=(host,)):
-                    pos = candidate
-        elif len(hosts) >= 3:
+                candidates.append(xyz[host] + (push / norm) * radius)
+        else:
             triangle = xyz[list(hosts[:3])]
             center = triangle.mean(axis=0)
             normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
@@ -1918,16 +1917,32 @@ def place_cl_on_zb_core(
                 normal = normal / nrm
                 if float(np.dot(center + normal - core_com, normal)) < 0.0:
                     normal = -normal
-                candidate = center + normal * 1.10
-                if not _too_close(candidate, xyz, floor=clash_floor, ignore=ignore):
-                    pos = candidate
+                candidates.append(center + normal * 1.10)
+                candidates.append(center - normal * 1.10)
+        pos: Optional[np.ndarray] = None
+        for candidate in candidates:
+            if not _too_close(
+                candidate, xyz, floor=clash_floor, ignore=ignore, only=placed
+            ):
+                pos = candidate
+                break
+        if pos is None and candidates:
+            # Crowded 2p shell: keep the least-clashing guess for g-xTB.
+            def _gap(point: np.ndarray) -> float:
+                return min(
+                    (
+                        float(np.linalg.norm(point - xyz[i]))
+                        for i in placed
+                        if i not in ignore
+                    ),
+                    default=99.0,
+                )
+
+            pos = max(candidates, key=_gap)
         if pos is None:
             return None
         xyz[cl] = pos
-    from .molecular_rules import cl_on_cn4_cd_violations
-
-    if cl_on_cn4_cd_violations(state, spec, xyz):
-        return None
+        placed.add(cl)
     return xyz
 
 

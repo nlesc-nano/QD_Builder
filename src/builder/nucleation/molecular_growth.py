@@ -5080,8 +5080,9 @@ def run_growth_step(
         if log and window.move_zb_sites:
             log.line(
                 "move Z cores -> pack decorate (2p / bridge-target) -> "
-                "anchored embed.yaml motif_factor -> unconstrained g-xTB; "
-                "propagate only converged, topology-preserving endpoints"
+                "geometric Cl + embed.yaml start -> unconstrained g-xTB; "
+                "CIF occupation is the next parent if chemically ok "
+                "(no Se-Cl / artifacts); topology-preserved = ZB minimum"
             )
 
         if log and result.skeleton_catalog and do_redecorate:
@@ -6522,7 +6523,23 @@ def _embed_one(job: Tuple[Any, Dict[int, Any]]) -> List[Tuple[int, Any]]:
             state, anchored, _EMBED_CTX["spec"], _EMBED_CTX["pack"]
         )
         if xyz is None:
-            return []
+            rebuilt = reconstruct_motif_state(
+                state,
+                _EMBED_CTX["pack"],
+                _EMBED_CTX["spec"],
+                starts=int(params["starts"]),
+                keep=max(1, int(params["keep"])),
+                max_nfev=int(params["max_nfev"]),
+                overlap_min_A=float(params["overlap_min_A"]),
+                start_max_bond_error_A=float(params["start_max_bond_error_A"]),
+                core_coordinates=anchored,
+            )
+            keep = int(params["keep"])
+            return [
+                (int(c.start_index), np.asarray(c.coordinates, dtype=float))
+                for c in rebuilt.candidates
+                if not c.audit_violations
+            ][: max(1, keep)]
         adapted = adapt_to_embed_table(
             state,
             xyz,
@@ -6531,9 +6548,9 @@ def _embed_one(job: Tuple[Any, Dict[int, Any]]) -> List[Tuple[int, Any]]:
             max_nfev=int(params.get("table_adapt_nfev", 16)),
             overlap_min_A=float(params["overlap_min_A"]),
         )
-        if adapted is None:
-            return []
-        return [(0, adapted)]
+        # Table morph may clash on a crowded 2p shell; the geometric Cl
+        # seed is still a legal g-xTB start.
+        return [(0, adapted if adapted is not None else xyz)]
     rebuilt = reconstruct_motif_state(
         state,
         _EMBED_CTX["pack"],
@@ -6840,6 +6857,12 @@ def _opt_zb_occupations(
                     }
                 )
 
+        if log is not None:
+            log.line(
+                f"    embed starts {len(embed_jobs)}->{len(jobs)} "
+                f"(empty place_cl/adapt no longer drop a legal graph)"
+            )
+
         # ---- pass 2b: one batched relaxation for the whole bin ----
         started = time.perf_counter()
         elapsed_by_index: Dict[int, float] = {}
@@ -6899,46 +6922,56 @@ def _opt_zb_occupations(
             ligand = map_spec.precursor.ligand
             for job, xr in zip(jobs, refined):
                 n_core = len(job["occupation"].symbols)
-                if not xr.ok or xr.coordinates is None:
-                    if zb_stats is not None:
-                        zb_stats.clash_skip += 1
-                    continue
-                coords = np.asarray(xr.coordinates, dtype=float)
-                symbols = list(job["payload"]["symbols"])
-                if coords.shape != (len(symbols), 3):
-                    if zb_stats is not None:
-                        zb_stats.clash_skip += 1
-                    continue
                 lattice = np.asarray(
                     job["occupation"].coordinates, dtype=float
                 )
-                core_shift = float(
-                    np.sqrt(
-                        np.mean(np.sum((coords[:n_core] - lattice) ** 2, axis=1))
-                    )
+                symbols = list(job["payload"]["symbols"])
+                coords = np.asarray(
+                    job["payload"]["positions"], dtype=float
                 )
-                if core_shift > 0.15:
-                    # $fix was ignored; keep the geometric Cl seed.
-                    coords = np.asarray(
-                        job["payload"]["positions"], dtype=float
+                if (
+                    xr.ok
+                    and xr.coordinates is not None
+                    and np.asarray(xr.coordinates).shape == (len(symbols), 3)
+                ):
+                    coords = np.asarray(xr.coordinates, dtype=float)
+                    core_shift = float(
+                        np.sqrt(
+                            np.mean(
+                                np.sum((coords[:n_core] - lattice) ** 2, axis=1)
+                            )
+                        )
                     )
-                coords[:n_core] = lattice
-                cl_edges = [
-                    (int(a), int(b))
-                    for a, b in job["source_edges"]
-                    if symbols[int(a)] == ligand or symbols[int(b)] == ligand
-                ]
-                if construction_clash(
-                    symbols, coords, map_spec, bonded=cl_edges
-                ) or cl_on_cn4_cd_violations(job["state"], map_spec, coords):
-                    if zb_stats is not None:
-                        zb_stats.clash_skip += 1
-                    continue
+                    if core_shift > 0.15:
+                        coords = np.asarray(
+                            job["payload"]["positions"], dtype=float
+                        )
+                    coords[:n_core] = lattice
+                    cl_edges = [
+                        (int(a), int(b))
+                        for a, b in job["source_edges"]
+                        if symbols[int(a)] == ligand
+                        or symbols[int(b)] == ligand
+                    ]
+                    if construction_clash(
+                        symbols, coords, map_spec, bonded=cl_edges
+                    ) or cl_on_cn4_cd_violations(
+                        job["state"], map_spec, coords
+                    ):
+                        coords = np.asarray(
+                            job["payload"]["positions"], dtype=float
+                        )
+                        coords[:n_core] = lattice
                 job["payload"]["positions"] = [list(point) for point in coords]
                 job["payload"].pop("freeze_atoms", None)
                 job["payload"].pop("opt_level", None)
                 kept_jobs.append(job)
             jobs = kept_jobs
+            if log is not None:
+                log.line(
+                    f"    freeze_core kept {len(jobs)} for full opt "
+                    "(clash starts still go to unconstrained g-xTB)"
+                )
             started = time.perf_counter()
             elapsed_by_index.clear()
             completed[0] = 0
