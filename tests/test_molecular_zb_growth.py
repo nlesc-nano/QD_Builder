@@ -97,6 +97,33 @@ def test_attach_cdse_has_no_diamond(map_spec) -> None:
         assert emb is not None
 
 
+def test_attach_cdse_cap_is_compact_subset(map_spec) -> None:
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=2)
+    assert parent is not None
+    full = attach_cdse(parent, map_spec, model, cap=0)
+    top = attach_cdse(parent, map_spec, model, cap=2)
+    assert top
+    assert len(top) <= 2
+    assert {item.occupation_id for item in top} <= {
+        item.occupation_id for item in full
+    }
+
+
+def test_capped_grow_zb_children_stays_within_cap(map_spec) -> None:
+    model = lattice_model(map_spec)
+    parent = lattice_k1_occupation(map_spec, model, p=2)
+    assert parent is not None
+    kids = grow_zb_children(
+        parent, s=0, p_m=1, spec=map_spec, model=model, cap=4
+    )
+    assert kids
+    assert len(kids) <= 4
+    for kid in kids:
+        assert kid.k == 2
+        assert kid.occupation_id
+
+
 def test_grow_zb_children_stoich(map_spec) -> None:
     model = lattice_model(map_spec)
     parent = lattice_k1_occupation(map_spec, model, p=2)

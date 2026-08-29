@@ -443,6 +443,7 @@ def occupation_from_state(
     notes: str = "",
     parent_occupation_ids: Sequence[str] = (),
     parent_structure_ids: Sequence[str] = (),
+    identify: bool = True,
 ) -> Optional[ZbOccupation]:
     cation, anion, _ = _species(spec)
     se = [a for a in state.atoms if a.symbol == anion]
@@ -484,7 +485,9 @@ def occupation_from_state(
         p_m=int(p_m),
         notes=notes,
     )
-    return ensure_occupation_identity(occupation, model)
+    if identify:
+        return ensure_occupation_identity(occupation, model)
+    return occupation
 
 
 def state_from_occupation(
@@ -1276,6 +1279,56 @@ def _place_monomer(
     return child
 
 
+def _compactness_from_core(
+    symbols: Sequence[str],
+    coordinates: np.ndarray,
+    core_edges: Sequence[Edge],
+) -> Tuple[Any, ...]:
+    """Sort key: more 6-rings and branching, then smaller radius of gyration."""
+
+    import networkx as nx
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(symbols)))
+    graph.add_edges_from(core_edges)
+    n6 = sum(1 for cycle in nx.cycle_basis(graph) if len(cycle) == 6)
+    degrees = [0] * len(symbols)
+    for left, right in core_edges:
+        degrees[left] += 1
+        degrees[right] += 1
+    n_cn3 = sum(1 for degree in degrees if degree >= 3)
+    points = np.asarray(coordinates, dtype=float)
+    if len(points):
+        centered = points - points.mean(axis=0)
+        radius = float(np.sqrt(np.mean(np.sum(centered * centered, axis=1))))
+    else:
+        radius = 0.0
+    return (-int(n6), -int(n_cn3), round(radius, 3), -len(core_edges))
+
+
+def _compactness_tuple(occupation: ZbOccupation) -> Tuple[Any, ...]:
+    return _compactness_from_core(
+        occupation.symbols, occupation.coordinates, occupation.core_edges
+    )
+
+
+def _state_compactness_tuple(
+    state: _State, spec: NucleationSpec, model: _LatticeModel
+) -> Tuple[Any, ...]:
+    cation, anion, _ = _species(spec)
+    n_se = sum(1 for atom in state.atoms if atom.symbol == anion)
+    n_cd = sum(1 for atom in state.atoms if atom.symbol == cation)
+    p = n_cd - n_se
+    if n_se < 1 or p < 0:
+        return (0, 0, 1.0e9, 0)
+    draft = occupation_from_state(
+        state, spec, model=model, k=n_se, p=p, identify=False
+    )
+    if draft is None:
+        return (0, 0, 1.0e9, 0)
+    return _compactness_tuple(draft)
+
+
 def attach_cdse(
     occ: ZbOccupation,
     spec: NucleationSpec,
@@ -1283,14 +1336,20 @@ def attach_cdse(
     *,
     cap: int,
 ) -> List[ZbOccupation]:
+    """Attach one CdSe on vacant tet sites.
+
+    When ``cap > 0``, all legal attaches are scored by compact ZB shape
+    (6-rings, branching, small radius) and only the best ``cap`` keep a
+    cubic-symmetry ``occupation_id``.  ``cap = 0`` still returns the full set.
+    """
+
     state = state_from_occupation(occ, spec, model)
-    out: List[ZbOccupation] = []
-    seen: set = set()
+    ranked: List[Tuple[Tuple[Any, ...], Any]] = []
     for cd_pos, se_pos in _monomer_pairs(state, model, spec):
         child = _place_monomer(state, cd_pos, se_pos, model, spec)
         if child is None:
             continue
-        new = occupation_from_state(
+        draft = occupation_from_state(
             child,
             spec,
             model=model,
@@ -1300,16 +1359,22 @@ def attach_cdse(
             shed=occ.shed,
             notes="attach",
             parent_occupation_ids=(occ.occupation_id,),
+            identify=False,
         )
-        if new is None:
+        if draft is None:
             continue
-        key = new.occupation_id
-        if key in seen:
+        ranked.append((_compactness_tuple(draft), draft))
+    ranked.sort(key=lambda item: item[0])
+    if cap > 0:
+        ranked = ranked[: int(cap)]
+    out: List[ZbOccupation] = []
+    seen: set = set()
+    for _key, draft in ranked:
+        new = ensure_occupation_identity(draft, model)
+        if new.occupation_id in seen:
             continue
-        seen.add(key)
+        seen.add(new.occupation_id)
         out.append(new)
-        if cap > 0 and len(out) >= cap:
-            break
     return out
 
 
@@ -1363,7 +1428,10 @@ def _add_precursor_cd(
                 nxt.append(child)
         if not nxt:
             return []
-        frontier = nxt if cap <= 0 else nxt[: max(1, cap)]
+        if cap > 0 and len(nxt) > max(1, cap):
+            nxt.sort(key=lambda st: _state_compactness_tuple(st, spec, model))
+            nxt = nxt[: max(1, cap)]
+        frontier = nxt
     out: List[ZbOccupation] = []
     seen_e: set = set()
     for st in frontier:
@@ -1457,12 +1525,17 @@ def grow_zb_children(
         child.shed_kind = worst.kind
         child.shed_se_wbo = float(sum(unit.se_wbo for unit in assigned))
 
+    n_keep = int(cap) if cap else 0
+    # Explore a few compact attaches/pads per shed, then the final cap
+    # still ranks by ``_growth_site_priority``.  cap=0 stays exhaustive.
+    attach_cap = 0 if n_keep <= 0 else max(n_keep * 3, n_keep)
+    pad_cap = 0 if n_keep <= 0 else max(n_keep * 2, n_keep)
     unique: Dict[str, ZbOccupation] = {}
     for after in after_all:
-        attached = attach_cdse(after, spec, model, cap=0)
+        attached = attach_cdse(after, spec, model, cap=attach_cap)
         for core in attached:
             core.shed = s
-            packed = _add_precursor_cd(core, p_m, spec, model, cap=0)
+            packed = _add_precursor_cd(core, p_m, spec, model, cap=pad_cap)
             for child in packed:
                 _annotate(child, after)
                 existing = unique.get(child.occupation_id)
@@ -1687,24 +1760,7 @@ def occupation_compactness_key(occupation: ZbOccupation) -> Tuple[Any, ...]:
     radius of gyration.  Collapsed g-xTB energy is not used.
     """
 
-    import networkx as nx
-
-    graph = nx.Graph()
-    graph.add_nodes_from(range(len(occupation.symbols)))
-    graph.add_edges_from(occupation.core_edges)
-    n6 = sum(1 for cycle in nx.cycle_basis(graph) if len(cycle) == 6)
-    degrees = [0] * len(occupation.symbols)
-    for left, right in occupation.core_edges:
-        degrees[left] += 1
-        degrees[right] += 1
-    n_cn3 = sum(1 for degree in degrees if degree >= 3)
-    return (
-        -int(n6),
-        -int(n_cn3),
-        round(_occupation_radius_of_gyration(occupation), 3),
-        -len(occupation.core_edges),
-        occupation.occupation_id,
-    )
+    return _compactness_tuple(occupation) + (occupation.occupation_id,)
 
 
 def _cdcl_bond(pack: Any) -> float:

@@ -3629,6 +3629,8 @@ def grow_cores_from_parents(
         )
     )
 
+    n_zb_parents = len(parents) if use_zb else 0
+    zb_parent_i = 0
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
         packages = identify_packages(parent, spec)
@@ -3677,6 +3679,12 @@ def grow_cores_from_parents(
                     zb_stats.n4_reject += 1
             else:
                 zb_stats.snapped += 1
+                zb_parent_i += 1
+                print(
+                    f"[growth] move Z parent {zb_parent_i}/{n_zb_parents} "
+                    f"{parent.structure_id} p={parent.p}",
+                    flush=True,
+                )
                 if spec.precursor.ligand in parent.symbols:
                     ztype_units = ztype_shed_units(
                         zb_occ,
