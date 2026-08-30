@@ -3559,6 +3559,189 @@ def build_coord_seed(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _ZbParentWork:
+    """Move Z output for one parent, computed off the serial path.
+
+    Everything here is a pure function of the parent, its occupation and the
+    window, which is what lets the parents run in a process pool: the shared
+    catalogs are merged afterwards, in parent order, so the result does not
+    depend on completion order.
+    """
+
+    ztype_info: Dict[str, int]
+    max_s_z: int
+    children: Dict[Tuple[int, int], List[Any]]
+    stats: Any
+
+
+def _zb_parent_work(task: Tuple[Any, ...]) -> Tuple[str, _ZbParentWork]:
+    """Z-type census plus every (shed, p_m) child list for one parent."""
+
+    from .molecular_zb_growth import (
+        ZbGrowStats,
+        grow_zb_children,
+        ztype_census,
+        ztype_shed_units,
+    )
+
+    parent, zb_occ, spec, model, window, ligand_bond, cap = task
+    stats = ZbGrowStats()
+    ztype_info: Dict[str, int] = {
+        "geminal_terminal": 0,
+        "geminal_bridge": 0,
+        "borrowed": 0,
+        "cl_free": 0,
+        "disjoint": 0,
+    }
+    ztype_units = None
+    if spec.precursor.ligand in parent.symbols:
+        ztype_units = ztype_shed_units(
+            zb_occ,
+            spec,
+            parent_symbols=parent.symbols,
+            parent_coordinates=np.asarray(parent.coordinates, dtype=float),
+            parent_edges=parent.edges,
+            parent_wbo=parent.wbo,
+            ligand_bond_length=ligand_bond,
+        )
+        ztype_info = ztype_census(zb_occ, ztype_units, spec)
+        max_s_z = min(
+            window.s_max_for(parent.k, parent.p),
+            parent.p,
+            int(ztype_info["disjoint"]),
+        )
+    else:
+        # Core-only fixture: no Z-type leaving group to inspect.
+        max_s_z = min(window.s_max_for(parent.k, parent.p), parent.p)
+
+    core_feedback = np.asarray(parent.coordinates, dtype=float)[
+        : len(zb_occ.symbols)
+    ]
+    if (
+        not parent.propagation_eligible
+        or str(parent.topology_status).lower() == "changed"
+    ):
+        # Off-path XYZ is a molecular well; attach ranking uses the CIF
+        # occupation, Cl still from the formed shell.
+        core_feedback = np.asarray(zb_occ.coordinates, dtype=float)
+    parent_wbo = (
+        parent.wbo
+        if tuple(parent.symbols[: len(zb_occ.symbols)]) == tuple(zb_occ.symbols)
+        else None
+    )
+    # The occupation carries no Cl, but the relaxed parent does, and the
+    # ranking needs it to tell an open coordination slot from one a ligand
+    # already fills.
+    ligand_coordinates = np.asarray(
+        [
+            point
+            for symbol, point in zip(parent.symbols, parent.coordinates)
+            if symbol == spec.precursor.ligand
+        ],
+        dtype=float,
+    ).reshape(-1, 3)
+
+    children: Dict[Tuple[int, int], List[Any]] = {}
+    for s in range(0, int(max_s_z) + 1):
+        p_out = parent.p - s
+        if p_out < 0:
+            continue
+        for p_m in window.monomer_p_values:
+            if not window.allow_p_child(parent.k + 1, p_out + p_m):
+                continue
+            children[(s, p_m)] = grow_zb_children(
+                zb_occ,
+                s=s,
+                p_m=p_m,
+                spec=spec,
+                model=model,
+                cap=int(cap),
+                stats=stats,
+                relaxed_parent_coordinates=core_feedback,
+                parent_wbo=parent_wbo,
+                parent_ligand_coordinates=ligand_coordinates,
+                ligand_bond_length=ligand_bond,
+                ztype_units=ztype_units,
+            )
+    return str(parent.structure_id), _ZbParentWork(
+        ztype_info=ztype_info,
+        max_s_z=int(max_s_z),
+        children=children,
+        stats=stats,
+    )
+
+
+def _growth_graph_workers(n_tasks: int) -> int:
+    """Worker count for the Move Z parent fan-out.
+
+    ``QD_GRAPH_WORKERS`` overrides; otherwise follow ``QD_EMBED_WORKERS``,
+    which is already set to one process per core in the production scripts.
+    1 keeps everything in this process.
+    """
+
+    raw = os.environ.get("QD_GRAPH_WORKERS") or os.environ.get(
+        "QD_EMBED_WORKERS"
+    )
+    try:
+        workers = int(raw) if raw else (os.cpu_count() or 1)
+    except ValueError:
+        workers = os.cpu_count() or 1
+    return max(1, min(int(workers), max(1, int(n_tasks))))
+
+
+def _run_zb_parent_work(
+    tasks: List[Tuple[Any, ...]],
+    *,
+    progress: Optional[Any] = None,
+) -> Dict[str, _ZbParentWork]:
+    """Run ``_zb_parent_work`` over every parent, in a pool when it pays."""
+
+    out: Dict[str, _ZbParentWork] = {}
+    if not tasks:
+        return out
+    workers = _growth_graph_workers(len(tasks))
+
+    def _serial() -> Dict[str, _ZbParentWork]:
+        done: Dict[str, _ZbParentWork] = {}
+        for index, task in enumerate(tasks, start=1):
+            key, work = _zb_parent_work(task)
+            done[key] = work
+            print(
+                f"[growth] move Z parent {index}/{len(tasks)} "
+                f"{key} p={task[0].p}",
+                flush=True,
+            )
+        return done
+
+    if workers <= 1 or len(tasks) < 2:
+        return _serial()
+    from concurrent.futures import ProcessPoolExecutor
+
+    print(
+        f"[growth] move Z: {len(tasks)} parents on {workers} workers",
+        flush=True,
+    )
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for done, (task, (key, work)) in enumerate(
+                zip(tasks, pool.map(_zb_parent_work, tasks)), start=1
+            ):
+                out[key] = work
+                print(
+                    f"[growth] move Z parent {done}/{len(tasks)} "
+                    f"{key} p={task[0].p}",
+                    flush=True,
+                )
+        return out
+    except Exception as exc:  # pragma: no cover - pool setup failure
+        print(
+            f"[growth] move Z pool unavailable ({exc}); running serially",
+            flush=True,
+        )
+        return _serial()
+
+
 def grow_cores_from_parents(
     parents: Sequence[ParentStructure],
     *,
@@ -3612,11 +3795,8 @@ def grow_cores_from_parents(
         from .molecular_zb_growth import (
             ZbGrowStats,
             ensure_occupation_identity,
-            grow_zb_children,
             lattice_k1_occupation,
             lattice_model,
-            ztype_census,
-            ztype_shed_units,
         )
 
         zb_model = lattice_model(spec)
@@ -3629,8 +3809,52 @@ def grow_cores_from_parents(
         )
     )
 
-    n_zb_parents = len(parents) if use_zb else 0
-    zb_parent_i = 0
+    # Move Z, hoisted: snap every parent to its stored occupation (cheap and
+    # order-dependent for the stats), then run the per-parent enumeration --
+    # which is the whole cost of this stage -- across processes.  The merge
+    # below walks `parents` in order, so the catalogs, channel list and child
+    # ids do not depend on completion order.
+    zb_occ_by_parent: Dict[str, Any] = {}
+    zb_why_by_parent: Dict[str, str] = {}
+    zb_work: Dict[str, _ZbParentWork] = {}
+    if use_zb and zb_model is not None:
+        zb_tasks: List[Tuple[Any, ...]] = []
+        for parent in parents:
+            stored = getattr(parent, "zb_occupation", None)
+            snapped_occ = None
+            why = "missing_occupation_manifest"
+            if stored is not None:
+                snapped_occ = ensure_occupation_identity(stored, zb_model)
+                if snapped_occ.k != parent.k or snapped_occ.p != parent.p:
+                    why = f"stored_stoich_k{snapped_occ.k}p{snapped_occ.p}"
+                    snapped_occ = None
+                else:
+                    snapped_occ.parent_id = parent.structure_id
+                    why = "stored_occupation"
+            # A legacy parent tree can initialize Move Z only at k=1.  Every
+            # later step must load the occupation written by the prior step;
+            # relaxed-coordinate snapping is intentionally not a lineage path.
+            if snapped_occ is None and parent.k == 1:
+                snapped_occ = lattice_k1_occupation(spec, zb_model, parent.p)
+                if snapped_occ is not None:
+                    snapped_occ.parent_id = parent.structure_id
+                    why = "lattice_k1"
+            zb_why_by_parent[parent.structure_id] = why
+            if snapped_occ is not None:
+                zb_occ_by_parent[parent.structure_id] = snapped_occ
+                zb_tasks.append(
+                    (
+                        parent,
+                        snapped_occ,
+                        spec,
+                        zb_model,
+                        window,
+                        ligand_bond,
+                        int(window.max_children_per_channel),
+                    )
+                )
+        zb_work = _run_zb_parent_work(zb_tasks)
+
     for parent in parents:
         core = parent_core_in_blocks(parent, spec)
         packages = identify_packages(parent, spec)
@@ -3642,7 +3866,6 @@ def grow_cores_from_parents(
         )
 
         zb_occ = None
-        ztype_units = None
         max_s_z = 0
         ztype_info: Dict[str, int] = {
             "geminal_terminal": 0,
@@ -3651,58 +3874,36 @@ def grow_cores_from_parents(
             "cl_free": 0,
             "disjoint": 0,
         }
+        work = None
         if use_zb and zb_model is not None and zb_stats is not None:
             zb_stats.parents += 1
-            stored = getattr(parent, "zb_occupation", None)
-            why = "missing_occupation_manifest"
-            if stored is not None:
-                zb_occ = ensure_occupation_identity(stored, zb_model)
-                if zb_occ.k != parent.k or zb_occ.p != parent.p:
-                    why = (
-                        f"stored_stoich_k{zb_occ.k}p{zb_occ.p}"
-                    )
-                    zb_occ = None
-                else:
-                    zb_occ.parent_id = parent.structure_id
-                    why = "stored_occupation"
-            # A legacy parent tree can initialize Move Z only at k=1.  Every
-            # later step must load the occupation written by the prior step;
-            # relaxed-coordinate snapping is intentionally not a lineage path.
-            if zb_occ is None and parent.k == 1:
-                zb_occ = lattice_k1_occupation(spec, zb_model, parent.p)
-                if zb_occ is not None:
-                    zb_occ.parent_id = parent.structure_id
-                    why = "lattice_k1"
+            zb_occ = zb_occ_by_parent.get(parent.structure_id)
+            why = zb_why_by_parent.get(
+                parent.structure_id, "missing_occupation_manifest"
+            )
             if zb_occ is None:
                 zb_stats.snap_fail += 1
                 if str(why).startswith("n4"):
                     zb_stats.n4_reject += 1
             else:
                 zb_stats.snapped += 1
-                zb_parent_i += 1
-                print(
-                    f"[growth] move Z parent {zb_parent_i}/{n_zb_parents} "
-                    f"{parent.structure_id} p={parent.p}",
-                    flush=True,
-                )
+                work = zb_work.get(parent.structure_id)
+                if work is None:
+                    _, work = _zb_parent_work(
+                        (
+                            parent,
+                            zb_occ,
+                            spec,
+                            zb_model,
+                            window,
+                            ligand_bond,
+                            int(window.max_children_per_channel),
+                        )
+                    )
+                ztype_info = work.ztype_info
+                max_s_z = work.max_s_z
+                zb_stats.attach_attempts += work.stats.attach_attempts
                 if spec.precursor.ligand in parent.symbols:
-                    ztype_units = ztype_shed_units(
-                        zb_occ,
-                        spec,
-                        parent_symbols=parent.symbols,
-                        parent_coordinates=np.asarray(
-                            parent.coordinates, dtype=float
-                        ),
-                        parent_edges=parent.edges,
-                        parent_wbo=parent.wbo,
-                        ligand_bond_length=ligand_bond,
-                    )
-                    ztype_info = ztype_census(zb_occ, ztype_units, spec)
-                    max_s_z = min(
-                        window.s_max_for(parent.k, parent.p),
-                        parent.p,
-                        int(ztype_info["disjoint"]),
-                    )
                     zb_stats.ztype_geminal_terminal += ztype_info[
                         "geminal_terminal"
                     ]
@@ -3712,13 +3913,6 @@ def grow_cores_from_parents(
                     zb_stats.ztype_borrowed += ztype_info["borrowed"]
                     zb_stats.ztype_cl_free_cd += ztype_info["cl_free"]
                     zb_stats.ztype_disjoint += max_s_z
-                else:
-                    # Core-only fixture: no Z-type leaving group to inspect.
-                    ztype_units = None
-                    max_s_z = min(
-                        window.s_max_for(parent.k, parent.p),
-                        parent.p,
-                    )
 
         max_s = 0
         if use_graph or use_coord:
@@ -3884,48 +4078,10 @@ def grow_cores_from_parents(
                 if use_zb and zb_occ is not None and zb_model is not None:
                     if s > max_s_z:
                         continue
-                    core_feedback = np.asarray(
-                        parent.coordinates, dtype=float
-                    )[: len(zb_occ.symbols)]
-                    if (
-                        not parent.propagation_eligible
-                        or str(parent.topology_status).lower() == "changed"
-                    ):
-                        # Off-path XYZ is a molecular well; attach ranking
-                        # uses the CIF occupation, Cl still from the formed shell.
-                        core_feedback = np.asarray(
-                            zb_occ.coordinates, dtype=float
-                        )
-                    kids = grow_zb_children(
-                        zb_occ,
-                        s=s,
-                        p_m=p_m,
-                        spec=spec,
-                        model=zb_model,
-                        cap=int(window.max_children_per_channel),
-                        stats=zb_stats,
-                        relaxed_parent_coordinates=core_feedback,
-                        parent_wbo=(
-                            parent.wbo
-                            if tuple(parent.symbols[: len(zb_occ.symbols)])
-                            == tuple(zb_occ.symbols)
-                            else None
-                        ),
-                        # The occupation carries no Cl, but the relaxed parent
-                        # does, and the ranking needs it to tell an open
-                        # coordination slot from one a ligand already fills.
-                        parent_ligand_coordinates=np.asarray(
-                            [
-                                point
-                                for symbol, point in zip(
-                                    parent.symbols, parent.coordinates
-                                )
-                                if symbol == spec.precursor.ligand
-                            ],
-                            dtype=float,
-                        ).reshape(-1, 3),
-                        ligand_bond_length=ligand_bond,
-                        ztype_units=ztype_units,
+                    # Enumerated by _zb_parent_work, one task per parent; the
+                    # dedup and catalog merge below stay serial and in order.
+                    kids = (
+                        work.children.get((s, p_m), []) if work is not None else []
                     )
                     kept_kids = []
                     for kid in kids:

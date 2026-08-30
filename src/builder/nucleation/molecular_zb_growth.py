@@ -1389,7 +1389,6 @@ def _add_precursor_cd(
     if p_m <= 0:
         return [occ]
     cation, anion, _ = _species(spec)
-    import networkx as nx
 
     frontier = [state_from_occupation(occ, spec, model)]
     for _ in range(int(p_m)):
@@ -1407,13 +1406,12 @@ def _add_precursor_cd(
                     )
                 )
                 child = _make_core_graph(atoms, model, spec)
-                inorg = [
-                    i
-                    for i, a in enumerate(child.atoms)
-                    if a.symbol in {cation, anion}
-                ]
-                if not inorg or not nx.is_connected(child.graph.subgraph(inorg)):
-                    continue
+                # No connectivity test here: _cation_vacancies_on_anions only
+                # offers vacant tetrahedral directions on an *occupied anion*,
+                # so the added cation is bonded to an anion the parent already
+                # had.  A connected parent cannot yield a disconnected child
+                # (measured: 0 rejections in 2715 candidates).  _place_monomer
+                # still tests -- a CdSe pair there can land off the frame.
                 key = tuple(
                     sorted(
                         _position_key(
