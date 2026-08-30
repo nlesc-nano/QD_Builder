@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from builder.nucleation.molecular_growth import GrowthLog
+from builder.nucleation.molecular_growth import GrowthLog, _zb_motif_bin_done
 from builder.nucleation.molecular_zb_growth import (
     lattice_k1_occupation,
     lattice_model,
@@ -125,6 +125,17 @@ def test_job_status_labels() -> None:
     assert kind == "failed"
     assert cause == "artifact:Cl-Se"
     assert short_fail_cause([], "abnormal termination of xtb") == "gxtb_abort"
+
+
+def test_zb_motif_bin_done_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "zb_motifs.jsonl"
+    path.write_text(
+        '{"bin": "k007_p009", "k": 7, "p": 9}\n',
+        encoding="utf-8",
+    )
+    assert _zb_motif_bin_done(tmp_path, 7, 9)
+    assert not _zb_motif_bin_done(tmp_path, 7, 10)
+    assert not _zb_motif_bin_done(tmp_path, 6, 9)
 
 
 def test_growth_log_status_column(tmp_path: Path, capsys) -> None:

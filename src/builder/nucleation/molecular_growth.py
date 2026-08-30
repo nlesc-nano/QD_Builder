@@ -4801,6 +4801,7 @@ def run_growth_step(
       * skip finished k-step if ``.step_kXXX_complete`` exists
       * skip move-B opts already in ``index.csv`` / ``*_xtb.xyz``
       * skip move-A bins with ``.bin_A_complete`` marker (reload ranks from index)
+      * skip move-Z bins already listed in ``zb_motifs.jsonl`` (bin finished)
     """
 
     log = progress if isinstance(progress, GrowthLog) else None
@@ -5098,6 +5099,7 @@ def run_growth_step(
                 child_minima=child_minima,
                 bin_ranks=bin_ranks,
                 zb_stats=result.zb_stats,
+                resume=resume,
             )
 
         if log and window.move_zb_sites:
@@ -5491,6 +5493,35 @@ def bin_A_complete_marker(output_dir: Path, k: int, p: int) -> Path:
     return Path(output_dir) / f"k{int(k):03d}" / f"p{int(p):03d}" / ".bin_A_complete"
 
 
+def _zb_motif_bin_done(output_dir: Path, k: int, p: int) -> bool:
+    """True when ``zb_motifs.jsonl`` already has this (k, p) bin.
+
+    That record is written only after the bin's g-xTB jobs finish, so it is
+    the Move Z checkpoint.  An interrupted bin (freeze/opt in flight) is
+    not listed and will be opted again.
+    """
+
+    path = Path(output_dir) / "zb_motifs.jsonl"
+    if not path.is_file():
+        return False
+    want = f"k{int(k):03d}_p{int(p):03d}"
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(rec.get("bin") or "") == want:
+            return True
+        try:
+            if int(rec.get("k", -1)) == int(k) and int(rec.get("p", -1)) == int(p):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _parse_energy_from_xyz_comment(path: Path) -> Optional[float]:
     """Read energy_eV=... from the second line of an XYZ if present."""
 
@@ -5583,10 +5614,12 @@ def _load_ranked_from_disk(
                 continue
             move = (row.get("move") or "?").strip()
             if move_filter is not None and move != move_filter:
-                # move column: "coord" for B, often empty/1 for A
+                # move column: "coord" for B, "Z" for Move Z, often empty/1 for A
                 if move_filter == "B" and move not in ("coord", "B", "b"):
                     continue
-                if move_filter == "A" and move in ("coord", "B", "b"):
+                if move_filter == "Z" and move not in ("Z", "z"):
+                    continue
+                if move_filter == "A" and move in ("coord", "B", "b", "Z", "z"):
                     continue
             sid = (row.get("structure_id") or "").strip()
             try:
@@ -5595,7 +5628,12 @@ def _load_ranked_from_disk(
                 continue
             if not sid or not math.isfinite(e):
                 continue
-            gmove = "B" if move in ("coord", "B", "b") else "A"
+            if move in ("coord", "B", "b"):
+                gmove = "B"
+            elif move in ("Z", "z"):
+                gmove = "Z"
+            else:
+                gmove = "A"
             rows.append(
                 RankedIsomer(
                     structure_id=sid,
@@ -6604,6 +6642,7 @@ def _opt_zb_occupations(
     child_minima: Dict[Tuple[int, int], Dict[str, Any]],
     bin_ranks: Dict[Tuple[int, int], List[RankedIsomer]],
     zb_stats: Any = None,
+    resume: bool = True,
 ) -> None:
     """Decorate stored ZB occupations, anchor-embed, relax, and audit.
 
@@ -6678,6 +6717,27 @@ def _opt_zb_occupations(
         key: list(value) for key, value in zb_seeds.items()
     }
     for (k, p), occupations in sorted(zb_bins.items()):
+        if (
+            resume
+            and output_dir is not None
+            and _zb_motif_bin_done(Path(output_dir), k, p)
+        ):
+            ranks = _load_ranked_from_disk(
+                Path(output_dir), k, p, move_filter="Z"
+            )
+            if ranks:
+                bin_ranks[(k, p)] = ranks
+                best = min(ranks, key=lambda row: float(row.xtb_energy_eV))
+                child_minima[(k, p)] = {
+                    "energy_eV": float(best.xtb_energy_eV),
+                    "structure_id": best.structure_id,
+                }
+            if log:
+                log.line(
+                    f"RESUME: skip move Z k={k} p={p} "
+                    f"(zb_motifs.jsonl, {len(ranks)} index rows)"
+                )
+            continue
         injected: List[str] = []
         if getattr(growth, "zb_channel_b", True):
             from .zb_motifs import inject_missing_motifs
