@@ -1,0 +1,327 @@
+# BRANCH of growth.yaml -- do not use for production comparisons.
+#
+# Identical to growth.yaml except for parents.compact_rank_below_k below.
+# growth.yaml is frozen so that a run started under it is comparable end to
+# end; this file exists to test one hypothesis and must write to its own
+# --output.  Everything else -- envelope, shell budget, references, cuts --
+# is unchanged, so the only difference between the two runs is which parents
+# propagate below k=5.
+#
+# Readout:  PYTHONPATH=src python scripts/check_wulff_ancestry.py <output_dir>
+#
+# PRODUCTION envelope for the zb CdSe/CdCl2 growth, k = 1 -> 13.
+#
+# Frozen.  Settled against growth_k1_to_k5_zb5 (flat 250), zb6 (decay +1.20)
+# and bh_24c (basin hopping on).  Change this file only with a measurement
+# that says the current setting is wrong -- a run started under it should be
+# comparable end to end, which earlier runs were not.
+#
+# Cd CN = 4 rises with p (k=4 runs 10, 13, 18, 34, 44, 50% over p=1..6), but
+# that is mostly ligand decoration, not core quality, so it is not used as the
+# ranking target.  Within a bin, dE is.
+#
+# Known ceiling, not fixed here: with every Se at CN 4 the mean Cl denticity
+# needed for all-Cd-CN-4 is exactly 2.0; letting surface Se sit at CN 3 raises
+# it to (k + 4p) / 2p, which is 2.42 at k5p6 and needs mu3 chloride.  The k>=3
+# decorator (iter_cl_attachments_bridge_target) cannot emit mu3 at all, and
+# the observed denticity is 1.7-1.9.  That caps how far Cd CN = 4 can go.
+#
+#   python tools/run_molecular_growth.py \
+#     --pack-dir geometry_packs/cdse_cdcl2_zb \
+#     --growth growth.yaml \
+#     --parents /path/to/gxtb_cdse_target_k1k2_p1p5 \
+#     --k-from 1 --k-to 6 --p-parents all \
+#     --output /path/to/growth_prod_k1_to_k6
+#
+# Resume is on by default: same command, same --output.
+
+schema_version: 1
+name: cdse_growth_zb_k1k13
+
+monomer_p_values: [1, 2, 3]
+
+references:
+  method: g-xTB
+  energy_cdse_hartree: -2569.111491084828
+  energy_cdcl2_hartree: -1088.171326501977
+  energy_cdse_eV: -69909.0850929154
+  energy_cdcl2_eV: -29610.6502672544
+  package_cluster_eV:
+    1: -99522.586496
+    2: -129134.745316
+    3: -158746.985871
+
+surface:
+  # p_surf = floor(beta * k^(2/3)) + p_slack is the ligand capacity envelope.
+  #
+  # This is a smooth stand-in for an exact lattice quantity: the number of zb
+  # cation sites adjacent to at least one occupied Se, minus k.  That count is
+  # the true ceiling -- _cation_vacancies_on_anions only ever places precursor
+  # Cd on a cation vacancy that touches an anion, so a bin whose p exceeds it
+  # simply comes out empty.  No cap is needed to enforce it.
+  #
+  # The exact count on ideal compact cores, against this envelope:
+  #     k        1   2   3   4   5   8  10  13  19  25  38  55
+  #     exact    3   5   6   6   8  12  14  15  21  25  32  40
+  #     beta+1   3   5   6   7   8  11  13  15  20  24  31  40
+  # The k=13 cuboctahedron -- centre Se plus its 12 fcc neighbours, the first
+  # closed shell -- gives exactly 15, reproducing the Wulff anchor with no
+  # fitted parameter.  beta = 2.7 with p_slack = 1 tracks the exact count to
+  # +/-1 everywhere tested, so the envelope is kept as the cheap form of it.
+  #
+  # Real cores are not all compact, and elongated ones have more surface: the
+  # per-occupation count over growth_k1_to_k5_zb5 runs k2 5, k3 6-7, k4 6-9,
+  # k5 8-10, so p_slack = 2 would admit the elongated tail if wanted.
+  beta: 2.7
+  alpha: 1.0
+  p_slack: 1
+  # No hard ceiling on child p.
+  #
+  # A constant cannot be right here: what limits p is a surface quantity that
+  # grows with k, and the lattice already enforces its own exact bound (above).
+  # High-p bins are expensive rather than impossible -- in zb5 the failures are
+  # 88-95% core_changed with 0-2% fragmentation, i.e. intact structures that
+  # left the zb lattice -- so they belong in the budget allocation, not behind
+  # a cutoff.  Measured yield, for choosing how much wall to spend:
+  #     k3   p2 24%   p3 10%   p4 3.6%   p5 0.4%   p6 0%
+  #     k4   p2 14%   p3 11%   p4 2.1%   p5 1.2%   p6 0.2%   p7 0%
+  #     k5   p2 8.4%  p3 3.1%  p4 1.0%
+  max_p_child: 0
+
+parents:
+  energy_window_eV: 0.80
+  rank_by: energy
+  # EXPERIMENT.  Below this parent k, Move Z parents are ranked by compact ZB
+  # shape instead of relaxed g-xTB energy, and deduplicated on the anion
+  # backbone rather than on the coordination class.
+  #
+  # Why k=5.  Among parents actually used in growth_lattice_motifs_k1_to_k8,
+  # compactness predicts how many lattice-preserving children they go on to
+  # produce better than energy at k=3-4 (rho -0.24 / +0.08 against +0.18 /
+  # +0.30), and energy wins from k=5 (rho -0.51, -0.42, -0.34 at k=5,6,7).
+  # A k=4 fragment of a larger closed shell is a bare corner of that shell:
+  # strained, and mediocre on energy precisely because its payoff arrives
+  # later.  Energy ranking there fills the cap with well-relaxed small
+  # clusters and prunes the ancestors of the compact cuts.
+  #
+  # What it changes, measured on the k1-k8 run at k=4 p=6: the anion backbone
+  # of the k=13 Wulff core ranks 34/44 by energy and 2/329 by compactness,
+  # and goes from discarded to selected second.  At p=3 and p=4 it still
+  # misses the cap (ranks 9 and 12), so one of three carriers survives.
+  compact_rank_below_k: 5
+  max_skeletons_frac: 1.0
+  max_skeletons_cap: 10
+  decorations_per_skeleton: 2
+  min_p: 1
+  core_source: relaxed
+  bond_cutoffs: from_graph_rules
+
+shed:
+  mode: distance
+  max_shed: 2
+  prefer_low_shed: true
+  persist_wbo: true
+
+attach: local
+
+geometry:
+  start_from: relaxed_coords
+  place_monomer: embed_tables
+  clash_policy: soft
+  local_cleanup:
+    enabled: true
+    method: g-xTB
+    max_cycles: 25
+    freeze_core: true
+    opt_level: crude
+  require_charge_neutral_for_cleanup: true
+
+child:
+  redecorate: true              # pack decorate + embed.yaml on Z cores
+  redecorate_slack: false
+  full_opt: g-xTB
+  full_opt_cycles: 150
+
+moves:
+  graph: false
+  coord: false
+  zb_sites: true
+
+max_children_per_channel: 20
+
+# Per-(k, p) ceiling on the (occupation, ligand shell) pairs move Z sends to
+# geometry + g-xTB, spent best-shell-first and round-robin over occupations.
+# This is the only cap that does not grow with k: the per-channel cap is
+# multiplied by a channel count that widens as the lattice offers more sites.
+# Replaying the complete k1-k4 run: 150 shells keeps 47% of eligible endpoints
+# and 54% of within-bin minima for 0.34x the relaxations, but it misses the bin
+# winner at k4p4 (+0.44 eV) and finds nothing at k4p6.  250 is the knee -- 64%
+# of eligible, 67% of minima, 0.54x cost.  It also matters that the budget be
+# comfortably above the occupation count (k4p3 has 177): at 150 the round-robin
+# never gets past one shell per core, so the three bridge-count families that
+# bridge_target_count_window now generates are never sampled.
+zb_max_shells_per_bin: 400
+
+# After every (k, p) bin: log chairs / adamantane / T1 / T3 / two-cage on the
+# CIF occupations (not the relaxed XYZ).  Writes zb_motifs.jsonl and a
+# [growth] zb-motifs ... line.  STATUS missing:* means Channel B should have
+# injected that cut if the builder could construct it.
+zb_motif_log: true
+
+# Channel B: if a bin's generated occupations do not contain an expected ZB
+# unit (T1, chair, adamantane Cd6Se4, T3 Cd10Se4, two fused cages), inject
+# that CIF cut (padded with extra Cd to the bin p) before decorate/opt.
+zb_channel_b: true
+
+# Yield weighting: OFF.  Flat is the right shape, measured.
+#
+# The enumerator's own offer already tracks where the work is -- a bin with
+# many occupations offers many shells -- so a flat cap spends proportionally
+# and clamps only where there is genuinely too much.  Any p-dependent decay
+# fights that distribution and misallocates at both ends.  Measured over the
+# shells growth_k1_to_k5_zb6 offered:
+#     decay +1.20 gave k3p1 400 shells against an offer of 29, and k3p4 120
+#     against an offer of 468 -- waste at one end, starvation at the other.
+#     decay -0.60 makes the mirror error: 400 to k4p7, which offers 96, while
+#     k5p4 offers 1026 and gets 203.
+# zb5 (flat 250) beat zb6 (decay +1.20) on the bin minima for exactly this
+# reason, and those two runs differ in nothing else.
+#
+# Sizing, against the 8083 shells offered over k=1..5:
+#     cap 250 -> 3870 shells, 48% covered   (this was zb5)
+#     cap 400 -> 5435 shells, 67% covered
+#     cap 500 -> 6294 shells, 78% covered
+#     no cap  -> 8083 shells, 100%
+# 400 is the production choice: k1..k5 cost about 5 h on 24 cores, and the cap
+# still binds at large k, which is what stops the bin count exploding there.
+#
+# Extra shells are also the most efficient thing to buy.  Bins that lost
+# shells between zb5 and zb6 lost 0.985 eV of bin minimum for 1094 relaxations
+# saved -- 0.90 meV per relaxation.  Basin hopping returned 0.04 meV per
+# relaxation on the same run.  Spend on shells, not on search.
+zb_shell_budget_decay: 0.0
+zb_min_shells_per_bin: 0
+zb_shell_budget_ceiling: 0
+
+# Basin hopping: OFF, and not worth enabling.  Measured on
+# growth_k1_to_k5_bh_24c: 1560 g-xTB optimisations returned 0.04 meV per
+# relaxation, against 0.90 meV per relaxation for simply buying more ligand
+# shells (bins that lost shells between zb5 and zb6 lost 0.985 eV of bin
+# minimum for 1094 relaxations saved).  Shells are ~20x the better buy, so the
+# budget belongs in zb_max_shells_per_bin above.
+#
+# Note also what this stage is and is not: it runs at the *start* of the next
+# step, on parents already chosen by select_parents, groups by relaxed-minimum
+# basin rather than by skeleton, is capped at max_seeds_per_bin, and writes to
+# <output>/basin_hop/ only -- so a refined minimum can never become a bin
+# minimum or enter the index.  It refines what propagates; it does not search
+# a bin.
+#
+# Optional basin-hopping refinement of the parents of each growth step.
+#
+# It runs AFTER select_parents, so the ranking that chose those parents is
+# already fixed and refining a subset cannot bias it.  A walker may replace a
+# parent only with a minimum that keeps its Cd-Se core and passes the same
+# audits move Z applies -- otherwise it is a different lattice route, not a
+# better representative of this one.  Nothing under --parents is rewritten;
+# refinements land in <output>/basin_hop/.
+#
+# Measured on growth_k1_to_k4_zb3: from the k4p3 parents a walker reached
+# -368485.4973 eV, 0.181 eV below that bin's best and 0.071 eV below what the
+# wide-decoration run found with 3x the relaxations.  Cost is real -- roughly
+# max_seeds_per_bin x steps g-xTB per bin, so 8 x 50 = 400 against a bin's own
+# ~425 -- which is why it is opt-in.
+basin_hop:
+  enabled: false
+  min_k: 3              # k=2 bins already sample every shell
+  max_seeds_per_bin: 8
+  steps: 50             # first gains land at steps 4-21, nothing past ~45
+  moves: [shake, single_atom]   # surface_swap: 433 tries, 0 improvements
+  amplitude_A: 0.45
+  temperature_eV: 0.15
+  seed_by: minimum      # one walker per distinct basin, not per lowest energy
+  workers: 1
+
+lattice_switch:
+  enabled: false
+
+soft_rules:
+  enabled: false
+
+# A report-only comparison at k=13.  It never filters or ranks structures.
+endpoint_diagnostic:
+  enabled: true
+  k: 13
+  reference: k13_wulff_core.yaml
+  site_match_tolerance_A: 0.35
+
+# Consolidate g-xTB endpoints into relaxed basins before parent selection.
+# The test is invariant to translation, proper rotation, and permutations of
+# graph-equivalent atoms.  Raw XYZ/manifests are never deleted.
+minimum_consolidation:
+  enabled: true
+  energy_tolerance_eV: 0.01
+  pair_distance_rms_A: 0.05
+  core_rmsd_A: 0.10
+  full_rmsd_A: 0.15
+  max_displacement_A: 0.25
+  wbo_rms_tolerance: 0.15
+  require_wbo_when_available: false  # report WBO RMS; geometry/topology decide
+  allow_reflection: false
+  max_graph_mappings: 256
+  max_minima_per_occupation: 2
+  max_occupations_per_minimum: 0  # 0 = preserve every distinct ZB route
+
+by_k:
+  - k_min: 1
+    k_max: 1
+    monomer_p_values: [1, 2, 3]
+    max_shed: 2
+    energy_window_eV: 1.00
+    max_skeletons_cap: 12
+    decorations_per_skeleton: 1
+    min_p: 1
+    redecorate: true
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 20
+    p_slack: 1
+  - k_min: 2
+    k_max: 2
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.80
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 1
+    min_p: 1
+    redecorate: true
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+  - k_min: 3
+    k_max: 3
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.60
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 2
+    min_p: 2
+    redecorate: true
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+  - k_min: 4
+    k_max: 12
+    monomer_p_values: [1, 2]
+    max_shed: 2
+    energy_window_eV: 0.60
+    max_skeletons_cap: 8
+    decorations_per_skeleton: 2
+    min_p: 2
+    redecorate: true
+    moves: {graph: false, coord: false, zb_sites: true}
+    max_children_per_channel: 16
+    p_slack: 1
+
+chemical_potential:
+  enabled: true
+  delta_mu_cdcl2_eV: [-1.0, -0.5, 0.0, 0.5, 1.0]
