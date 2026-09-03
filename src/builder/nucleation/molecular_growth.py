@@ -372,6 +372,15 @@ class GrowthWindow:
     prefer_low_shed: bool
     max_opts_per_k: int
     min_p_parent: int = 1
+    #: Below this parent k, rank Move Z parents by compact ZB shape rather than
+    #: by relaxed g-xTB energy.  0 disables it, which is the historical
+    #: behaviour.  Measured on growth_lattice_motifs_k1_to_k8: among parents
+    #: that were actually used, compactness predicts how many lattice-preserving
+    #: children they go on to produce better than energy at k=3-4
+    #: (rho -0.24 / +0.08 against +0.18 / +0.30), and energy wins from k=5
+    #: (rho -0.51, -0.42, -0.34 at k=5,6,7).  The crossover at k=5 is why this
+    #: is a threshold and not a replacement.
+    compact_rank_below_k: int = 0
     #: Hard ceiling on the child p of any channel.  0 = only the p_surf
     #: envelope applies.  Measured over the k1-k4 zb run: yield collapses
     #: once p exceeds 3 -- k3p4 1.5%, k3p5 0.6%, k4p4 0.8%, k2p4 0.0%, which
@@ -492,6 +501,7 @@ class GrowthConfig:
     basin_hop: BasinHopStage = field(default_factory=BasinHopStage)
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
     min_p_parent: int = 1
+    compact_rank_below_k: int = 0
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
     endpoint_diagnostic_k: int = 0
     endpoint_reference: Optional[Path] = None
@@ -605,6 +615,9 @@ class GrowthConfig:
             min_p_parent=int(
                 overlay.get("min_p", overlay.get("min_p_parent", self.min_p_parent))
             ),
+            compact_rank_below_k=int(
+                overlay.get("compact_rank_below_k", self.compact_rank_below_k)
+            ),
             lattice=self.lattice,
             soft_rules=soft,
         )
@@ -686,6 +699,9 @@ class GrowthConfig:
                 parents.get("decorations_per_skeleton", 2)
             ),
             min_p_parent=int(parents.get("min_p", parents.get("min_p_parent", 1))),
+            compact_rank_below_k=int(
+                parents.get("compact_rank_below_k", 0) or 0
+            ),
             shed_mode=shed_mode,
             max_shed=int(shed.get("max_shed", 2)),
             prefer_low_shed=bool(shed.get("prefer_low_shed", True)),
@@ -2200,6 +2216,7 @@ def refine_parents_with_basin_hop(
 def _select_zb_occupation_parents(
     group: Sequence[ParentStructure],
     win: "GrowthWindow",
+    spec: Optional[NucleationSpec] = None,
 ) -> List[ParentStructure]:
     """Select Move Z parents: lattice occupations, not rhombus XYZ.
 
@@ -2213,6 +2230,7 @@ def _select_zb_occupation_parents(
     """
 
     from .molecular_zb_growth import (
+        occupation_anion_skeleton_key,
         occupation_compactness_key,
         occupation_diversity_signature,
     )
@@ -2252,6 +2270,55 @@ def _select_zb_occupation_parents(
     n_keep = min(n_keep, len(reps))
     selected: List[ParentStructure] = []
     seen_shapes: set[Tuple[Any, ...]] = set()
+
+    # Below compact_rank_below_k the whole pool is ranked by compact ZB shape,
+    # preserved and collapsed routes alike.  At k <= 4 a fragment of a larger
+    # closed shell is a bare corner of that shell: strained, and mediocre on
+    # relaxed energy precisely because its payoff arrives later.  Energy
+    # ranking there fills the cap with well-relaxed small clusters and prunes
+    # the ancestors of the compact cuts -- measured on the k1-k8 run, the
+    # anion backbone of the k=13 Wulff core ranks 34th of 44 by energy at
+    # k=4 p=6 and 2nd by compactness, and its lineage dies at exactly that
+    # step.  From k=5 energy is the better predictor and takes over.
+    if 0 < int(win.compact_rank_below_k) and int(win.k_from) < int(
+        win.compact_rank_below_k
+    ):
+        ordered = sorted(
+            reps,
+            key=lambda item: (
+                occupation_compactness_key(item.zb_occupation)
+                if item.zb_occupation is not None
+                else (0, 0, 0.0, 0, item.structure_id)
+            ),
+        )
+        # Dedup on the anion backbone, not on the coordination class.  The
+        # point of this branch is to spend the cap on distinct backbones, and
+        # occupation_diversity_signature does not separate them: at k=4 p=6 it
+        # collides the second-most-compact cut with the first and drops it,
+        # which is how the Wulff ancestor was lost even under compact ranking.
+        anion = spec.core.anion if spec is not None else None
+        tolerance = float(getattr(spec, "site_tolerance", 0.2) or 0.2)
+        for item in ordered:
+            if len(selected) >= n_keep:
+                break
+            occ = item.zb_occupation
+            if occ is None:
+                signature: Any = ()
+            elif anion is not None:
+                signature = occupation_anion_skeleton_key(occ, anion, tolerance)
+            else:
+                signature = occupation_diversity_signature(occ)
+            if signature and signature in seen_shapes:
+                continue
+            selected.append(item)
+            seen_shapes.add(signature)
+        # Never return an empty selection merely because every shape collided.
+        for item in ordered:
+            if len(selected) >= n_keep:
+                break
+            if item not in selected:
+                selected.append(item)
+        return selected
 
     if preserved_reps:
         emin = min(float(item.energy_eV) for item in preserved_reps)
@@ -2315,7 +2382,7 @@ def select_parents(
             getattr(getattr(member, "zb_occupation", None), "symbols", None)
             for member in group
         ):
-            selected.extend(_select_zb_occupation_parents(group, win))
+            selected.extend(_select_zb_occupation_parents(group, win, spec))
             continue
         consolidation = growth.minimum_consolidation
 

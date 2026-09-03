@@ -1761,6 +1761,38 @@ def occupation_compactness_key(occupation: ZbOccupation) -> Tuple[Any, ...]:
     return _compactness_tuple(occupation) + (occupation.occupation_id,)
 
 
+def occupation_anion_skeleton_key(
+    occupation: ZbOccupation, anion: str, tolerance: float
+) -> str:
+    """Rigid-motion invariant identity of the anion sublattice alone.
+
+    The same 48-fold cubic canonical form used for ``occupation_id``, applied
+    to the anions only, so translated, rotated and mirrored copies of one
+    backbone collapse together while genuinely different backbones stay apart.
+
+    This is deliberately *not* ``occupation_diversity_signature``: that one is
+    a coordination class (degree histogram plus size buckets) and two cuts
+    with different anion backbones routinely share it -- fine for thinning
+    near-duplicates, useless for keeping backbones diverse.  A distance
+    multiset is not enough either: at k=4 the anion set is four points, six
+    distances, and distinct backbones collide.
+    """
+
+    points = np.asarray(
+        [
+            point
+            for symbol, point in zip(occupation.symbols, occupation.coordinates)
+            if symbol == anion
+        ],
+        dtype=float,
+    )
+    if not len(points):
+        return "0"
+    return _occupation_shape_certificate(
+        [str(anion)] * len(points), points, float(tolerance)
+    )
+
+
 def _cdcl_bond(pack: Any) -> float:
     if pack is None:
         return 2.50
