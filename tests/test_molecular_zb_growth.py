@@ -1086,3 +1086,173 @@ def test_load_parents_includes_offpath_lattice_occupation(
     assert loaded[0].zb_occupation is not None
     assert loaded[0].zb_occupation.occupation_id == occ.occupation_id
     assert loaded[0].energy_eV == pytest.approx(-12.5)
+
+
+def test_select_parents_compact_rank_below_k(map_spec) -> None:
+    from builder.nucleation.molecular_zb_growth import (
+        ensure_occupation_identity,
+        grow_zb_children,
+        lattice_k1_occupation,
+        lattice_model,
+        occupation_compactness_key,
+    )
+
+    model = lattice_model(map_spec)
+    seed = lattice_k1_occupation(map_spec, model, p=1)
+    assert seed is not None
+    kids = grow_zb_children(seed, s=0, p_m=1, spec=map_spec, model=model, cap=0)
+    assert len(kids) >= 2
+    for kid in kids:
+        ensure_occupation_identity(kid, model)
+
+    kids_by_compact = sorted(kids, key=occupation_compactness_key)
+    most_compact = kids_by_compact[0]
+    least_compact = kids_by_compact[-1]
+
+    def as_parent(occ, energy: float, tag: str) -> ParentStructure:
+        return ParentStructure(
+            k=occ.k,
+            p=occ.p,
+            structure_id=tag,
+            symbols=occ.symbols,
+            coordinates=occ.coordinates,
+            energy_eV=energy,
+            edges=occ.core_edges,
+            core_edges=occ.core_edges,
+            zb_occupation=occ,
+            topology_status="preserved",
+            propagation_eligible=True,
+        )
+
+    p_compact = as_parent(most_compact, energy=+5.0, tag="compact-high-e")
+    p_least = as_parent(least_compact, energy=-10.0, tag="loose-low-e")
+
+    # Baseline: energy ranking selects loose-low-e first
+    cfg_energy = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    cfg_energy.by_k = ()
+    cfg_energy.max_skeletons_cap = 1
+    cfg_energy.energy_window_eV = 20.0
+    sel_energy = select_parents([p_compact, p_least], cfg_energy, map_spec)
+    assert len(sel_energy) == 1
+    assert sel_energy[0].structure_id == "loose-low-e"
+
+    # With compact_rank_below_k = 5, compactness ranking selects compact-high-e
+    cfg_compact = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    cfg_compact.by_k = ()
+    cfg_compact.compact_rank_below_k = 5
+    cfg_compact.max_skeletons_cap = 1
+    sel_compact = select_parents([p_compact, p_least], cfg_compact, map_spec)
+    assert len(sel_compact) == 1
+    assert sel_compact[0].structure_id == "compact-high-e"
+
+
+def test_select_parents_reserved_compact_seats(map_spec) -> None:
+    ptsA = np.array([[0.0, 0.0, 0.0], [2.15, 2.15, 0.0], [2.15, 0.0, 2.15]], dtype=float)
+    ptsB = np.array([[0.0, 0.0, 0.0], [2.15, 2.15, 0.0], [4.30, 4.30, 0.0]], dtype=float)
+    ptsC = np.array([[0.0, 0.0, 0.0], [2.15, 2.15, 0.0], [6.45, 6.45, 0.0]], dtype=float)
+    occA = ZbOccupation(k=3, p=2, symbols=("Se", "Se", "Se"), coordinates=ptsA, core_edges=(), occupation_id="occA")
+    occB = ZbOccupation(k=3, p=2, symbols=("Se", "Se", "Se"), coordinates=ptsB, core_edges=(), occupation_id="occB")
+    occC = ZbOccupation(k=3, p=2, symbols=("Se", "Se", "Se"), coordinates=ptsC, core_edges=(), occupation_id="occC")
+
+    def as_parent(occ, energy: float, tag: str) -> ParentStructure:
+        return ParentStructure(
+            k=3,
+            p=2,
+            structure_id=tag,
+            symbols=occ.symbols,
+            coordinates=occ.coordinates,
+            energy_eV=energy,
+            edges=occ.core_edges,
+            core_edges=occ.core_edges,
+            zb_occupation=occ,
+            topology_status="preserved",
+            propagation_eligible=True,
+        )
+
+    # occC has lowest energy, occB second lowest, occA (most compact) has highest energy
+    p1 = as_parent(occA, energy=+10.0, tag="best-compact")
+    p2 = as_parent(occB, energy=-5.0, tag="mid-energy")
+    p3 = as_parent(occC, energy=-10.0, tag="best-energy")
+
+    # With cap=2 and reserved_compact_seats=0: p3 and p2 win by energy
+    cfg_std = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    cfg_std.by_k = ()
+    cfg_std.max_skeletons_cap = 2
+    cfg_std.energy_window_eV = 20.0
+    cfg_std.reserved_compact_seats = 0
+    sel_std = select_parents([p1, p2, p3], cfg_std, map_spec)
+    assert {item.structure_id for item in sel_std} == {"best-energy", "mid-energy"}
+
+    # With cap=2 and reserved_compact_seats=1:
+    # 1 seat for energy ("best-energy") + 1 seat reserved for compactness ("best-compact")
+    cfg_res = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    cfg_res.by_k = ()
+    cfg_res.max_skeletons_cap = 2
+    cfg_res.energy_window_eV = 20.0
+    cfg_res.reserved_compact_seats = 1
+    sel_res = select_parents([p1, p2, p3], cfg_res, map_spec)
+    assert {item.structure_id for item in sel_res} == {"best-energy", "best-compact"}
+
+
+def test_select_parents_cross_p_retention(map_spec) -> None:
+    from builder.nucleation.molecular_zb_growth import (
+        ensure_occupation_identity,
+        lattice_model,
+        occupation_anion_skeleton_key,
+    )
+
+    model = lattice_model(map_spec)
+    # Construct two different 3-anion geometries (triangle vs line)
+    ptsA = np.array([[0.0, 0.0, 0.0], [2.15, 2.15, 0.0], [2.15, 0.0, 2.15]], dtype=float)
+    ptsB = np.array([[0.0, 0.0, 0.0], [2.15, 2.15, 0.0], [4.30, 4.30, 0.0]], dtype=float)
+    occA = ZbOccupation(k=3, p=2, symbols=("Se", "Se", "Se"), coordinates=ptsA, core_edges=())
+    occB = ZbOccupation(k=3, p=2, symbols=("Se", "Se", "Se"), coordinates=ptsB, core_edges=())
+    ensure_occupation_identity(occA, model)
+    ensure_occupation_identity(occB, model)
+
+    assert occupation_anion_skeleton_key(occA, "Se", 0.2) != occupation_anion_skeleton_key(occB, "Se", 0.2)
+
+    def as_parent(occ, p: int, energy: float, tag: str) -> ParentStructure:
+        return ParentStructure(
+            k=3,
+            p=p,
+            structure_id=tag,
+            symbols=occ.symbols,
+            coordinates=occ.coordinates,
+            energy_eV=energy,
+            edges=occ.core_edges,
+            core_edges=occ.core_edges,
+            zb_occupation=occ,
+            topology_status="preserved",
+            propagation_eligible=True,
+        )
+
+    # In lean bin (p=2), occB has lower energy (-10) than occA (+5)
+    lean_winner = as_parent(occB, p=2, energy=-10.0, tag="lean-winner")
+    lean_dropped = as_parent(occA, p=2, energy=+5.0, tag="lean-dropped-target")
+
+    # In high-p bin (p=5), occA is present and selected
+    high_p_selected = as_parent(occA, p=5, energy=-10.0, tag="high-p-target")
+
+    # Baseline with cross_p_retention=False: lean_dropped is NOT selected in lean bin
+    cfg = GrowthConfig.from_yaml(PACK_ZB / "growth.yaml")
+    cfg.by_k = ()
+    cfg.max_skeletons_cap = 1
+    cfg.energy_window_eV = 20.0
+    cfg.cross_p_retention = False
+    sel = select_parents([lean_winner, lean_dropped, high_p_selected], cfg, map_spec)
+    sel_ids = {item.structure_id for item in sel}
+    assert "lean-winner" in sel_ids
+    assert "high-p-target" in sel_ids
+    assert "lean-dropped-target" not in sel_ids
+
+    # With cross_p_retention=True: occA survived at high-p (p=5), so lean_dropped is rescued
+    cfg.cross_p_retention = True
+    sel_cross = select_parents(
+        [lean_winner, lean_dropped, high_p_selected], cfg, map_spec
+    )
+    sel_cross_ids = {item.structure_id for item in sel_cross}
+    assert "lean-winner" in sel_cross_ids
+    assert "high-p-target" in sel_cross_ids
+    assert "lean-dropped-target" in sel_cross_ids
+

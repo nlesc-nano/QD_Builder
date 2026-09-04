@@ -381,6 +381,13 @@ class GrowthWindow:
     #: (rho -0.51, -0.42, -0.34 at k=5,6,7).  The crossover at k=5 is why this
     #: is a threshold and not a replacement.
     compact_rank_below_k: int = 0
+    #: Number of parent slots strictly reserved for the most compact ZB anion
+    #: backbones (using occupation_compactness_key), deduplicated on the
+    #: canonical anion skeleton key.  0 disables it.
+    reserved_compact_seats: int = 0
+    #: Whether to retain distinct anion backbones across different p values
+    #: at the same k (e.g. backbones stabilized at high p rescued in lean bins).
+    cross_p_retention: bool = False
     #: Hard ceiling on the child p of any channel.  0 = only the p_surf
     #: envelope applies.  Measured over the k1-k4 zb run: yield collapses
     #: once p exceeds 3 -- k3p4 1.5%, k3p5 0.6%, k4p4 0.8%, k2p4 0.0%, which
@@ -502,6 +509,8 @@ class GrowthConfig:
     delta_mu_cdcl2_eV: Tuple[float, ...] = ()
     min_p_parent: int = 1
     compact_rank_below_k: int = 0
+    reserved_compact_seats: int = 0
+    cross_p_retention: bool = False
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
     endpoint_diagnostic_k: int = 0
     endpoint_reference: Optional[Path] = None
@@ -618,6 +627,14 @@ class GrowthConfig:
             compact_rank_below_k=int(
                 overlay.get("compact_rank_below_k", self.compact_rank_below_k)
             ),
+            reserved_compact_seats=int(
+                overlay.get(
+                    "reserved_compact_seats", self.reserved_compact_seats
+                )
+            ),
+            cross_p_retention=bool(
+                overlay.get("cross_p_retention", self.cross_p_retention)
+            ),
             lattice=self.lattice,
             soft_rules=soft,
         )
@@ -701,6 +718,15 @@ class GrowthConfig:
             min_p_parent=int(parents.get("min_p", parents.get("min_p_parent", 1))),
             compact_rank_below_k=int(
                 parents.get("compact_rank_below_k", 0) or 0
+            ),
+            reserved_compact_seats=int(
+                parents.get("reserved_compact_seats", 0) or 0
+            ),
+            cross_p_retention=bool(
+                parents.get(
+                    "cross_p_retention",
+                    raw.get("cross_p_retention", False),
+                )
             ),
             shed_mode=shed_mode,
             max_shed=int(shed.get("max_shed", 2)),
@@ -2320,6 +2346,73 @@ def _select_zb_occupation_parents(
                 selected.append(item)
         return selected
 
+    n_res = (
+        min(int(getattr(win, "reserved_compact_seats", 0) or 0), n_keep // 2)
+        if n_keep > 1
+        else 0
+    )
+    if n_res > 0:
+        anion = spec.core.anion if spec is not None else None
+        tolerance = float(getattr(spec, "site_tolerance", 0.2) or 0.2)
+        n_std = n_keep - n_res
+
+        if preserved_reps:
+            emin = min(float(item.energy_eV) for item in preserved_reps)
+            windowed = [
+                item
+                for item in preserved_reps
+                if float(item.energy_eV) <= emin + win.energy_window_eV
+            ] or [min(preserved_reps, key=lambda item: float(item.energy_eV))]
+            windowed.sort(
+                key=lambda item: (float(item.energy_eV), item.structure_id)
+            )
+            for item in windowed:
+                if len(selected) >= n_std:
+                    break
+                selected.append(item)
+                occ = item.zb_occupation
+                if occ is not None:
+                    if anion is not None:
+                        seen_shapes.add(
+                            occupation_anion_skeleton_key(
+                                occ, anion, tolerance
+                            )
+                        )
+                    else:
+                        seen_shapes.add(occupation_diversity_signature(occ))
+
+        remaining_reps = [item for item in reps if item not in selected]
+        remaining_reps.sort(
+            key=lambda item: (
+                occupation_compactness_key(item.zb_occupation)
+                if item.zb_occupation is not None
+                else (0, 0, 0.0, 0, item.structure_id)
+            )
+        )
+        for item in remaining_reps:
+            if len(selected) >= n_keep:
+                break
+            occ = item.zb_occupation
+            if occ is None:
+                sig: Any = ()
+            elif anion is not None:
+                sig = occupation_anion_skeleton_key(occ, anion, tolerance)
+            else:
+                sig = occupation_diversity_signature(occ)
+            if sig and sig in seen_shapes:
+                continue
+            selected.append(item)
+            if sig:
+                seen_shapes.add(sig)
+
+        if len(selected) < n_keep:
+            for item in remaining_reps:
+                if len(selected) >= n_keep:
+                    break
+                if item not in selected:
+                    selected.append(item)
+        return selected
+
     if preserved_reps:
         emin = min(float(item.energy_eV) for item in preserved_reps)
         windowed = [
@@ -2554,6 +2647,91 @@ def select_parents(
         for _fp, members in retained_buckets:
             members_sorted = sorted(members, key=_score)
             selected.extend(members_sorted[: win.decorations_per_skeleton])
+
+    # Cross-p backbone retention:
+    # If an anion backbone survived at high p (p >= 5, stabilized by ligand passivation)
+    # but was generated and unselected in a lean bin (p < 5), rescue at most one representative
+    # per missing backbone in that lean bin.
+    has_cross_p = bool(
+        getattr(growth, "cross_p_retention", False)
+        or any(
+            getattr(growth.window_for(k), "cross_p_retention", False)
+            for (k, _p) in by_bin
+        )
+    )
+    if has_cross_p and spec is not None and getattr(spec, "core", None) is not None:
+        from .molecular_zb_growth import (
+            occupation_anion_skeleton_key,
+            occupation_compactness_key,
+        )
+
+        anion = spec.core.anion
+        tolerance = float(getattr(spec, "site_tolerance", 0.2) or 0.2)
+        if anion is not None:
+            by_k: Dict[int, List[ParentStructure]] = {}
+            for item in selected:
+                by_k.setdefault(item.k, []).append(item)
+            for k, k_selected in by_k.items():
+                win = growth.window_for(k)
+                if not (
+                    getattr(win, "cross_p_retention", False)
+                    or getattr(growth, "cross_p_retention", False)
+                ):
+                    continue
+                high_p_keys = {
+                    occupation_anion_skeleton_key(
+                        item.zb_occupation, anion, tolerance
+                    )
+                    for item in k_selected
+                    if item.p >= 5 and item.zb_occupation is not None
+                }
+                lean_p_keys = {
+                    occupation_anion_skeleton_key(
+                        item.zb_occupation, anion, tolerance
+                    )
+                    for item in k_selected
+                    if item.p < 5 and item.zb_occupation is not None
+                }
+                missing_in_lean = high_p_keys - lean_p_keys
+                if not missing_in_lean:
+                    continue
+
+                selected_ids = {item.structure_id for item in selected}
+                candidates_by_p: Dict[int, Dict[str, List[ParentStructure]]] = (
+                    defaultdict(lambda: defaultdict(list))
+                )
+                for item in parents:
+                    if (
+                        item.k == k
+                        and item.p < 5
+                        and item.structure_id not in selected_ids
+                        and item.zb_occupation is not None
+                    ):
+                        if (
+                            item.propagation_eligible
+                            or str(item.topology_status).lower() == "preserved"
+                        ):
+                            key = occupation_anion_skeleton_key(
+                                item.zb_occupation, anion, tolerance
+                            )
+                            if key in missing_in_lean:
+                                candidates_by_p[item.p][key].append(item)
+
+                for cp in sorted(candidates_by_p):
+                    for mkey in sorted(candidates_by_p[cp]):
+                        cands = candidates_by_p[cp][mkey]
+                        best = min(
+                            cands,
+                            key=lambda item: (
+                                occupation_compactness_key(item.zb_occupation)
+                                if item.zb_occupation is not None
+                                else (0, 0, 0.0, 0, item.structure_id)
+                            ),
+                        )
+                        selected.append(best)
+                        selected_ids.add(best.structure_id)
+                        lean_p_keys.add(mkey)
+
     return selected
 
 
