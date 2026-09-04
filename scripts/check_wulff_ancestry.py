@@ -72,10 +72,11 @@ def target_sub_skeletons(
 
 def built_skeletons(
     run_dir: Path, anion: str, tolerance: float
-) -> dict[int, set[str]]:
-    """Anion backbones the run actually produced, by k."""
+) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
+    """Anion backbones the run actually produced: all built vs preserved."""
 
-    out: dict[int, set[str]] = collections.defaultdict(set)
+    built: dict[int, set[str]] = collections.defaultdict(set)
+    preserved: dict[int, set[str]] = collections.defaultdict(set)
     path = run_dir / "zb_occupations.jsonl"
     if not path.is_file():
         raise SystemExit(f"missing {path}")
@@ -83,7 +84,8 @@ def built_skeletons(
         if not line.strip():
             continue
         try:
-            occupation = (json.loads(line).get("occupation") or {})
+            record = json.loads(line)
+            occupation = record.get("occupation") or {}
         except json.JSONDecodeError:
             continue
         k = occupation.get("k")
@@ -94,10 +96,16 @@ def built_skeletons(
         pts = coords[symbols == anion]
         if not len(pts):
             continue
-        out[int(k)].add(
-            _occupation_shape_certificate([anion] * len(pts), pts, tolerance)
+        cert = _occupation_shape_certificate([anion] * len(pts), pts, tolerance)
+        k_int = int(k)
+        built[k_int].add(cert)
+        is_preserved = bool(
+            record.get("propagation_eligible", False)
+            or str(record.get("topology_status", "")).lower() == "preserved"
         )
-    return out
+        if is_preserved:
+            preserved[k_int].add(cert)
+    return built, preserved
 
 
 def main() -> int:
@@ -121,28 +129,29 @@ def main() -> int:
         f"({(symbols != args.anion).sum()} cations)"
     )
 
-    built = built_skeletons(args.run_dir, args.anion, args.tolerance)
+    built, preserved = built_skeletons(args.run_dir, args.anion, args.tolerance)
     k_max = max(built) if built else len(target)
     anc = target_sub_skeletons(target, args.anion, args.tolerance, min(k_max, len(target)))
 
     print(f"\nrun {args.run_dir.name}")
-    print("   k | target sub-skeletons | built by run | ON THE ROAD")
+    print("   k | target sub-skeletons | built by run | on-road (built) | on-road (preserved)")
     lost_at = None
     for k in sorted(anc):
-        hit = anc[k] & built.get(k, set())
+        hit_built = anc[k] & built.get(k, set())
+        hit_pres = anc[k] & preserved.get(k, set())
         flag = ""
-        if not hit and lost_at is None and k > 1 and (anc[k - 1] & built.get(k - 1, set())):
+        if not hit_pres and lost_at is None and k > 1 and (anc[k - 1] & preserved.get(k - 1, set())):
             lost_at = k
-            flag = "  <-- lineage lost here"
+            flag = "  <-- preserved lineage lost here"
         print(
             f"  {k:2} | {len(anc[k]):20} | {len(built.get(k, set())):12} |"
-            f" {len(hit):11}{flag}"
+            f" {len(hit_built):15} | {len(hit_pres):19}{flag}"
         )
     if lost_at is None and anc:
-        alive = max(k for k in sorted(anc) if anc[k] & built.get(k, set()))
-        print(f"\nlineage still alive at k={alive}")
+        alive = max(k for k in sorted(anc) if anc[k] & preserved.get(k, set()))
+        print(f"\npreserved lineage still alive at k={alive}")
     else:
-        print(f"\nlineage lost at k={lost_at}")
+        print(f"\npreserved lineage lost at k={lost_at}")
     return 0
 
 
