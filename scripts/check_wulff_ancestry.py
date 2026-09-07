@@ -99,10 +99,9 @@ def built_skeletons(
         cert = _occupation_shape_certificate([anion] * len(pts), pts, tolerance)
         k_int = int(k)
         built[k_int].add(cert)
-        is_preserved = bool(
-            record.get("propagation_eligible", False)
-            or str(record.get("topology_status", "")).lower() == "preserved"
-        )
+        clean = record.get("chemically_ok", not record.get("violations", []))
+        is_preserved = bool(clean and record.get("xtb_converged", False)
+                            and str(record.get("topology_status", "")).lower() == "preserved")
         if is_preserved:
             preserved[k_int].add(cert)
     return built, preserved
@@ -118,6 +117,9 @@ def main() -> int:
     )
     ap.add_argument("--anion", default="Se")
     ap.add_argument("--tolerance", type=float, default=0.2)
+    ap.add_argument("--target-p", type=int, default=None)
+    ap.add_argument("--max-shed", type=int, default=2)
+    ap.add_argument("--min-incoming-p", type=int, default=1)
     args = ap.parse_args()
 
     raw = yaml.safe_load(args.reference.read_text(encoding="utf-8")) or {}
@@ -132,9 +134,29 @@ def main() -> int:
     built, preserved = built_skeletons(args.run_dir, args.anion, args.tolerance)
     k_max = max(built) if built else len(target)
     anc = target_sub_skeletons(target, args.anion, args.tolerance, min(k_max, len(target)))
+    target_p = args.target_p if args.target_p is not None else int((symbols != args.anion).sum()-len(target))
+    reachable = collections.defaultdict(set)
+    selected = collections.defaultdict(set)
+    selected_ids = set()
+    for path in sorted(args.run_dir.glob("growth_parents_k???_to_k???.json")):
+        selected_ids.update(r['structure_id'] for r in json.loads(path.read_text()) if r.get('structure_id'))
+    with (args.run_dir/'zb_occupations.jsonl').open() as fh:
+        for line in fh:
+            try: record=json.loads(line)
+            except ValueError: continue
+            o=record.get('occupation') or {}; k=int(o.get('k',0))
+            if k not in anc: continue
+            pts=np.asarray(o['lattice_coordinates'])[np.asarray(o['symbols'])==args.anion]
+            key=_occupation_shape_certificate([args.anion]*len(pts),pts,args.tolerance)
+            if key not in anc[k]: continue
+            clean=record.get('chemically_ok',not record.get('violations',[]))
+            if not (clean and record.get('xtb_converged') and record.get('topology_status')=='preserved'): continue
+            bound=target_p+(len(target)-k)*(args.max_shed-args.min_incoming_p)
+            if int(o['p'])<=bound:reachable[k].add(key)
+            if record.get('structure_id') in selected_ids:selected[k].add(key)
 
     print(f"\nrun {args.run_dir.name}")
-    print("   k | target sub-skeletons | built by run | on-road (built) | on-road (preserved)")
+    print("   k | target sub-skeletons | evaluated | compatible | clean+converged | p-reachable | selected")
     lost_at = None
     for k in sorted(anc):
         hit_built = anc[k] & built.get(k, set())
@@ -144,14 +166,16 @@ def main() -> int:
             lost_at = k
             flag = "  <-- preserved lineage lost here"
         print(
-            f"  {k:2} | {len(anc[k]):20} | {len(built.get(k, set())):12} |"
-            f" {len(hit_built):15} | {len(hit_pres):19}{flag}"
+            f"  {k:2} | {len(anc[k]):20} | {len(built.get(k, set())):9} |"
+            f" {len(hit_built):10} | {len(hit_pres):15} | {len(reachable[k]):11} | {len(selected[k]):8}{flag}"
         )
     if lost_at is None and anc:
-        alive = max(k for k in sorted(anc) if anc[k] & preserved.get(k, set()))
-        print(f"\npreserved lineage still alive at k={alive}")
+        alive = max((k for k in sorted(anc) if anc[k] & preserved.get(k, set())), default=None)
+        print(f"\nlast compatible clean/converged backbone: k={alive}")
     else:
         print(f"\npreserved lineage lost at k={lost_at}")
+    print("Per-size compatibility is necessary, not proof of an uninterrupted selected-parent path.")
+    print("Empty selected catalogs may reflect overwritten resume metadata; generated-but-unrelaxed candidates are not counted.")
     return 0
 
 
