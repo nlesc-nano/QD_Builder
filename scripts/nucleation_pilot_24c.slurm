@@ -39,7 +39,7 @@ export OMP_STACKSIZE=1G
 ulimit -s unlimited
 
 ROOT=${QD_ROOT:-/scratch/iinfante/escience/QD_Builder}
-SEEDS=${QD_SEEDS:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/new_generator/runs/gxtb_cdse_target_k1k2_p1p5}
+SEEDS=${QD_SEEDS:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/runs/gxtb_cdse_target_k1k2_p1p5}
 OUT=${QD_OUT:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_pilot_v1}
 CONFIG="$ROOT/geometry_packs/cdse_cdcl2_zb/pilot.yaml"
 PACK="$ROOT/geometry_packs/cdse_cdcl2_zb"
