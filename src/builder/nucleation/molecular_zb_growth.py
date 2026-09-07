@@ -62,6 +62,8 @@ class ZbOccupation:
     #: geminal_bridge, borrowed, or empty when s = 0 / unrestricted.
     shed_kind: str = ""
     shed_se_wbo: float = 0.0
+    identity_aliases: Tuple[str, ...] = ()
+    shed_ligand_indices: Tuple[int, ...] = ()
 
 
 def _site_id(symbol: str, point: Sequence[float], tolerance: float) -> str:
@@ -72,47 +74,48 @@ def _site_id(symbol: str, point: Sequence[float], tolerance: float) -> str:
 def _occupation_shape_certificate(
     symbols: Sequence[str], coordinates: np.ndarray, tolerance: float
 ) -> str:
-    """Rigid-motion and atom-order invariant certificate for a lattice site set.
+    """Translation/order/cubic-symmetry invariant integer site-offset key.
 
-    The complete, element-labelled distance graph distinguishes spatial lattice
-    occupations that share the same nearest-neighbour Cd--Se graph.  It also
-    merges translated, rotated, and reflected copies of the same finite ZB
-    fragment, which is the symmetry reduction Move Z needs.
+    Remove the occupied anchor BEFORE quantization. Rounding absolute points
+    first made translated copies acquire different identities (schema <= 2).
+    General rotations are deliberately not part of a lattice-site identity.
     """
 
     from itertools import permutations, product
 
     points = np.asarray(coordinates, dtype=float)
     scale = max(float(tolerance), 1.0e-6)
-    quantized = np.rint(points / scale).astype(np.int64)
+    if not len(points):
+        return hashlib.sha256(b"()").hexdigest()[:24]
     canonical: Optional[Tuple[Tuple[Any, ...], ...]] = None
     # Cubic ZB symmetry is a subset of signed axis permutations.  Including
     # all 48 also merges mirror partners, which are energetically equivalent
     # in this achiral composition.  A deterministic occupied anchor removes
     # translation without throwing away the actual site arrangement.
     for axes in permutations(range(3)):
-        permuted = quantized[:, axes]
+        permuted = points[:, axes]
         for signs in product((-1, 1), repeat=3):
             transformed = permuted * np.asarray(signs, dtype=np.int64)
             anchor_index = min(
                 range(len(symbols)),
                 key=lambda index: (
                     str(symbols[index]),
-                    int(transformed[index, 0]),
-                    int(transformed[index, 1]),
-                    int(transformed[index, 2]),
+                    round(float(transformed[index, 0]), 8),
+                    round(float(transformed[index, 1]), 8),
+                    round(float(transformed[index, 2]), 8),
                 ),
             )
             anchor = transformed[anchor_index]
+            offsets = np.rint((transformed - anchor) / scale).astype(np.int64)
             rows = tuple(
                 sorted(
                     (
                         str(symbol),
-                        int(point[0] - anchor[0]),
-                        int(point[1] - anchor[1]),
-                        int(point[2] - anchor[2]),
+                        int(point[0]),
+                        int(point[1]),
+                        int(point[2]),
                     )
-                    for symbol, point in zip(symbols, transformed)
+                    for symbol, point in zip(symbols, offsets)
                 )
             )
             if canonical is None or rows < canonical:
@@ -144,6 +147,9 @@ def ensure_occupation_identity(
 
 def occupation_to_record(occupation: ZbOccupation) -> Dict[str, Any]:
     return {
+        "identity_version": 3,
+        "identity_aliases": list(occupation.identity_aliases),
+        "shed_ligand_indices": list(occupation.shed_ligand_indices),
         "occupation_id": occupation.occupation_id,
         "parent_occupation_ids": list(occupation.parent_occupation_ids),
         "parent_structure_ids": list(occupation.parent_structure_ids),
@@ -188,6 +194,8 @@ def occupation_from_record(record: Dict[str, Any]) -> ZbOccupation:
         notes=str(record.get("notes") or ""),
         shed_kind=str(record.get("shed_kind") or ""),
         shed_se_wbo=float(record.get("shed_se_wbo") or 0.0),
+        identity_aliases=tuple(record.get("identity_aliases", ())),
+        shed_ligand_indices=tuple(record.get("shed_ligand_indices", ())),
     )
 
 
@@ -1291,7 +1299,8 @@ def _compactness_from_core(
     graph = nx.Graph()
     graph.add_nodes_from(range(len(symbols)))
     graph.add_edges_from(core_edges)
-    n6 = sum(1 for cycle in nx.cycle_basis(graph) if len(cycle) == 6)
+    from .zb_motifs import _all_n_cycles
+    n6 = len(_all_n_cycles(graph, 6))
     degrees = [0] * len(symbols)
     for left, right in core_edges:
         degrees[left] += 1
@@ -1365,8 +1374,6 @@ def attach_cdse(
             continue
         ranked.append((_compactness_tuple(draft), draft))
     ranked.sort(key=lambda item: item[0])
-    if cap > 0:
-        ranked = ranked[: int(cap)]
     out: List[ZbOccupation] = []
     seen: set = set()
     for _key, draft in ranked:
@@ -1375,6 +1382,8 @@ def attach_cdse(
             continue
         seen.add(new.occupation_id)
         out.append(new)
+        if cap > 0 and len(out) >= cap:
+            break
     return out
 
 
@@ -1426,6 +1435,14 @@ def _add_precursor_cd(
                 nxt.append(child)
         if not nxt:
             return []
+        # Spend the frontier budget on distinct cubic occupations.
+        distinct = {}
+        for st in nxt:
+            draft = occupation_from_state(st, spec, model=model, k=occ.k,
+                                          p=sum(a.symbol == cation for a in st.atoms) - occ.k)
+            if draft is not None:
+                distinct.setdefault(draft.occupation_id, st)
+        nxt = list(distinct.values())
         if cap > 0 and len(nxt) > max(1, cap):
             nxt.sort(key=lambda st: _state_compactness_tuple(st, spec, model))
             nxt = nxt[: max(1, cap)]
@@ -1522,6 +1539,8 @@ def grow_zb_children(
         worst = max(assigned, key=lambda unit: unit.kind_rank)
         child.shed_kind = worst.kind
         child.shed_se_wbo = float(sum(unit.se_wbo for unit in assigned))
+        child.shed_ligand_indices = tuple(sorted({i - len(occ.symbols)
+                                                for unit in assigned for i in unit.cl}))
 
     n_keep = int(cap) if cap else 0
     # Explore a few compact attaches/pads per shed, then the final cap
@@ -1646,6 +1665,17 @@ def _growth_site_priority(
     ):
         ligands = np.asarray(parent_ligand_coordinates, dtype=float)
         reference = np.asarray(parent.coordinates, dtype=float)
+        dropped = set(child.shed_ligand_indices)
+        ligands = np.asarray([pt for i, pt in enumerate(ligands) if i not in dropped]).reshape(-1, 3)
+        if relaxed_parent_coordinates is not None:
+            relaxed = np.asarray(relaxed_parent_coordinates, dtype=float)
+            if relaxed.shape == reference.shape and len(reference) >= 2:
+                rc = relaxed - relaxed.mean(axis=0)
+                lc = reference - reference.mean(axis=0)
+                u, _, vt = np.linalg.svd(rc.T @ lc)
+                if np.linalg.det(u @ vt) < 0:
+                    u[:, -1] *= -1
+                ligands = (ligands - relaxed.mean(axis=0)) @ (u @ vt) + reference.mean(axis=0)
         cutoff = float(ligand_bond_length)
         for index in host_parent_indices:
             if index >= len(reference):

@@ -827,7 +827,8 @@ class ParentStructure:
     minimum_occupation_ids: Tuple[str, ...] = ()
     minimum_multiplicity: int = 1
     #: Move Z: unconstrained g-xTB topology vs the stored lattice occupation.
-    #: ``preserved`` means the relaxed XYZ is a ZB minimum; ``changed`` means
+    #: ``preserved`` means Cd-Se connectivity survived (not crystallinity);
+    #: ``changed`` means
     #: a molecular well (often a 4-ring) whose energy is still reported.
     topology_status: str = ""
     propagation_eligible: bool = True
@@ -3222,6 +3223,7 @@ def place_monomer_and_packages(
     p_m: int,
     spec: NucleationSpec,
     pack: Optional[GeometryPack] = None,
+    attach_host: Optional[int] = None,
 ) -> Tuple[Tuple[str, ...], FloatArray, EdgeList]:
     """Add CdSe monomer + ``p_m`` CdCl2 packages in 3D (embed-table distances).
 
@@ -3259,7 +3261,9 @@ def place_monomer_and_packages(
         core_cd = [i for i in cd_ids if len(neigh[i]) < max_cd] or cd_ids
     if not core_cd:
         raise ValueError("no Cd to attach monomer")
-    host = min(core_cd, key=lambda i: len(neigh[i]))
+    host = min(core_cd, key=lambda i: len(neigh[i])) if attach_host is None else int(attach_host)
+    if host not in cd_ids:
+        raise ValueError("attach_host must identify a Cd atom")
 
     # new Se along outward direction from host
     d = _outward_direction(xyz, host, neigh[host])
@@ -3863,13 +3867,8 @@ def _zb_parent_work(task: Tuple[Any, ...]) -> Tuple[str, _ZbParentWork]:
     core_feedback = np.asarray(parent.coordinates, dtype=float)[
         : len(zb_occ.symbols)
     ]
-    if (
-        not parent.propagation_eligible
-        or str(parent.topology_status).lower() == "changed"
-    ):
-        # Off-path XYZ is a molecular well; attach ranking uses the CIF
-        # occupation, Cl still from the formed shell.
-        core_feedback = np.asarray(zb_occ.coordinates, dtype=float)
+    # Keep the actual core frame: the ranking aligns core AND ligands jointly.
+    # Substituting ideal core coordinates here leaves the relaxed Cl unaligned.
     parent_wbo = (
         parent.wbo
         if tuple(parent.symbols[: len(zb_occ.symbols)]) == tuple(zb_occ.symbols)
@@ -7710,7 +7709,7 @@ def _opt_zb_occupations(
                 }
                 _append_zb_manifest(Path(output_dir), manifest_record)
 
-            if energy is None or not chemically_ok:
+            if energy is None or not chemically_ok or not xr.converged:
                 continue
             previous = child_minima.get((k, p))
             if previous is None or energy < float(previous["energy_eV"]):
