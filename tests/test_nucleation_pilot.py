@@ -12,6 +12,7 @@ from builder.nucleation.molecular_zb_growth import (
     _growth_site_priority,
 )
 from builder.nucleation.pilot import Pilot, PilotConfig, round_robin, select_population
+from builder.nucleation.adaptive import AdaptiveConfig, AdaptivePilot, lineage_family
 from builder.nucleation.pilot_proposals import (
     Proposal,
     bounded_shells,
@@ -276,7 +277,7 @@ def test_deadline_and_reaction_composition(tmp_path):
     pilot.evaluate([("shared", example())], 1)
     assert not pilot.calls
     parent = dict(example().record(), minimum_id="seed", role="primary")
-    for channel in ["growth", "exchange", "reconstruction"]:
+    for channel in ["growth", "exchange", "reconstruction", "topology"]:
         jobs = local_proposals(
             parent,
             np.random.default_rng(5),
@@ -289,6 +290,107 @@ def test_deadline_and_reaction_composition(tmp_path):
         for job in jobs:
             assert validate_composition(job)
             assert job.k == parent["k"] + (channel == "growth")
+
+
+def test_topology_moves_change_core_graph_and_preserve_formula(tmp_path):
+    pilot = make_pilot(tmp_path, lambda *args: [])
+    parent = dict(
+        k=2,
+        p=1,
+        symbols=["Se", "Se", "Cd", "Cd", "Cd", "Cl", "Cl"],
+        positions=[
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 2.6, 0.0],
+            [1.5, 0.0, 0.0],
+            [3.0, 2.6, 0.0],
+            [0.0, 4.9, 0.0],
+            [3.0, 4.9, 0.0],
+        ],
+        edges=[[0, 2], [0, 3], [1, 3], [1, 4], [2, 5], [4, 6]],
+        minimum_id="parent",
+        role="primary",
+    )
+    jobs = local_proposals(
+        parent,
+        np.random.default_rng(7),
+        pilot.spec,
+        pilot.pack,
+        channel="topology",
+        limit=6,
+    )
+    assert jobs
+    old_core = {
+        tuple(edge)
+        for edge in parent["edges"]
+        if {parent["symbols"][edge[0]], parent["symbols"][edge[1]]} == {"Cd", "Se"}
+    }
+    assert all(validate_composition(job) for job in jobs)
+    assert any(
+        {
+            tuple(edge)
+            for edge in job.edges
+            if {job.symbols[edge[0]], job.symbols[edge[1]]} == {"Cd", "Se"}
+        }
+        != old_core
+        for job in jobs
+    )
+
+
+def test_adaptive_archive_import_preserves_ids_without_self_routes(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    proposal = example()
+    row = dict(
+        proposal.record(),
+        structure_id=proposal.id,
+        minimum_id="minimum_source",
+        energy_eV=-10.0,
+        role="primary",
+        final=descriptors(proposal.symbols, proposal.edges, proposal.positions),
+        protocol="old-protocol",
+        source="old",
+        routes=["minimum_source", "seed:root"],
+        occupations=[],
+        occupation_origins=[],
+    )
+    (source / "minima.json").write_text(
+        json.dumps({"control": {}, "experimental": {"minimum_source": row}})
+    )
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=5,
+        stage_calls={1: 1, 2: 1, 3: 1},
+        family_slots={1: 1, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "adaptive",
+        backend=lambda *args: [],
+    )
+    pilot.setup()
+    pilot.initialize_source()
+    imported = pilot.rows["experimental"]["minimum_source"]
+    assert imported["routes"] == ["seed:root"]
+    assert imported["source_protocol"] == "old-protocol"
+    assert lineage_family(imported).startswith("family_")
+    resumed = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "adaptive",
+        backend=lambda *args: [],
+    )
+    resumed.setup()
+    assert list(resumed.rows["experimental"]) == ["minimum_source"]
 
 
 def test_round_robin_compositions():

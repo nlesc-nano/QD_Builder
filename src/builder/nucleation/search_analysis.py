@@ -226,7 +226,7 @@ class MinimumArchive:
         self.buckets = defaultdict(list)
         self.members = {}
 
-    def add(self, row, xyz):
+    def add(self, row, xyz, preferred_id=None):
         parent = as_parent(row, xyz)
         key = (row.get("protocol", ""), row["k"], row["p"], row["final"]["graph_hash"])
         for mid, members in self.buckets[key]:
@@ -239,7 +239,7 @@ class MinimumArchive:
                 members.append(parent)
                 self.members[mid].append(row["source"])
                 return mid, False
-        mid = "minimum_" + digest([key, row["source"]])[:20]
+        mid = preferred_id or "minimum_" + digest([key, row["source"]])[:20]
         self.buckets[key].append((mid, [parent]))
         self.members[mid] = [row["source"]]
         return mid, True

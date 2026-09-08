@@ -1,0 +1,38 @@
+version: 2
+chemistry_adapter: cdse_cdcl2
+seed: 314159
+workers: 24
+max_calls: 18000
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+
+# Phase A completes/backfills k=4--6.  B and C are gated extensions to k=7
+# and k=8.  A phase advances only after two consecutive discovery/energy
+# plateaus; reaching max_cycles without a plateau stops the workflow safely.
+phase_a_k: [4, 5, 6]
+phase_b_k: 7
+phase_c_k: 8
+stage_calls: {4: 1600, 5: 2400, 6: 3200, 7: 5000, 8: 5000}
+family_slots: {4: 80, 5: 120, 6: 150, 7: 160, 8: 160}
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11}
+p_states_per_family: 3
+geometries_per_family: 2
+
+min_cycles: 2
+max_cycles: 8
+convergence_patience: 2
+new_families_per_100_calls: 5.0
+energy_improvement_eV: 0.05
+proposals_per_family_fixed: 3
+proposals_per_family_growth: 6
+
+# Endpoint handling remains deliberately conservative.  Audit structures are
+# retained separately and their descendants remain a bounded minority.
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0

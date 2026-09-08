@@ -53,3 +53,20 @@ Repeat exactly the same command and output path to resume. Protocol fingerprints
 Compare arms at matched calls and worker cost, including rejection rates and family coverage, rather than interpreting one low energy as decisive. Electronic energies across different compositions require reservoir chemical potentials and thermal/solvation corrections before thermodynamic interpretation. Transition frequencies do not establish rates or barriers. Repeat a promising pilot with independent random seeds and validate representative minima at a higher electronic-structure level before expanding the search.
 
 The ancestry checker now distinguishes evaluated occupations, clean converged connectivity-preserving endpoints and selected parent catalogs. Compatible Se sub-backbones are a necessary condition for monotone lattice growth to the reference, not proof of a connected kinetic pathway or recoverable full Cd/Cl structure. Legacy IDs are retained as aliases in analysis; original result folders are not rewritten.
+
+## Automated lineage protocol: A → B → C
+
+The comparison pilot above remains frozen as an experiment. The follow-up runner is a separate adaptive protocol:
+
+```bash
+PYTHONPATH=src python tools/run_adaptive_nucleation.py \
+  --source /path/to/nucleation_pilot_v2 \
+  --output /path/to/nucleation_adaptive_abc_v1 \
+  --dry-run
+```
+
+Remove `--dry-run` to execute, or submit `scripts/nucleation_adaptive_abc_24c.slurm`. Phase A repeatedly applies fixed-composition topology changes, ligand exchange, coordinate reconstruction and k→k+1 backfill over k=4–6. Families, rather than individual low-energy geometries, are the survival unit. One lean/central/passivated p representative is rotated per family per cycle. Phase B grows and refines k=7; Phase C does the same at k=8. B and C remain locked until the preceding phase has both covered its retained families and shown two consecutive plateaus in new-family discovery and within-(k,p) energy improvement. Exhausting a k budget or the cycle limit is a halt, not false convergence.
+
+The default caps are in `geometry_packs/cdse_cdcl2_zb/adaptive_abc.yaml`. The run imports `minima.json` without charging old calculations, fingerprints that source, removes self-lineage loops, and journals every family plan, frozen proposal queue, backend reservation, result, cycle decision and phase gate. Resume uses the identical command and output. Summary state is written to `adaptive_assessment.json`; detailed state remains in `events.jsonl`, `minima.json` and `status.json`. The default 18,000-call ceiling is a safety cap; phase plateaus can stop substantially earlier.
+
+For a new system, the phase controller itself does not change. Set `chemistry_adapter` to a built-in name or `module:Class`. An adapter supplies bootstrap proposals, composition validation, endpoint classification, family identity/archive behavior, fixed-k graph moves and k-growth proposals; geometry and electronic-structure settings remain in the system pack. A completed minima archive can seed the protocol directly. A raw seed directory with `index.csv` is also supported when the adaptive config gives `seed_calls > 0`, a k=1 call cap, and a Phase A range beginning low enough to connect the seed sizes to the desired frontier. This separation automates the workflow, but it does not pretend that Cd/Se/Cl valences or reaction moves are transferable to unrelated chemistry: a chemically new model requires one tested adapter, after which no edits to the A/B/C scheduler are needed.
