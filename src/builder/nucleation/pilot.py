@@ -235,7 +235,6 @@ class Pilot:
         self.protocol = None
 
     def setup(self):
-        print("[pilot] validating executable, sources and seed data", flush=True)
         binary = shutil.which(self.settings.binary or "gxtb")
         if self._real_backend and not binary:
             raise RuntimeError(f"g-xTB executable not found: {self.settings.binary}")
@@ -303,11 +302,6 @@ class Pilot:
         else:
             self.atomic_json(path, self.protocol)
         self.replay()
-        print(
-            f"[pilot] protocol ready; resumed {sum(self.calls.values())} charged calls, "
-            f"{len(self.stage_done)} completed stages",
-            flush=True,
-        )
 
     @staticmethod
     def atomic_json(path, value):
@@ -362,10 +356,6 @@ class Pilot:
     def prepare_queue(self, arm, k, round_number, build):
         key = (arm, k, round_number)
         if key not in self.queues:
-            print(
-                f"[pilot] building queue arm={arm} k={k} round={round_number}",
-                flush=True,
-            )
             records = [p.record() for p in build()]
             self.event(
                 dict(
@@ -377,17 +367,6 @@ class Pilot:
                 )
             )
             self.queues[key] = records
-            print(
-                f"[pilot] queue ready arm={arm} k={k} round={round_number}: "
-                f"{len(records)} proposals",
-                flush=True,
-            )
-        else:
-            print(
-                f"[pilot] restored queue arm={arm} k={k} round={round_number}: "
-                f"{len(self.queues[key])} proposals",
-                flush=True,
-            )
         return [Proposal(**r) for r in self.queues[key]]
 
     def allowed(self, arm, stage):
@@ -561,11 +540,6 @@ class Pilot:
                 batch.append((arm, p))
             if not batch:
                 break
-            print(
-                f"[pilot] launching stage={stage} batch={len(batch)} "
-                f"charged_total={sum(self.calls.values())}",
-                flush=True,
-            )
 
             def one(task):
                 arm, p = task
@@ -580,12 +554,10 @@ class Pilot:
 
             with ThreadPoolExecutor(max_workers=self.config.workers) as pool:
                 results = list(pool.map(one, batch))
-            accepted = 0
             for (arm, p), (xr, seconds) in zip(batch, results):
                 self.last_audit = {}
                 row = self.classify(p, xr, arm)
                 if row:
-                    accepted += 1
                     row["minimum_id"], _ = self.store(arm, row)
                 self.event(
                     dict(
@@ -624,11 +596,6 @@ class Pilot:
                     )
                     tasks.appendleft((arm, retry))
             self.checkpoint()
-            print(
-                f"[pilot] finished stage={stage} batch={len(batch)} "
-                f"accepted={accepted} charged_total={sum(self.calls.values())}",
-                flush=True,
-            )
 
     def checkpoint(self):
         self.atomic_json(self.output / "minima.json", self.rows)
@@ -1016,7 +983,6 @@ class Pilot:
 
     def run(self):
         self.setup()
-        print("[pilot] search started", flush=True)
         # Recover launched jobs once, as explicit charged retries.
         for ev in list(self.events):
             if (
@@ -1111,15 +1077,10 @@ class Pilot:
                 break
         self.checkpoint()
         self.report()
-        print(
-            f"[pilot] search finished; charged calls={sum(self.calls.values())}",
-            flush=True,
-        )
 
     def mark_stage(self, arm, k, round_number):
         self.event(dict(event="stage_done", arm=arm, stage=k, round=round_number))
         self.stage_done.add((arm, k, round_number))
-        print(f"[pilot] completed arm={arm} k={k} round={round_number}", flush=True)
 
     def report(self):
         bins = defaultdict(dict)

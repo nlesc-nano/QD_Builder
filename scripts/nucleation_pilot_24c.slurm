@@ -44,7 +44,7 @@ ulimit -s unlimited
 
 ROOT=${QD_ROOT:-/scratch/iinfante/escience/QD_Builder}
 SEEDS=${QD_SEEDS:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/runs/gxtb_cdse_target_k1k2_p1p5}
-OUT=${QD_OUT:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_pilot_v2}
+OUT=${QD_OUT:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_pilot_v3}
 CONFIG="$ROOT/geometry_packs/cdse_cdcl2_zb/pilot.yaml"
 PACK="$ROOT/geometry_packs/cdse_cdcl2_zb"
 GROWTH="$PACK/growth_agnostic_k5.yaml"
