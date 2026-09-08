@@ -6,6 +6,8 @@
 #SBATCH --mem-per-cpu=2g
 #SBATCH --qos=regular
 #SBATCH --open-mode=append
+#SBATCH -o nucleation_pilot_%j.out
+#SBATCH -e nucleation_pilot_%j.err
 
 # Bounded k<=6 control/experimental nucleation pilot. The internal launch
 # cutoff is 46 h, leaving two hours inside this allocation for the final
@@ -23,9 +25,11 @@
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1
+echo "[launcher] entered job ${SLURM_JOB_ID} at $(date -Is) on $(hostname)"
 
 source /scicomp/builds/Rocky/8.7/Common/software/Mamba/23.11.0-0/etc/profile.d/conda.sh
 mamba activate qd-builder
+echo "[launcher] activated qd-builder with python $(command -v python)"
 
 export PATH="/scratch/iinfante/xtb/xtb-6.7.1/bin:$PATH"
 export XTBPATH="/scratch/iinfante/xtb/xtb-6.7.1/share/xtb"
@@ -46,9 +50,7 @@ PACK="$ROOT/geometry_packs/cdse_cdcl2_zb"
 GROWTH="$PACK/growth_agnostic_k5.yaml"
 
 export TMPDIR=${SLURM_TMPDIR:-/scratch/iinfante/tmp/nucleation_pilot_${SLURM_JOB_ID}}
-mkdir -p "$TMPDIR" "$OUT" "$OUT/logs"
-LOG="$OUT/logs/slurm_${SLURM_JOB_ID}.log"
-exec >> "$LOG" 2>&1
+mkdir -p "$TMPDIR" "$OUT"
 
 echo "[pilot] start $(date -Is), job ${SLURM_JOB_ID}, host $(hostname)"
 echo "[pilot] root=$ROOT"

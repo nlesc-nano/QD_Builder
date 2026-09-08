@@ -32,7 +32,7 @@ On the current HPC, the ready-to-submit launcher is `scripts/nucleation_pilot_24
 sbatch scripts/nucleation_pilot_24c.slurm
 ```
 
-Its defaults follow the existing `/scratch/iinfante` layout. Override a path without editing the script with `sbatch --export=ALL,QD_ROOT=/path/to/QD_Builder,QD_SEEDS=/path/to/seeds,QD_OUT=/path/to/output scripts/nucleation_pilot_24c.slurm`. Resubmission with the same code, inputs and output resumes; a per-output `flock` prevents two jobs from writing concurrently.
+Its defaults follow the existing `/scratch/iinfante` layout. Override a path without editing the script with `sbatch --export=ALL,QD_ROOT=/path/to/QD_Builder,QD_SEEDS=/path/to/seeds,QD_OUT=/path/to/output scripts/nucleation_pilot_24c.slurm`. Resubmission with the same code, inputs and output resumes; a per-output `flock` prevents two jobs from writing concurrently. SLURM writes `nucleation_pilot_JOBID.out` and `.err` in the directory from which `sbatch` is called. The output reports launcher entry, environment activation, queue construction and every backend batch.
 
 Defaults in `geometry_packs/cdse_cdcl2_zb/pilot.yaml`:
 
