@@ -388,7 +388,74 @@ def local_proposals(parent, rng, spec, pack, *, channel, limit=8):
         if validate_composition(proposal):
             out.append(proposal)
 
-    if channel == "reconstruction":
+    if channel == "topology":
+        # Deliberately change the Cd--Se graph before relaxation.  A coordinate
+        # perturbation alone almost always returns to the same local basin and
+        # therefore cannot repair a lineage search that has lost a core family.
+        # These are search moves, not claims about elementary reaction steps.
+        core = graph.subgraph(i for i, s in enumerate(sy) if s != "Cl").copy()
+        cd = [i for i, s in enumerate(sy) if s == "Cd"]
+        se = [i for i, s in enumerate(sy) if s == "Se"]
+        candidates = [(a, b) for a in cd for b in se if not core.has_edge(a, b)]
+        rng.shuffle(candidates)
+        core_degree = dict(core.degree)
+
+        def moved_coordinates(new_edges, removed=()):
+            trial = xyz.copy()
+            for a, b in new_edges:
+                # Move the cation part-way toward its new anion neighbour.  A
+                # full ideal-bond projection is too violent when ligands remain
+                # attached; 35% is enough to put the new basin in reach.
+                cation, anion = (a, b) if sy[a] == "Cd" else (b, a)
+                vector = trial[anion] - trial[cation]
+                distance = float(np.linalg.norm(vector))
+                if distance > 1e-8:
+                    trial[cation] += max(0.0, distance - 2.66) * 0.35 * vector / distance
+            touched = sorted({i for edge in list(new_edges) + list(removed) for i in edge})
+            if touched:
+                trial[touched] += np.clip(
+                    rng.normal(0.0, 0.12, (len(touched), 3)), -0.3, 0.3
+                )
+            return trial
+
+        # Ring closure / coordination increase.
+        for a, b in candidates:
+            if core_degree.get(a, 0) >= 4 or core_degree.get(b, 0) >= 4:
+                continue
+            changed = sorted(set(edges + [(min(a, b), max(a, b))]))
+            emit(sy, moved_coordinates([(a, b)]), changed, k, p)
+            if len(out) >= max(1, limit // 2):
+                break
+
+        # Bond migration/swap.  Keep the inorganic graph connected and both
+        # atom types coordinated; this supplies open-chain and ring-changing
+        # moves without enumerating all labelled graphs.
+        core_edges = list(core.edges)
+        rng.shuffle(core_edges)
+        for old_a, old_b in core_edges:
+            for new_a, new_b in candidates:
+                if {old_a, old_b} == {new_a, new_b}:
+                    continue
+                trial_core = core.copy()
+                trial_core.remove_edge(old_a, old_b)
+                trial_core.add_edge(new_a, new_b)
+                if not nx.is_connected(trial_core):
+                    continue
+                if any(trial_core.degree(i) == 0 or trial_core.degree(i) > 4 for i in trial_core):
+                    continue
+                changed = [e for e in edges if set(e) != {old_a, old_b}]
+                changed.append((min(new_a, new_b), max(new_a, new_b)))
+                emit(
+                    sy,
+                    moved_coordinates([(new_a, new_b)], [(old_a, old_b)]),
+                    changed,
+                    k,
+                    p,
+                )
+                break
+            if len(out) >= limit:
+                break
+    elif channel == "reconstruction":
         surface = [
             i for i, s in enumerate(sy) if s == "Cl" or graph.degree(i) < 4
         ] or list(graph)

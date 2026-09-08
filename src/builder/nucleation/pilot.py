@@ -234,6 +234,11 @@ class Pilot:
         self.elapsed_before = 0.0
         self.protocol = None
 
+    def extra_protocol_sources(self):
+        """Additional source hashes supplied by a protocol subclass."""
+
+        return {}
+
     def setup(self):
         binary = shutil.which(self.settings.binary or "gxtb")
         if self._real_backend and not binary:
@@ -247,6 +252,7 @@ class Pilot:
             str(p.relative_to(repo)): digest(p.read_text())
             for p in sorted((repo / "src/builder/nucleation").glob("*.py"))
         }
+        sources.update(self.extra_protocol_sources())
         seed_index = self.seed_dir / "index.csv"
 
         def file_hash(path):
@@ -260,6 +266,13 @@ class Pilot:
             str(p.relative_to(self.seed_dir)): file_hash(p)
             for p in sorted(self.seed_dir.rglob("*.xyz"))
         }
+        # Continuation protocols may import a completed pilot archive rather
+        # than a legacy XYZ/index corpus.  Its scientific contents are part of
+        # the immutable protocol fingerprint too.
+        for name in ("minima.json", "protocol.json", "status.json"):
+            candidate = self.seed_dir / name
+            if candidate.is_file():
+                seed_hashes[name] = file_hash(candidate)
         fingerprint = digest(
             dict(
                 config=asdict(self.config),
@@ -351,6 +364,14 @@ class Pilot:
                 self.stage_done.add((ev["arm"], ev["stage"], ev["round"]))
             elif kind == "queue":
                 self.queues[ev["arm"], ev["stage"], ev["round"]] = ev["proposals"]
+            elif kind == "archive_import":
+                for row in ev["rows"]:
+                    self.store(
+                        ev.get("arm", "experimental"),
+                        row,
+                        replay=True,
+                        preferred_id=row.get("minimum_id"),
+                    )
         self.events = valid
 
     def prepare_queue(self, arm, k, round_number, build):
@@ -387,9 +408,9 @@ class Pilot:
             >= self.config.launch_hours * 3600
         )
 
-    def store(self, arm, row, replay=False):
+    def store(self, arm, row, replay=False, preferred_id=None):
         row = dict(row)
-        mid, fresh = self.archive.add(row, row["positions"])
+        mid, fresh = self.archive.add(row, row["positions"], preferred_id=preferred_id)
         row["minimum_id"] = mid
         for target in ["control", "experimental"] if arm == "shared" else [arm]:
             if target == "control" and row["role"] == "audit":
@@ -397,7 +418,7 @@ class Pilot:
             old = self.rows[target].get(mid)
             if old:
                 old["routes"] = sorted(
-                    set(old.get("routes", []) + row.get("routes", []))
+                    set(old.get("routes", []) + row.get("routes", [])) - {mid}
                 )
                 # Preserve every ideal occupation mapping into this basin.
                 occupations = {
@@ -417,6 +438,7 @@ class Pilot:
                     row["occupation_origins"] = old["occupation_origins"]
                     self.rows[target][mid] = row.copy()
             else:
+                row["routes"] = sorted(set(row.get("routes", [])) - {mid})
                 self.rows[target][mid] = row.copy()
         return mid, fresh
 
@@ -505,6 +527,11 @@ class Pilot:
             converged=True,
         )
 
+    def proposal_valid(self, proposal):
+        """Chemistry hook used before any backend call."""
+
+        return validate_composition(proposal)
+
     def evaluate(self, tasks, stage):
         """Bounded deterministic batches; backend timing includes failed calls."""
         tasks = deque(tasks)
@@ -521,7 +548,7 @@ class Pilot:
                         + 1e-12
                     ):
                         continue
-                if not validate_composition(p):
+                if not self.proposal_valid(p):
                     raise ValueError("proposal composition mismatch")
                 self.event(
                     dict(
@@ -981,8 +1008,9 @@ class Pilot:
             counts[c] += 1
         return ordered
 
-    def run(self):
-        self.setup()
+    def recover(self):
+        """Recover charged interrupted calls and recorded max-cycle retries."""
+
         # Recover launched jobs once, as explicit charged retries.
         for ev in list(self.events):
             if (
@@ -1023,6 +1051,10 @@ class Pilot:
                     ],
                     ev["stage"],
                 )
+
+    def run(self):
+        self.setup()
+        self.recover()
         if ("shared", 1, 0) not in self.stage_done:
             self.evaluate(
                 [("shared", p) for p in self.prepare_queue("shared", 1, 0, self.seeds)],
