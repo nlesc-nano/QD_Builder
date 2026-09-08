@@ -28,7 +28,7 @@ export PYTHONUNBUFFERED=1
 echo "[launcher] entered job ${SLURM_JOB_ID} at $(date -Is) on $(hostname)"
 
 source /scicomp/builds/Rocky/8.7/Common/software/Mamba/23.11.0-0/etc/profile.d/conda.sh
-mamba activate qd-builder
+conda activate qd-builder
 echo "[launcher] activated qd-builder with python $(command -v python)"
 
 export PATH="/scratch/iinfante/xtb/xtb-6.7.1/bin:$PATH"
