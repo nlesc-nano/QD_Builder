@@ -77,7 +77,9 @@ def main():
                         initial_fraction=1.0 - config.admission_fraction,
                         admission_fraction=config.admission_fraction,
                         minimum_launched_cycles=config.minimum_launched_cycles,
+                        import_source_cohorts=config.import_source_cohorts,
                     ),
+                    phase_cycle_start=config.phase_cycle_start,
                     plateau=dict(
                         patience=config.convergence_patience,
                         new_families_per_100_calls=config.new_families_per_100_calls,

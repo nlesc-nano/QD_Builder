@@ -44,6 +44,8 @@ class AdaptiveConfig(PilotConfig):
     subfamilies_per_family: int = 2
     admission_fraction: float = 0.15
     minimum_launched_cycles: int = 2
+    import_source_cohorts: bool = False
+    phase_cycle_start: dict = field(default_factory=dict)
     enabled_phases: list = field(default_factory=lambda: ["A", "B", "C"])
     phase_a_k: list = field(default_factory=lambda: [4, 5, 6])
     phase_b_k: int = 7
@@ -79,6 +81,10 @@ class AdaptiveConfig(PilotConfig):
             for k, limits in value.operation_calls.items()
         }
         value.family_slots = {int(k): int(v) for k, v in value.family_slots.items()}
+        value.phase_cycle_start = {
+            str(phase): int(cycle)
+            for phase, cycle in value.phase_cycle_start.items()
+        }
         expected = list(range(1, value.phase_c_k + 1))
         if sorted(value.p_max) != expected:
             raise ValueError("p_max must cover every k through Phase C")
@@ -88,6 +94,11 @@ class AdaptiveConfig(PilotConfig):
             phase not in {"A", "B", "C"} for phase in value.enabled_phases
         ):
             raise ValueError("enabled_phases must contain A, B and/or C")
+        if any(
+            phase not in {"A", "B", "C"} or cycle < 0 or cycle >= value.max_cycles
+            for phase, cycle in value.phase_cycle_start.items()
+        ):
+            raise ValueError("phase_cycle_start requires valid phases and cycle indices")
         searched = set(value.phase_a_k if "A" in value.enabled_phases else [])
         if "B" in value.enabled_phases:
             searched.add(value.phase_b_k)
@@ -352,48 +363,123 @@ class AdaptivePilot(Pilot):
         }
 
     def initialize_source(self):
-        if any(event["event"] == "archive_import" for event in self.events):
+        imported = any(event["event"] == "archive_import" for event in self.events)
+        if not imported:
+            path = self.seed_dir / "minima.json"
+            if not path.is_file():
+                if not (self.seed_dir / "index.csv").is_file():
+                    raise ValueError("adaptive source requires minima.json or index.csv")
+                if 1 not in self.config.stage_limits() or self.config.seed_calls <= 0:
+                    raise ValueError(
+                        "bootstrap sources require seed_calls > 0 and a stage_calls entry for k=1"
+                    )
+                tag = "bootstrap"
+                if ("experimental", 1, tag) not in self.stage_done:
+                    queue = self.prepare_queue(
+                        "experimental", 1, tag, lambda: self.adapter.bootstrap(self)
+                    )
+                    self.evaluate(
+                        [("experimental", proposal) for proposal in queue], 1
+                    )
+                    if not self.expired():
+                        self.mark_stage("experimental", 1, tag)
+                return
+            data = json.loads(path.read_text())
+            source_rows = data.get("experimental") or data.get("control")
+            if not isinstance(source_rows, dict) or not source_rows:
+                raise ValueError("source minima.json has no usable minimum archive")
+            rows = []
+            for original_id, source in sorted(source_rows.items()):
+                row = dict(source)
+                row["minimum_id"] = original_id
+                row["source_protocol"] = row.get("protocol")
+                row["protocol"] = self.protocol["fingerprint"]
+                row["source"] = f"import:{original_id}"
+                row["routes"] = sorted(set(row.get("routes", [])) - {original_id})
+                rows.append(row)
+            event = dict(event="archive_import", arm="experimental", rows=rows)
+            self.event(event)
+            for row in rows:
+                self.store(
+                    "experimental", row, preferred_id=row["minimum_id"]
+                )
+            self.checkpoint()
+            print(f"[adaptive] imported {len(rows)} source minima", flush=True)
+        self._import_source_cohorts()
+
+    def _import_source_cohorts(self):
+        """Freeze selected family cohorts from an earlier adaptive archive.
+
+        Minima remain the authoritative structural source.  Only cohort
+        membership is transferred; calls, queues, plateau counters and phase
+        completion state deliberately start afresh in the new output.
+        """
+
+        if not self.config.import_source_cohorts or any(
+            event["event"] == "source_cohorts_imported" for event in self.events
+        ):
             return
-        path = self.seed_dir / "minima.json"
-        if not path.is_file():
-            if not (self.seed_dir / "index.csv").is_file():
-                raise ValueError("adaptive source requires minima.json or index.csv")
-            if 1 not in self.config.stage_limits() or self.config.seed_calls <= 0:
-                raise ValueError(
-                    "bootstrap sources require seed_calls > 0 and a stage_calls entry for k=1"
+        journal = self.seed_dir / "events.jsonl"
+        if not journal.is_file():
+            raise ValueError("import_source_cohorts requires source events.jsonl")
+        states = {}
+        with journal.open() as handle:
+            for line_number, line in enumerate(handle, start=1):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"invalid source events.jsonl line {line_number}"
+                    ) from exc
+                phase = event.get("phase")
+                k = event.get("k")
+                if event.get("event") == "cohort_initialized":
+                    states[phase, k] = list(event.get("families", []))
+                elif event.get("event") == "cohort_admission" and (phase, k) in states:
+                    states[phase, k].extend(event.get("families", []))
+
+        imported = {}
+        for phase in self.config.enabled_phases:
+            phase_ks = {
+                "A": self.config.phase_a_k,
+                "B": [self.config.phase_b_k],
+                "C": [self.config.phase_c_k],
+            }[phase]
+            for k in phase_ks:
+                if self._cohort_state(phase, k)[0] is not None:
+                    continue
+                families = list(dict.fromkeys(states.get((phase, k), [])))
+                if not families:
+                    raise ValueError(f"source has no {phase} k={k} cohort to import")
+                available = set(self._ranked_families(k)[0])
+                missing = [family for family in families if family not in available]
+                if missing:
+                    raise ValueError(
+                        f"source {phase} k={k} cohort has {len(missing)} families "
+                        "absent from imported minima"
+                    )
+                capacity = self.config.family_slots[k]
+                if len(families) > capacity:
+                    raise ValueError(
+                        f"source {phase} k={k} cohort size {len(families)} exceeds "
+                        f"configured capacity {capacity}"
+                    )
+                self.event(
+                    dict(
+                        event="cohort_initialized",
+                        phase=phase,
+                        k=k,
+                        cycle=self.config.phase_cycle_start.get(phase, 0),
+                        capacity=capacity,
+                        families=families,
+                        known_families=sorted(available),
+                        imported_from=str(self.seed_dir),
+                    )
                 )
-            tag = "bootstrap"
-            if ("experimental", 1, tag) not in self.stage_done:
-                queue = self.prepare_queue(
-                    "experimental", 1, tag, lambda: self.adapter.bootstrap(self)
-                )
-                self.evaluate(
-                    [("experimental", proposal) for proposal in queue], 1
-                )
-                if not self.expired():
-                    self.mark_stage("experimental", 1, tag)
-            return
-        data = json.loads(path.read_text())
-        source_rows = data.get("experimental") or data.get("control")
-        if not isinstance(source_rows, dict) or not source_rows:
-            raise ValueError("source minima.json has no usable minimum archive")
-        rows = []
-        for original_id, source in sorted(source_rows.items()):
-            row = dict(source)
-            row["minimum_id"] = original_id
-            row["source_protocol"] = row.get("protocol")
-            row["protocol"] = self.protocol["fingerprint"]
-            row["source"] = f"import:{original_id}"
-            row["routes"] = sorted(set(row.get("routes", [])) - {original_id})
-            rows.append(row)
-        event = dict(event="archive_import", arm="experimental", rows=rows)
-        self.event(event)
-        for row in rows:
-            self.store(
-                "experimental", row, preferred_id=row["minimum_id"]
-            )
+                imported[f"{phase}:k{k}"] = len(families)
+        self.event(dict(event="source_cohorts_imported", cohorts=imported))
         self.checkpoint()
-        print(f"[adaptive] imported {len(rows)} source minima", flush=True)
+        print(f"[adaptive] imported frozen source cohorts: {imported}", flush=True)
 
     def _plans(self):
         return Counter(
@@ -469,6 +555,11 @@ class AdaptivePilot(Pilot):
             )
             return cohort
 
+        # An imported continuation cohort is an experimental control: archive
+        # new families, but do not let discoveries alter the population whose
+        # representative rotation is being completed.
+        if initialized.get("imported_from"):
+            return cohort
         if len(cohort) >= capacity:
             return cohort
         known = set(initialized.get("known_families", initialized["families"]))
@@ -857,7 +948,10 @@ class AdaptivePilot(Pilot):
                 if not metrics or not metrics["stagnant"]:
                     break
                 stagnant_runs[k] += 1
-        start = max((event["cycle"] for event in old_cycles), default=-1) + 1
+        start = max(
+            max((event["cycle"] for event in old_cycles), default=-1) + 1,
+            self.config.phase_cycle_start.get(phase, 0),
+        )
         requirements = [("fixed", k) for k in ks]
         requirements.extend(("growth", k) for k in ks[:-1])
         if extend_from is not None:
