@@ -1,0 +1,46 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 271828
+workers: 24
+max_calls: 6200
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 20
+
+# Targeted continuation from nucleation_adaptive_abc_v1.  This run stops after
+# Phase A so the revised family/convergence logic can be assessed before k=7.
+enabled_phases: [A]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 8
+operation_calls:
+  5: {fixed: 1800}
+  6: {growth: 2200, fixed: 2200}
+family_slots: {5: 120, 6: 150}
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11}
+
+# A stable 85% initial cohort is frozen.  At most 15% of the slots can then be
+# filled by genuinely new coarse CN/ring/geometry families.
+admission_fraction: 0.15
+subfamilies_per_family: 2
+p_states_per_family: 3
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+min_cycles: 2
+max_cycles: 5
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 4
+proposals_per_family_growth: 6
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0

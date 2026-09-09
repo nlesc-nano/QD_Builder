@@ -12,7 +12,12 @@ from builder.nucleation.molecular_zb_growth import (
     _growth_site_priority,
 )
 from builder.nucleation.pilot import Pilot, PilotConfig, round_robin, select_population
-from builder.nucleation.adaptive import AdaptiveConfig, AdaptivePilot, lineage_family
+from builder.nucleation.adaptive import (
+    AdaptiveConfig,
+    AdaptivePilot,
+    coarse_lineage_family,
+    lineage_family,
+)
 from builder.nucleation.pilot_proposals import (
     Proposal,
     bounded_shells,
@@ -391,6 +396,117 @@ def test_adaptive_archive_import_preserves_ids_without_self_routes(tmp_path):
     )
     resumed.setup()
     assert list(resumed.rows["experimental"]) == ["minimum_source"]
+
+
+def test_coarse_family_keeps_exact_graphs_as_subfamilies():
+    base = dict(
+        k=5,
+        final=dict(
+            core_hash="exact-a",
+            se_cn={"2": 1, "3": 4},
+            cd_environments={"1,2": 2, "2,1": 6},
+            n4=1,
+            n6=3,
+            radius_A=3.4,
+            tetrahedral_q4=[0.7, 0.8],
+        ),
+    )
+    changed = json.loads(json.dumps(base))
+    changed["final"]["core_hash"] = "exact-b"
+    assert lineage_family(base) != lineage_family(changed)
+    assert coarse_lineage_family(base) == coarse_lineage_family(changed)
+
+
+def test_adaptive_cohort_is_stable_and_only_admits_new_families(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=10,
+        stage_calls={1: 2, 2: 2, 3: 2},
+        family_slots={1: 4, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+        admission_fraction=0.25,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    pilot.setup()
+
+    def row(index, radius, energy):
+        proposal = example(index)
+        return dict(
+            proposal.record(),
+            structure_id=proposal.id,
+            minimum_id=f"minimum_{index}",
+            energy_eV=energy,
+            role="primary",
+            final=dict(
+                descriptors(proposal.symbols, proposal.edges, proposal.positions),
+                radius_A=radius,
+                core_hash=f"exact-{index}",
+            ),
+            protocol="test",
+            source=f"test:{index}",
+            routes=[],
+            occupations=[],
+            occupation_origins=[],
+        )
+
+    pilot.rows["experimental"] = {
+        f"minimum_{i}": row(i, 2.0 + i, -20.0 + i) for i in range(5)
+    }
+    initial = pilot._update_cohort("A", 1, 0)
+    assert len(initial) == 3
+    excluded_existing = {
+        pilot.adapter.family(r) for r in pilot.rows["experimental"].values()
+    } - set(initial)
+    new = row(9, 20.0, -100.0)
+    pilot.rows["experimental"]["minimum_9"] = new
+    updated = pilot._update_cohort("A", 1, 1)
+    assert updated[:3] == initial
+    assert pilot.adapter.family(new) in updated
+    assert excluded_existing.isdisjoint(updated)
+
+
+def test_operation_budgets_are_independent(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=4,
+        operation_calls={1: {"fixed": 1, "growth": 2}},
+        family_slots={1: 1, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    fixed = replace(example(), search_operation="fixed")
+    growth = replace(example(), search_operation="growth")
+    assert pilot.allowed("experimental", 1, fixed)
+    assert pilot.allowed("experimental", 1, growth)
+    pilot.operation_calls_used[1, "fixed"] = 1
+    assert not pilot.allowed("experimental", 1, fixed)
+    assert pilot.allowed("experimental", 1, growth)
 
 
 def test_round_robin_compositions():

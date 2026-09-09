@@ -25,7 +25,7 @@ from .search_analysis import MinimumArchive, digest
 class AdaptiveConfig(PilotConfig):
     """System-independent search policy; chemistry lives in the adapter."""
 
-    version: int = 2
+    version: int = 3
     k_max: int = 8
     max_calls: int = 18_000
     seed_calls: int = 0
@@ -35,11 +35,16 @@ class AdaptiveConfig(PilotConfig):
     stage_calls: dict = field(
         default_factory=lambda: {4: 1_600, 5: 2_400, 6: 3_200, 7: 5_000, 8: 5_000}
     )
+    operation_calls: dict = field(default_factory=dict)
     family_slots: dict = field(
         default_factory=lambda: {4: 80, 5: 120, 6: 150, 7: 160, 8: 160}
     )
     p_states_per_family: int = 3
     geometries_per_family: int = 2
+    subfamilies_per_family: int = 2
+    admission_fraction: float = 0.15
+    minimum_launched_cycles: int = 2
+    enabled_phases: list = field(default_factory=lambda: ["A", "B", "C"])
     phase_a_k: list = field(default_factory=lambda: [4, 5, 6])
     phase_b_k: int = 7
     phase_c_k: int = 8
@@ -48,6 +53,7 @@ class AdaptiveConfig(PilotConfig):
     convergence_patience: int = 2
     new_families_per_100_calls: float = 5.0
     energy_improvement_eV: float = 0.05
+    minimum_endpoint_fraction: float = 0.25
     proposals_per_family_fixed: int = 3
     proposals_per_family_growth: int = 6
     chemistry_adapter: str = "cdse_cdcl2"
@@ -56,8 +62,8 @@ class AdaptiveConfig(PilotConfig):
     def load(cls, path):
         raw = yaml.safe_load(Path(path).read_text()) or {}
         value = cls(**raw)
-        if value.version != 2:
-            raise ValueError("adaptive configuration requires version 2")
+        if value.version not in {2, 3}:
+            raise ValueError("adaptive configuration requires version 2 or 3")
         if value.chemistry_adapter != "cdse_cdcl2" and ":" not in value.chemistry_adapter:
             raise ValueError("chemistry_adapter must be a built-in name or module:Class")
         if not (1 <= value.workers <= 24 and 0 < value.max_calls <= 50_000):
@@ -68,25 +74,51 @@ class AdaptiveConfig(PilotConfig):
             raise ValueError("invalid optimization cycle limit")
         value.p_max = {int(k): int(v) for k, v in value.p_max.items()}
         value.stage_calls = {int(k): int(v) for k, v in value.stage_calls.items()}
+        value.operation_calls = {
+            int(k): {str(operation): int(limit) for operation, limit in limits.items()}
+            for k, limits in value.operation_calls.items()
+        }
         value.family_slots = {int(k): int(v) for k, v in value.family_slots.items()}
         expected = list(range(1, value.phase_c_k + 1))
         if sorted(value.p_max) != expected:
             raise ValueError("p_max must cover every k through Phase C")
         if value.phase_a_k != list(range(value.phase_a_k[0], value.phase_a_k[-1] + 1)):
             raise ValueError("phase_a_k must be a contiguous increasing range")
-        searched = set(value.phase_a_k + [value.phase_b_k, value.phase_c_k])
-        if not searched <= set(value.stage_calls) or not searched <= set(value.family_slots):
+        if not value.enabled_phases or any(
+            phase not in {"A", "B", "C"} for phase in value.enabled_phases
+        ):
+            raise ValueError("enabled_phases must contain A, B and/or C")
+        searched = set(value.phase_a_k if "A" in value.enabled_phases else [])
+        if "B" in value.enabled_phases:
+            searched.add(value.phase_b_k)
+        if "C" in value.enabled_phases:
+            searched.add(value.phase_c_k)
+        if not searched <= set(value.stage_limits()) or not searched <= set(value.family_slots):
             raise ValueError("stage_calls and family_slots must cover all phase k values")
-        if sum(value.stage_calls.values()) > value.max_calls:
+        if sum(value.stage_limits().values()) > value.max_calls:
             raise ValueError("per-k stage_calls exceed max_calls")
+        if value.operation_calls and any(
+            operation not in {"fixed", "growth"} or limit <= 0
+            for limits in value.operation_calls.values()
+            for operation, limit in limits.items()
+        ):
+            raise ValueError("operation_calls accepts positive fixed/growth limits")
         if not (1 <= value.p_states_per_family <= 4):
             raise ValueError("invalid p_states_per_family")
         if not (1 <= value.geometries_per_family <= 2):
             raise ValueError("invalid geometries_per_family")
+        if not (1 <= value.subfamilies_per_family <= 4):
+            raise ValueError("invalid subfamilies_per_family")
+        if not 0 <= value.admission_fraction < 0.5:
+            raise ValueError("admission_fraction must be in [0, 0.5)")
+        if not (1 <= value.minimum_launched_cycles <= value.max_cycles):
+            raise ValueError("invalid minimum_launched_cycles")
         if not (1 <= value.min_cycles <= value.max_cycles <= 20):
             raise ValueError("invalid adaptive cycle bounds")
         if not (1 <= value.convergence_patience <= value.max_cycles):
             raise ValueError("invalid convergence patience")
+        if not 0 < value.minimum_endpoint_fraction <= 1:
+            raise ValueError("minimum_endpoint_fraction must be in (0, 1]")
         if min(value.stage_calls.values()) <= 0 or min(value.family_slots.values()) <= 0:
             raise ValueError("stage and family budgets must be positive")
         if value.proposals_per_family_fixed < 3:
@@ -94,7 +126,16 @@ class AdaptiveConfig(PilotConfig):
         return value
 
     def stage_limits(self):
+        if self.operation_calls:
+            return {
+                k: sum(limits.values()) for k, limits in self.operation_calls.items()
+            }
         return dict(self.stage_calls)
+
+    def operation_limit(self, k, operation):
+        if not self.operation_calls:
+            return self.stage_limits().get(k, 0)
+        return self.operation_calls.get(k, {}).get(operation, 0)
 
 
 def lineage_family(row):
@@ -112,6 +153,37 @@ def lineage_family(row):
     )[:20]
 
 
+def coarse_lineage_family(row):
+    """Coordination/ring/geometry family used for bounded lineage survival.
+
+    Exact graph topology remains available through :func:`lineage_family` as a
+    subfamily.  The coarser key prevents every graph edit from consuming a new
+    beam slot while still separating compact geometrically distinct motifs.
+    """
+
+    final = row["final"]
+    cd_se_cn = Counter()
+    for environment, count in final.get("cd_environments", {}).items():
+        cd_se_cn[int(environment.split(",", 1)[0])] += count
+
+    def ring_class(value):
+        return 0 if value == 0 else 1 if value == 1 else 2
+
+    q4 = final.get("tetrahedral_q4", [])
+    mean_q4 = sum(q4) / len(q4) if q4 else -2.0
+    return "coarse_" + digest(
+        [
+            row["k"],
+            tuple(sorted((int(cn), count) for cn, count in final["se_cn"].items())),
+            tuple(sorted(cd_se_cn.items())),
+            ring_class(final.get("n4", 0)),
+            ring_class(final.get("n6", 0)),
+            round(final.get("radius_A", 0.0) / 0.25),
+            round(mean_q4 / 0.2),
+        ]
+    )[:20]
+
+
 class CdSeCdClAdapter:
     """Chemistry hook for the present Cd_(k+p)Se_kCl_(2p) model."""
 
@@ -120,6 +192,10 @@ class CdSeCdClAdapter:
 
     @staticmethod
     def family(row):
+        return coarse_lineage_family(row)
+
+    @staticmethod
+    def subfamily(row):
         return lineage_family(row)
 
     @staticmethod
@@ -140,19 +216,28 @@ class CdSeCdClAdapter:
 
     def fixed(self, pilot, parent, cycle, limit):
         jobs = []
-        each = max(1, limit // len(self.fixed_channels))
-        for channel in self.fixed_channels:
+        # Exchange was the productive fixed-k move in v1.  Topology remains as
+        # a minority exploration channel; reconstruction is sampled every
+        # third cycle because it mostly reconverged existing basins.
+        schedule = [("exchange", 2), ("topology", 1)]
+        if cycle % 3 == 0:
+            schedule.append(("reconstruction", 1))
+        remaining = limit
+        for channel, requested in schedule:
+            count = min(requested, remaining)
+            if count <= 0:
+                break
             rng = pilot.rng("adaptive", "fixed", cycle, channel, parent["minimum_id"])
-            jobs.extend(
-                local_proposals(
-                    parent,
-                    rng,
-                    pilot.spec,
-                    pilot.pack,
-                    channel=channel,
-                    limit=each,
-                )
+            made = local_proposals(
+                parent,
+                rng,
+                pilot.spec,
+                pilot.pack,
+                channel=channel,
+                limit=count,
             )
+            jobs.extend(made)
+            remaining -= len(made)
         return jobs[:limit]
 
     def grow(self, pilot, parent, target_k, cycle, limit):
@@ -192,6 +277,7 @@ def load_adapter(name):
         "bootstrap",
         "fixed",
         "grow",
+        "subfamily",
     )
     missing = [method for method in required if not callable(getattr(adapter, method, None))]
     if missing:
@@ -208,6 +294,25 @@ class AdaptivePilot(Pilot):
         super().__init__(config, map_path, growth_path, source, output, backend=backend)
         self.adapter = load_adapter(config.chemistry_adapter)
         self.archive = self.adapter.archive(self.spec)
+        self.operation_calls_used = Counter()
+
+    def setup(self):
+        super().setup()
+        self.operation_calls_used = Counter()
+        for event in self.events:
+            if event["event"] != "launch":
+                continue
+            proposal = event["proposal"]
+            operation = proposal.get("search_operation", "")
+            if operation:
+                self.operation_calls_used[event["stage"], operation] += 1
+
+    def event(self, data):
+        super().event(data)
+        if data["event"] == "launch":
+            operation = data["proposal"].get("search_operation", "")
+            if operation:
+                self.operation_calls_used[data["stage"], operation] += 1
 
     def extra_protocol_sources(self):
         path = inspect.getsourcefile(type(self.adapter))
@@ -222,14 +327,29 @@ class AdaptivePilot(Pilot):
     def classify(self, proposal, result, arm):
         return self.adapter.classify(self, proposal, result, arm)
 
-    def allowed(self, arm, stage):
-        return (
+    def allowed(self, arm, stage, proposal=None):
+        base = (
             arm == "experimental"
             and stage in self.config.stage_limits()
             and self.calls[arm, stage] < self.config.stage_limits()[stage]
             and sum(self.calls.values()) < self.config.max_calls
             and not self.expired()
         )
+        if not base or proposal is None or not proposal.search_operation:
+            return base
+        limit = self.config.operation_limit(stage, proposal.search_operation)
+        return (
+            limit > 0
+            and self.operation_calls_used[stage, proposal.search_operation] < limit
+        )
+
+    def extra_status(self):
+        return {
+            "operation_calls": {
+                f"{k}:{operation}": count
+                for (k, operation), count in sorted(self.operation_calls_used.items())
+            }
+        }
 
     def initialize_source(self):
         if any(event["event"] == "archive_import" for event in self.events):
@@ -282,15 +402,12 @@ class AdaptivePilot(Pilot):
             if event["event"] == "family_plan"
         )
 
-    def adaptive_parents(self, k, phase, operation, cycle=0):
+    def _ranked_families(self, k):
         rows = [r for r in self.rows["experimental"].values() if r["k"] == k]
         by_family = defaultdict(list)
         for row in rows:
             by_family[self.adapter.family(row)].append(row)
-        plans = self._plans()
 
-        # Rank energies only within fixed composition.  Energies at different p
-        # are not compared without ligand/cation reservoirs.
         energy_rank = {}
         for p in sorted({r["p"] for r in rows}):
             ordered = sorted(
@@ -300,10 +417,7 @@ class AdaptivePilot(Pilot):
             for rank, row in enumerate(ordered):
                 energy_rank[row["minimum_id"]] = rank / max(1, len(ordered) - 1)
 
-        # Retention is stable and scientifically ranked.  The ledger orders
-        # work *within* that retained set; it must not rotate through an
-        # unbounded tail and thereby defeat the family cap.
-        families = sorted(
+        ranked = sorted(
             by_family,
             key=lambda family_id: (
                 min(
@@ -314,8 +428,107 @@ class AdaptivePilot(Pilot):
                 ),
                 family_id,
             ),
-        )[: self.config.family_slots[k]]
-        families.sort(key=lambda family_id: (plans[phase, operation, family_id], family_id))
+        )
+        return ranked, by_family
+
+    def _cohort_state(self, phase, k):
+        initialized = None
+        admitted = []
+        for event in self.events:
+            if event.get("phase") != phase or event.get("k") != k:
+                continue
+            if event["event"] == "cohort_initialized":
+                initialized = event
+            elif event["event"] == "cohort_admission":
+                admitted.extend(event["families"])
+        if initialized is None:
+            return None, []
+        return initialized, list(dict.fromkeys(initialized["families"] + admitted))
+
+    def _update_cohort(self, phase, k, cycle):
+        ranked, _ = self._ranked_families(k)
+        if not ranked:
+            return []
+        initialized, cohort = self._cohort_state(phase, k)
+        capacity = self.config.family_slots[k]
+        if initialized is None:
+            initial_capacity = max(
+                1, int(capacity * (1.0 - self.config.admission_fraction))
+            )
+            cohort = ranked[:initial_capacity]
+            self.event(
+                dict(
+                    event="cohort_initialized",
+                    phase=phase,
+                    k=k,
+                    cycle=cycle,
+                    capacity=capacity,
+                    families=cohort,
+                    known_families=ranked,
+                )
+            )
+            return cohort
+
+        if len(cohort) >= capacity:
+            return cohort
+        known = set(initialized.get("known_families", initialized["families"]))
+        candidates = [
+            family_id
+            for family_id in ranked
+            if family_id not in known and family_id not in cohort
+        ]
+        admitted = candidates[: capacity - len(cohort)]
+        if admitted:
+            self.event(
+                dict(
+                    event="cohort_admission",
+                    phase=phase,
+                    k=k,
+                    cycle=cycle,
+                    families=admitted,
+                )
+            )
+            cohort.extend(admitted)
+        return cohort
+
+    def _coverage_cycle_ledger(self):
+        launched = {
+            (event["id"], event["proposal"].get("search_cycle", -1))
+            for event in self.events
+            if event["event"] == "launch"
+        }
+        ledger = defaultdict(set)
+        for event in self.events:
+            if event["event"] != "family_plan":
+                continue
+            if any(
+                (proposal_id, event["cycle"]) in launched
+                for proposal_id in event.get("proposal_ids", [])
+            ) or not event.get("novel_proposal_ids", event.get("proposal_ids", [])):
+                ledger[
+                    event["phase"], event["operation"], event["family_id"]
+                ].add(event["cycle"])
+        return ledger
+
+    def _covered_cycles(self, phase, operation, family_id, ledger=None):
+        ledger = ledger if ledger is not None else self._coverage_cycle_ledger()
+        return ledger[phase, operation, family_id]
+
+    def adaptive_parents(self, k, phase, operation, cycle=0):
+        _, by_family = self._ranked_families(k)
+        _, families = self._cohort_state(phase, k)
+        families = [family_id for family_id in families if family_id in by_family]
+        coverage_ledger = self._coverage_cycle_ledger()
+        families.sort(
+            key=lambda family_id: (
+                len(
+                    self._covered_cycles(
+                        phase, operation, family_id, coverage_ledger
+                    )
+                ),
+                family_id,
+            )
+        )
         selected = []
         for family_id in families:
             candidates = by_family[family_id]
@@ -325,6 +538,27 @@ class AdaptivePilot(Pilot):
             clean_lineage = [r for r in candidates if not r.get("audit_derived", False)]
             if clean_lineage:
                 candidates = clean_lineage
+            exact_groups = defaultdict(list)
+            for row in candidates:
+                exact_groups[row["p"], self.adapter.subfamily(row)].append(row)
+            exact_by_p = defaultdict(deque)
+            for (p, exact), group in exact_groups.items():
+                exact_by_p[p].append(
+                    (min(row["energy_eV"] for row in group), exact)
+                )
+            for p in exact_by_p:
+                exact_by_p[p] = deque(sorted(exact_by_p[p]))
+            exact_ranked = []
+            while any(exact_by_p.values()):
+                for p in sorted(exact_by_p):
+                    if exact_by_p[p]:
+                        _, exact = exact_by_p[p].popleft()
+                        exact_ranked.append((p, exact))
+                        if len(exact_ranked) >= self.config.subfamilies_per_family:
+                            break
+                if len(exact_ranked) >= self.config.subfamilies_per_family:
+                    break
+            candidates = [row for exact in exact_ranked for row in exact_groups[exact]]
             representatives_by_p = defaultdict(list)
             seen_geometries = defaultdict(set)
             for row in sorted(
@@ -381,19 +615,27 @@ class AdaptivePilot(Pilot):
             by_parent[tuple(job.parents)].append(job)
         queues = [
             deque(round_robin(sorted(group, key=lambda p: (p.channel, p.id))))
-            for _, group in sorted(by_parent.items())
+            for group in by_parent.values()
         ]
         ordered = []
         while any(queues):
             for queue in queues:
                 if queue:
                     ordered.append(queue.popleft())
-        # The running audit quota cannot accept an audit-derived proposal at
-        # call zero.  Put clean lineages first so audit work is not silently
-        # discarded merely because of queue order.
-        return [job for job in ordered if not job.audit_derived] + [
-            job for job in ordered if job.audit_derived
-        ]
+        # Interleave one audit descendant after nine clean proposals.  This
+        # satisfies the conservative running 10% quota while giving admitted
+        # audit lineages a real chance to launch.
+        clean = deque(job for job in ordered if not job.audit_derived)
+        audit = deque(job for job in ordered if job.audit_derived)
+        scheduled = []
+        while clean:
+            for _ in range(9):
+                if clean:
+                    scheduled.append(clean.popleft())
+            if audit:
+                scheduled.append(audit.popleft())
+        scheduled.extend(audit)
+        return scheduled
 
     def adaptive_proposals(self, phase, operation, source_k, target_k, cycle):
         jobs = []
@@ -417,6 +659,23 @@ class AdaptivePilot(Pilot):
                     cycle,
                     self.config.proposals_per_family_growth,
                 )
+            made = [
+                proposal
+                for proposal in made
+                if proposal.k == target_k
+                and 1 <= proposal.p <= self.config.p_max[target_k]
+                and self.proposal_valid(proposal)
+            ]
+            for proposal in made:
+                proposal.search_phase = phase
+                proposal.search_cycle = cycle
+                proposal.search_operation = operation
+                proposal.source_family = family_id
+            reserved_ids = {
+                proposal_id
+                for reserved_arm, proposal_id, _ in self.reserved
+                if reserved_arm == "experimental"
+            }
             self.event(
                 dict(
                     event="family_plan",
@@ -429,45 +688,92 @@ class AdaptivePilot(Pilot):
                     parent_id=parent["minimum_id"],
                     proposals=len(made),
                     proposal_ids=[proposal.id for proposal in made],
+                    novel_proposal_ids=[
+                        proposal.id for proposal in made if proposal.id not in reserved_ids
+                    ],
                 )
             )
             jobs.extend(made)
-        return self._fair_jobs(
-            proposal
-            for proposal in jobs
-            if proposal.k == target_k
-            and 1 <= proposal.p <= self.config.p_max[target_k]
-            and self.proposal_valid(proposal)
-        )
+        return self._fair_jobs(jobs)
 
     def _snapshot(self, ks):
-        families = {
-            self.adapter.family(row)
-            for row in self.rows["experimental"].values()
-            if row["k"] in ks and row["role"] == "primary"
-        }
-        best = {}
-        for row in self.rows["experimental"].values():
-            key = (row["k"], row["p"])
-            if row["k"] in ks and row["role"] == "primary":
-                best[key] = min(best.get(key, float("inf")), row["energy_eV"])
-        return families, best, sum(self.calls.values())
+        snapshot = {}
+        for k in ks:
+            rows = [
+                row
+                for row in self.rows["experimental"].values()
+                if row["k"] == k and row["role"] == "primary"
+            ]
+            best = {}
+            for row in rows:
+                best[row["p"]] = min(
+                    best.get(row["p"], float("inf")), row["energy_eV"]
+                )
+            snapshot[k] = dict(
+                families={self.adapter.family(row) for row in rows},
+                best=best,
+                calls=self.calls["experimental", k],
+            )
+        return snapshot
 
     def _cycle_metrics(self, phase, cycle, before, after):
-        old_families, old_best, old_calls = before
-        new_families, new_best, new_calls = after
-        calls = new_calls - old_calls
-        discovered = len(new_families - old_families)
-        rate = 100.0 * discovered / max(1, calls)
-        improvements = [
-            old_best[key] - energy
-            for key, energy in new_best.items()
-            if key in old_best and energy < old_best[key]
-        ]
-        improvement = max(improvements, default=0.0)
-        stagnant = calls > 0 and (
-            rate < self.config.new_families_per_100_calls
-            and improvement < self.config.energy_improvement_eV
+        outcomes = defaultdict(Counter)
+        launches = {
+            (event["arm"], event["id"], event["attempt"]): event
+            for event in self.events
+            if event["event"] == "launch"
+        }
+        for event in self.events:
+            if event["event"] != "result":
+                continue
+            launch = launches.get(
+                (event["arm"], event["id"], event["attempt"])
+            )
+            if launch is None:
+                continue
+            proposal = launch["proposal"]
+            if (
+                proposal.get("search_phase") == phase
+                and proposal.get("search_cycle") == cycle
+            ):
+                outcomes[event["stage"]][
+                    event["row"]["role"] if event.get("row") else "rejected"
+                ] += 1
+        per_k = {}
+        for k in sorted(before):
+            calls = after[k]["calls"] - before[k]["calls"]
+            discovered = len(after[k]["families"] - before[k]["families"])
+            rate = 100.0 * discovered / max(1, calls)
+            improvements = [
+                before[k]["best"][p] - energy
+                for p, energy in after[k]["best"].items()
+                if p in before[k]["best"] and energy < before[k]["best"][p]
+            ]
+            improvement = max(improvements, default=0.0)
+            usable = outcomes[k]["primary"] + outcomes[k]["audit"]
+            endpoint_fraction = usable / max(1, calls)
+            per_k[str(k)] = dict(
+                calls=calls,
+                new_primary_families=discovered,
+                new_families_per_100_calls=rate,
+                maximum_within_composition_improvement_eV=improvement,
+                usable_endpoints=usable,
+                endpoint_fraction=endpoint_fraction,
+                stagnant=calls > 0
+                and endpoint_fraction >= self.config.minimum_endpoint_fraction
+                and rate < self.config.new_families_per_100_calls
+                and improvement < self.config.energy_improvement_eV,
+            )
+        calls = sum(metrics["calls"] for metrics in per_k.values())
+        discovered = sum(
+            metrics["new_primary_families"] for metrics in per_k.values()
+        )
+        improvement = max(
+            (
+                metrics["maximum_within_composition_improvement_eV"]
+                for metrics in per_k.values()
+            ),
+            default=0.0,
         )
         event = dict(
             event="adaptive_cycle",
@@ -475,59 +781,49 @@ class AdaptivePilot(Pilot):
             cycle=cycle,
             calls=calls,
             new_primary_families=discovered,
-            new_families_per_100_calls=rate,
+            new_families_per_100_calls=100.0 * discovered / max(1, calls),
             maximum_within_composition_improvement_eV=improvement,
-            stagnant=stagnant,
+            stagnant=bool(per_k) and all(m["stagnant"] for m in per_k.values()),
+            per_k=per_k,
         )
         self.event(event)
         return event
 
-    def _coverage_complete(self, phase, requirements, cycle):
-        plans = self._plans()
-        launched = {
-            (event["arm"], event["id"])
-            for event in self.events
-            if event["event"] == "launch"
-        }
+    def _coverage_debt(self, phase, requirements):
+        coverage_ledger = self._coverage_cycle_ledger()
+        debt = {}
         for operation, source_k in requirements:
-            retained = {
-                family_id
-                for family_id, _ in self.adaptive_parents(
-                    source_k, phase, operation, cycle
-                )
-            }
-            minimum_plans = min(
-                self.config.min_cycles, self.config.p_states_per_family
-            )
-            if any(
-                plans[phase, operation, family_id] < minimum_plans
-                for family_id in retained
-            ):
-                return False
+            _, retained = self._cohort_state(phase, source_k)
+            missing = []
             for family_id in retained:
-                family_events = [
-                    event
-                    for event in self.events
-                    if event["event"] == "family_plan"
-                    and event["phase"] == phase
-                    and event["operation"] == operation
-                    and event["family_id"] == family_id
-                ]
-                proposed = {
-                    proposal_id
-                    for event in family_events
-                    for proposal_id in event.get("proposal_ids", [])
-                }
-                if proposed and not any(
-                    ("experimental", proposal_id) in launched for proposal_id in proposed
-                ):
-                    return False
-        return True
+                covered_cycles = coverage_ledger[phase, operation, family_id]
+                if len(covered_cycles) < self.config.minimum_launched_cycles:
+                    missing.append(family_id)
+            debt[f"{operation}:k{source_k}"] = missing
+        return debt
+
+    def _coverage_complete(self, phase, requirements):
+        return not any(self._coverage_debt(phase, requirements).values())
 
     def _run_queue(self, phase, cycle, operation, source_k, target_k):
         tag = f"{phase}:{cycle}:{operation}:{source_k}:{target_k}"
         if ("experimental", target_k, tag) in self.stage_done:
             return
+        limit = self.config.operation_limit(target_k, operation)
+        if limit <= 0 or self.operation_calls_used[target_k, operation] >= limit:
+            self.event(
+                dict(
+                    event="operation_budget_exhausted",
+                    phase=phase,
+                    cycle=cycle,
+                    operation=operation,
+                    source_k=source_k,
+                    target_k=target_k,
+                )
+            )
+            self.mark_stage("experimental", target_k, tag)
+            return
+        self._update_cohort(phase, source_k, cycle)
         queue = self.prepare_queue(
             "experimental",
             target_k,
@@ -554,11 +850,13 @@ class AdaptivePilot(Pilot):
             for event in self.events
             if event["event"] == "adaptive_cycle" and event["phase"] == phase
         ]
-        stagnant_run = 0
-        for event in reversed(old_cycles):
-            if not event["stagnant"]:
-                break
-            stagnant_run += 1
+        stagnant_runs = {k: 0 for k in ks}
+        for k in ks:
+            for event in reversed(old_cycles):
+                metrics = event.get("per_k", {}).get(str(k))
+                if not metrics or not metrics["stagnant"]:
+                    break
+                stagnant_runs[k] += 1
         start = max((event["cycle"] for event in old_cycles), default=-1) + 1
         requirements = [("fixed", k) for k in ks]
         requirements.extend(("growth", k) for k in ks[:-1])
@@ -577,33 +875,52 @@ class AdaptivePilot(Pilot):
                     self._run_queue(phase, cycle, "growth", k, ks[index + 1])
             after = self._snapshot(ks)
             metrics = self._cycle_metrics(phase, cycle, before, after)
-            print(
-                f"[adaptive] phase={phase} cycle={cycle} calls={metrics['calls']} "
-                f"new_families={metrics['new_primary_families']} "
-                f"rate_per_100={metrics['new_families_per_100_calls']:.2f} "
-                f"best_dE={metrics['maximum_within_composition_improvement_eV']:.4f}",
-                flush=True,
-            )
-            stagnant_run = stagnant_run + 1 if metrics["stagnant"] else 0
+            for k in ks:
+                km = metrics["per_k"][str(k)]
+                print(
+                    f"[adaptive] phase={phase} cycle={cycle} k={k} "
+                    f"calls={km['calls']} new_families={km['new_primary_families']} "
+                    f"rate_per_100={km['new_families_per_100_calls']:.2f} "
+                    f"best_dE={km['maximum_within_composition_improvement_eV']:.4f}",
+                    flush=True,
+                )
+                stagnant_runs[k] = (
+                    stagnant_runs[k] + 1 if km["stagnant"] else 0
+                )
             self.checkpoint()
-            if metrics["calls"] == 0 and any(
-                self.calls["experimental", k] >= self.config.stage_limits()[k]
-                for k in ks
-            ):
+            exhausted_without_plateau = []
+            target_operations = defaultdict(set)
+            for operation, source_k in requirements:
+                target_k = source_k if operation == "fixed" else source_k + 1
+                target_operations[target_k].add(operation)
+            for k in ks:
+                if metrics["per_k"][str(k)]["calls"]:
+                    continue
+                if target_operations[k] and all(
+                    self.operation_calls_used[k, operation]
+                    >= self.config.operation_limit(k, operation)
+                    for operation in target_operations[k]
+                ):
+                    exhausted_without_plateau.append(k)
+            if exhausted_without_plateau:
                 self.event(
                     dict(
                         event="adaptive_phase_halted",
                         phase=phase,
-                        reason="stage_budget_exhausted_before_plateau",
+                        reason="operation_budget_exhausted_before_per_k_plateau",
                         cycle=cycle,
+                        k=exhausted_without_plateau,
+                        coverage_debt=self._coverage_debt(phase, requirements),
                     )
                 )
                 print(f"[adaptive] phase={phase} halted: stage budget", flush=True)
                 return False
             if (
                 cycle + 1 >= self.config.min_cycles
-                and stagnant_run >= self.config.convergence_patience
-                and self._coverage_complete(phase, requirements, cycle)
+                and all(
+                    stagnant_runs[k] >= self.config.convergence_patience for k in ks
+                )
+                and self._coverage_complete(phase, requirements)
             ):
                 self.event(
                     dict(
@@ -620,6 +937,8 @@ class AdaptivePilot(Pilot):
                 event="adaptive_phase_halted",
                 phase=phase,
                 reason="maximum_cycles_without_plateau",
+                coverage_debt=self._coverage_debt(phase, requirements),
+                stagnant_runs=stagnant_runs,
             )
         )
         print(f"[adaptive] phase={phase} halted: maximum cycles", flush=True)
@@ -629,20 +948,35 @@ class AdaptivePilot(Pilot):
         plans = self._plans()
         rows = []
         for k in sorted(self.config.family_slots):
-            families = {
+            coarse_families = {
                 self.adapter.family(row)
                 for row in self.rows["experimental"].values()
                 if row["k"] == k and row["role"] == "primary"
             }
+            exact_families = {
+                self.adapter.subfamily(row)
+                for row in self.rows["experimental"].values()
+                if row["k"] == k and row["role"] == "primary"
+            }
+            cohorts = {
+                phase: len(self._cohort_state(phase, k)[1])
+                for phase in self.config.enabled_phases
+            }
             rows.append(
                 dict(
                     k=k,
-                    primary_families=len(families),
+                    primary_families=len(coarse_families),
+                    exact_graph_families=len(exact_families),
                     primary_minima=sum(
                         row["k"] == k and row["role"] == "primary"
                         for row in self.rows["experimental"].values()
                     ),
                     calls=self.calls["experimental", k],
+                    operation_calls={
+                        operation: self.operation_calls_used[k, operation]
+                        for operation in ("fixed", "growth")
+                    },
+                    cohorts=cohorts,
                 )
             )
         cycles = [e for e in self.events if e["event"] == "adaptive_cycle"]
@@ -659,6 +993,7 @@ class AdaptivePilot(Pilot):
                 cycles=cycles,
                 phases=phases,
                 family_plans=sum(plans.values()),
+                enabled_phases=self.config.enabled_phases,
             ),
         )
 
@@ -666,11 +1001,15 @@ class AdaptivePilot(Pilot):
         self.setup()
         self.recover()
         self.initialize_source()
-        phase_a = self._run_phase("A", list(self.config.phase_a_k))
-        phase_b = phase_a and self._run_phase(
-            "B", [self.config.phase_b_k], extend_from=self.config.phase_b_k - 1
-        )
-        if phase_b:
+        phase_a = True
+        if "A" in self.config.enabled_phases:
+            phase_a = self._run_phase("A", list(self.config.phase_a_k))
+        phase_b = phase_a
+        if phase_a and "B" in self.config.enabled_phases:
+            phase_b = self._run_phase(
+                "B", [self.config.phase_b_k], extend_from=self.config.phase_b_k - 1
+            )
+        if phase_b and "C" in self.config.enabled_phases:
             self._run_phase(
                 "C", [self.config.phase_c_k], extend_from=self.config.phase_c_k - 1
             )

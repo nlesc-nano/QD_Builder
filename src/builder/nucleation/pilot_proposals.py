@@ -23,6 +23,10 @@ class Proposal:
     audit_derived: bool = False
     attempt: int = 0
     origin_id: str = ""
+    search_phase: str = ""
+    search_cycle: int = -1
+    search_operation: str = ""
+    source_family: str = ""
 
     @property
     def id(self):

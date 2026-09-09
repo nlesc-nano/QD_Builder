@@ -58,17 +58,31 @@ def main():
                     chemistry_adapter=config.chemistry_adapter,
                     source=str(args.source.resolve()),
                     phases={
-                        "A": config.phase_a_k,
-                        "B": [config.phase_b_k],
-                        "C": [config.phase_c_k],
+                        phase: ks
+                        for phase, ks in {
+                            "A": config.phase_a_k,
+                            "B": [config.phase_b_k],
+                            "C": [config.phase_c_k],
+                        }.items()
+                        if phase in config.enabled_phases
                     },
-                    per_k_call_caps=config.stage_calls,
+                    per_k_call_caps=config.stage_limits(),
+                    per_operation_call_caps=config.operation_calls,
                     max_calls=config.max_calls,
                     family_slots=config.family_slots,
+                    family_policy=dict(
+                        coarse_survival=True,
+                        subfamilies_per_family=config.subfamilies_per_family,
+                        geometries_per_family=config.geometries_per_family,
+                        initial_fraction=1.0 - config.admission_fraction,
+                        admission_fraction=config.admission_fraction,
+                        minimum_launched_cycles=config.minimum_launched_cycles,
+                    ),
                     plateau=dict(
                         patience=config.convergence_patience,
                         new_families_per_100_calls=config.new_families_per_100_calls,
                         energy_improvement_eV=config.energy_improvement_eV,
+                        minimum_endpoint_fraction=config.minimum_endpoint_fraction,
                     ),
                     workers=config.workers,
                     launch_hours=config.launch_hours,
