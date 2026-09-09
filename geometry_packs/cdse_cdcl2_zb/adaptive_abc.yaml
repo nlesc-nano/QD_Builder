@@ -1,4 +1,4 @@
-version: 2
+version: 3
 chemistry_adapter: cdse_cdcl2
 seed: 314159
 workers: 24
@@ -13,19 +13,30 @@ max_steps: 150
 phase_a_k: [4, 5, 6]
 phase_b_k: 7
 phase_c_k: 8
-stage_calls: {4: 1600, 5: 2400, 6: 3200, 7: 5000, 8: 5000}
+operation_calls:
+  4: {fixed: 1600}
+  5: {growth: 1200, fixed: 1200}
+  6: {growth: 1600, fixed: 1600}
+  7: {growth: 2500, fixed: 2500}
+  8: {growth: 2500, fixed: 2500}
 family_slots: {4: 80, 5: 120, 6: 150, 7: 160, 8: 160}
 p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11}
 p_states_per_family: 3
 geometries_per_family: 2
+subfamilies_per_family: 2
+admission_fraction: 0.15
+minimum_launched_cycles: 2
+enabled_phases: [A, B, C]
 
 min_cycles: 2
 max_cycles: 8
 convergence_patience: 2
 new_families_per_100_calls: 5.0
 energy_improvement_eV: 0.05
-proposals_per_family_fixed: 3
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 4
 proposals_per_family_growth: 6
+checkpoint_interval_batches: 20
 
 # Endpoint handling remains deliberately conservative.  Audit structures are
 # retained separately and their descendants remain a bounded minority.

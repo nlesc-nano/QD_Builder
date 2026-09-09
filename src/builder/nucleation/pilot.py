@@ -73,6 +73,7 @@ class PilotConfig:
     proposals_per_move: int = 8
     proposals_per_parent: int = 32
     fixed_rounds: int = 2
+    checkpoint_interval_batches: int = 1
 
     @classmethod
     def load(cls, path):
@@ -104,6 +105,8 @@ class PilotConfig:
             raise ValueError("audit allowance exceeds pilot limit")
         if value.fixed_rounds > 2 or value.fixed_rounds < 0:
             raise ValueError("at most two fixed-k rounds")
+        if value.checkpoint_interval_batches < 1:
+            raise ValueError("checkpoint_interval_batches must be positive")
         value.p_max = {int(k): int(v) for k, v in value.p_max.items()}
         if any(
             k not in value.p_max or value.p_max[k] < 1
@@ -233,6 +236,7 @@ class Pilot:
         self.started = time.time()
         self.elapsed_before = 0.0
         self.protocol = None
+        self._batches_since_checkpoint = 0
 
     def extra_protocol_sources(self):
         """Additional source hashes supplied by a protocol subclass."""
@@ -390,7 +394,7 @@ class Pilot:
             self.queues[key] = records
         return [Proposal(**r) for r in self.queues[key]]
 
-    def allowed(self, arm, stage):
+    def allowed(self, arm, stage, proposal=None):
         limit = (
             self.config.seed_calls
             if arm == "shared"
@@ -540,7 +544,7 @@ class Pilot:
             while tasks and len(batch) < self.config.workers:
                 arm, p = tasks.popleft()
                 key = (arm, p.id, p.attempt)
-                if key in self.reserved or not self.allowed(arm, stage):
+                if key in self.reserved or not self.allowed(arm, stage, p):
                     continue
                 if p.audit_derived and arm != "shared":
                     if self.audit_calls[arm, stage] + 1 > (
@@ -622,20 +626,31 @@ class Pilot:
                         origin_id=p.id,
                     )
                     tasks.appendleft((arm, retry))
-            self.checkpoint()
+            self._batches_since_checkpoint += 1
+            if (
+                self._batches_since_checkpoint
+                >= self.config.checkpoint_interval_batches
+            ):
+                self.checkpoint()
+                self._batches_since_checkpoint = 0
 
     def checkpoint(self):
         self.atomic_json(self.output / "minima.json", self.rows)
+        status = dict(
+            calls={f"{a}:{k}": n for (a, k), n in self.calls.items()},
+            worker_seconds=dict(self.worker_seconds),
+            elapsed_hours=(self.elapsed_before + time.time() - self.started) / 3600,
+            completed_stages=sorted(self.stage_done),
+            reserved_unfinished=len(self.reserved - self.completed),
+        )
+        status.update(self.extra_status())
         self.atomic_json(
             self.output / "status.json",
-            dict(
-                calls={f"{a}:{k}": n for (a, k), n in self.calls.items()},
-                worker_seconds=dict(self.worker_seconds),
-                elapsed_hours=(self.elapsed_before + time.time() - self.started) / 3600,
-                completed_stages=sorted(self.stage_done),
-                reserved_unfinished=len(self.reserved - self.completed),
-            ),
+            status,
         )
+
+    def extra_status(self):
+        return {}
 
     def rng(self, *parts):
         return np.random.default_rng(int(digest([self.config.seed, *parts])[:16], 16))
