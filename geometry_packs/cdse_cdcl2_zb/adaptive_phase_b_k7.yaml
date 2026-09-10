@@ -1,0 +1,49 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 141421
+workers: 24
+max_calls: 5800
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 20
+
+# Phase B only: grow the completed k=6 landscape to k=7, then perform bounded
+# fixed-composition exploration at k=7.  It cannot launch k=8.
+enabled_phases: [B]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 8
+operation_calls:
+  7: {growth: 2800, fixed: 3000}
+family_slots: {6: 150, 7: 160}
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11}
+
+# Use all 150 k=6 parent slots immediately.  Up to 20% are reserved for
+# stable families first discovered in the source completion (all 12 in v1).
+# At k=7, retain a 15% admission reserve for families discovered during B.
+admission_fraction: 0.15
+admission_fraction_by_k: {6: 0.0, 7: 0.15}
+source_novelty_fraction: 0.20
+subfamilies_per_family: 2
+p_states_per_family: 3
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+min_cycles: 2
+max_cycles: 8
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 4
+proposals_per_family_growth: 6
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0

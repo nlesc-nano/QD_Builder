@@ -43,6 +43,8 @@ class AdaptiveConfig(PilotConfig):
     geometries_per_family: int = 2
     subfamilies_per_family: int = 2
     admission_fraction: float = 0.15
+    admission_fraction_by_k: dict = field(default_factory=dict)
+    source_novelty_fraction: float = 0.0
     minimum_launched_cycles: int = 2
     import_source_cohorts: bool = False
     phase_cycle_start: dict = field(default_factory=dict)
@@ -54,6 +56,7 @@ class AdaptiveConfig(PilotConfig):
     max_cycles: int = 8
     convergence_patience: int = 2
     new_families_per_100_calls: float = 5.0
+    convergence_energy_window_eV: float | None = None
     energy_improvement_eV: float = 0.05
     minimum_endpoint_fraction: float = 0.25
     proposals_per_family_fixed: int = 3
@@ -81,6 +84,10 @@ class AdaptiveConfig(PilotConfig):
             for k, limits in value.operation_calls.items()
         }
         value.family_slots = {int(k): int(v) for k, v in value.family_slots.items()}
+        value.admission_fraction_by_k = {
+            int(k): float(fraction)
+            for k, fraction in value.admission_fraction_by_k.items()
+        }
         value.phase_cycle_start = {
             str(phase): int(cycle)
             for phase, cycle in value.phase_cycle_start.items()
@@ -122,6 +129,18 @@ class AdaptiveConfig(PilotConfig):
             raise ValueError("invalid subfamilies_per_family")
         if not 0 <= value.admission_fraction < 0.5:
             raise ValueError("admission_fraction must be in [0, 0.5)")
+        if any(
+            k not in value.family_slots or not 0 <= fraction < 0.5
+            for k, fraction in value.admission_fraction_by_k.items()
+        ):
+            raise ValueError("admission_fraction_by_k has an invalid k or fraction")
+        if not 0 <= value.source_novelty_fraction < 0.5:
+            raise ValueError("source_novelty_fraction must be in [0, 0.5)")
+        if (
+            value.convergence_energy_window_eV is not None
+            and value.convergence_energy_window_eV <= 0
+        ):
+            raise ValueError("convergence_energy_window_eV must be positive or null")
         if not (1 <= value.minimum_launched_cycles <= value.max_cycles):
             raise ValueError("invalid minimum_launched_cycles")
         if not (1 <= value.min_cycles <= value.max_cycles <= 20):
@@ -148,6 +167,9 @@ class AdaptiveConfig(PilotConfig):
             return self.stage_limits().get(k, 0)
         return self.operation_calls.get(k, {}).get(operation, 0)
 
+    def family_admission_fraction(self, k):
+        return self.admission_fraction_by_k.get(k, self.admission_fraction)
+
 
 def lineage_family(row):
     """Stable relaxed inorganic-core family used as the survival unit."""
@@ -165,12 +187,37 @@ def lineage_family(row):
 
 
 def coarse_lineage_family(row):
-    """Coordination/ring/geometry family used for bounded lineage survival.
+    """Stable discrete coordination/ring family used for lineage survival.
 
     Exact graph topology remains available through :func:`lineage_family` as a
     subfamily.  The coarser key prevents every graph edit from consuming a new
-    beam slot while still separating compact geometrically distinct motifs.
+    beam slot.  Continuous radius and tetrahedral-order descriptors are not
+    hashed: tiny relaxation changes near a bin boundary must not rename a
+    frozen family.  Geometry diversity is retained separately through
+    ``core_geometry_hash`` representatives in :meth:`adaptive_parents`.
     """
+
+    final = row["final"]
+    cd_se_cn = Counter()
+    for environment, count in final.get("cd_environments", {}).items():
+        cd_se_cn[int(environment.split(",", 1)[0])] += count
+
+    def ring_class(value):
+        return 0 if value == 0 else 1 if value == 1 else 2
+
+    return "coarse_" + digest(
+        [
+            row["k"],
+            tuple(sorted((int(cn), count) for cn, count in final["se_cn"].items())),
+            tuple(sorted(cd_se_cn.items())),
+            ring_class(final.get("n4", 0)),
+            ring_class(final.get("n6", 0)),
+        ]
+    )[:20]
+
+
+def _legacy_coarse_lineage_family(row):
+    """Version-3 q4/radius hash, used only to translate old journals."""
 
     final = row["final"]
     cd_se_cn = Counter()
@@ -306,6 +353,7 @@ class AdaptivePilot(Pilot):
         self.adapter = load_adapter(config.chemistry_adapter)
         self.archive = self.adapter.archive(self.spec)
         self.operation_calls_used = Counter()
+        self._source_novel_families_cache = None
 
     def setup(self):
         super().setup()
@@ -423,6 +471,7 @@ class AdaptivePilot(Pilot):
         if not journal.is_file():
             raise ValueError("import_source_cohorts requires source events.jsonl")
         states = {}
+        representatives = defaultdict(list)
         with journal.open() as handle:
             for line_number, line in enumerate(handle, start=1):
                 try:
@@ -437,6 +486,10 @@ class AdaptivePilot(Pilot):
                     states[phase, k] = list(event.get("families", []))
                 elif event.get("event") == "cohort_admission" and (phase, k) in states:
                     states[phase, k].extend(event.get("families", []))
+                elif event.get("event") == "family_plan":
+                    representatives[
+                        phase, event.get("source_k"), event.get("family_id")
+                    ].append(event.get("parent_id"))
 
         imported = {}
         for phase in self.config.enabled_phases:
@@ -452,6 +505,38 @@ class AdaptivePilot(Pilot):
                 if not families:
                     raise ValueError(f"source has no {phase} k={k} cohort to import")
                 available = set(self._ranked_families(k)[0])
+                legacy_translation = {
+                    _legacy_coarse_lineage_family(row): self.adapter.family(row)
+                    for row in self.rows["experimental"].values()
+                    if row["k"] == k
+                }
+                # Version-3 archives may contain family hashes made with the
+                # retired continuous q4/radius bins.  Translate them through
+                # their journaled parent representatives instead of rejecting
+                # an otherwise valid continuation archive.
+                translated = []
+                unresolved = []
+                for family in families:
+                    if family in available:
+                        translated.append(family)
+                        continue
+                    for parent_id in representatives.get((phase, k, family), []):
+                        row = self.rows["experimental"].get(parent_id)
+                        if row is not None:
+                            translated.append(self.adapter.family(row))
+                            break
+                    else:
+                        translated_family = legacy_translation.get(family)
+                        if translated_family is None:
+                            unresolved.append(family)
+                        else:
+                            translated.append(translated_family)
+                if unresolved:
+                    raise ValueError(
+                        f"source {phase} k={k} cohort has {len(unresolved)} "
+                        "families with no current or journaled representative"
+                    )
+                families = list(dict.fromkeys(translated))
                 missing = [family for family in families if family not in available]
                 if missing:
                     raise ValueError(
@@ -517,6 +602,48 @@ class AdaptivePilot(Pilot):
         )
         return ranked, by_family
 
+    def _source_novel_families(self, k):
+        """Families first discovered by the immediately preceding archive.
+
+        This supports a bounded novelty reserve when extending k.  It compares
+        primary result rows with the archive-import baseline in the source
+        journal using the *current* stable family definition.  Missing legacy
+        journals simply provide no reserve candidates.
+        """
+
+        if self._source_novel_families_cache is None:
+            discovered = defaultdict(list)
+            seen = defaultdict(set)
+            journal = self.seed_dir / "events.jsonl"
+            if journal.is_file():
+                with journal.open() as handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"invalid source events.jsonl line {line_number}"
+                            ) from exc
+                        if event.get("event") == "archive_import":
+                            for row in event.get("rows", []):
+                                if row.get("role") != "primary":
+                                    continue
+                                family = self.adapter.family(row)
+                                seen[row["k"]].add(family)
+                        elif event.get("event") == "result":
+                            row = event.get("row")
+                            if not row or row.get("role") != "primary":
+                                continue
+                            family = self.adapter.family(row)
+                            if family not in seen[row["k"]]:
+                                seen[row["k"]].add(family)
+                                discovered[row["k"]].append(family)
+            self._source_novel_families_cache = {
+                size: list(dict.fromkeys(families))
+                for size, families in discovered.items()
+            }
+        return self._source_novel_families_cache.get(k, [])
+
     def _cohort_state(self, phase, k):
         initialized = None
         admitted = []
@@ -538,10 +665,35 @@ class AdaptivePilot(Pilot):
         initialized, cohort = self._cohort_state(phase, k)
         capacity = self.config.family_slots[k]
         if initialized is None:
+            admission_fraction = self.config.family_admission_fraction(k)
             initial_capacity = max(
-                1, int(capacity * (1.0 - self.config.admission_fraction))
+                1, int(capacity * (1.0 - admission_fraction))
             )
-            cohort = ranked[:initial_capacity]
+            source_novel = (
+                set(self._source_novel_families(k))
+                if self.config.source_novelty_fraction > 0
+                else set()
+            )
+            novelty_candidates = [
+                family for family in ranked if family in source_novel
+            ]
+            novelty_slots = min(
+                len(novelty_candidates),
+                initial_capacity,
+                int(round(capacity * self.config.source_novelty_fraction)),
+            )
+            reserved_novelty = novelty_candidates[:novelty_slots]
+            general = [family for family in ranked if family not in source_novel]
+            cohort = general[: initial_capacity - novelty_slots] + reserved_novelty
+            # If fewer established families exist than expected, fill without
+            # exceeding the fixed initial capacity.
+            if len(cohort) < initial_capacity:
+                cohort.extend(
+                    family
+                    for family in ranked
+                    if family not in cohort
+                )
+                cohort = cohort[:initial_capacity]
             self.event(
                 dict(
                     event="cohort_initialized",
@@ -551,6 +703,7 @@ class AdaptivePilot(Pilot):
                     capacity=capacity,
                     families=cohort,
                     known_families=ranked,
+                    source_novelty_families=reserved_novelty,
                 )
             )
             return cohort
@@ -800,8 +953,20 @@ class AdaptivePilot(Pilot):
                 best[row["p"]] = min(
                     best.get(row["p"], float("inf")), row["energy_eV"]
                 )
+            families = {self.adapter.family(row) for row in rows}
+            window = self.config.convergence_energy_window_eV
+            relevant_families = (
+                families
+                if window is None
+                else {
+                    self.adapter.family(row)
+                    for row in rows
+                    if row["energy_eV"] <= best[row["p"]] + window
+                }
+            )
             snapshot[k] = dict(
-                families={self.adapter.family(row) for row in rows},
+                families=families,
+                relevant_families=relevant_families,
                 best=best,
                 calls=self.calls["experimental", k],
             )
@@ -835,6 +1000,10 @@ class AdaptivePilot(Pilot):
             calls = after[k]["calls"] - before[k]["calls"]
             discovered = len(after[k]["families"] - before[k]["families"])
             rate = 100.0 * discovered / max(1, calls)
+            relevant_discovered = len(
+                after[k]["relevant_families"] - before[k]["families"]
+            )
+            relevant_rate = 100.0 * relevant_discovered / max(1, calls)
             improvements = [
                 before[k]["best"][p] - energy
                 for p, energy in after[k]["best"].items()
@@ -847,17 +1016,25 @@ class AdaptivePilot(Pilot):
                 calls=calls,
                 new_primary_families=discovered,
                 new_families_per_100_calls=rate,
+                new_energy_window_families=relevant_discovered,
+                new_energy_window_families_per_100_calls=relevant_rate,
+                convergence_energy_window_eV=(
+                    self.config.convergence_energy_window_eV
+                ),
                 maximum_within_composition_improvement_eV=improvement,
                 usable_endpoints=usable,
                 endpoint_fraction=endpoint_fraction,
                 stagnant=calls > 0
                 and endpoint_fraction >= self.config.minimum_endpoint_fraction
-                and rate < self.config.new_families_per_100_calls
+                and relevant_rate < self.config.new_families_per_100_calls
                 and improvement < self.config.energy_improvement_eV,
             )
         calls = sum(metrics["calls"] for metrics in per_k.values())
         discovered = sum(
             metrics["new_primary_families"] for metrics in per_k.values()
+        )
+        relevant_discovered = sum(
+            metrics["new_energy_window_families"] for metrics in per_k.values()
         )
         improvement = max(
             (
@@ -873,6 +1050,11 @@ class AdaptivePilot(Pilot):
             calls=calls,
             new_primary_families=discovered,
             new_families_per_100_calls=100.0 * discovered / max(1, calls),
+            new_energy_window_families=relevant_discovered,
+            new_energy_window_families_per_100_calls=(
+                100.0 * relevant_discovered / max(1, calls)
+            ),
+            convergence_energy_window_eV=self.config.convergence_energy_window_eV,
             maximum_within_composition_improvement_eV=improvement,
             stagnant=bool(per_k) and all(m["stagnant"] for m in per_k.values()),
             per_k=per_k,
@@ -975,6 +1157,7 @@ class AdaptivePilot(Pilot):
                     f"[adaptive] phase={phase} cycle={cycle} k={k} "
                     f"calls={km['calls']} new_families={km['new_primary_families']} "
                     f"rate_per_100={km['new_families_per_100_calls']:.2f} "
+                    f"window_rate={km['new_energy_window_families_per_100_calls']:.2f} "
                     f"best_dE={km['maximum_within_composition_improvement_eV']:.4f}",
                     flush=True,
                 )

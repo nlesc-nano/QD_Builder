@@ -76,6 +76,8 @@ def main():
                         geometries_per_family=config.geometries_per_family,
                         initial_fraction=1.0 - config.admission_fraction,
                         admission_fraction=config.admission_fraction,
+                        admission_fraction_by_k=config.admission_fraction_by_k,
+                        source_novelty_fraction=config.source_novelty_fraction,
                         minimum_launched_cycles=config.minimum_launched_cycles,
                         import_source_cohorts=config.import_source_cohorts,
                     ),
@@ -83,6 +85,9 @@ def main():
                     plateau=dict(
                         patience=config.convergence_patience,
                         new_families_per_100_calls=config.new_families_per_100_calls,
+                        convergence_energy_window_eV=(
+                            config.convergence_energy_window_eV
+                        ),
                         energy_improvement_eV=config.energy_improvement_eV,
                         minimum_endpoint_fraction=config.minimum_endpoint_fraction,
                     ),
