@@ -68,6 +68,11 @@ def main():
                     },
                     per_k_call_caps=config.stage_limits(),
                     per_operation_call_caps=config.operation_calls,
+                    parent_p_by_k=config.parent_p_by_k,
+                    proposal_p_by_k=config.proposal_p_by_k,
+                    required_primary_families_by_p=(
+                        config.required_primary_families_by_p
+                    ),
                     max_calls=config.max_calls,
                     family_slots=config.family_slots,
                     family_policy=dict(

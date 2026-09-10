@@ -530,6 +530,44 @@ def test_energy_window_limits_convergence_family_novelty(tmp_path):
     assert len(snapshot["relevant_families"]) == 1
 
 
+def test_composition_coverage_debt_counts_independent_primary_families(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=10,
+        stage_calls={1: 2, 2: 2, 3: 2},
+        family_slots={1: 4, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+        required_primary_families_by_p={1: {1: 2, 2: 1}},
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    proposal = example()
+    row = dict(
+        proposal.record(),
+        minimum_id="only_p1",
+        energy_eV=-10.0,
+        role="primary",
+        final=descriptors(proposal.symbols, proposal.edges, proposal.positions),
+    )
+    pilot.rows["experimental"] = {"only_p1": row}
+    assert pilot._composition_coverage_debt([1]) == {
+        "k1:p1": 1,
+        "k1:p2": 1,
+    }
+
+
 def test_source_novelty_reserve_is_in_initial_cohort(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

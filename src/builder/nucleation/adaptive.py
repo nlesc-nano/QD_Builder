@@ -39,6 +39,9 @@ class AdaptiveConfig(PilotConfig):
     family_slots: dict = field(
         default_factory=lambda: {4: 80, 5: 120, 6: 150, 7: 160, 8: 160}
     )
+    parent_p_by_k: dict = field(default_factory=dict)
+    proposal_p_by_k: dict = field(default_factory=dict)
+    required_primary_families_by_p: dict = field(default_factory=dict)
     p_states_per_family: int = 3
     geometries_per_family: int = 2
     subfamilies_per_family: int = 2
@@ -84,6 +87,18 @@ class AdaptiveConfig(PilotConfig):
             for k, limits in value.operation_calls.items()
         }
         value.family_slots = {int(k): int(v) for k, v in value.family_slots.items()}
+        value.parent_p_by_k = {
+            int(k): [int(p) for p in values]
+            for k, values in value.parent_p_by_k.items()
+        }
+        value.proposal_p_by_k = {
+            int(k): [int(p) for p in values]
+            for k, values in value.proposal_p_by_k.items()
+        }
+        value.required_primary_families_by_p = {
+            int(k): {int(p): int(count) for p, count in requirements.items()}
+            for k, requirements in value.required_primary_families_by_p.items()
+        }
         value.admission_fraction_by_k = {
             int(k): float(fraction)
             for k, fraction in value.admission_fraction_by_k.items()
@@ -134,6 +149,24 @@ class AdaptiveConfig(PilotConfig):
             for k, fraction in value.admission_fraction_by_k.items()
         ):
             raise ValueError("admission_fraction_by_k has an invalid k or fraction")
+        for label, selection in (
+            ("parent_p_by_k", value.parent_p_by_k),
+            ("proposal_p_by_k", value.proposal_p_by_k),
+        ):
+            if any(
+                k not in value.p_max
+                or not values
+                or len(values) != len(set(values))
+                or any(p < 1 or p > value.p_max[k] for p in values)
+                for k, values in selection.items()
+            ):
+                raise ValueError(f"{label} has an invalid k or p selection")
+        if any(
+            k not in value.p_max
+            or any(p < 1 or p > value.p_max[k] or count < 1 for p, count in req.items())
+            for k, req in value.required_primary_families_by_p.items()
+        ):
+            raise ValueError("required_primary_families_by_p has an invalid requirement")
         if not 0 <= value.source_novelty_fraction < 0.5:
             raise ValueError("source_novelty_fraction must be in [0, 0.5)")
         if (
@@ -574,7 +607,12 @@ class AdaptivePilot(Pilot):
         )
 
     def _ranked_families(self, k):
-        rows = [r for r in self.rows["experimental"].values() if r["k"] == k]
+        parent_p = set(self.config.parent_p_by_k.get(k, []))
+        rows = [
+            r
+            for r in self.rows["experimental"].values()
+            if r["k"] == k and (not parent_p or r["p"] in parent_p)
+        ]
         by_family = defaultdict(list)
         for row in rows:
             by_family[self.adapter.family(row)].append(row)
@@ -908,6 +946,10 @@ class AdaptivePilot(Pilot):
                 for proposal in made
                 if proposal.k == target_k
                 and 1 <= proposal.p <= self.config.p_max[target_k]
+                and (
+                    not self.config.proposal_p_by_k.get(target_k)
+                    or proposal.p in self.config.proposal_p_by_k[target_k]
+                )
                 and self.proposal_valid(proposal)
             ]
             for proposal in made:
@@ -943,10 +985,13 @@ class AdaptivePilot(Pilot):
     def _snapshot(self, ks):
         snapshot = {}
         for k in ks:
+            target_p = set(self.config.proposal_p_by_k.get(k, []))
             rows = [
                 row
                 for row in self.rows["experimental"].values()
-                if row["k"] == k and row["role"] == "primary"
+                if row["k"] == k
+                and row["role"] == "primary"
+                and (not target_p or row["p"] in target_p)
             ]
             best = {}
             for row in rows:
@@ -969,6 +1014,16 @@ class AdaptivePilot(Pilot):
                 relevant_families=relevant_families,
                 best=best,
                 calls=self.calls["experimental", k],
+                primary_families_by_p={
+                    p: len(
+                        {
+                            self.adapter.family(row)
+                            for row in rows
+                            if row["p"] == p
+                        }
+                    )
+                    for p in sorted({row["p"] for row in rows})
+                },
             )
         return snapshot
 
@@ -1021,6 +1076,7 @@ class AdaptivePilot(Pilot):
                 convergence_energy_window_eV=(
                     self.config.convergence_energy_window_eV
                 ),
+                primary_families_by_p=after[k]["primary_families_by_p"],
                 maximum_within_composition_improvement_eV=improvement,
                 usable_endpoints=usable,
                 endpoint_fraction=endpoint_fraction,
@@ -1078,6 +1134,29 @@ class AdaptivePilot(Pilot):
     def _coverage_complete(self, phase, requirements):
         return not any(self._coverage_debt(phase, requirements).values())
 
+    def _composition_coverage_debt(self, ks):
+        debt = {}
+        for k in ks:
+            requirements = self.config.required_primary_families_by_p.get(k, {})
+            if not requirements:
+                continue
+            rows = [
+                row
+                for row in self.rows["experimental"].values()
+                if row["k"] == k and row["role"] == "primary"
+            ]
+            by_p = defaultdict(set)
+            for row in rows:
+                by_p[row["p"]].add(self.adapter.family(row))
+            for p, required in sorted(requirements.items()):
+                missing = max(0, required - len(by_p[p]))
+                if missing:
+                    debt[f"k{k}:p{p}"] = missing
+        return debt
+
+    def _composition_coverage_complete(self, ks):
+        return not self._composition_coverage_debt(ks)
+
     def _run_queue(self, phase, cycle, operation, source_k, target_k):
         tag = f"{phase}:{cycle}:{operation}:{source_k}:{target_k}"
         if ("experimental", target_k, tag) in self.stage_done:
@@ -1134,20 +1213,38 @@ class AdaptivePilot(Pilot):
             max((event["cycle"] for event in old_cycles), default=-1) + 1,
             self.config.phase_cycle_start.get(phase, 0),
         )
-        requirements = [("fixed", k) for k in ks]
-        requirements.extend(("growth", k) for k in ks[:-1])
-        if extend_from is not None:
+        requirements = [
+            ("fixed", k)
+            for k in ks
+            if self.config.operation_limit(k, "fixed") > 0
+        ]
+        requirements.extend(
+            ("growth", k)
+            for k in ks[:-1]
+            if self.config.operation_limit(k + 1, "growth") > 0
+        )
+        if (
+            extend_from is not None
+            and self.config.operation_limit(ks[0], "growth") > 0
+        ):
             requirements.append(("growth", extend_from))
         for cycle in range(start, self.config.max_cycles):
             if self.expired() or sum(self.calls.values()) >= self.config.max_calls:
                 return False
             print(f"[adaptive] phase={phase} cycle={cycle} started", flush=True)
             before = self._snapshot(ks)
-            if extend_from is not None:
+            if (
+                extend_from is not None
+                and self.config.operation_limit(ks[0], "growth") > 0
+            ):
                 self._run_queue(phase, cycle, "growth", extend_from, ks[0])
             for index, k in enumerate(ks):
-                self._run_queue(phase, cycle, "fixed", k, k)
-                if index + 1 < len(ks):
+                if self.config.operation_limit(k, "fixed") > 0:
+                    self._run_queue(phase, cycle, "fixed", k, k)
+                if (
+                    index + 1 < len(ks)
+                    and self.config.operation_limit(ks[index + 1], "growth") > 0
+                ):
                     self._run_queue(phase, cycle, "growth", k, ks[index + 1])
             after = self._snapshot(ks)
             metrics = self._cycle_metrics(phase, cycle, before, after)
@@ -1188,6 +1285,7 @@ class AdaptivePilot(Pilot):
                         cycle=cycle,
                         k=exhausted_without_plateau,
                         coverage_debt=self._coverage_debt(phase, requirements),
+                        composition_coverage_debt=self._composition_coverage_debt(ks),
                     )
                 )
                 print(f"[adaptive] phase={phase} halted: stage budget", flush=True)
@@ -1198,6 +1296,7 @@ class AdaptivePilot(Pilot):
                     stagnant_runs[k] >= self.config.convergence_patience for k in ks
                 )
                 and self._coverage_complete(phase, requirements)
+                and self._composition_coverage_complete(ks)
             ):
                 self.event(
                     dict(
@@ -1205,6 +1304,7 @@ class AdaptivePilot(Pilot):
                         phase=phase,
                         reason="discovery_and_energy_plateau",
                         cycle=cycle,
+                        composition_coverage_debt={},
                     )
                 )
                 print(f"[adaptive] phase={phase} complete: plateau", flush=True)
@@ -1214,8 +1314,9 @@ class AdaptivePilot(Pilot):
                 event="adaptive_phase_halted",
                 phase=phase,
                 reason="maximum_cycles_without_plateau",
-                coverage_debt=self._coverage_debt(phase, requirements),
-                stagnant_runs=stagnant_runs,
+            coverage_debt=self._coverage_debt(phase, requirements),
+            composition_coverage_debt=self._composition_coverage_debt(ks),
+            stagnant_runs=stagnant_runs,
             )
         )
         print(f"[adaptive] phase={phase} halted: maximum cycles", flush=True)
