@@ -88,3 +88,7 @@ For a new system, the phase controller itself does not change. Set `chemistry_ad
 ### Final Phase-A completion
 
 After `nucleation_phase_a_continuation_v1`, run `scripts/nucleation_phase_a_completion_24c.slurm`. Its completion configuration imports the exact frozen k=5/k=6 cohorts from the source `events.jsonl` and executes representative cycles 5--7. Only cohort membership is inherited: calculation budgets, queues, convergence counters and phase status are new. This prevents cycles 0--4 from being repeated and prevents newly discovered families from changing the bounded completion cohort.
+
+### Phase B: bounded k=6 to k=7 extension
+
+Submit `scripts/nucleation_phase_b_k7_24c.slurm` with `nucleation_phase_a_completion_v1` as its source. Phase B uses a stable discrete CN/ring family identity; continuous radius and tetrahedral-order descriptors remain geometry diagnostics and no longer rename lineages at bin boundaries. Its 150-family k=6 parent beam reserves up to 20% for stable families first discovered in the source run, while the k=7 beam retains a 15% admission reserve. Plateau decisions use newly discovered families within 1 eV of the best same-composition minimum; raw family novelty is still reported. The run has independent 2,800-call growth and 3,000-call fixed-k caps and cannot proceed to k=8.

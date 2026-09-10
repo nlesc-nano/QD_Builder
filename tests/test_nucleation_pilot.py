@@ -483,6 +483,103 @@ def test_coarse_family_keeps_exact_graphs_as_subfamilies():
     assert lineage_family(base) != lineage_family(changed)
     assert coarse_lineage_family(base) == coarse_lineage_family(changed)
 
+    # Continuous geometry descriptors can cross arbitrary reporting bins after
+    # a numerically negligible re-relaxation.  They must not rename a lineage.
+    changed["final"]["radius_A"] = 20.0
+    changed["final"]["tetrahedral_q4"] = [-0.8, 0.99]
+    assert coarse_lineage_family(base) == coarse_lineage_family(changed)
+
+
+def test_energy_window_limits_convergence_family_novelty(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=10,
+        stage_calls={1: 2, 2: 2, 3: 2},
+        family_slots={1: 4, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+        convergence_energy_window_eV=1.0,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    low = dict(
+        example().record(),
+        minimum_id="low",
+        energy_eV=-10.0,
+        role="primary",
+        final=descriptors(example().symbols, example().edges, example().positions),
+    )
+    high = json.loads(json.dumps(low))
+    high["minimum_id"] = "high"
+    high["energy_eV"] = -8.0
+    high["final"]["n4"] += 1
+    pilot.rows["experimental"] = {"low": low, "high": high}
+    snapshot = pilot._snapshot([1])[1]
+    assert len(snapshot["families"]) == 2
+    assert len(snapshot["relevant_families"]) == 1
+
+
+def test_source_novelty_reserve_is_in_initial_cohort(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=10,
+        stage_calls={1: 2, 2: 2, 3: 2},
+        family_slots={1: 4, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+        admission_fraction=0.0,
+        source_novelty_fraction=0.25,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    pilot.setup()
+
+    rows = {}
+    for index in range(5):
+        proposal = example(index)
+        row = dict(
+            proposal.record(),
+            minimum_id=f"minimum_{index}",
+            energy_eV=-20.0 + index,
+            role="primary",
+            final=dict(
+                descriptors(proposal.symbols, proposal.edges, proposal.positions),
+                se_cn={str(index + 1): 1},
+            ),
+        )
+        rows[row["minimum_id"]] = row
+    pilot.rows["experimental"] = rows
+    ranked, _ = pilot._ranked_families(1)
+    reserved = ranked[-1]
+    pilot._source_novel_families_cache = {1: [reserved]}
+    cohort = pilot._update_cohort("A", 1, 0)
+    assert len(cohort) == 4
+    assert reserved in cohort
+    initialized, _ = pilot._cohort_state("A", 1)
+    assert initialized["source_novelty_families"] == [reserved]
+
 
 def test_adaptive_cohort_is_stable_and_only_admits_new_families(tmp_path):
     source = tmp_path / "source"
@@ -520,6 +617,7 @@ def test_adaptive_cohort_is_stable_and_only_admits_new_families(tmp_path):
             final=dict(
                 descriptors(proposal.symbols, proposal.edges, proposal.positions),
                 radius_A=radius,
+                se_cn={str(index + 1): 1},
                 core_hash=f"exact-{index}",
             ),
             protocol="test",
