@@ -224,6 +224,21 @@ def test_failed_calls_are_charged_and_global_cap(tmp_path):
     assert len(pilot.completed) == 4
 
 
+def test_batch_progress_is_compact_and_reports_outcomes(tmp_path, capsys):
+    def backend(*args):
+        return [XtbResult(ok=False, error="test failure")]
+
+    pilot = make_pilot(tmp_path, backend)
+    pilot.setup()
+    pilot.evaluate([("shared", example(0)), ("shared", example(1))], 1)
+    output = capsys.readouterr().out
+    assert "[pilot] launch k=1 batch=1 size=2" in output
+    assert "channels=seed0:1,seed1:1 compositions=p1:2" in output
+    assert "calls_total=2/12" in output
+    assert "[pilot] finish k=1 batch=1 outcomes=failed:2" in output
+    assert "queue_left=0" in output
+
+
 def test_frozen_queue_and_changed_seed_reject_resume(tmp_path):
     pilot = make_pilot(tmp_path, lambda *args: [])
     seed_xyz = pilot.seed_dir / "seed.xyz"
