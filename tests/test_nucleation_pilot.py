@@ -619,6 +619,55 @@ def test_source_novelty_reserve_is_in_initial_cohort(tmp_path):
     assert initialized["source_novelty_families"] == [reserved]
 
 
+def test_composition_stratified_cohort_reserves_sparse_p_family(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text('{"experimental": {}}')
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=10,
+        stage_calls={1: 2, 2: 2, 3: 2},
+        family_slots={1: 3, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+        admission_fraction=0.0,
+        cohort_min_primary_families_by_p={1: {2: 1}},
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "out",
+        backend=lambda *args: [],
+    )
+    pilot.setup()
+    rows = {}
+    for index in range(4):
+        proposal = example(index)
+        row = dict(
+            proposal.record(),
+            p=2 if index == 3 else 1,
+            minimum_id=f"minimum_{index}",
+            energy_eV=-20.0 + index,
+            role="primary",
+            final=dict(
+                descriptors(proposal.symbols, proposal.edges, proposal.positions),
+                se_cn={str(index + 1): 1},
+            ),
+        )
+        rows[row["minimum_id"]] = row
+    pilot.rows["experimental"] = rows
+    sparse_family = pilot.adapter.family(rows["minimum_3"])
+    cohort = pilot._update_cohort("A", 1, 0)
+    assert len(cohort) == 3
+    assert sparse_family in cohort
+    initialized, _ = pilot._cohort_state("A", 1)
+    assert initialized["composition_reserved_families"] == [sparse_family]
+
+
 def test_adaptive_cohort_is_stable_and_only_admits_new_families(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
