@@ -36,12 +36,15 @@ class AdaptiveConfig(PilotConfig):
         default_factory=lambda: {4: 1_600, 5: 2_400, 6: 3_200, 7: 5_000, 8: 5_000}
     )
     operation_calls: dict = field(default_factory=dict)
+    operation_calls_by_p: dict = field(default_factory=dict)
     family_slots: dict = field(
         default_factory=lambda: {4: 80, 5: 120, 6: 150, 7: 160, 8: 160}
     )
     parent_p_by_k: dict = field(default_factory=dict)
+    parent_roles_by_k: dict = field(default_factory=dict)
     proposal_p_by_k: dict = field(default_factory=dict)
     cohort_min_primary_families_by_p: dict = field(default_factory=dict)
+    cohort_min_families_by_p: dict = field(default_factory=dict)
     required_primary_families_by_p: dict = field(default_factory=dict)
     p_states_per_family: int = 3
     geometries_per_family: int = 2
@@ -66,6 +69,7 @@ class AdaptiveConfig(PilotConfig):
     proposals_per_family_fixed: int = 3
     proposals_per_family_growth: int = 6
     chemistry_adapter: str = "cdse_cdcl2"
+    chemistry_options: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path):
@@ -89,10 +93,21 @@ class AdaptiveConfig(PilotConfig):
             int(k): {str(operation): int(limit) for operation, limit in limits.items()}
             for k, limits in value.operation_calls.items()
         }
+        value.operation_calls_by_p = {
+            int(k): {
+                str(operation): {int(p): int(limit) for p, limit in limits.items()}
+                for operation, limits in operations.items()
+            }
+            for k, operations in value.operation_calls_by_p.items()
+        }
         value.family_slots = {int(k): int(v) for k, v in value.family_slots.items()}
         value.parent_p_by_k = {
             int(k): [int(p) for p in values]
             for k, values in value.parent_p_by_k.items()
+        }
+        value.parent_roles_by_k = {
+            int(k): [str(role) for role in roles]
+            for k, roles in value.parent_roles_by_k.items()
         }
         value.proposal_p_by_k = {
             int(k): [int(p) for p in values]
@@ -101,6 +116,10 @@ class AdaptiveConfig(PilotConfig):
         value.cohort_min_primary_families_by_p = {
             int(k): {int(p): int(count) for p, count in requirements.items()}
             for k, requirements in value.cohort_min_primary_families_by_p.items()
+        }
+        value.cohort_min_families_by_p = {
+            int(k): {int(p): int(count) for p, count in requirements.items()}
+            for k, requirements in value.cohort_min_families_by_p.items()
         }
         value.required_primary_families_by_p = {
             int(k): {int(p): int(count) for p, count in requirements.items()}
@@ -143,6 +162,21 @@ class AdaptiveConfig(PilotConfig):
             for operation, limit in limits.items()
         ):
             raise ValueError("operation_calls accepts positive fixed/growth limits")
+        if any(
+            k not in value.p_max
+            or operation not in {"fixed", "growth"}
+            or not limits
+            or any(p < 1 or p > value.p_max[k] or limit <= 0 for p, limit in limits.items())
+            for k, operations in value.operation_calls_by_p.items()
+            for operation, limits in operations.items()
+        ):
+            raise ValueError("operation_calls_by_p has an invalid k, operation, p or limit")
+        for k, operations in value.operation_calls_by_p.items():
+            for operation, limits in operations.items():
+                if sum(limits.values()) > value.operation_limit(k, operation):
+                    raise ValueError(
+                        f"operation_calls_by_p k={k} {operation} exceeds operation budget"
+                    )
         if not (1 <= value.p_states_per_family <= 4):
             raise ValueError("invalid p_states_per_family")
         if not (1 <= value.geometries_per_family <= 2):
@@ -168,11 +202,20 @@ class AdaptiveConfig(PilotConfig):
                 for k, values in selection.items()
             ):
                 raise ValueError(f"{label} has an invalid k or p selection")
+        if any(
+            k not in value.p_max
+            or not roles
+            or len(roles) != len(set(roles))
+            or any(role not in {"primary", "audit"} for role in roles)
+            for k, roles in value.parent_roles_by_k.items()
+        ):
+            raise ValueError("parent_roles_by_k has an invalid k or role selection")
         for label, requirements in (
             (
                 "cohort_min_primary_families_by_p",
                 value.cohort_min_primary_families_by_p,
             ),
+            ("cohort_min_families_by_p", value.cohort_min_families_by_p),
             ("required_primary_families_by_p", value.required_primary_families_by_p),
         ):
             if any(
@@ -186,6 +229,10 @@ class AdaptiveConfig(PilotConfig):
                 raise ValueError(f"{label} has an invalid requirement")
         if not 0 <= value.source_novelty_fraction < 0.5:
             raise ValueError("source_novelty_fraction must be in [0, 0.5)")
+        if not 0 <= value.audit_fraction <= 1:
+            raise ValueError("audit_fraction must be in [0, 1]")
+        if not isinstance(value.chemistry_options, dict):
+            raise ValueError("chemistry_options must be a mapping")
         if (
             value.convergence_energy_window_eV is not None
             and value.convergence_energy_window_eV <= 0
@@ -216,6 +263,12 @@ class AdaptiveConfig(PilotConfig):
         if not self.operation_calls:
             return self.stage_limits().get(k, 0)
         return self.operation_calls.get(k, {}).get(operation, 0)
+
+    def operation_p_limit(self, k, operation, p):
+        by_operation = self.operation_calls_by_p.get(k, {})
+        if operation not in by_operation:
+            return None
+        return by_operation[operation].get(p, 0)
 
     def family_admission_fraction(self, k):
         return self.admission_fraction_by_k.get(k, self.admission_fraction)
@@ -296,7 +349,7 @@ class CdSeCdClAdapter:
     """Chemistry hook for the present Cd_(k+p)Se_kCl_(2p) model."""
 
     name = "cdse_cdcl2"
-    fixed_channels = ("topology", "exchange", "reconstruction")
+    fixed_channels = ("topology", "exchange", "reconstruction", "repair")
 
     @staticmethod
     def family(row):
@@ -327,9 +380,22 @@ class CdSeCdClAdapter:
         # Exchange was the productive fixed-k move in v1.  Topology remains as
         # a minority exploration channel; reconstruction is sampled every
         # third cycle because it mostly reconverged existing basins.
-        schedule = [("exchange", 2), ("topology", 1)]
-        if cycle % 3 == 0:
-            schedule.append(("reconstruction", 1))
+        configured = pilot.config.chemistry_options.get("fixed_channel_counts")
+        if configured:
+            unknown = set(configured) - set(self.fixed_channels)
+            if unknown:
+                raise ValueError(
+                    f"unknown CdSe/CdCl2 fixed channels: {sorted(unknown)}"
+                )
+            schedule = [
+                (channel, int(count))
+                for channel, count in configured.items()
+                if int(count) > 0
+            ]
+        else:
+            schedule = [("exchange", 2), ("topology", 1)]
+            if cycle % 3 == 0:
+                schedule.append(("reconstruction", 1))
         remaining = limit
         for channel, requested in schedule:
             count = min(requested, remaining)
@@ -403,11 +469,13 @@ class AdaptivePilot(Pilot):
         self.adapter = load_adapter(config.chemistry_adapter)
         self.archive = self.adapter.archive(self.spec)
         self.operation_calls_used = Counter()
+        self.operation_p_calls_used = Counter()
         self._source_novel_families_cache = None
 
     def setup(self):
         super().setup()
         self.operation_calls_used = Counter()
+        self.operation_p_calls_used = Counter()
         for event in self.events:
             if event["event"] != "launch":
                 continue
@@ -415,6 +483,9 @@ class AdaptivePilot(Pilot):
             operation = proposal.get("search_operation", "")
             if operation:
                 self.operation_calls_used[event["stage"], operation] += 1
+                self.operation_p_calls_used[
+                    event["stage"], operation, int(proposal["p"])
+                ] += 1
 
     def event(self, data):
         super().event(data)
@@ -422,6 +493,9 @@ class AdaptivePilot(Pilot):
             operation = data["proposal"].get("search_operation", "")
             if operation:
                 self.operation_calls_used[data["stage"], operation] += 1
+                self.operation_p_calls_used[
+                    data["stage"], operation, int(data["proposal"]["p"])
+                ] += 1
 
     def extra_protocol_sources(self):
         path = inspect.getsourcefile(type(self.adapter))
@@ -447,17 +521,30 @@ class AdaptivePilot(Pilot):
         if not base or proposal is None or not proposal.search_operation:
             return base
         limit = self.config.operation_limit(stage, proposal.search_operation)
-        return (
+        if not (
             limit > 0
             and self.operation_calls_used[stage, proposal.search_operation] < limit
+        ):
+            return False
+        p_limit = self.config.operation_p_limit(
+            stage, proposal.search_operation, proposal.p
         )
+        return p_limit is None or self.operation_p_calls_used[
+            stage, proposal.search_operation, proposal.p
+        ] < p_limit
 
     def extra_status(self):
         return {
             "operation_calls": {
                 f"{k}:{operation}": count
                 for (k, operation), count in sorted(self.operation_calls_used.items())
-            }
+            },
+            "operation_calls_by_p": {
+                f"{k}:{operation}:p{p}": count
+                for (k, operation, p), count in sorted(
+                    self.operation_p_calls_used.items()
+                )
+            },
         }
 
     def initialize_source(self):
@@ -625,10 +712,13 @@ class AdaptivePilot(Pilot):
 
     def _ranked_families(self, k):
         parent_p = set(self.config.parent_p_by_k.get(k, []))
+        parent_roles = set(self.config.parent_roles_by_k.get(k, []))
         rows = [
             r
             for r in self.rows["experimental"].values()
-            if r["k"] == k and (not parent_p or r["p"] in parent_p)
+            if r["k"] == k
+            and (not parent_p or r["p"] in parent_p)
+            and (not parent_roles or r["role"] in parent_roles)
         ]
         by_family = defaultdict(list)
         for row in rows:
@@ -749,6 +839,28 @@ class AdaptivePilot(Pilot):
                 for family in candidates[:required]:
                     if family not in composition_reserved:
                         composition_reserved.append(family)
+            for p, required in sorted(
+                self.config.cohort_min_families_by_p.get(k, {}).items()
+            ):
+                candidates = [
+                    family
+                    for family in ranked
+                    if any(row["p"] == p for row in by_family[family])
+                ]
+                if len(candidates) < required:
+                    raise ValueError(
+                        f"k={k} parent cohort requires {required} families "
+                        f"at p={p}, but the source has {len(candidates)}"
+                    )
+                selected = 0
+                for family in candidates:
+                    if family not in composition_reserved:
+                        composition_reserved.append(family)
+                        selected += 1
+                    elif any(row["p"] == p for row in by_family[family]):
+                        selected += 1
+                    if selected >= required:
+                        break
             if len(composition_reserved) > initial_capacity:
                 raise ValueError(
                     f"k={k} composition reservations exceed initial capacity "
@@ -870,7 +982,7 @@ class AdaptivePilot(Pilot):
         for family_id in families:
             candidates = by_family[family_id]
             primary_candidates = [r for r in candidates if r["role"] == "primary"]
-            if primary_candidates:
+            if primary_candidates and k not in self.config.parent_roles_by_k:
                 candidates = primary_candidates
             clean_lineage = [r for r in candidates if not r.get("audit_derived", False)]
             if clean_lineage:
@@ -1265,12 +1377,23 @@ class AdaptivePilot(Pilot):
             f"{channel}:{count}" for channel, count in sorted(channels.items())
         )
         used_before = self.operation_calls_used[target_k, operation]
+        p_limits = self.config.operation_calls_by_p.get(target_k, {}).get(
+            operation, {}
+        )
+
+        def p_budget_text():
+            return ",".join(
+                f"p{p}:{self.operation_p_calls_used[target_k, operation, p]}/{cap}"
+                for p, cap in sorted(p_limits.items())
+            )
+
         print(
             f"[adaptive] queue phase={phase} cycle={cycle} operation={operation} "
             f"k={source_k}->{target_k} cohort={cohort_size} total={len(queue)} "
             f"pending={len(pending)} channels={channel_text or '-'} "
             f"compositions={p_text or '-'} "
-            f"operation_calls={used_before}/{limit}",
+            f"operation_calls={used_before}/{limit} "
+            f"composition_calls={p_budget_text() or '-'}",
             flush=True,
         )
         self.evaluate([("experimental", proposal) for proposal in queue], target_k)
@@ -1279,6 +1402,7 @@ class AdaptivePilot(Pilot):
             f"[adaptive] operation_done phase={phase} cycle={cycle} "
             f"operation={operation} k={source_k}->{target_k} "
             f"launched={used_after - used_before} operation_calls={used_after}/{limit} "
+            f"composition_calls={p_budget_text() or '-'} "
             f"calls_total={sum(self.calls.values())}/{self.config.max_calls}",
             flush=True,
         )
