@@ -248,7 +248,13 @@ def test_export_adaptive_archive_writes_energy_ranked_xyz_stacks(tmp_path):
         structure_id="higher-route",
         energy_eV=-9.0,
         role="primary",
-        final={"mu2": 2, "n4": 1, "n6": 0, "se_cn": {"2": 1}},
+        final={
+            "graph_hash": "same-relaxed-graph",
+            "mu2": 2,
+            "n4": 1,
+            "n6": 0,
+            "se_cn": {"2": 1},
+        },
         source="test",
     )
     second = dict(first, minimum_id="lower", energy_eV=-10.0)
@@ -267,12 +273,25 @@ def test_export_adaptive_archive_writes_energy_ranked_xyz_stacks(tmp_path):
     assert summary == {"structures": 2, "bins": 1, "skipped": 0}
     lines = (tmp_path / "xyz/k1_p1.xyz").read_text().splitlines()
     frame_lines = len(first["symbols"]) + 2
-    assert lines[1].startswith("lower E=-10.0000000000eV dE=0.000000eV")
-    assert lines[frame_lines + 1].startswith("higher E=-9.0000000000eV dE=1.000000eV")
+    assert lines[1].startswith(
+        "-0.3674932218 lower E_Ha=-0.3674932218 E_eV=-10.0000000000"
+    )
+    assert lines[frame_lines + 1].startswith(
+        "-0.3307438996 higher E_Ha=-0.3307438996 E_eV=-9.0000000000"
+    )
     with (tmp_path / "xyz/index.csv").open() as handle:
         exported = list(csv.DictReader(handle))
     assert [row["minimum_id"] for row in exported] == ["lower", "higher"]
     assert exported[1]["relative_energy_kcal_mol"] == "23.060548"
+
+    collapsed = export_archive(
+        archive, tmp_path / "collapsed", one_per_graph=True
+    )
+    assert collapsed == {"structures": 1, "bins": 1, "skipped": 0}
+    with (tmp_path / "collapsed/index.csv").open() as handle:
+        representative = next(csv.DictReader(handle))
+    assert representative["minimum_id"] == "lower"
+    assert representative["graph_members"] == "2"
 
 
 def test_frozen_queue_and_changed_seed_reject_resume(tmp_path):
