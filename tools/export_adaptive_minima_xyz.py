@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 EV_TO_KCAL_MOL = 23.060548
+HARTREE_TO_EV = 27.211386245988
 
 
 def _json_cell(value) -> str:
@@ -24,10 +25,16 @@ def _input_path(path: Path) -> Path:
 def _comment(row, minimum_id, rank, delta_eV) -> str:
     final = row.get("final", {})
     energy = float(row["energy_eV"])
+    graph_members = int(row.get("_export_graph_members", 1))
+    # Molden's concatenated XYZ reader parses the second line with atof(), so
+    # the energy must be the first token.  Metadata may safely follow it.
     return (
-        f"{minimum_id} E={energy:.10f}eV dE={delta_eV:.6f}eV "
-        f"dE={delta_eV * EV_TO_KCAL_MOL:.3f}kcal/mol rank={rank} "
+        f"{energy / HARTREE_TO_EV:.10f} {minimum_id} "
+        f"E_Ha={energy / HARTREE_TO_EV:.10f} E_eV={energy:.10f} "
+        f"dE_eV={delta_eV:.6f} "
+        f"dE_kcal_mol={delta_eV * EV_TO_KCAL_MOL:.3f} rank={rank} "
         f"k={row['k']} p={row['p']} role={row.get('role', 'unknown')} "
+        f"graph_members={graph_members} "
         f"mu2={final.get('mu2', 'NA')} n4={final.get('n4', 'NA')} "
         f"n6={final.get('n6', 'NA')}"
     )
@@ -42,6 +49,7 @@ def export_archive(
     selected_k=None,
     selected_p=None,
     max_per_bin=None,
+    one_per_graph=False,
 ):
     """Write one energy-ranked XYZ trajectory per selected ``(k, p)`` bin."""
 
@@ -96,6 +104,7 @@ def export_archive(
         "energy_eV",
         "relative_energy_eV",
         "relative_energy_kcal_mol",
+        "graph_members",
         "n_atoms",
         "mu2",
         "mu3",
@@ -114,6 +123,17 @@ def export_archive(
     for (k, p), records in sorted(grouped.items()):
         records.sort(key=lambda item: (item[0], item[1]))
         available = len(records)
+        if one_per_graph:
+            graph_groups = defaultdict(list)
+            for record in records:
+                graph_hash = record[2].get("final", {}).get("graph_hash")
+                graph_groups[graph_hash or f"missing:{record[1]}"].append(record)
+            representatives = []
+            for members in graph_groups.values():
+                representative = members[0]
+                representative[2]["_export_graph_members"] = len(members)
+                representatives.append(representative)
+            records = sorted(representatives, key=lambda item: (item[0], item[1]))
         if max_per_bin is not None:
             records = records[:max_per_bin]
         reference = records[0][0]
@@ -144,6 +164,7 @@ def export_archive(
                         energy_eV=f"{energy:.10f}",
                         relative_energy_eV=f"{delta_eV:.10f}",
                         relative_energy_kcal_mol=f"{delta_eV * EV_TO_KCAL_MOL:.6f}",
+                        graph_members=int(row.get("_export_graph_members", 1)),
                         n_atoms=len(symbols),
                         mu2=final.get("mu2", ""),
                         mu3=final.get("mu3", ""),
@@ -173,8 +194,10 @@ def export_archive(
                 arm=arm,
                 roles=sorted(role_set),
                 sorting="ascending raw g-xTB energy within each fixed (k,p) composition",
+                molden_energy="first XYZ comment token, converted from eV to Hartree",
                 relative_energy_reference="lowest exported energy in the same (k,p) stack",
                 max_per_bin=max_per_bin,
+                one_per_graph=one_per_graph,
                 structures=len(index_rows),
                 skipped_invalid=skipped,
                 bins=bin_summary,
@@ -208,6 +231,14 @@ def main():
         type=int,
         help="write only the N lowest-energy structures in each (k,p) stack",
     )
+    parser.add_argument(
+        "--one-per-graph",
+        action="store_true",
+        help=(
+            "write only the lowest-energy representative of each relaxed graph "
+            "topology; the complete minima.json is never modified"
+        ),
+    )
     args = parser.parse_args()
     if args.max_per_bin is not None and args.max_per_bin < 1:
         parser.error("--max-per-bin must be positive")
@@ -221,6 +252,7 @@ def main():
         selected_k=args.k,
         selected_p=args.p,
         max_per_bin=args.max_per_bin,
+        one_per_graph=args.one_per_graph,
     )
     print(
         f"[export] wrote {summary['structures']} structures in "
