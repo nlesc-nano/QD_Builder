@@ -2,7 +2,8 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 from itertools import combinations
-from collections import Counter
+from collections import Counter, defaultdict
+import math
 import networkx as nx
 import numpy as np
 
@@ -392,7 +393,142 @@ def local_proposals(parent, rng, spec, pack, *, channel, limit=8):
         if validate_composition(proposal):
             out.append(proposal)
 
-    if channel == "topology":
+    if channel == "repair":
+        # Local graph repairs for relaxed audit structures.  These moves keep
+        # the composition and inorganic core fixed while changing only the
+        # offending ligand coordination.  They are search proposals, not
+        # elementary reaction mechanisms.
+        cd = [i for i, symbol in enumerate(sy) if symbol == "Cd"]
+        cl = [i for i, symbol in enumerate(sy) if symbol == "Cl"]
+        max_cd = int(spec.graph_rules.max_cn.get("Cd", 4))
+        min_bridge = int(spec.graph_rules.min_bridged_host_cn)
+        bond_length = float(_cdcl_bond_A(pack))
+        seen = set()
+
+        def reposition_ligand(trial, trial_graph, ligand):
+            hosts = [i for i in trial_graph[ligand] if sy[i] == "Cd"]
+            if len(hosts) == 1:
+                host = hosts[0]
+                neighbors = [i for i in trial_graph[host] if i != ligand]
+                direction = _outward_direction(trial, host, neighbors)
+                trial[ligand] = trial[host] + bond_length * direction
+            elif len(hosts) == 2:
+                a, b = hosts
+                midpoint = 0.5 * (trial[a] + trial[b])
+                axis = trial[b] - trial[a]
+                distance = float(np.linalg.norm(axis))
+                if distance > 1e-10:
+                    axis /= distance
+                normal = trial[ligand] - midpoint
+                normal -= float(normal @ axis) * axis
+                if np.linalg.norm(normal) < 1e-8:
+                    center = np.mean(trial[cd], axis=0)
+                    normal = midpoint - center
+                    normal -= float(normal @ axis) * axis
+                if np.linalg.norm(normal) < 1e-8:
+                    normal = np.cross(
+                        axis,
+                        [1.0, 0.0, 0.0] if abs(axis[0]) < 0.9 else [0.0, 1.0, 0.0],
+                    )
+                normal /= max(float(np.linalg.norm(normal)), 1e-12)
+                height = math.sqrt(max(bond_length**2 - (0.5 * distance) ** 2, 0.04))
+                trial[ligand] = midpoint + height * normal
+            trial[ligand] += np.clip(rng.normal(0.0, 0.04, 3), -0.10, 0.10)
+
+        def emit_edit(remove, add, ligand):
+            trial_graph = graph.copy()
+            if remove is not None and trial_graph.has_edge(*remove):
+                trial_graph.remove_edge(*remove)
+            if add is not None:
+                trial_graph.add_edge(*add)
+            if trial_graph.degree(ligand) < 1 or not nx.is_connected(trial_graph):
+                return
+            key = tuple(sorted(tuple(sorted(edge)) for edge in trial_graph.edges))
+            if key in seen:
+                return
+            seen.add(key)
+            trial = xyz.copy()
+            reposition_ligand(trial, trial_graph, ligand)
+            emit(sy, trial, list(trial_graph.edges), k, p)
+
+        # Demote a mu3 cap at a host that also carries another bridge.
+        for cap in cl:
+            cap_hosts = [i for i in graph[cap] if sy[i] == "Cd"]
+            if len(cap_hosts) < 3:
+                continue
+            overlapping = [
+                host
+                for host in cap_hosts
+                if any(
+                    other != cap
+                    and sy[other] == "Cl"
+                    and sum(sy[n] == "Cd" for n in graph[other]) >= 2
+                    for other in graph[host]
+                )
+            ]
+            for host in overlapping + [h for h in cap_hosts if h not in overlapping]:
+                emit_edit((cap, host), None, cap)
+                if len(out) >= limit:
+                    return out[:limit]
+
+        # If two ligands bridge the same Cd pair, demote either bridge arm.
+        pair_ligands = defaultdict(list)
+        for ligand in cl:
+            hosts = tuple(sorted(i for i in graph[ligand] if sy[i] == "Cd"))
+            if len(hosts) == 2:
+                pair_ligands[hosts].append(ligand)
+        for hosts, ligands in pair_ligands.items():
+            if len(ligands) < 2:
+                continue
+            for ligand in ligands[1:]:
+                for host in hosts:
+                    emit_edit((ligand, host), None, ligand)
+                    if len(out) >= limit:
+                        return out[:limit]
+
+        # Remove a bridge arm from an under-coordinated or over-coordinated Cd.
+        priority_hosts = [i for i in cd if graph.degree(i) > max_cd]
+        priority_hosts += [
+            i
+            for i in cd
+            if graph.degree(i) < min_bridge
+            and any(sy[j] == "Cl" and graph.degree(j) >= 2 for j in graph[i])
+        ]
+        for host in dict.fromkeys(priority_hosts):
+            ligands = [j for j in graph[host] if sy[j] == "Cl" and graph.degree(j) >= 2]
+            for ligand in ligands:
+                emit_edit((ligand, host), None, ligand)
+                if len(out) >= limit:
+                    return out[:limit]
+
+        # Reroute one bridge arm to a less-coordinated, geometrically reachable Cd.
+        bridge_ligands = [ligand for ligand in cl if graph.degree(ligand) >= 2]
+        rng.shuffle(bridge_ligands)
+        for ligand in bridge_ligands:
+            hosts = [i for i in graph[ligand] if sy[i] == "Cd"]
+            for old_host in hosts:
+                retained = [i for i in hosts if i != old_host]
+                candidates = [
+                    host
+                    for host in cd
+                    if host not in hosts
+                    and graph.degree(host) < max_cd
+                    and (
+                        not retained
+                        or min(
+                            float(np.linalg.norm(xyz[host] - xyz[other]))
+                            for other in retained
+                        )
+                        <= 4.75
+                    )
+                ]
+                candidates.sort(key=lambda host: (graph.degree(host), host))
+                for new_host in candidates[:2]:
+                    emit_edit((ligand, old_host), (ligand, new_host), ligand)
+                    if len(out) >= limit:
+                        return out[:limit]
+        return out[:limit]
+    elif channel == "topology":
         # Deliberately change the Cd--Se graph before relaxation.  A coordinate
         # perturbation alone almost always returns to the same local basin and
         # therefore cannot repair a lineage search that has lost a core family.

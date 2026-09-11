@@ -68,11 +68,16 @@ def main():
                     },
                     per_k_call_caps=config.stage_limits(),
                     per_operation_call_caps=config.operation_calls,
+                    per_operation_composition_call_caps=(
+                        config.operation_calls_by_p
+                    ),
                     parent_p_by_k=config.parent_p_by_k,
+                    parent_roles_by_k=config.parent_roles_by_k,
                     proposal_p_by_k=config.proposal_p_by_k,
                     cohort_min_primary_families_by_p=(
                         config.cohort_min_primary_families_by_p
                     ),
+                    cohort_min_families_by_p=config.cohort_min_families_by_p,
                     required_primary_families_by_p=(
                         config.required_primary_families_by_p
                     ),
@@ -89,6 +94,7 @@ def main():
                         minimum_launched_cycles=config.minimum_launched_cycles,
                         import_source_cohorts=config.import_source_cohorts,
                     ),
+                    chemistry_options=config.chemistry_options,
                     phase_cycle_start=config.phase_cycle_start,
                     plateau=dict(
                         patience=config.convergence_patience,

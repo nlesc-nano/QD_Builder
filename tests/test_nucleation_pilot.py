@@ -19,9 +19,12 @@ from builder.nucleation.adaptive import (
     coarse_lineage_family,
     lineage_family,
 )
+from builder.nucleation.geometry_pack import load_geometry_pack
+from builder.nucleation.molecular import mu3_host_bridge_overlap_violations
 from builder.nucleation.pilot_proposals import (
     Proposal,
     bounded_shells,
+    graph_state,
     local_proposals,
     validate_composition,
 )
@@ -32,6 +35,7 @@ from builder.nucleation.search_analysis import (
     analyze_corpus,
 )
 from builder.nucleation.xtb_relax import XtbResult
+from builder.nucleation.spec import load_nucleation_spec
 from tools.export_adaptive_minima_xyz import export_archive
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -808,6 +812,9 @@ def test_operation_budgets_are_independent(tmp_path):
         workers=1,
         max_calls=4,
         operation_calls={1: {"fixed": 1, "growth": 2}},
+        operation_calls_by_p={
+            1: {"fixed": {1: 1}, "growth": {1: 1, 2: 1}}
+        },
         family_slots={1: 1, 2: 1, 3: 1},
         p_max={1: 3, 2: 5, 3: 6},
         phase_a_k=[1],
@@ -826,6 +833,10 @@ def test_operation_budgets_are_independent(tmp_path):
     growth = replace(example(), search_operation="growth")
     assert pilot.allowed("experimental", 1, fixed)
     assert pilot.allowed("experimental", 1, growth)
+    pilot.operation_p_calls_used[1, "growth", 1] = 1
+    assert not pilot.allowed("experimental", 1, growth)
+    assert pilot.allowed("experimental", 1, replace(growth, p=2))
+    pilot.operation_p_calls_used.clear()
     pilot.operation_calls_used[1, "fixed"] = 1
     assert not pilot.allowed("experimental", 1, fixed)
     assert pilot.allowed("experimental", 1, growth)
@@ -889,3 +900,68 @@ def test_integration_through_k3_without_solver(tmp_path, monkeypatch):
     assert curves and any(point["primary_minima"] for point in curves)
     assert (pilot.output / "composition_comparison.json").exists()
     assert sum(pilot.calls.values()) <= pilot.config.max_calls
+
+
+def test_ligand_repair_moves_target_mu3_overlap_and_preserve_formula():
+    spec_path = PACK / "run_gxtb.yaml"
+    spec = load_nucleation_spec(spec_path)
+    pack = load_geometry_pack(spec_path)
+    parent = dict(
+        k=1,
+        p=2,
+        minimum_id="audit_parent",
+        role="audit",
+        audit_derived=False,
+        symbols=["Se", "Cd", "Cd", "Cd", "Cl", "Cl", "Cl", "Cl"],
+        positions=[
+            [0, 0, 0],
+            [2.6, 0, 0],
+            [-1.3, 2.25, 0],
+            [-1.3, -2.25, 0],
+            [0, 0, 2],
+            [0.65, 1.125, 2],
+            [4.9, 0, 0],
+            [-3.5, -2.25, 0],
+        ],
+        edges=[
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [1, 4],
+            [2, 4],
+            [3, 4],
+            [1, 5],
+            [2, 5],
+            [1, 6],
+            [3, 7],
+        ],
+    )
+    before = mu3_host_bridge_overlap_violations(
+        graph_state(parent["symbols"], parent["edges"], parent["positions"]), spec
+    )
+    repairs = local_proposals(
+        parent,
+        np.random.default_rng(4),
+        spec,
+        pack,
+        channel="repair",
+        limit=8,
+    )
+    assert before and repairs
+    assert all(validate_composition(proposal) for proposal in repairs)
+    assert all(proposal.audit_derived for proposal in repairs)
+    assert any(
+        not mu3_host_bridge_overlap_violations(
+            graph_state(proposal.symbols, proposal.edges, proposal.positions), spec
+        )
+        for proposal in repairs
+    )
+
+
+def test_phase_c_completion_configuration_has_composition_call_caps():
+    config = AdaptiveConfig.load(PACK / "adaptive_phase_c_completion.yaml")
+    assert config.phase_cycle_start == {"C": 8}
+    assert config.parent_roles_by_k[8] == ["primary", "audit"]
+    assert config.operation_p_limit(8, "growth", 9) == 400
+    assert config.operation_p_limit(8, "fixed", 11) == 900
+    assert config.operation_p_limit(8, "fixed", 8) == 0
