@@ -70,6 +70,9 @@ def main():
                     per_operation_call_caps=config.operation_calls,
                     parent_p_by_k=config.parent_p_by_k,
                     proposal_p_by_k=config.proposal_p_by_k,
+                    cohort_min_primary_families_by_p=(
+                        config.cohort_min_primary_families_by_p
+                    ),
                     required_primary_families_by_p=(
                         config.required_primary_families_by_p
                     ),

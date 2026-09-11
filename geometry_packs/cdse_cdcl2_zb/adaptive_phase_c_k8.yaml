@@ -1,0 +1,59 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 223607
+workers: 24
+max_calls: 7000
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 20
+
+# Phase C only: grow the completed k=7 p1--p10 map to k=8, then perform
+# bounded fixed-composition exploration at k=8.  There is no larger-k phase.
+enabled_phases: [C]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 8
+operation_calls:
+  8: {growth: 3300, fixed: 3700}
+family_slots: {7: 160, 8: 180}
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11}
+
+# Guarantee representation across the complete k=7 composition map, including
+# all three stable p10 families needed to reach the ligand-rich k8 frontier.
+cohort_min_primary_families_by_p:
+  7: {1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3, 9: 3, 10: 3}
+
+# Use the complete 160-family k7 parent beam immediately.  At k8, start with
+# 85% of the 180 slots and admit up to 27 genuinely new stable families.
+admission_fraction: 0.15
+admission_fraction_by_k: {7: 0.0, 8: 0.15}
+source_novelty_fraction: 0.15
+subfamilies_per_family: 2
+p_states_per_family: 3
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+# Phase C cannot claim convergence with an empty or single-lineage
+# composition.  A targeted p10/p11 tail can be run later if this broad phase
+# exhausts its transformations before satisfying the frontier.
+required_primary_families_by_p:
+  8: {1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3, 9: 3, 10: 3, 11: 3}
+
+min_cycles: 2
+max_cycles: 8
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 4
+proposals_per_family_growth: 6
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0

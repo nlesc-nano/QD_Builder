@@ -41,6 +41,7 @@ class AdaptiveConfig(PilotConfig):
     )
     parent_p_by_k: dict = field(default_factory=dict)
     proposal_p_by_k: dict = field(default_factory=dict)
+    cohort_min_primary_families_by_p: dict = field(default_factory=dict)
     required_primary_families_by_p: dict = field(default_factory=dict)
     p_states_per_family: int = 3
     geometries_per_family: int = 2
@@ -94,6 +95,10 @@ class AdaptiveConfig(PilotConfig):
         value.proposal_p_by_k = {
             int(k): [int(p) for p in values]
             for k, values in value.proposal_p_by_k.items()
+        }
+        value.cohort_min_primary_families_by_p = {
+            int(k): {int(p): int(count) for p, count in requirements.items()}
+            for k, requirements in value.cohort_min_primary_families_by_p.items()
         }
         value.required_primary_families_by_p = {
             int(k): {int(p): int(count) for p, count in requirements.items()}
@@ -161,12 +166,22 @@ class AdaptiveConfig(PilotConfig):
                 for k, values in selection.items()
             ):
                 raise ValueError(f"{label} has an invalid k or p selection")
-        if any(
-            k not in value.p_max
-            or any(p < 1 or p > value.p_max[k] or count < 1 for p, count in req.items())
-            for k, req in value.required_primary_families_by_p.items()
+        for label, requirements in (
+            (
+                "cohort_min_primary_families_by_p",
+                value.cohort_min_primary_families_by_p,
+            ),
+            ("required_primary_families_by_p", value.required_primary_families_by_p),
         ):
-            raise ValueError("required_primary_families_by_p has an invalid requirement")
+            if any(
+                k not in value.p_max
+                or any(
+                    p < 1 or p > value.p_max[k] or count < 1
+                    for p, count in req.items()
+                )
+                for k, req in requirements.items()
+            ):
+                raise ValueError(f"{label} has an invalid requirement")
         if not 0 <= value.source_novelty_fraction < 0.5:
             raise ValueError("source_novelty_fraction must be in [0, 0.5)")
         if (
@@ -697,7 +712,7 @@ class AdaptivePilot(Pilot):
         return initialized, list(dict.fromkeys(initialized["families"] + admitted))
 
     def _update_cohort(self, phase, k, cycle):
-        ranked, _ = self._ranked_families(k)
+        ranked, by_family = self._ranked_families(k)
         if not ranked:
             return []
         initialized, cohort = self._cohort_state(phase, k)
@@ -712,17 +727,54 @@ class AdaptivePilot(Pilot):
                 if self.config.source_novelty_fraction > 0
                 else set()
             )
+            composition_reserved = []
+            for p, required in sorted(
+                self.config.cohort_min_primary_families_by_p.get(k, {}).items()
+            ):
+                candidates = [
+                    family
+                    for family in ranked
+                    if any(
+                        row["p"] == p and row["role"] == "primary"
+                        for row in by_family[family]
+                    )
+                ]
+                if len(candidates) < required:
+                    raise ValueError(
+                        f"k={k} parent cohort requires {required} primary families "
+                        f"at p={p}, but the source has {len(candidates)}"
+                    )
+                for family in candidates[:required]:
+                    if family not in composition_reserved:
+                        composition_reserved.append(family)
+            if len(composition_reserved) > initial_capacity:
+                raise ValueError(
+                    f"k={k} composition reservations exceed initial capacity "
+                    f"{initial_capacity}"
+                )
             novelty_candidates = [
-                family for family in ranked if family in source_novel
+                family
+                for family in ranked
+                if family in source_novel and family not in composition_reserved
             ]
             novelty_slots = min(
                 len(novelty_candidates),
-                initial_capacity,
+                initial_capacity - len(composition_reserved),
                 int(round(capacity * self.config.source_novelty_fraction)),
             )
             reserved_novelty = novelty_candidates[:novelty_slots]
-            general = [family for family in ranked if family not in source_novel]
-            cohort = general[: initial_capacity - novelty_slots] + reserved_novelty
+            reserved = composition_reserved + reserved_novelty
+            if len(reserved) > initial_capacity:
+                raise ValueError(
+                    f"k={k} cohort reservations exceed initial capacity "
+                    f"{initial_capacity}"
+                )
+            general = [
+                family
+                for family in ranked
+                if family not in source_novel and family not in composition_reserved
+            ]
+            cohort = general[: initial_capacity - len(reserved)] + reserved
             # If fewer established families exist than expected, fill without
             # exceeding the fixed initial capacity.
             if len(cohort) < initial_capacity:
@@ -741,6 +793,7 @@ class AdaptivePilot(Pilot):
                     capacity=capacity,
                     families=cohort,
                     known_families=ranked,
+                    composition_reserved_families=composition_reserved,
                     source_novelty_families=reserved_novelty,
                 )
             )
