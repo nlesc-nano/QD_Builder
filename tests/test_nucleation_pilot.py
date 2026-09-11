@@ -1,4 +1,5 @@
 """Scientific invariants and budget/resume behaviour; no quantum backend required."""
+import csv
 import json
 from pathlib import Path
 from dataclasses import replace
@@ -31,6 +32,7 @@ from builder.nucleation.search_analysis import (
     analyze_corpus,
 )
 from builder.nucleation.xtb_relax import XtbResult
+from tools.export_adaptive_minima_xyz import export_archive
 
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "geometry_packs/cdse_cdcl2_zb"
@@ -237,6 +239,40 @@ def test_batch_progress_is_compact_and_reports_outcomes(tmp_path, capsys):
     assert "calls_total=2/12" in output
     assert "[pilot] finish k=1 batch=1 outcomes=failed:2" in output
     assert "queue_left=0" in output
+
+
+def test_export_adaptive_archive_writes_energy_ranked_xyz_stacks(tmp_path):
+    first = dict(
+        example(0).record(),
+        minimum_id="higher",
+        structure_id="higher-route",
+        energy_eV=-9.0,
+        role="primary",
+        final={"mu2": 2, "n4": 1, "n6": 0, "se_cn": {"2": 1}},
+        source="test",
+    )
+    second = dict(first, minimum_id="lower", energy_eV=-10.0)
+    audit = dict(first, minimum_id="audit", energy_eV=-11.0, role="audit")
+    archive = tmp_path / "run"
+    archive.mkdir()
+    (archive / "minima.json").write_text(
+        json.dumps(
+            {
+                "experimental": {row["minimum_id"]: row for row in (first, second, audit)},
+                "control": {},
+            }
+        )
+    )
+    summary = export_archive(archive, tmp_path / "xyz")
+    assert summary == {"structures": 2, "bins": 1, "skipped": 0}
+    lines = (tmp_path / "xyz/k1_p1.xyz").read_text().splitlines()
+    frame_lines = len(first["symbols"]) + 2
+    assert lines[1].startswith("lower E=-10.0000000000eV dE=0.000000eV")
+    assert lines[frame_lines + 1].startswith("higher E=-9.0000000000eV dE=1.000000eV")
+    with (tmp_path / "xyz/index.csv").open() as handle:
+        exported = list(csv.DictReader(handle))
+    assert [row["minimum_id"] for row in exported] == ["lower", "higher"]
+    assert exported[1]["relative_energy_kcal_mol"] == "23.060548"
 
 
 def test_frozen_queue_and_changed_seed_reject_resume(tmp_path):
