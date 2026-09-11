@@ -74,6 +74,7 @@ class PilotConfig:
     proposals_per_parent: int = 32
     fixed_rounds: int = 2
     checkpoint_interval_batches: int = 1
+    progress_interval_batches: int = 1
 
     @classmethod
     def load(cls, path):
@@ -107,6 +108,8 @@ class PilotConfig:
             raise ValueError("at most two fixed-k rounds")
         if value.checkpoint_interval_batches < 1:
             raise ValueError("checkpoint_interval_batches must be positive")
+        if value.progress_interval_batches < 1:
+            raise ValueError("progress_interval_batches must be positive")
         value.p_max = {int(k): int(v) for k, v in value.p_max.items()}
         if any(
             k not in value.p_max or value.p_max[k] < 1
@@ -539,6 +542,7 @@ class Pilot:
     def evaluate(self, tasks, stage):
         """Bounded deterministic batches; backend timing includes failed calls."""
         tasks = deque(tasks)
+        batch_number = 0
         while tasks and not self.expired():
             batch = []
             while tasks and len(batch) < self.config.workers:
@@ -572,6 +576,30 @@ class Pilot:
             if not batch:
                 break
 
+            batch_number += 1
+            show_progress = (
+                batch_number == 1
+                or batch_number % self.config.progress_interval_batches == 0
+                or not tasks
+            )
+            if show_progress:
+                channels = Counter(p.channel for _, p in batch)
+                compositions = Counter(p.p for _, p in batch)
+                channel_text = ",".join(
+                    f"{name}:{count}" for name, count in sorted(channels.items())
+                )
+                p_text = ",".join(
+                    f"p{p}:{count}" for p, count in sorted(compositions.items())
+                )
+                print(
+                    f"[pilot] launch k={stage} batch={batch_number} size={len(batch)} "
+                    f"queue_left={len(tasks)} channels={channel_text or '-'} "
+                    f"compositions={p_text or '-'} "
+                    f"calls_k={sum(n for (arm, k), n in self.calls.items() if k == stage)} "
+                    f"calls_total={sum(self.calls.values())}/{self.config.max_calls}",
+                    flush=True,
+                )
+
             def one(task):
                 arm, p = task
                 start = time.monotonic()
@@ -583,13 +611,24 @@ class Pilot:
                     result = XtbResult(ok=False, error=f"{type(exc).__name__}: {exc}")
                 return result, time.monotonic() - start
 
+            batch_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=self.config.workers) as pool:
                 results = list(pool.map(one, batch))
+            batch_wall_seconds = time.monotonic() - batch_started
+            outcomes = Counter()
+            retries = 0
             for (arm, p), (xr, seconds) in zip(batch, results):
                 self.last_audit = {}
                 row = self.classify(p, xr, arm)
                 if row:
                     row["minimum_id"], _ = self.store(arm, row)
+                    outcomes[row["role"]] += 1
+                elif not xr.ok:
+                    outcomes["failed"] += 1
+                elif not xr.converged:
+                    outcomes["unconverged"] += 1
+                else:
+                    outcomes["rejected"] += 1
                 self.event(
                     dict(
                         event="result",
@@ -626,6 +665,22 @@ class Pilot:
                         origin_id=p.id,
                     )
                     tasks.appendleft((arm, retry))
+                    retries += 1
+            if show_progress:
+                outcome_text = ",".join(
+                    f"{name}:{outcomes[name]}"
+                    for name in ("primary", "audit", "rejected", "unconverged", "failed")
+                    if outcomes[name]
+                )
+                worker_seconds = sum(seconds for _, seconds in results)
+                print(
+                    f"[pilot] finish k={stage} batch={batch_number} "
+                    f"outcomes={outcome_text or '-'} retries={retries} "
+                    f"queue_left={len(tasks)} wall_s={batch_wall_seconds:.1f} "
+                    f"worker_s={worker_seconds:.1f} "
+                    f"calls_total={sum(self.calls.values())}/{self.config.max_calls}",
+                    flush=True,
+                )
             self._batches_since_checkpoint += 1
             if (
                 self._batches_since_checkpoint

@@ -81,6 +81,8 @@ class AdaptiveConfig(PilotConfig):
             raise ValueError("invalid adaptive deadline")
         if not 1 <= value.max_steps <= 150:
             raise ValueError("invalid optimization cycle limit")
+        if value.progress_interval_batches < 1:
+            raise ValueError("progress_interval_batches must be positive")
         value.p_max = {int(k): int(v) for k, v in value.p_max.items()}
         value.stage_calls = {int(k): int(v) for k, v in value.stage_calls.items()}
         value.operation_calls = {
@@ -1213,6 +1215,11 @@ class AdaptivePilot(Pilot):
     def _run_queue(self, phase, cycle, operation, source_k, target_k):
         tag = f"{phase}:{cycle}:{operation}:{source_k}:{target_k}"
         if ("experimental", target_k, tag) in self.stage_done:
+            print(
+                f"[adaptive] skip phase={phase} cycle={cycle} operation={operation} "
+                f"k={source_k}->{target_k} reason=already_complete",
+                flush=True,
+            )
             return
         limit = self.config.operation_limit(target_k, operation)
         if limit <= 0 or self.operation_calls_used[target_k, operation] >= limit:
@@ -1227,6 +1234,12 @@ class AdaptivePilot(Pilot):
                 )
             )
             self.mark_stage("experimental", target_k, tag)
+            print(
+                f"[adaptive] skip phase={phase} cycle={cycle} operation={operation} "
+                f"k={source_k}->{target_k} reason=budget_exhausted "
+                f"calls={self.operation_calls_used[target_k, operation]}/{limit}",
+                flush=True,
+            )
             return
         self._update_cohort(phase, source_k, cycle)
         queue = self.prepare_queue(
@@ -1237,7 +1250,38 @@ class AdaptivePilot(Pilot):
                 phase, operation, source_k, target_k, cycle
             ),
         )
+        pending = [
+            proposal
+            for proposal in queue
+            if ("experimental", proposal.id, proposal.attempt) not in self.reserved
+        ]
+        compositions = Counter(proposal.p for proposal in pending)
+        channels = Counter(proposal.channel for proposal in pending)
+        cohort_size = len(self._cohort_state(phase, source_k)[1])
+        p_text = ",".join(
+            f"p{p}:{count}" for p, count in sorted(compositions.items())
+        )
+        channel_text = ",".join(
+            f"{channel}:{count}" for channel, count in sorted(channels.items())
+        )
+        used_before = self.operation_calls_used[target_k, operation]
+        print(
+            f"[adaptive] queue phase={phase} cycle={cycle} operation={operation} "
+            f"k={source_k}->{target_k} cohort={cohort_size} total={len(queue)} "
+            f"pending={len(pending)} channels={channel_text or '-'} "
+            f"compositions={p_text or '-'} "
+            f"operation_calls={used_before}/{limit}",
+            flush=True,
+        )
         self.evaluate([("experimental", proposal) for proposal in queue], target_k)
+        used_after = self.operation_calls_used[target_k, operation]
+        print(
+            f"[adaptive] operation_done phase={phase} cycle={cycle} "
+            f"operation={operation} k={source_k}->{target_k} "
+            f"launched={used_after - used_before} operation_calls={used_after}/{limit} "
+            f"calls_total={sum(self.calls.values())}/{self.config.max_calls}",
+            flush=True,
+        )
         if not self.expired():
             self.mark_stage("experimental", target_k, tag)
 
@@ -1281,6 +1325,20 @@ class AdaptivePilot(Pilot):
             and self.config.operation_limit(ks[0], "growth") > 0
         ):
             requirements.append(("growth", extend_from))
+        budget_text = ",".join(
+            f"k{target_k}.{operation}="
+            f"{self.operation_calls_used[target_k, operation]}/"
+            f"{self.config.operation_limit(target_k, operation)}"
+            for target_k in ks
+            for operation in ("growth", "fixed")
+            if self.config.operation_limit(target_k, operation) > 0
+        )
+        print(
+            f"[adaptive] phase={phase} ready cycles={start}..{self.config.max_cycles - 1} "
+            f"workers={self.config.workers} budgets={budget_text or '-'} "
+            f"calls_total={sum(self.calls.values())}/{self.config.max_calls}",
+            flush=True,
+        )
         for cycle in range(start, self.config.max_cycles):
             if self.expired() or sum(self.calls.values()) >= self.config.max_calls:
                 return False
@@ -1308,13 +1366,42 @@ class AdaptivePilot(Pilot):
                     f"calls={km['calls']} new_families={km['new_primary_families']} "
                     f"rate_per_100={km['new_families_per_100_calls']:.2f} "
                     f"window_rate={km['new_energy_window_families_per_100_calls']:.2f} "
-                    f"best_dE={km['maximum_within_composition_improvement_eV']:.4f}",
+                    f"best_dE={km['maximum_within_composition_improvement_eV']:.4f} "
+                    f"endpoints={km['usable_endpoints']}/{km['calls']} "
+                    f"stagnant={str(km['stagnant']).lower()} "
+                    f"families_by_p="
+                    + (
+                        ",".join(
+                            f"p{p}:{count}"
+                            for p, count in sorted(
+                                km["primary_families_by_p"].items(),
+                                key=lambda item: int(item[0]),
+                            )
+                        )
+                        or "-"
+                    ),
                     flush=True,
                 )
                 stagnant_runs[k] = (
                     stagnant_runs[k] + 1 if km["stagnant"] else 0
                 )
             self.checkpoint()
+            lineage_debt = self._coverage_debt(phase, requirements)
+            composition_debt = self._composition_coverage_debt(ks)
+            lineage_text = ",".join(
+                f"{key}:{len(missing)}"
+                for key, missing in sorted(lineage_debt.items())
+            )
+            composition_text = ",".join(
+                f"{key}:{missing}"
+                for key, missing in sorted(composition_debt.items())
+            )
+            print(
+                f"[adaptive] coverage phase={phase} cycle={cycle} "
+                f"lineage_debt={lineage_text or 'none'} "
+                f"composition_debt={composition_text or 'none'}",
+                flush=True,
+            )
             exhausted_without_plateau = []
             target_operations = defaultdict(set)
             for operation, source_k in requirements:

@@ -101,6 +101,10 @@ def main():
                     ),
                     workers=config.workers,
                     launch_hours=config.launch_hours,
+                    logging=dict(
+                        progress_interval_batches=config.progress_interval_batches,
+                        checkpoint_interval_batches=config.checkpoint_interval_batches,
+                    ),
                 ),
                 indent=2,
             )
