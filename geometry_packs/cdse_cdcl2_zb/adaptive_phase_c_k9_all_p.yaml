@@ -1,0 +1,77 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 902211
+workers: 24
+max_calls: 4400
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 20
+progress_interval_batches: 1
+
+# Complete the k=9 growth map for every p.  The source already contains the
+# targeted k=9 high-p results; this run adds the missing low-p lineages while
+# retaining the existing high-p archive.
+enabled_phases: [C]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 9
+phase_cycle_start: {C: 0}
+min_cycles: 2
+max_cycles: 8
+
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12}
+
+# Every k=8 primary composition is eligible as a parent.  This is the key
+# lineage-preservation correction relative to the earlier frontier-only run.
+parent_p_by_k:
+  8: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+parent_roles_by_k:
+  8: [primary]
+proposal_p_by_k:
+  9: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+# Stratified growth budget.  Low-p bins receive the largest aggregate share;
+# p9--12 are retained but do not consume the whole frontier budget again.
+operation_calls:
+  9: {growth: 3800}
+operation_calls_by_p:
+  9:
+    growth: {1: 350, 2: 350, 3: 350, 4: 350, 5: 350, 6: 350,
+             7: 350, 8: 350, 9: 250, 10: 250, 11: 250, 12: 250}
+
+family_slots: {8: 180, 9: 140}
+cohort_min_primary_families_by_p:
+  8: {1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3,
+      9: 3, 10: 3, 11: 3}
+cohort_min_families_by_p: {}
+required_primary_families_by_p:
+  9: {1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3,
+      9: 3, 10: 3, 11: 3, 12: 3}
+
+admission_fraction: 0.15
+admission_fraction_by_k: {8: 0.0, 9: 0.15}
+source_novelty_fraction: 0.0
+subfamilies_per_family: 3
+p_states_per_family: 4
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0
+
+chemistry_options:
+  classification_mode: strict_k9_all_p_growth_completion
+
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 6
+proposals_per_family_growth: 10
