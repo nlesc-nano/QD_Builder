@@ -209,6 +209,30 @@ class Pilot:
         self.output = Path(output)
         self.spec = load_nucleation_spec(self.map_path)
         self.pack = load_geometry_pack(self.map_path)
+        # A validation branch may explicitly soften a named graph rule while
+        # retaining the original pack on disk.  Apply the override to both
+        # executable representations so proposal generation and final
+        # post-relax classification use the same chemistry.  The override is
+        # part of the adaptive config/protocol fingerprint and therefore
+        # cannot be mixed with a strict continuation.
+        overrides = config.chemistry_options.get("graph_rule_overrides", {})
+        if overrides:
+            if not isinstance(overrides, dict):
+                raise ValueError("graph_rule_overrides must be a mapping")
+            unknown = sorted(
+                key for key in overrides
+                if not hasattr(self.spec.graph_rules, str(key))
+            )
+            if unknown:
+                raise ValueError(
+                    f"unknown nucleation graph-rule override(s): {unknown}"
+                )
+            self.spec = replace(
+                self.spec,
+                graph_rules=replace(self.spec.graph_rules, **overrides),
+            )
+            self.pack.graph_rules.update(overrides)
+            self.pack.raw.setdefault("graph_rules", {}).update(overrides)
         self.growth = GrowthConfig.from_yaml(Path(growth_path))
         self.model = lattice_model(self.spec)
         self.cutoffs = bond_cutoffs_from_spec(self.spec)
@@ -530,6 +554,9 @@ class Pilot:
             else [],
             connectivity_preserved=minimum.core_preserved,
             audit_derived=proposal.audit_derived,
+            classification_mode=self.config.chemistry_options.get(
+                "classification_mode", "strict"
+            ),
             construction=descriptors(proposal.symbols, proposal.edges),
             converged=True,
         )
