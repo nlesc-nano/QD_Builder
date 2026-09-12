@@ -1,0 +1,74 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 901337
+workers: 24
+max_calls: 2800
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 20
+progress_interval_batches: 1
+
+# Targeted extension from the completed k=8 archive to k=9.  Phases A/B are
+# disabled; the k=8 source cohort is frozen and only growth into k=9 runs.
+enabled_phases: [C]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 9
+phase_cycle_start: {C: 0}
+min_cycles: 2
+max_cycles: 6
+
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12}
+
+# Keep the strict k=8 p<=10 primary lineages and the validated relaxed p=11
+# primary lineages.  Strict p=11 audits are retained in the source archive but
+# are not allowed to dominate the k=9 growth parent cohort.
+parent_p_by_k:
+  8: [8, 9, 10, 11]
+parent_roles_by_k:
+  8: [primary]
+proposal_p_by_k:
+  9: [9, 10, 11, 12]
+
+# Growth only; fixed-k k=9 exploration will be scheduled after the first
+# k=9 archive has been inspected.
+operation_calls:
+  9: {growth: 2500}
+operation_calls_by_p:
+  9:
+    growth: {9: 700, 10: 700, 11: 700, 12: 400}
+
+family_slots: {8: 60, 9: 90}
+cohort_min_primary_families_by_p:
+  8: {8: 3, 9: 3, 10: 3, 11: 3}
+cohort_min_families_by_p: {}
+required_primary_families_by_p:
+  9: {9: 3, 10: 3, 11: 3}
+
+admission_fraction: 0.15
+admission_fraction_by_k: {8: 0.0, 9: 0.15}
+source_novelty_fraction: 0.0
+subfamilies_per_family: 3
+p_states_per_family: 4
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0
+
+chemistry_options:
+  classification_mode: strict_k9_from_mixed_k8_lineages
+
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 6
+proposals_per_family_growth: 8
