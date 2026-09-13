@@ -32,7 +32,7 @@ export OMP_STACKSIZE=1G
 ulimit -s unlimited
 
 ROOT=${QD_ROOT:-/scratch/iinfante/escience/QD_Builder}
-SOURCE=${QD_SOURCE:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_phase_c_k9_relaxed_high_p_v1}
+SOURCE=${QD_SOURCE:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_phase_c_k9_canonical_v1}
 OUT=${QD_OUT:-/scratch/iinfante/CP2K/Nucleation/xtb/CdSe/growth_zb/nucleation_phase_c_k10_v1}
 CONFIG=${QD_CONFIG:-$ROOT/geometry_packs/cdse_cdcl2_zb/adaptive_phase_c_k10.yaml}
 PACK="$ROOT/geometry_packs/cdse_cdcl2_zb"
