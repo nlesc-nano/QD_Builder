@@ -1,0 +1,68 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 902311
+workers: 24
+max_calls: 3400
+launch_hours: 46
+timeout_s: 1800
+max_steps: 150
+checkpoint_interval_batches: 10
+progress_interval_batches: 1
+
+# Lineage-coverage continuation.  The all-p k=9 archive is imported, while
+# every available k=8 primary family at p=3,4,5 receives two growth cycles.
+# This is deliberately not another broad composition search.
+enabled_phases: [C]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 9
+phase_cycle_start: {C: 0}
+min_cycles: 2
+max_cycles: 3
+
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12}
+parent_p_by_k:
+  8: [3, 4, 5]
+parent_roles_by_k:
+  8: [primary]
+proposal_p_by_k:
+  9: [2, 3, 4, 5, 6, 7]
+
+operation_calls:
+  9: {growth: 3000}
+operation_calls_by_p:
+  9:
+    growth: {2: 500, 3: 500, 4: 500, 5: 500, 6: 500, 7: 500}
+
+# Large enough to retain all p3--p5 source families rather than ranking them
+# down to the usual frontier beam.
+family_slots: {8: 260, 9: 100}
+cohort_min_primary_families_by_p: {}
+cohort_min_families_by_p: {}
+required_primary_families_by_p: {}
+
+admission_fraction: 0.0
+source_novelty_fraction: 0.0
+subfamilies_per_family: 3
+p_states_per_family: 3
+geometries_per_family: 2
+minimum_launched_cycles: 2
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0
+
+chemistry_options:
+  classification_mode: strict_k9_low_p_lineage_completion
+
+convergence_patience: 3
+new_families_per_100_calls: 1.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.20
+proposals_per_family_fixed: 6
+proposals_per_family_growth: 8
