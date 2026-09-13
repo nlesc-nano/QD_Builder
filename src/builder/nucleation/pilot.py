@@ -187,6 +187,58 @@ def family(row):
     )
 
 
+def classification_observations(row):
+    """Return the distinct classification decisions represented by ``row``.
+
+    A relaxed geometry can be evaluated under more than one graph-rule policy.
+    Those decisions describe eligibility, not distinct potential-energy minima,
+    and must therefore survive geometric basin consolidation.
+    """
+
+    observations = row.get("classification_history")
+    if not observations:
+        observations = [
+            dict(
+                role=row.get("role", "unknown"),
+                violations=sorted(set(row.get("violations", []))),
+                classification_mode=row.get("classification_mode", "unknown"),
+                energy_eV=row.get("energy_eV"),
+                structure_id=row.get("structure_id"),
+                source=row.get("source"),
+            )
+        ]
+    unique = {}
+    for observation in observations:
+        value = dict(observation)
+        value["violations"] = sorted(set(value.get("violations", [])))
+        key = json.dumps(value, sort_keys=True, default=str, allow_nan=False)
+        unique[key] = value
+    return [unique[key] for key in sorted(unique)]
+
+
+def add_classification_provenance(row, *others):
+    """Attach non-destructive multi-policy classification provenance."""
+
+    observations = classification_observations(row)
+    for other in others:
+        observations.extend(classification_observations(other))
+    unique = {}
+    for observation in observations:
+        key = json.dumps(observation, sort_keys=True, default=str, allow_nan=False)
+        unique[key] = observation
+    history = [unique[key] for key in sorted(unique)]
+    modes = defaultdict(set)
+    for observation in history:
+        modes[observation.get("role", "unknown")].add(
+            observation.get("classification_mode", "unknown")
+        )
+    row["classification_history"] = history
+    row["classification_eligibility"] = {
+        role: sorted(values) for role, values in sorted(modes.items())
+    }
+    return row
+
+
 def round_robin(items):
     bins = defaultdict(deque)
     for item in items:
@@ -463,11 +515,33 @@ class Pilot:
                     + row.get("occupation_origins", [])
                 }
                 old["occupation_origins"] = list(origins.values())
-                if row["energy_eV"] < old["energy_eV"]:
-                    row["routes"] = old["routes"]
-                    row["occupations"] = old["occupations"]
-                    row["occupation_origins"] = old["occupation_origins"]
-                    self.rows[target][mid] = row.copy()
+                # Role is a graph-policy eligibility decision.  Never let a
+                # slightly lower-energy audit realization make an established
+                # primary basin disappear.  Conversely, a primary realization
+                # upgrades an audit basin even when it is marginally higher in
+                # energy.  Preserve both decisions as provenance.
+                role_rank = {"primary": 0, "audit": 1}
+                replace_row = (
+                    role_rank.get(row.get("role"), 2), row["energy_eV"]
+                ) < (
+                    role_rank.get(old.get("role"), 2), old["energy_eV"]
+                )
+                classification_differs = (
+                    row.get("role") != old.get("role")
+                    or row.get("classification_mode")
+                    != old.get("classification_mode")
+                    or sorted(row.get("violations", []))
+                    != sorted(old.get("violations", []))
+                    or "classification_history" in row
+                    or "classification_history" in old
+                )
+                selected = row.copy() if replace_row else old
+                selected["routes"] = old["routes"]
+                selected["occupations"] = old["occupations"]
+                selected["occupation_origins"] = old["occupation_origins"]
+                if classification_differs:
+                    add_classification_provenance(selected, old, row)
+                self.rows[target][mid] = selected.copy()
             else:
                 row["routes"] = sorted(set(row.get("routes", [])) - {mid})
                 self.rows[target][mid] = row.copy()

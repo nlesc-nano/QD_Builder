@@ -472,6 +472,66 @@ def test_adaptive_archive_import_preserves_ids_without_self_routes(tmp_path):
     assert list(resumed.rows["experimental"]) == ["minimum_source"]
 
 
+def test_basin_consolidation_does_not_downgrade_primary_role(tmp_path):
+    proposal = example()
+    final = descriptors(proposal.symbols, proposal.edges, proposal.positions)
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=5,
+        stage_calls={1: 1, 2: 1, 3: 1},
+        family_slots={1: 1, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+    )
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        tmp_path,
+        tmp_path / "adaptive",
+        backend=lambda *args: [],
+    )
+    pilot.protocol = {"fingerprint": "test"}
+    base = dict(
+        proposal.record(),
+        structure_id="strict-primary",
+        energy_eV=-10.0,
+        role="primary",
+        violations=[],
+        final=final,
+        protocol="test",
+        source="strict-primary",
+        routes=[],
+        occupations=[],
+        occupation_origins=[],
+        classification_mode="relaxed_high_p",
+    )
+    minimum_id, fresh = pilot.store("experimental", base)
+    assert fresh
+    audit = dict(
+        base,
+        structure_id="strict-audit",
+        source="strict-audit",
+        energy_eV=-10.001,
+        role="audit",
+        violations=["mu3_host_bridge_overlap:1-2-3"],
+        classification_mode="strict",
+    )
+    duplicate_id, fresh = pilot.store("experimental", audit)
+    assert not fresh
+    assert duplicate_id == minimum_id
+    retained = pilot.rows["experimental"][minimum_id]
+    assert retained["role"] == "primary"
+    assert retained["energy_eV"] == -10.0
+    assert retained["classification_eligibility"] == {
+        "audit": ["strict"],
+        "primary": ["relaxed_high_p"],
+    }
+    assert len(retained["classification_history"]) == 2
+
+
 def test_adaptive_continuation_imports_and_freezes_source_cohort(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
