@@ -582,12 +582,34 @@ class AdaptivePilot(Pilot):
                 row["source"] = f"import:{original_id}"
                 row["routes"] = sorted(set(row.get("routes", [])) - {original_id})
                 rows.append(row)
-            event = dict(event="archive_import", arm="experimental", rows=rows)
+            source_protocol_path = self.seed_dir / "protocol.json"
+            source_protocol = (
+                json.loads(source_protocol_path.read_text())
+                if source_protocol_path.is_file()
+                else {}
+            )
+            preconsolidated = (
+                source_protocol.get("kind") == "adaptive_archive_merge_v1"
+            )
+            event = dict(
+                event="archive_import",
+                arm="experimental",
+                rows=rows,
+                preconsolidated=preconsolidated,
+            )
+            print(
+                f"[adaptive] importing {len(rows)} source minima "
+                f"preconsolidated={preconsolidated}",
+                flush=True,
+            )
             self.event(event)
             for row in rows:
-                self.store(
-                    "experimental", row, preferred_id=row["minimum_id"]
-                )
+                if preconsolidated:
+                    self.store_preconsolidated("experimental", row)
+                else:
+                    self.store(
+                        "experimental", row, preferred_id=row["minimum_id"]
+                    )
             self.checkpoint()
             print(f"[adaptive] imported {len(rows)} source minima", flush=True)
         self._import_source_cohorts()

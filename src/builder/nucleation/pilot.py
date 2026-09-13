@@ -449,12 +449,17 @@ class Pilot:
                 self.queues[ev["arm"], ev["stage"], ev["round"]] = ev["proposals"]
             elif kind == "archive_import":
                 for row in ev["rows"]:
-                    self.store(
-                        ev.get("arm", "experimental"),
-                        row,
-                        replay=True,
-                        preferred_id=row.get("minimum_id"),
-                    )
+                    if ev.get("preconsolidated"):
+                        self.store_preconsolidated(
+                            ev.get("arm", "experimental"), row
+                        )
+                    else:
+                        self.store(
+                            ev.get("arm", "experimental"),
+                            row,
+                            replay=True,
+                            preferred_id=row.get("minimum_id"),
+                        )
         self.events = valid
 
     def prepare_queue(self, arm, k, round_number, build):
@@ -546,6 +551,15 @@ class Pilot:
                 row["routes"] = sorted(set(row.get("routes", [])) - {mid})
                 self.rows[target][mid] = row.copy()
         return mid, fresh
+
+    def store_preconsolidated(self, arm, row):
+        """Import one merger-validated minimum in constant time."""
+
+        row = dict(row)
+        minimum_id = row["minimum_id"]
+        self.archive.seed_preconsolidated(row, row["positions"], minimum_id)
+        self.rows[arm][minimum_id] = row
+        return minimum_id, True
 
     def classify(self, proposal, xr, arm):
         if (
