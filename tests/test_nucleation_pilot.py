@@ -472,6 +472,68 @@ def test_adaptive_archive_import_preserves_ids_without_self_routes(tmp_path):
     assert list(resumed.rows["experimental"]) == ["minimum_source"]
 
 
+def test_adaptive_import_uses_preconsolidated_merge_archive(tmp_path):
+    source = tmp_path / "merged"
+    source.mkdir()
+    proposal = example()
+    row = dict(
+        proposal.record(),
+        structure_id=proposal.id,
+        minimum_id="minimum_merged",
+        energy_eV=-10.0,
+        role="primary",
+        final=descriptors(proposal.symbols, proposal.edges, proposal.positions),
+        protocol="merged-protocol",
+        source="merged",
+        routes=[],
+        occupations=[],
+        occupation_origins=[],
+    )
+    (source / "minima.json").write_text(
+        json.dumps({"control": {}, "experimental": {"minimum_merged": row}})
+    )
+    (source / "protocol.json").write_text(
+        json.dumps({"kind": "adaptive_archive_merge_v1"})
+    )
+    config = AdaptiveConfig(
+        workers=1,
+        max_calls=5,
+        stage_calls={1: 1, 2: 1, 3: 1},
+        family_slots={1: 1, 2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        phase_a_k=[1],
+        phase_b_k=2,
+        phase_c_k=3,
+    )
+    output = tmp_path / "adaptive"
+    pilot = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        output,
+        backend=lambda *args: [],
+    )
+    pilot.setup()
+    pilot.initialize_source()
+    assert pilot.rows["experimental"]["minimum_merged"]["minimum_id"] == (
+        "minimum_merged"
+    )
+    event = next(e for e in pilot.events if e["event"] == "archive_import")
+    assert event["preconsolidated"] is True
+
+    resumed = AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        output,
+        backend=lambda *args: [],
+    )
+    resumed.setup()
+    assert list(resumed.rows["experimental"]) == ["minimum_merged"]
+
+
 def test_basin_consolidation_does_not_downgrade_primary_role(tmp_path):
     proposal = example()
     final = descriptors(proposal.symbols, proposal.edges, proposal.positions)

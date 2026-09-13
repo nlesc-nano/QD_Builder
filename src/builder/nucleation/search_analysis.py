@@ -228,7 +228,12 @@ class MinimumArchive:
 
     def add(self, row, xyz, preferred_id=None):
         parent = as_parent(row, xyz)
-        key = (row.get("protocol", ""), row["k"], row["p"], row["final"]["graph_hash"])
+        key = (
+            row.get("protocol", ""),
+            row["k"],
+            row["p"],
+            row["final"]["graph_hash"],
+        )
         for mid, members in self.buckets[key]:
             if all(
                 abs(m.energy_eV - parent.energy_eV) <= self.config.energy_tolerance_eV
@@ -243,6 +248,22 @@ class MinimumArchive:
         self.buckets[key].append((mid, [parent]))
         self.members[mid] = [row["source"]]
         return mid, True
+
+    def seed_preconsolidated(self, row, xyz, minimum_id):
+        """Register a trusted distinct minimum without pairwise comparisons."""
+
+        if minimum_id in self.members:
+            raise ValueError(f"duplicate preconsolidated minimum ID: {minimum_id}")
+        parent = as_parent(row, xyz)
+        key = (
+            row.get("protocol", ""),
+            row["k"],
+            row["p"],
+            row["final"]["graph_hash"],
+        )
+        self.buckets[key].append((minimum_id, [parent]))
+        self.members[minimum_id] = [row["source"]]
+        return minimum_id, True
 
 
 def analyze_corpus(root, output, spec, *, geometry=True):
