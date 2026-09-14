@@ -588,9 +588,10 @@ class AdaptivePilot(Pilot):
                 if source_protocol_path.is_file()
                 else {}
             )
-            preconsolidated = (
-                source_protocol.get("kind") == "adaptive_archive_merge_v1"
-            )
+            preconsolidated = source_protocol.get("kind") in {
+                "adaptive_archive_merge_v1",
+                "adaptive_archive_policy_view_v1",
+            }
             event = dict(
                 event="archive_import",
                 arm="experimental",
