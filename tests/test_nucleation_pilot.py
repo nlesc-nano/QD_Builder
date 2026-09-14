@@ -36,6 +36,7 @@ from builder.nucleation.search_analysis import (
 )
 from builder.nucleation.xtb_relax import XtbResult
 from builder.nucleation.spec import load_nucleation_spec
+from tools.build_adaptive_policy_view import build_policy_view
 from tools.export_adaptive_minima_xyz import export_archive
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -296,6 +297,54 @@ def test_export_adaptive_archive_writes_energy_ranked_xyz_stacks(tmp_path):
         representative = next(csv.DictReader(handle))
     assert representative["minimum_id"] == "lower"
     assert representative["graph_members"] == "2"
+
+
+def test_policy_view_promotes_only_selected_overlap_only_audits(tmp_path):
+    base = dict(
+        example().record(),
+        k=10,
+        p=13,
+        role="audit",
+        energy_eV=-10.0,
+        protocol="strict",
+        classification_mode="strict",
+    )
+    overlap = dict(
+        base,
+        minimum_id="overlap",
+        violations=["mu3_host_bridge_overlap:1-2-3"],
+    )
+    multiple = dict(
+        base,
+        minimum_id="multiple",
+        violations=["mu3_host_bridge_overlap:1-2-3", "max_cn:Cd:1:5>4"],
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "minima.json").write_text(
+        json.dumps(
+            {
+                "control": {},
+                "experimental": {"overlap": overlap, "multiple": multiple},
+            }
+        )
+    )
+    archive, policy = build_policy_view(
+        source,
+        k=10,
+        ps={11, 12, 13},
+        allowed_violations={"mu3_host_bridge_overlap"},
+        mode="relaxed-overlap",
+    )
+    assert policy["promoted_by_p"] == {"13": 1}
+    promoted = archive["experimental"]["overlap"]
+    assert promoted["role"] == "primary"
+    assert promoted["violations"] == []
+    assert promoted["classification_eligibility"] == {
+        "audit": ["strict"],
+        "primary": ["relaxed-overlap"],
+    }
+    assert archive["experimental"]["multiple"]["role"] == "audit"
 
 
 def test_frozen_queue_and_changed_seed_reject_resume(tmp_path):

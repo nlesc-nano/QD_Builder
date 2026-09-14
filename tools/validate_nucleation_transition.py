@@ -117,12 +117,14 @@ def _cd_cl_contacts(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _select(rows: list[dict[str, Any]], ps: set[int], top: int) -> list[dict[str, Any]]:
+def _select(
+    rows: list[dict[str, Any]], k_selected: int, ps: set[int], top: int
+) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     grouped: dict[tuple[int, int, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         k, p = int(row.get("k", -1)), int(row.get("p", -1))
-        if k != 8 or p not in ps or not row.get("converged", False):
+        if k != k_selected or p not in ps or not row.get("converged", False):
             continue
         role = str(row.get("role", "unknown"))
         grouped[(k, p, role, _graph_key(row))].append(row)
@@ -162,11 +164,18 @@ def _write_xyz(rows: list[dict[str, Any]], path: Path) -> None:
                 )
 
 
-def validate(source: Path, output: Path, *, ps: set[int], top: int) -> dict[str, Any]:
+def validate(
+    source: Path,
+    output: Path,
+    *,
+    k_selected: int = 8,
+    ps: set[int],
+    top: int,
+) -> dict[str, Any]:
     source = _input_path(source)
     archive = json.loads(source.read_text())
     rows = list(archive.get("experimental", {}).values())
-    selected = _select(rows, ps, top)
+    selected = _select(rows, k_selected, ps, top)
     records: list[dict[str, Any]] = []
     for row in selected:
         contacts = _cd_cl_contacts(row)
@@ -217,7 +226,11 @@ def validate(source: Path, output: Path, *, ps: set[int], top: int) -> dict[str,
             writer.writerow(row)
     report = {
         "source": str(source.resolve()),
-        "selection": {"k": 8, "p": sorted(ps), "top_unique_graphs": top},
+        "selection": {
+            "k": k_selected,
+            "p": sorted(ps),
+            "top_unique_graphs": top,
+        },
         "structures": len(records),
         "records": records,
         "interpretation": {
@@ -234,12 +247,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="run directory or minima.json")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--p", type=int, nargs="+", default=[9, 10, 11])
     parser.add_argument("--top", type=int, default=12)
     args = parser.parse_args()
     if args.top < 1:
         parser.error("--top must be positive")
-    report = validate(args.source, args.output, ps=set(args.p), top=args.top)
+    report = validate(
+        args.source,
+        args.output,
+        k_selected=args.k,
+        ps=set(args.p),
+        top=args.top,
+    )
     print(
         f"[transition-validation] selected {report['structures']} structures; "
         f"wrote {args.output / 'validation.json'} and {args.output / 'validation.xyz'}"
