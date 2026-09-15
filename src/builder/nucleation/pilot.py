@@ -272,7 +272,10 @@ class Pilot:
         # post-relax classification use the same chemistry.  The override is
         # part of the adaptive config/protocol fingerprint and therefore
         # cannot be mixed with a strict continuation.
-        overrides = config.chemistry_options.get("graph_rule_overrides", {})
+        # ``chemistry_options`` exists only on AdaptiveConfig; the base pilot
+        # runs with the pack's rules unchanged.
+        chemistry_options = getattr(config, "chemistry_options", None) or {}
+        overrides = chemistry_options.get("graph_rule_overrides", {})
         if overrides:
             if not isinstance(overrides, dict):
                 raise ValueError("graph_rule_overrides must be a mapping")
@@ -663,9 +666,9 @@ class Pilot:
             else [],
             connectivity_preserved=minimum.core_preserved,
             audit_derived=proposal.audit_derived,
-            classification_mode=self.config.chemistry_options.get(
-                "classification_mode", "strict"
-            ),
+            classification_mode=(
+                getattr(self.config, "chemistry_options", None) or {}
+            ).get("classification_mode", "strict"),
             construction=descriptors(proposal.symbols, proposal.edges),
             converged=True,
         )
