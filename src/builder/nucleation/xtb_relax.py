@@ -33,9 +33,16 @@ from typing import (
     Tuple,
 )
 
-__all__ = ["XtbSettings", "XtbResult", "relax_structures"]
+__all__ = [
+    "XtbSettings",
+    "XtbResult",
+    "backend_provenance",
+    "relax_structures",
+    "validate_backend",
+]
 
 _WORKER = Path(__file__).resolve().parents[3] / "tools" / "xtb_worker.py"
+_MACE_WORKER = Path(__file__).resolve().parents[3] / "tools" / "mace_worker.py"
 
 
 def _is_gxtb(method: str) -> bool:
@@ -44,6 +51,13 @@ def _is_gxtb(method: str) -> bool:
     return str(method).strip().lower().replace("_", "-") in {
         "g-xtb", "gxtb", "g-xtb-cli",
     }
+
+
+def _is_mace(method: str) -> bool:
+    """Whether ``method`` selects a MACE potential."""
+
+    value = str(method).strip().lower().replace("_", "-")
+    return value in {"mace", "mace-mh-1", "mace-mh1", "mh-1", "mh1"}
 
 
 def _parse_artifact_min_distance(raw: Any) -> Dict[str, float]:
@@ -72,6 +86,9 @@ class XtbSettings:
     """``relaxation:`` block of a geometry pack."""
 
     enabled: bool = False
+    #: Explicit relaxation implementation. ``auto`` preserves the historical
+    #: method-based dispatch used by existing geometry packs.
+    backend: str = "auto"
     method: str = "GFN1-xTB"
     accuracy: float = 1.0
     electronic_temperature: float = 300.0
@@ -127,6 +144,15 @@ class XtbSettings:
     #: ``xtb --opt`` level (``crude``, ``loose``, ``normal``, …).  Empty keeps
     #: the binary default (normal).
     opt_level: str = ""
+    #: MACE checkpoint and calculator choices.  These fields are ignored by
+    #: xTB/g-xTB, allowing the legacy settings/result names to remain as a
+    #: compatibility layer while the relaxation API is generalized.
+    model: Optional[str] = None
+    head: str = "omat_pbe"
+    device: str = "mps"
+    dtype: str = "float32"
+    optimizer: str = "BFGS"
+    maxstep: float = 0.2
 
     @classmethod
     def from_pack(cls, raw: Optional[Mapping[str, Any]]) -> "XtbSettings":
@@ -134,6 +160,7 @@ class XtbSettings:
             return cls()
         python = raw.get("python")
         method = str(raw.get("method", "GFN1-xTB"))
+        backend = str(raw.get("backend", "auto")).strip().lower()
         # g-xTB defaults: short maxcycle (100).  Beyond that, most remaining
         # steps are sub-kcal/mol noise; packs can still override.
         default_max_steps = 100 if _is_gxtb(method) else 500
@@ -144,6 +171,7 @@ class XtbSettings:
         )
         return cls(
             enabled=bool(raw.get("enabled", False)),
+            backend=backend,
             method=method,
             accuracy=float(raw.get("accuracy", 1.0)),
             electronic_temperature=float(raw.get("electronic_temperature", 300.0)),
@@ -180,10 +208,20 @@ class XtbSettings:
                 int(i) for i in (raw.get("freeze_atoms") or ())
             ),
             opt_level=str(raw.get("opt_level") or ""),
+            model=(
+                None if raw.get("model") is None
+                else str(Path(str(raw["model"])).expanduser())
+            ),
+            head=str(raw.get("head") or "omat_pbe"),
+            device=str(raw.get("device") or "mps").lower(),
+            dtype=str(raw.get("dtype") or "float32").lower(),
+            optimizer=str(raw.get("optimizer") or "BFGS"),
+            maxstep=float(raw.get("maxstep", 0.2)),
         )
 
     def payload(self) -> Dict[str, Any]:
         return {
+            "backend": self.backend,
             "method": self.method,
             "accuracy": self.accuracy,
             "electronic_temperature": self.electronic_temperature,
@@ -194,6 +232,12 @@ class XtbSettings:
             "artifact_min_distance": dict(self.artifact_min_distance or {}),
             "freeze_atoms": list(self.freeze_atoms),
             "opt_level": self.opt_level,
+            "model": self.model,
+            "head": self.head,
+            "device": self.device,
+            "dtype": self.dtype,
+            "optimizer": self.optimizer,
+            "maxstep": self.maxstep,
         }
 
 
@@ -224,6 +268,117 @@ _HARTREE_EV = 27.211386245988
 
 #: the banner is per-process state, so a batch prints it once, not per bin
 _BACKEND_BANNER_DONE = False
+_MACE_BANNER_DONE = False
+
+
+def _backend_name(settings: "XtbSettings") -> str:
+    value = str(settings.backend or "auto").strip().lower()
+    if value in {"mace", "mace-mh-1", "mace_mh1"}:
+        return "mace"
+    if value in {"gxtb", "g-xtb", "g_xtb"}:
+        return "gxtb"
+    if value not in {"", "auto", "xtb"}:
+        raise ValueError(f"unknown relaxation backend: {settings.backend}")
+    if _is_mace(settings.method):
+        return "mace"
+    return "gxtb" if _is_gxtb(settings.method) else "xtb"
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def backend_provenance(settings: "XtbSettings") -> Dict[str, Any]:
+    """Stable backend identity included in run protocol fingerprints."""
+
+    import shutil
+
+    backend = _backend_name(settings)
+    if backend == "mace":
+        interpreter = Path(settings.python or sys.executable).expanduser()
+        model = Path(settings.model or "").expanduser()
+        return {
+            "backend": "mace",
+            "method": settings.method,
+            "python": str(interpreter.resolve()) if interpreter.exists() else str(interpreter),
+            "model": str(model.resolve()) if model.exists() else str(model),
+            "model_sha256": _sha256_file(model) if model.is_file() else None,
+            "head": settings.head,
+            "device": settings.device,
+            "dtype": settings.dtype,
+            "optimizer": settings.optimizer,
+            "fmax_eV_A": settings.fmax,
+            "max_steps": settings.max_steps,
+            "maxstep_A": settings.maxstep,
+            "worker_sha256": _sha256_file(_MACE_WORKER) if _MACE_WORKER.is_file() else None,
+        }
+    if backend == "gxtb":
+        binary = shutil.which(settings.binary or "gxtb")
+        return {
+            "backend": "gxtb",
+            "method": settings.method,
+            "binary": binary,
+            "binary_sha256": _sha256_file(Path(binary)) if binary else None,
+            "xtb_path": settings.xtb_path or os.environ.get("XTBPATH", ""),
+        }
+    interpreter = Path(settings.python or sys.executable).expanduser()
+    return {
+        "backend": "xtb-python",
+        "method": settings.method,
+        "python": str(interpreter.resolve()) if interpreter.exists() else str(interpreter),
+    }
+
+
+def validate_backend(settings: "XtbSettings") -> Dict[str, Any]:
+    """Fail early when the configured relaxation implementation is unusable."""
+
+    import shutil
+
+    backend = _backend_name(settings)
+    if backend == "gxtb":
+        binary = shutil.which(settings.binary or "gxtb")
+        if not binary:
+            raise RuntimeError(f"g-xTB executable not found: {settings.binary or 'gxtb'}")
+        return backend_provenance(settings)
+    if backend == "mace":
+        interpreter = Path(settings.python or sys.executable).expanduser()
+        model = Path(settings.model or "").expanduser()
+        if not interpreter.is_file():
+            raise RuntimeError(f"MACE Python interpreter not found: {interpreter}")
+        if not model.is_file():
+            raise RuntimeError(f"MACE model checkpoint not found: {model}")
+        if settings.dtype not in {"float32", "float64"}:
+            raise ValueError("MACE dtype must be float32 or float64")
+        if settings.device == "mps" and settings.dtype != "float32":
+            raise ValueError("Apple MPS requires MACE dtype=float32")
+        code = (
+            "import json, torch, mace, ase; "
+            "print(json.dumps({'torch':torch.__version__,'mace':mace.__version__,"
+            "'ase':ase.__version__,'mps_built':torch.backends.mps.is_built(),"
+            "'mps_available':torch.backends.mps.is_available()}))"
+        )
+        proc = subprocess.run(
+            [str(interpreter), "-c", code], capture_output=True, text=True,
+            check=False, timeout=60.0,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "MACE import failed").strip()
+            raise RuntimeError(detail.splitlines()[-1])
+        runtime = json.loads(proc.stdout.strip().splitlines()[-1])
+        if settings.device == "mps" and not runtime.get("mps_available"):
+            raise RuntimeError(
+                "MACE requested device=mps but torch.backends.mps.is_available() is false"
+            )
+        result = backend_provenance(settings)
+        result["runtime"] = runtime
+        return result
+    return backend_provenance(settings)
 
 
 def _binary_version(binary: str, env: Mapping[str, str]) -> str:
@@ -253,6 +408,22 @@ def describe_backend(settings: "XtbSettings") -> List[str]:
     import os
     import shutil
 
+    if _backend_name(settings) == "mace":
+        provenance = backend_provenance(settings)
+        return [
+            "[relax] backend   : MACE persistent worker",
+            f"[relax] method    : {settings.method}",
+            f"[relax] python    : {provenance['python']}",
+            f"[relax] model     : {provenance['model']}",
+            f"[relax] model sha : {provenance['model_sha256'] or '<missing>'}",
+            f"[relax] head      : {settings.head}",
+            f"[relax] device    : {settings.device}",
+            f"[relax] dtype     : {settings.dtype}",
+            f"[relax] optimizer : {settings.optimizer}",
+            f"[relax] fmax      : {settings.fmax:g} eV/A",
+            f"[relax] max_steps : {settings.max_steps}",
+        ]
+
     binary = settings.binary or "gxtb"
     env = _cli_env(settings)
     resolved = shutil.which(binary, path=env.get("PATH", os.defpath))
@@ -277,6 +448,128 @@ def describe_backend(settings: "XtbSettings") -> List[str]:
             "[relax] WARNING: binary not on PATH -- every relaxation will fail."
         )
     return lines
+
+
+class _MaceProcess:
+    """Single-owner JSON-lines client for a model kept resident on MPS/CPU."""
+
+    def __init__(self, settings: "XtbSettings"):
+        import threading
+
+        self.settings = settings
+        self.lock = threading.Lock()
+        interpreter = str(Path(settings.python or sys.executable).expanduser())
+        self.proc = subprocess.Popen(
+            [
+                interpreter,
+                str(_MACE_WORKER),
+                "--model", str(Path(settings.model or "").expanduser()),
+                "--head", settings.head,
+                "--device", settings.device,
+                "--dtype", settings.dtype,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+        )
+
+    def close(self) -> None:
+        proc = self.proc
+        if proc.poll() is not None:
+            return
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps({"command": "close"}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            proc.terminate()
+
+    def request(self, structures, settings: "XtbSettings") -> List[Dict[str, Any]]:
+        import selectors
+
+        timeout = None
+        if settings.timeout_s > 0:
+            timeout = float(settings.timeout_s) * max(1, len(structures))
+        payload = {
+            "command": "relax",
+            "settings": settings.payload(),
+            "structures": structures,
+        }
+        with self.lock:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"MACE worker exited with code {self.proc.returncode}")
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write(json.dumps(payload, allow_nan=False) + "\n")
+            self.proc.stdin.flush()
+            selector = selectors.DefaultSelector()
+            selector.register(self.proc.stdout, selectors.EVENT_READ)
+            try:
+                if not selector.select(timeout):
+                    self.proc.terminate()
+                    raise TimeoutError(f"MACE batch timed out after {timeout:g} s")
+                line = self.proc.stdout.readline()
+            finally:
+                selector.close()
+            if not line:
+                raise RuntimeError(
+                    f"MACE worker closed output (exit={self.proc.poll()})"
+                )
+            reply = json.loads(line)
+            if not reply.get("ok"):
+                raise RuntimeError(str(reply.get("error") or "MACE worker failed"))
+            return list(reply.get("results") or [])
+
+
+_MACE_PROCESSES: Dict[Tuple[str, ...], _MaceProcess] = {}
+
+
+def _mace_key(settings: "XtbSettings") -> Tuple[str, ...]:
+    return (
+        str(Path(settings.python or sys.executable).expanduser()),
+        str(Path(settings.model or "").expanduser()),
+        settings.head,
+        settings.device,
+        settings.dtype,
+    )
+
+
+def _close_mace_processes() -> None:
+    for worker in list(_MACE_PROCESSES.values()):
+        worker.close()
+    _MACE_PROCESSES.clear()
+
+
+def _run_mace(structures, settings, on_result=None) -> List[Dict[str, Any]]:
+    global _MACE_BANNER_DONE
+
+    if not _MACE_BANNER_DONE:
+        _MACE_BANNER_DONE = True
+        print("\n".join(describe_backend(settings)), flush=True)
+    key = _mace_key(settings)
+    worker = _MACE_PROCESSES.get(key)
+    if worker is None or worker.proc.poll() is not None:
+        worker = _MaceProcess(settings)
+        _MACE_PROCESSES[key] = worker
+    try:
+        raw = worker.request(structures, settings)
+    except Exception as exc:  # noqa: BLE001
+        _MACE_PROCESSES.pop(key, None)
+        worker.close()
+        raw = [
+            {"id": entry["id"], "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            for entry in structures
+        ]
+    if on_result is not None:
+        for index, result in enumerate(raw):
+            on_result(index, result)
+    return raw
+
+
+import atexit as _atexit
+_atexit.register(_close_mace_processes)
 
 
 def _cli_env(settings: "XtbSettings") -> Dict[str, str]:
@@ -713,7 +1006,10 @@ def relax_structures(
         }
         for entry in structures
     ]
-    if _is_gxtb(settings.method):
+    backend = _backend_name(settings)
+    if backend == "mace":
+        raw = _run_mace(payload, settings, on_result=on_result)
+    elif backend == "gxtb":
         raw = _run_cli(payload, settings, on_result=on_result)
     else:
         raw = _run_in_process(payload, settings)

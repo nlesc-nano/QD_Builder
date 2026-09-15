@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from builder.nucleation.xtb_relax import XtbSettings, _is_gxtb, relax_structures
+from builder.nucleation.xtb_relax import (
+    XtbSettings,
+    _is_gxtb,
+    _is_mace,
+    relax_structures,
+)
 
 PACK = Path(__file__).resolve().parents[1] / "geometry_packs" / "cdse_cdcl2_motif_GXTB.yaml"
 
@@ -14,6 +19,62 @@ def test_method_dispatch():
     assert _is_gxtb("g-xTB") and _is_gxtb("gxtb") and _is_gxtb("G-XTB")
     assert not _is_gxtb("GFN1-xTB")
     assert not _is_gxtb("GFN2-xTB")
+    assert _is_mace("MACE-MH-1") and _is_mace("mace")
+    assert not _is_mace("g-xTB")
+
+
+def test_mace_settings_and_dispatch(monkeypatch):
+    st = XtbSettings.from_pack(
+        {
+            "enabled": True,
+            "backend": "mace",
+            "method": "MACE-MH-1",
+            "python": "/opt/mace/bin/python",
+            "model": "/models/macemh1model",
+            "head": "omat_pbe",
+            "device": "mps",
+            "dtype": "float32",
+            "optimizer": "BFGS",
+            "maxstep": 0.15,
+        }
+    )
+    assert st.backend == "mace"
+    assert st.model == "/models/macemh1model"
+    assert st.head == "omat_pbe" and st.maxstep == 0.15
+
+    called = {}
+
+    def fake_mace(payload, settings, on_result=None):
+        called["ids"] = [row["id"] for row in payload]
+        return [
+            {
+                "id": "m1",
+                "ok": True,
+                "energy_eV": -12.5,
+                "steps": 7,
+                "converged": True,
+                "max_force": 0.01,
+                "positions": [[0, 0, 0], [0, 0, 2.6]],
+                "status": "converged",
+            }
+        ]
+
+    monkeypatch.setattr("builder.nucleation.xtb_relax._run_mace", fake_mace)
+    result = relax_structures(
+        [
+            {
+                "id": "m1",
+                "symbols": ["Cd", "Se"],
+                "positions": [[0, 0, 0], [0, 0, 2.5]],
+                "edges": [[0, 1]],
+            }
+        ],
+        st,
+        {("Cd", "Se"): 3.25},
+    )[0]
+    assert called["ids"] == ["m1"]
+    assert result.ok and result.converged and result.energy_eV == -12.5
+    assert result.max_force == 0.01 and result.relaxed_edges == ((0, 1),)
 
 
 def test_settings_round_trip():

@@ -1,0 +1,43 @@
+# CdSe/CdCl2 zinc-blende growth driver using MACE-MH-1 for relaxation.
+# This is deliberately separate from run_gxtb.yaml: archives produced by the
+# two potentials have different energy scales and must not be merged/ranked.
+
+schema_version: 2
+name: cdse_cdcl2_zb_mace_mh1
+
+include:
+  - graph_rules.yaml
+  - motifs.yaml
+  - embed.yaml
+
+cif: ../../examples/cifs/CdSe_zb.cif
+charges: {Cd: 2, Se: -2, Cl: -1}
+
+nucleation:
+  kmax: 13
+  mode: exact
+  core_monomer: {cation: Cd, anion: Se}
+  precursor: {center: Cd, ligand: Cl, ligand_count: 2}
+  site_tolerance: 0.2
+
+relaxation:
+  enabled: true
+  backend: mace
+  method: MACE-MH-1
+  python: /Users/ivaninfante/miniforge3/envs/orchestr_ai-mace/bin/python
+  model: /Users/ivaninfante/.cache/mace/macemh1model
+  head: omat_pbe
+  device: mps
+  dtype: float32
+  optimizer: BFGS
+  fmax: 0.02
+  max_steps: 500
+  maxstep: 0.20
+  accept_maxcycle: true
+  timeout_s: 1800
+  check_connectivity: true
+  artifact_min_distance:
+    Cd-Cd: 2.80
+    Se-Se: 2.80
+    Cl-Se: 2.80
+    Cl-Cl: 2.80

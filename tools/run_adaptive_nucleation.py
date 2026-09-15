@@ -22,6 +22,12 @@ def main():
         "--pack-dir", type=Path, default=ROOT / "geometry_packs/cdse_cdcl2_zb"
     )
     parser.add_argument(
+        "--relaxation-config",
+        type=Path,
+        default=None,
+        help="full geometry-pack driver; defaults to PACK_DIR/run_gxtb.yaml",
+    )
+    parser.add_argument(
         "--growth",
         type=Path,
         default=ROOT / "geometry_packs/cdse_cdcl2_zb/growth_agnostic_k5.yaml",
@@ -37,6 +43,9 @@ def main():
     args = parser.parse_args()
 
     config = AdaptiveConfig.load(args.config)
+    relaxation_config = args.relaxation_config or args.pack_dir / "run_gxtb.yaml"
+    if not relaxation_config.is_file():
+        parser.error(f"relaxation configuration does not exist: {relaxation_config}")
     if not (args.source / "minima.json").is_file() and not (
         args.source / "index.csv"
     ).is_file():
@@ -57,6 +66,7 @@ def main():
                     protocol="adaptive_A_B_C",
                     chemistry_adapter=config.chemistry_adapter,
                     source=str(args.source.resolve()),
+                    relaxation_config=str(relaxation_config.resolve()),
                     phases={
                         phase: ks
                         for phase, ks in {
@@ -119,7 +129,7 @@ def main():
 
     AdaptivePilot(
         config,
-        args.pack_dir / "run_gxtb.yaml",
+        relaxation_config,
         args.growth,
         args.source,
         args.output,

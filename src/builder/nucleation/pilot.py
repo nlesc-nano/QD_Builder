@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import shutil
 import subprocess
 import time
 from collections import Counter, defaultdict, deque
@@ -46,7 +45,11 @@ from .pilot_proposals import (
 )
 from .search_analysis import MinimumArchive, corrected_occupation, descriptors, digest
 from .spec import load_nucleation_spec
-from .xtb_relax import XtbSettings, relax_structures
+from .xtb_relax import (
+    XtbSettings,
+    relax_structures,
+    validate_backend,
+)
 
 
 @dataclass
@@ -323,9 +326,11 @@ class Pilot:
         return {}
 
     def setup(self):
-        binary = shutil.which(self.settings.binary or "gxtb")
-        if self._real_backend and not binary:
-            raise RuntimeError(f"g-xTB executable not found: {self.settings.binary}")
+        backend_info = (
+            validate_backend(self.settings)
+            if self._real_backend
+            else {"backend": "test-backend"}
+        )
         repo = Path(__file__).resolve().parents[3]
         git = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
@@ -366,8 +371,7 @@ class Pilot:
                 if seed_index.exists()
                 else None,
                 seed_hashes=seed_hashes,
-                binary=file_hash(Path(binary)) if binary else "test-backend",
-                xtbpath=os.environ.get("XTBPATH", ""),
+                relaxation_backend=backend_info,
             )
         )
         self.protocol = dict(
@@ -377,7 +381,7 @@ class Pilot:
             source_revision=git.stdout.strip(),
             source_hashes=sources,
             seed_hashes=seed_hashes,
-            binary=binary,
+            relaxation_backend=backend_info,
             seed_dir=str(self.seed_dir.resolve()),
             created=self.started,
         )

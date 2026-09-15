@@ -19,6 +19,12 @@ def main():
         "--pack-dir", type=Path, default=ROOT / "geometry_packs/cdse_cdcl2_zb"
     )
     ap.add_argument(
+        "--relaxation-config",
+        type=Path,
+        default=None,
+        help="full geometry-pack driver; defaults to PACK_DIR/run_gxtb.yaml",
+    )
+    ap.add_argument(
         "--growth",
         type=Path,
         default=ROOT / "geometry_packs/cdse_cdcl2_zb/growth_agnostic_k5.yaml",
@@ -31,6 +37,9 @@ def main():
         help="Validate configuration and print budgets; no files or calculations",
     )
     args = ap.parse_args()
+    relaxation_config = args.relaxation_config or args.pack_dir / "run_gxtb.yaml"
+    if not relaxation_config.is_file():
+        ap.error(f"relaxation configuration does not exist: {relaxation_config}")
     config = PilotConfig.load(args.config)
     if not args.seeds.is_dir():
         ap.error("seed directory does not exist")
@@ -52,13 +61,14 @@ def main():
                     max_calls=config.max_calls,
                     workers=config.workers,
                     launch_hours=config.launch_hours,
+                    relaxation_config=str(relaxation_config.resolve()),
                 ),
                 indent=2,
             )
         )
         return
     Pilot(
-        config, args.pack_dir / "run_gxtb.yaml", args.growth, args.seeds, args.output
+        config, relaxation_config, args.growth, args.seeds, args.output
     ).run()
 
 
