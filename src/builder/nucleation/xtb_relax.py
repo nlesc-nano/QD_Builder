@@ -153,6 +153,17 @@ class XtbSettings:
     dtype: str = "float32"
     optimizer: str = "BFGS"
     maxstep: float = 0.2
+    #: Which bond-cutoff model drives post-relax graphs and descriptors.
+    #: ``legacy``  -- single cutoffs from ``graph_rules.yaml`` (Cd–Se 3.25 Å),
+    #:               tuned on g-xTB endpoints.
+    #: ``two_tier`` -- ``mace_descriptors.MACE_CUTOFFS``: strong bonds
+    #:               (Cd–Se 2.95 / Cd–Cl 2.80 Å) build the graph used for
+    #:               chemistry rules, scaffold hashes and coordination; the
+    #:               all-bond tier (3.35 / 3.15 Å, first RDF minimum on MACE
+    #:               and PBE) and long contacts are reported alongside in
+    #:               ``final["two_tier"]``.  See docs/nucleation/mace_descriptors.md.
+    #: ``auto``     -- ``two_tier`` for the MACE backend, ``legacy`` otherwise.
+    descriptor_cutoffs: str = "auto"
 
     @classmethod
     def from_pack(cls, raw: Optional[Mapping[str, Any]]) -> "XtbSettings":
@@ -217,6 +228,7 @@ class XtbSettings:
             dtype=str(raw.get("dtype") or "float32").lower(),
             optimizer=str(raw.get("optimizer") or "BFGS"),
             maxstep=float(raw.get("maxstep", 0.2)),
+            descriptor_cutoffs=str(raw.get("descriptor_cutoffs") or "auto").strip().lower(),
         )
 
     def payload(self) -> Dict[str, Any]:
@@ -238,7 +250,39 @@ class XtbSettings:
             "dtype": self.dtype,
             "optimizer": self.optimizer,
             "maxstep": self.maxstep,
+            "descriptor_cutoffs": self.descriptor_cutoffs,
         }
+
+
+def descriptor_model(settings: "XtbSettings") -> str:
+    """Resolve ``settings.descriptor_cutoffs`` to ``legacy`` or ``two_tier``."""
+
+    value = str(getattr(settings, "descriptor_cutoffs", "auto") or "auto").lower()
+    if value == "auto":
+        return "two_tier" if _backend_name(settings) == "mace" else "legacy"
+    if value not in {"legacy", "two_tier"}:
+        raise ValueError(
+            f"relaxation.descriptor_cutoffs must be legacy, two_tier or auto; got {value!r}"
+        )
+    return value
+
+
+def descriptor_bond_cutoffs(
+    settings: "XtbSettings", legacy: Mapping[Tuple[str, str], float]
+) -> Dict[Tuple[str, str], float]:
+    """Bond cutoffs for post-relax graphs under the resolved descriptor model.
+
+    ``two_tier`` returns the strong-bond tier; the caller keeps ``legacy`` for
+    anything that must stay comparable with g-xTB-era archives.
+    """
+
+    if descriptor_model(settings) == "two_tier":
+        from .mace_descriptors import MACE_CUTOFFS
+
+        out = dict(legacy)
+        out.update(MACE_CUTOFFS["strong"])
+        return out
+    return dict(legacy)
 
 
 @dataclass
@@ -317,6 +361,7 @@ def backend_provenance(settings: "XtbSettings") -> Dict[str, Any]:
             "max_steps": settings.max_steps,
             "maxstep_A": settings.maxstep,
             "worker_sha256": _sha256_file(_MACE_WORKER) if _MACE_WORKER.is_file() else None,
+            "descriptor_model": descriptor_model(settings),
         }
     if backend == "gxtb":
         binary = shutil.which(settings.binary or "gxtb")

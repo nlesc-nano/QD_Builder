@@ -190,3 +190,34 @@ def test_missing_binary_reports_error_not_crash():
         st,
     )
     assert len(out) == 1 and not out[0].ok and out[0].error
+
+
+def test_descriptor_model_resolution():
+    from builder.nucleation.mace_descriptors import MACE_CUTOFFS
+    from builder.nucleation.xtb_relax import (
+        backend_provenance,
+        descriptor_bond_cutoffs,
+        descriptor_model,
+    )
+
+    legacy = {("Cd", "Se"): 3.25, ("Cd", "Cl"): 2.90}
+    mace = XtbSettings.from_pack(
+        {"backend": "mace", "method": "MACE-MH-1", "model": "/models/m", "python": "/opt/p"}
+    )
+    gxtb = XtbSettings.from_pack({"method": "g-xTB", "binary": "gxtb"})
+    # auto: two_tier only for MACE
+    assert descriptor_model(mace) == "two_tier"
+    assert descriptor_model(gxtb) == "legacy"
+    assert descriptor_bond_cutoffs(mace, legacy) == {**legacy, **MACE_CUTOFFS["strong"]}
+    assert descriptor_bond_cutoffs(gxtb, legacy) == legacy
+    # explicit override in either direction
+    assert descriptor_model(XtbSettings.from_pack({"method": "g-xTB", "descriptor_cutoffs": "two_tier"})) == "two_tier"
+    forced = XtbSettings.from_pack(
+        {"backend": "mace", "method": "MACE-MH-1", "model": "/models/m", "descriptor_cutoffs": "legacy"}
+    )
+    assert descriptor_model(forced) == "legacy"
+    with pytest.raises(ValueError):
+        descriptor_model(XtbSettings.from_pack({"method": "g-xTB", "descriptor_cutoffs": "nope"}))
+    # the choice is part of the MACE protocol identity and of the payload
+    assert backend_provenance(mace)["descriptor_model"] == "two_tier"
+    assert mace.payload()["descriptor_cutoffs"] == "auto"

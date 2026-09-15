@@ -114,12 +114,38 @@ DFT comparison (141 PBE → MACE): 125 retained, 6 minor, 6 changed, 0 split;
 strong Se CN pooled {3:302, 4:89, 5:27} → {3:298, 4:88, 5:29}; `zb_score`
 0.460 → 0.466. Same descriptor set, same verdict as the RMSD analysis.
 
-## How to use in the controller
+## Wiring in the run path
 
-- Scaffold lineage and duplicate consolidation: `core_hash_strong`
-  (+ `core_geometry` distance for basin identity as before).
-- ZB-family protection: `zb_score` and `q4_nn4_se` measured on MACE
-  endpoints; do not port g-xTB-era `Se CN4 fraction` targets.
+`relaxation.descriptor_cutoffs` in the pack YAML selects the model
+(`legacy` | `two_tier` | `auto`, default `auto` = `two_tier` for the MACE
+backend, `legacy` otherwise). `run_mace_mh1.yaml` sets `two_tier`
+explicitly. Resolution lives in `xtb_relax.descriptor_model()` /
+`descriptor_bond_cutoffs()`.
+
+Under `two_tier` the `Pilot`:
+
+- builds every post-relax bond graph (`describe_minimum`, chemistry-rule
+  violations, connectivity drift, legacy `final` descriptors and the WL
+  `core_hash` used for lineage and family keys) from the **strong** tier
+  (Cd–Se 2.95 / Cd–Cl 2.80 Å) instead of the pack's 3.25 / 2.90 Å;
+- records `final["descriptor_model"]`, `final["bond_cutoffs"]` and the full
+  two-tier block in `final["two_tier"]`, including
+  `scaffold_change` computed against the proposal's pre-relaxation
+  coordinates and `construction_core_hash_strong`;
+- puts `descriptor_model` and `bond_cutoffs` into the protocol's
+  `relaxation_backend` block, so a MACE archive built with two-tier graphs
+  cannot be resumed or merged with one built on legacy graphs.
+
+g-xTB packs are untouched (`auto` → `legacy`), so existing archives and
+their fingerprints are unaffected.
+
+Guidance for the controller (`adaptive.py` still keys families on
+`final["se_cn"]` / `cd_environments` / `core_hash`, which are now strong-tier
+values under MACE):
+
+- ZB-family protection: use `final["two_tier"]["zb_score"]` and
+  `q4_nn4_se` measured on MACE endpoints; do not port g-xTB-era
+  `Se CN4 fraction` targets.
 - Artefact/reconstruction screening: `se_scaffold_components_all > 1`,
   `cd_detached_all` increments, `min_distances` against the run's artefact
   floors (skip the Se–Se floor for p=0).

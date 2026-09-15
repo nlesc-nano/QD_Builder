@@ -36,6 +36,12 @@ relaxation:
   accept_maxcycle: true
   timeout_s: 1800
   check_connectivity: true
+  # Post-relax bond model.  MACE/PBE endpoints carry a 2.9-3.3 A Cd-Se
+  # contact tail that the g-xTB-era single cutoff (3.25 A) cuts through;
+  # two_tier builds chemistry/scaffold graphs on strong bonds (Cd-Se 2.95,
+  # Cd-Cl 2.80) and reports the all-bond tier and long contacts alongside.
+  # See docs/nucleation/mace_descriptors.md.  (auto == two_tier for mace.)
+  descriptor_cutoffs: two_tier
   artifact_min_distance:
     Cd-Cd: 2.80
     Se-Se: 2.80

@@ -47,6 +47,8 @@ from .search_analysis import MinimumArchive, corrected_occupation, descriptors, 
 from .spec import load_nucleation_spec
 from .xtb_relax import (
     XtbSettings,
+    descriptor_bond_cutoffs,
+    descriptor_model,
     relax_structures,
     validate_backend,
 )
@@ -290,7 +292,6 @@ class Pilot:
             self.pack.raw.setdefault("graph_rules", {}).update(overrides)
         self.growth = GrowthConfig.from_yaml(Path(growth_path))
         self.model = lattice_model(self.spec)
-        self.cutoffs = bond_cutoffs_from_spec(self.spec)
         raw = dict(self.pack.raw.get("relaxation", {}))
         self.settings = replace(
             XtbSettings.from_pack(raw),
@@ -301,6 +302,13 @@ class Pilot:
             timeout_s=config.timeout_s,
             accept_maxcycle=True,
         )
+        # Post-relax bond graphs: g-xTB archives use the pack's single
+        # cutoffs; MACE runs use the strong tier of the two-tier model so
+        # chemistry rules, scaffold hashes and family keys do not flicker on
+        # the 2.9-3.3 Å contact tail that MACE/PBE produce.
+        self.legacy_cutoffs = bond_cutoffs_from_spec(self.spec)
+        self.descriptor_model = descriptor_model(self.settings)
+        self.cutoffs = descriptor_bond_cutoffs(self.settings, self.legacy_cutoffs)
         self.backend = backend or relax_structures
         self._real_backend = backend is None
         self.calls = Counter()
@@ -331,6 +339,11 @@ class Pilot:
             if self._real_backend
             else {"backend": "test-backend"}
         )
+        backend_info = dict(backend_info)
+        backend_info["descriptor_model"] = self.descriptor_model
+        backend_info["bond_cutoffs"] = {
+            "-".join(k): v for k, v in sorted(self.cutoffs.items())
+        }
         repo = Path(__file__).resolve().parents[3]
         git = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
@@ -617,6 +630,10 @@ class Pilot:
         if arm == "control" and role == "audit":
             return None
         f = descriptors(proposal.symbols, minimum.edges, xr.coordinates)
+        f["descriptor_model"] = self.descriptor_model
+        f["bond_cutoffs"] = {"-".join(k): v for k, v in sorted(self.cutoffs.items())}
+        if self.descriptor_model == "two_tier":
+            f["two_tier"] = self.two_tier_descriptors(proposal, xr.coordinates)
         return dict(
             structure_id=proposal.id,
             k=proposal.k,
@@ -652,6 +669,26 @@ class Pilot:
             construction=descriptors(proposal.symbols, proposal.edges),
             converged=True,
         )
+
+    def two_tier_descriptors(self, proposal, coordinates):
+        """Two-tier (strong / all / long) descriptors of a relaxed endpoint.
+
+        Also classifies what relaxation did to the construction scaffold
+        (``scaffold_change``) using the proposal's pre-relax coordinates, so
+        lineage bookkeeping never has to infer retention from the endpoint
+        alone.
+        """
+
+        from .mace_descriptors import describe as two_tier_describe
+        from .mace_descriptors import scaffold_change
+
+        after = two_tier_describe(proposal.symbols, coordinates)
+        block = dict(after)
+        if proposal.positions is not None and len(proposal.positions) == len(proposal.symbols):
+            before = two_tier_describe(proposal.symbols, proposal.positions)
+            block["scaffold_change"] = scaffold_change(before, after)
+            block["construction_core_hash_strong"] = before["core_hash_strong"]
+        return block
 
     def proposal_valid(self, proposal):
         """Chemistry hook used before any backend call."""
