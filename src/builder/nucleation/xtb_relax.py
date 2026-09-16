@@ -164,6 +164,14 @@ class XtbSettings:
     #:               ``final["two_tier"]``.  See docs/nucleation/mace_descriptors.md.
     #: ``auto``     -- ``two_tier`` for the MACE backend, ``legacy`` otherwise.
     descriptor_cutoffs: str = "auto"
+    #: MACE energy-plateau stop: end the optimisation once the total energy
+    #: has moved by less than ``energy_tol_eV`` over the last ``energy_window``
+    #: steps, even if ``fmax`` is not yet met (reported as converged with
+    #: status ``energy_converged``).  0 disables.  Rankings are resolved at
+    #: tens of meV, so a 1-2 meV plateau is settled for that purpose.
+    energy_tol_eV: float = 0.0
+    energy_window: int = 5
+    energy_fmax_gate: float = 0.05
 
     @classmethod
     def from_pack(cls, raw: Optional[Mapping[str, Any]]) -> "XtbSettings":
@@ -229,6 +237,9 @@ class XtbSettings:
             optimizer=str(raw.get("optimizer") or "BFGS"),
             maxstep=float(raw.get("maxstep", 0.2)),
             descriptor_cutoffs=str(raw.get("descriptor_cutoffs") or "auto").strip().lower(),
+            energy_tol_eV=float(raw.get("energy_tol_eV", 0.0) or 0.0),
+            energy_window=int(raw.get("energy_window", 5) or 5),
+            energy_fmax_gate=float(raw.get("energy_fmax_gate", 0.05) or 0.05),
         )
 
     def payload(self) -> Dict[str, Any]:
@@ -251,6 +262,9 @@ class XtbSettings:
             "optimizer": self.optimizer,
             "maxstep": self.maxstep,
             "descriptor_cutoffs": self.descriptor_cutoffs,
+            "energy_tol_eV": self.energy_tol_eV,
+            "energy_window": self.energy_window,
+            "energy_fmax_gate": self.energy_fmax_gate,
         }
 
 
@@ -358,6 +372,9 @@ def backend_provenance(settings: "XtbSettings") -> Dict[str, Any]:
             "dtype": settings.dtype,
             "optimizer": settings.optimizer,
             "fmax_eV_A": settings.fmax,
+            "energy_tol_eV": settings.energy_tol_eV,
+            "energy_window": settings.energy_window,
+            "energy_fmax_gate": settings.energy_fmax_gate,
             "max_steps": settings.max_steps,
             "maxstep_A": settings.maxstep,
             "worker_sha256": _sha256_file(_MACE_WORKER) if _MACE_WORKER.is_file() else None,

@@ -99,12 +99,42 @@ def relax_one(entry, settings, calculator):
             trajectory=None,
             maxstep=float(settings.get("maxstep", 0.2)),
         )
-        converged = bool(
-            optimizer.run(
-                fmax=float(settings.get("fmax", 0.02)),
-                steps=int(settings.get("max_steps", 500)),
-            )
-        )
+        fmax = float(settings.get("fmax", 0.02))
+        max_steps = int(settings.get("max_steps", 500))
+        # Energy-plateau stop.  For a ranking search the geometry is
+        # structurally settled long before every force is below fmax; once the
+        # total energy has moved by less than ``energy_tol_eV`` over the last
+        # ``energy_window`` steps the optimisation is stopped and reported as
+        # converged (status ``energy_converged``).  0 disables it.
+        energy_tol = float(settings.get("energy_tol_eV", 0.0) or 0.0)
+        energy_window = max(1, int(settings.get("energy_window", 5) or 5))
+        # the plateau stop only fires once every force is already below this
+        # (a BFGS creep across a shoulder shows a flat energy with forces
+        # still ~0.05 eV/A and can drop hundreds of meV later)
+        energy_fmax_gate = float(settings.get("energy_fmax_gate", 0.05) or 0.05)
+        history = []
+        stop_reason = ""
+        converged = False
+        if energy_tol > 0.0:
+            for force_converged in optimizer.irun(fmax=fmax, steps=max_steps):
+                history.append(float(atoms.get_potential_energy()))
+                if force_converged:
+                    converged = True
+                    stop_reason = "fmax"
+                    break
+                if len(history) > energy_window:
+                    span = max(history[-energy_window - 1:]) - min(history[-energy_window - 1:])
+                    if span < energy_tol:
+                        fnow = float(np.linalg.norm(atoms.get_forces(), axis=1).max())
+                        if fnow <= energy_fmax_gate:
+                            converged = True
+                            stop_reason = "energy_plateau"
+                            break
+            else:
+                converged = False
+        else:
+            converged = bool(optimizer.run(fmax=fmax, steps=max_steps))
+            stop_reason = "fmax" if converged else ""
         if str(settings.get("device", "")).lower() == "mps":
             torch.mps.synchronize()
         energy = float(atoms.get_potential_energy())
@@ -115,7 +145,10 @@ def relax_one(entry, settings, calculator):
         if not _finite_matrix(final_positions):
             raise FloatingPointError("optimizer returned non-finite coordinates")
         max_force = float(np.linalg.norm(forces, axis=1).max()) if len(forces) else 0.0
-        status = "converged" if converged else "maxcycle"
+        if converged:
+            status = "energy_converged" if stop_reason == "energy_plateau" else "converged"
+        else:
+            status = "maxcycle"
         accept = converged or bool(settings.get("accept_maxcycle", True))
         return {
             "id": structure_id,
@@ -123,6 +156,7 @@ def relax_one(entry, settings, calculator):
             "energy_eV": energy,
             "steps": int(optimizer.nsteps),
             "converged": converged,
+            "stop_reason": stop_reason,
             "max_force": max_force,
             "positions": final_positions.tolist(),
             "bond_orders": None,

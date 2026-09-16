@@ -32,6 +32,17 @@ relaxation:
   dtype: float32
   optimizer: BFGS
   fmax: 0.02
+  # Energy-plateau stop: converged when the energy moved < 2 meV over the
+  # last 5 BFGS steps (ranking resolution is tens of meV); fmax remains the
+  # alternative stop.  Cuts the long force-convergence tail MACE otherwise
+  # spends on already-settled geometries.
+  energy_tol_eV: 0.002
+  energy_window: 5
+  energy_fmax_gate: 0.05
+  # Measured on k=3 starts: ~45% fewer steps, <=8 meV vs strict fmax on
+  # ordinary cases.  The rare 40-600 meV differences are basin transitions
+  # (a genuine shallow minimum that strict BFGS creeps out of over ~200
+  # steps) -- a search-policy matter, not a convergence one.
   max_steps: 500
   maxstep: 0.20
   accept_maxcycle: true

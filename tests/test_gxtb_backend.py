@@ -221,3 +221,17 @@ def test_descriptor_model_resolution():
     # the choice is part of the MACE protocol identity and of the payload
     assert backend_provenance(mace)["descriptor_model"] == "two_tier"
     assert mace.payload()["descriptor_cutoffs"] == "auto"
+
+
+def test_energy_plateau_settings_round_trip():
+    st = XtbSettings.from_pack(
+        {"backend": "mace", "method": "MACE-MH-1", "model": "/m", "python": "/p",
+         "energy_tol_eV": 0.002, "energy_window": 5, "energy_fmax_gate": 0.05}
+    )
+    assert (st.energy_tol_eV, st.energy_window, st.energy_fmax_gate) == (0.002, 5, 0.05)
+    payload = st.payload()
+    assert payload["energy_tol_eV"] == 0.002 and payload["energy_fmax_gate"] == 0.05
+    from builder.nucleation.xtb_relax import backend_provenance
+
+    assert backend_provenance(st)["energy_tol_eV"] == 0.002
+    assert XtbSettings.from_pack({"method": "g-xTB"}).energy_tol_eV == 0.0
