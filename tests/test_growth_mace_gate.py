@@ -67,3 +67,58 @@ def test_prerelax_wall_screen(spec):
     close_cl[3] = [0.0, 2.75, 0.0]  # Cl-Se 2.75: above the 2.70 pair wall, below a 2.80 floor
     assert prerelax_wall_violations(symbols, close_cl, spec) == []
     assert prerelax_wall_violations(symbols, close_cl, spec, floors={"Cl-Se": 2.80})
+
+
+def _occ(k, p, se_pts, cd_pts, oid):
+    from builder.nucleation.molecular_zb_growth import ZbOccupation
+
+    pts = np.vstack([se_pts, cd_pts])
+    symbols = tuple(["Se"] * len(se_pts) + ["Cd"] * len(cd_pts))
+    return ZbOccupation(
+        k=k, p=p, symbols=symbols, coordinates=pts, core_edges=(), occupation_id=oid
+    )
+
+
+def _parent(k, p, sid, energy, occ, topology="preserved"):
+    from builder.nucleation.molecular_growth import ParentStructure
+
+    return ParentStructure(
+        k=k, p=p, structure_id=sid, symbols=occ.symbols, coordinates=occ.coordinates,
+        energy_eV=energy, edges=(), core_edges=(), zb_occupation=occ,
+        topology_status=topology, propagation_eligible=topology in {"preserved", "extended"},
+    )
+
+
+def test_se_skeleton_family_selection_spans_p(spec):
+    from dataclasses import replace
+
+    from builder.nucleation.molecular_growth import GrowthConfig, select_parents
+
+    growth = GrowthConfig.from_yaml(PACK / "growth_agnostic_k5.yaml")
+    growth = replace(
+        growth, family_mode="se_skeleton", families_cap=2, p_states_per_family=2,
+        realizations_per_family=1, compact_rank_below_k=0, reserved_compact_seats=0,
+    )
+    a = 6.1405 / 4
+    se_A = np.array([[0, 0, 0], [2 * a, 2 * a, 0], [2 * a, 0, 2 * a]])       # skeleton A
+    se_B = np.array([[0, 0, 0], [2 * a, 2 * a, 0], [0, 2 * a, 2 * a]])       # skeleton A rotated (same family)
+    se_C = np.array([[0, 0, 0], [2 * a, 2 * a, 0], [4 * a, 4 * a, 0]])       # skeleton C (different)
+    cd1 = np.array([[a, a, a]])
+    cd2 = np.array([[a, a, a], [3 * a, a, a]])
+    # the k=3 overlay in growth_agnostic_k5.yaml sets min_p: 2, so use p=2,3
+    parents = [
+        # family A at p=2 (best in bin) and p=3 (rotated copy, best in bin)
+        _parent(3, 2, "A_p2", -100.0, _occ(3, 2, se_A, cd1, "occA1")),
+        _parent(3, 3, "A_p3", -130.0, _occ(3, 3, se_B, cd2, "occA2")),
+        # family C at p=2 only, 0.3 eV above A, and an off-path member at p=3
+        _parent(3, 2, "C_p2", -99.7, _occ(3, 2, se_C, cd1, "occC1")),
+        _parent(3, 3, "C_p3_off", -129.0, _occ(3, 3, se_C, cd2, "occC2"), topology="changed"),
+        # a third skeleton far above the window: dropped by families_cap=2
+        _parent(3, 2, "D_p2", -95.0, _occ(3, 2, se_C * 1.5, cd1, "occD1")),
+    ]
+    selected = select_parents(parents, growth, spec)
+    ids = {p.structure_id for p in selected}
+    assert {"A_p2", "A_p3"} <= ids            # same Se skeleton at two p -> one family, both p carried
+    assert "C_p2" in ids                      # second family kept
+    assert "D_p2" not in ids                  # families_cap honoured
+    assert "C_p3_off" not in ids              # off-path member not chosen while an in-path p exists

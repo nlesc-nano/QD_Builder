@@ -388,6 +388,24 @@ class GrowthWindow:
     #: Whether to retain distinct anion backbones across different p values
     #: at the same k (e.g. backbones stabilized at high p rescued in lean bins).
     cross_p_retention: bool = False
+    #: Parent-selection unit.  ``bin`` (historical): one selection per (k,p)
+    #: bin keyed on the full Cd+Se occupation.  ``se_skeleton``: one
+    #: selection per k keyed on the anion (Se) lattice skeleton, p-agnostic;
+    #: Cd realisation and p are chosen inside each family.  See
+    #: ``_select_se_skeleton_family_parents``.
+    family_mode: str = "bin"
+    #: se_skeleton mode: number of Se-skeleton families kept per k (0 =
+    #: ``max_skeletons_cap``).
+    families_cap: int = 0
+    #: se_skeleton mode: distinct p values carried per family (lean /
+    #: central / passivated when available).
+    p_states_per_family: int = 3
+    #: se_skeleton mode: distinct Cd realisations (occupation ids) per
+    #: family and p.
+    realizations_per_family: int = 2
+    #: se_skeleton mode: minimum parents for every p bin that has an
+    #: in-window representative, so no composition is orphaned.
+    min_parents_per_p: int = 1
     #: Hard ceiling on the child p of any channel.  0 = only the p_surf
     #: envelope applies.  Measured over the k1-k4 zb run: yield collapses
     #: once p exceeds 3 -- k3p4 1.5%, k3p5 0.6%, k4p4 0.8%, k2p4 0.0%, which
@@ -511,6 +529,11 @@ class GrowthConfig:
     compact_rank_below_k: int = 0
     reserved_compact_seats: int = 0
     cross_p_retention: bool = False
+    family_mode: str = "bin"
+    families_cap: int = 0
+    p_states_per_family: int = 3
+    realizations_per_family: int = 2
+    min_parents_per_p: int = 1
     soft_rules: SoftRulesConfig = field(default_factory=SoftRulesConfig)
     endpoint_diagnostic_k: int = 0
     endpoint_reference: Optional[Path] = None
@@ -635,6 +658,17 @@ class GrowthConfig:
             cross_p_retention=bool(
                 overlay.get("cross_p_retention", self.cross_p_retention)
             ),
+            family_mode=str(overlay.get("family_mode", self.family_mode)),
+            families_cap=int(overlay.get("families_cap", self.families_cap)),
+            p_states_per_family=int(
+                overlay.get("p_states_per_family", self.p_states_per_family)
+            ),
+            realizations_per_family=int(
+                overlay.get("realizations_per_family", self.realizations_per_family)
+            ),
+            min_parents_per_p=int(
+                overlay.get("min_parents_per_p", self.min_parents_per_p)
+            ),
             lattice=self.lattice,
             soft_rules=soft,
         )
@@ -728,6 +762,13 @@ class GrowthConfig:
                     raw.get("cross_p_retention", False),
                 )
             ),
+            family_mode=str(parents.get("family_mode", "bin")).strip().lower(),
+            families_cap=int(parents.get("families_cap", 0) or 0),
+            p_states_per_family=int(parents.get("p_states_per_family", 3) or 3),
+            realizations_per_family=int(
+                parents.get("realizations_per_family", 2) or 2
+            ),
+            min_parents_per_p=int(parents.get("min_parents_per_p", 1) or 1),
             shed_mode=shed_mode,
             max_shed=int(shed.get("max_shed", 2)),
             prefer_low_shed=bool(shed.get("prefer_low_shed", True)),
@@ -2569,6 +2610,152 @@ def _select_zb_occupation_parents(
     return selected
 
 
+def _select_se_skeleton_family_parents(
+    group: Sequence[ParentStructure],
+    win: "GrowthWindow",
+    spec: NucleationSpec,
+) -> List[ParentStructure]:
+    """Select Move Z parents for one k with the Se lattice skeleton as family.
+
+    A family is ``occupation_anion_skeleton_key`` of the stored occupation:
+    the cubic-invariant set of anion lattice sites, independent of the Cd
+    realisation and of p.  Energies are only compared inside one (k,p)
+    bin, so a family is ranked by the best *relative* energy any of its
+    members reaches in its own bin (dE to that bin's lowest in-path
+    representative); ties and off-path-only families fall back to the
+    compact-ZB key.  Then, per family, up to ``p_states_per_family``
+    distinct p (lowest, best-dE, highest) and ``realizations_per_family``
+    Cd realisations per p are kept, and every p bin with an in-window
+    member receives at least ``min_parents_per_p`` parents.
+    """
+
+    from .molecular_zb_growth import (
+        occupation_anion_skeleton_key,
+        occupation_compactness_key,
+    )
+
+    anion = spec.core.anion
+    tolerance = float(getattr(spec, "site_tolerance", 0.2) or 0.2)
+
+    def _in_path(item: ParentStructure) -> bool:
+        return bool(
+            item.propagation_eligible
+            or str(item.topology_status).lower() in {"preserved", "extended"}
+        )
+
+    # one representative per occupation id, in-path preferred, lowest energy
+    by_occupation: Dict[str, List[ParentStructure]] = {}
+    for parent in group:
+        occ_id = str(
+            getattr(parent.zb_occupation, "occupation_id", "") or parent.structure_id
+        )
+        by_occupation.setdefault(occ_id, []).append(parent)
+    reps: List[ParentStructure] = []
+    for members in by_occupation.values():
+        pool = [m for m in members if _in_path(m)] or list(members)
+        reps.append(min(pool, key=lambda m: (float(m.energy_eV), m.structure_id)))
+
+    # relative energy inside each (k,p) bin, in-path only
+    emin_by_p: Dict[int, float] = {}
+    for item in reps:
+        if _in_path(item):
+            e = float(item.energy_eV)
+            emin_by_p[item.p] = min(emin_by_p.get(item.p, e), e)
+
+    def _de(item: ParentStructure) -> float:
+        if not _in_path(item) or item.p not in emin_by_p:
+            return float("inf")
+        return float(item.energy_eV) - emin_by_p[item.p]
+
+    def _compact(item: ParentStructure) -> Tuple[Any, ...]:
+        occ = item.zb_occupation
+        return (
+            occupation_compactness_key(occ)
+            if occ is not None
+            else (0, 0, 0.0, 0, item.structure_id)
+        )
+
+    families: Dict[Any, List[ParentStructure]] = {}
+    for item in reps:
+        occ = item.zb_occupation
+        key = (
+            occupation_anion_skeleton_key(occ, anion, tolerance)
+            if occ is not None
+            else ("no-occupation", item.structure_id)
+        )
+        families.setdefault(key, []).append(item)
+
+    window = float(win.energy_window_eV)
+    compact_first = 0 < int(win.compact_rank_below_k) and int(win.k_from) < int(
+        win.compact_rank_below_k
+    )
+
+    def _family_rank(members: Sequence[ParentStructure]) -> Tuple[Any, ...]:
+        best_de = min(_de(m) for m in members)
+        best_compact = min(_compact(m) for m in members)
+        if compact_first:
+            return (best_compact, best_de)
+        # in-window families first by dE, then everything else by compactness
+        return (0 if best_de <= window else 1, best_de if best_de <= window else 0.0, best_compact)
+
+    ranked = sorted(families.items(), key=lambda kv: _family_rank(kv[1]))
+    n_fam = int(win.families_cap) or int(win.max_skeletons_cap)
+    n_fam = max(1, min(n_fam, len(ranked)))
+    chosen_families = ranked[:n_fam]
+
+    selected: List[ParentStructure] = []
+    chosen_ids: set[str] = set()
+
+    def _take(item: ParentStructure) -> None:
+        if item.structure_id not in chosen_ids:
+            chosen_ids.add(item.structure_id)
+            selected.append(item)
+
+    n_p = max(1, int(win.p_states_per_family))
+    n_real = max(1, int(win.realizations_per_family))
+    for _key, members in chosen_families:
+        by_p: Dict[int, List[ParentStructure]] = {}
+        # p states are drawn from in-path members; off-path (lattice-route)
+        # members only carry a family that has no in-path endpoint at all.
+        in_path_members = [m for m in members if _in_path(m)]
+        for m in in_path_members or members:
+            by_p.setdefault(m.p, []).append(m)
+        for plist in by_p.values():
+            plist.sort(key=lambda m: (_de(m), _compact(m), m.structure_id))
+        ps = sorted(by_p)
+        best_p = min(ps, key=lambda q: (_de(by_p[q][0]), _compact(by_p[q][0])))
+        wanted = [best_p]
+        if len(wanted) < n_p and ps[0] not in wanted:
+            wanted.append(ps[0])
+        if len(wanted) < n_p and ps[-1] not in wanted:
+            wanted.append(ps[-1])
+        for q in sorted(ps, key=lambda q: _de(by_p[q][0])):
+            if len(wanted) >= n_p:
+                break
+            if q not in wanted:
+                wanted.append(q)
+        for q in wanted:
+            for m in by_p[q][:n_real]:
+                _take(m)
+
+    # composition coverage: every p bin with an in-window representative
+    n_min = max(0, int(win.min_parents_per_p))
+    if n_min:
+        by_p_all: Dict[int, List[ParentStructure]] = {}
+        for item in reps:
+            if _de(item) <= window:
+                by_p_all.setdefault(item.p, []).append(item)
+        for q, plist in by_p_all.items():
+            have = sum(1 for m in selected if m.p == q)
+            for m in sorted(plist, key=lambda m: (_de(m), m.structure_id)):
+                if have >= n_min:
+                    break
+                if m.structure_id not in chosen_ids:
+                    _take(m)
+                    have += 1
+    return selected
+
+
 def select_parents(
     parents: Sequence[ParentStructure],
     growth: GrowthConfig,
@@ -2584,7 +2771,26 @@ def select_parents(
         by_bin.setdefault((p.k, p.p), []).append(p)
 
     selected: List[ParentStructure] = []
+    family_ks: set[int] = set()
+    for k in sorted({k for (k, _p) in by_bin}):
+        win = growth.window_for(k)
+        if str(getattr(win, "family_mode", "bin")).lower() != "se_skeleton":
+            continue
+        k_group = [
+            item
+            for (kk, p), members in by_bin.items()
+            if kk == k and int(p) >= int(win.min_p_parent)
+            for item in members
+        ]
+        if k_group and all(
+            getattr(getattr(member, "zb_occupation", None), "symbols", None)
+            for member in k_group
+        ):
+            selected.extend(_select_se_skeleton_family_parents(k_group, win, spec))
+            family_ks.add(k)
     for (k, p), group in sorted(by_bin.items()):
+        if k in family_ks:
+            continue
         win = growth.window_for(k)
         if int(p) < int(win.min_p_parent):
             continue
@@ -2789,6 +2995,8 @@ def select_parents(
             for item in selected:
                 by_k.setdefault(item.k, []).append(item)
             for k, k_selected in by_k.items():
+                if k in family_ks:
+                    continue  # se_skeleton families already span p
                 win = growth.window_for(k)
                 if not (
                     getattr(win, "cross_p_retention", False)
