@@ -192,3 +192,30 @@ def test_bridge_load_variance():
     # both bridges on one Cd pair vs. none elsewhere: loads (2,2,0) -> var > 0
     iso = SimpleNamespace(symbols=["Se", "Cd", "Cd", "Cd", "Cl", "Cl"], edges=[(0, 1), (0, 2), (0, 3), (1, 4), (2, 4), (1, 5), (2, 5)], graph=None)
     assert bridge_load_variance(iso) > 0.8
+
+
+def test_graph_energy_merge_consolidates_same_graph_conformers(spec):
+    """Same bonding graph + energies within the window = one basin, whatever the geometry."""
+    from dataclasses import replace
+
+    from builder.nucleation.molecular_growth import (
+        MinimumConsolidation,
+        ParentStructure,
+        consolidate_relaxed_minima,
+    )
+
+    # Cd-Se-Cd chain with two terminal Cl; second copy has one CdCl arm rotated by 90 deg
+    sym = ("Se", "Cd", "Cd", "Cl", "Cl")
+    edges = ((0, 1), (0, 2), (1, 3), (2, 4))
+    a = np.array([[0, 0, 0], [2.6, 0, 0], [-2.6, 0, 0], [4.9, 0, 0], [-4.9, 0, 0]], float)
+    b = a.copy()
+    b[4] = [-2.6, 2.3, 0]  # arm rotated: geometry differs by >1 A, graph identical
+    mk = lambda sid, xyz, e: ParentStructure(k=1, p=1, structure_id=sid, symbols=sym, coordinates=xyz, energy_eV=e, edges=edges, core_edges=edges[:2], propagation_eligible=True, topology_status="preserved")
+    strict = MinimumConsolidation(enabled=True)
+    merged = replace(strict, graph_energy_merge_eV=0.010)
+    twins = [mk("a", a, -10.000), mk("b", b, -9.996)]
+    assert len(consolidate_relaxed_minima(twins, strict, spec)) == 2
+    assert len(consolidate_relaxed_minima(twins, merged, spec)) == 1
+    # outside the energy window the geometric criteria decide again -> distinct
+    apart = [mk("a", a, -10.000), mk("b", b, -9.950)]
+    assert len(consolidate_relaxed_minima(apart, merged, spec)) == 2

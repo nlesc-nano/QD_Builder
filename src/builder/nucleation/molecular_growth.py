@@ -257,6 +257,14 @@ class MinimumConsolidation:
     max_graph_mappings: int = 256
     max_minima_per_occupation: int = 2
     max_occupations_per_minimum: int = 0
+    #: Graph+energy merge: two endpoints with isomorphic element-coloured
+    #: bonding graphs whose energies agree within this window are the same
+    #: basin even when their geometries do not superimpose (floppy same-graph
+    #: conformers -- terminal CdCl arms pointing differently -- sit within
+    #: a few meV of each other on MACE and would otherwise be counted and
+    #: propagated as distinct minima).  0 disables; the geometric criteria
+    #: above still apply to pairs outside this window.
+    graph_energy_merge_eV: float = 0.0
 
     @classmethod
     def from_raw(cls, raw: Any) -> "MinimumConsolidation":
@@ -281,6 +289,7 @@ class MinimumConsolidation:
             max_occupations_per_minimum=max(
                 0, int(raw.get("max_occupations_per_minimum", 0))
             ),
+            graph_energy_merge_eV=float(raw.get("graph_energy_merge_eV", 0.0) or 0.0),
         )
 
 
@@ -1920,13 +1929,17 @@ def relaxed_minimum_similarity(
     ):
         return None
     energy_delta = abs(float(left.energy_eV) - float(right.energy_eV))
-    if energy_delta > float(config.energy_tolerance_eV):
+    graph_energy_window = float(getattr(config, "graph_energy_merge_eV", 0.0) or 0.0)
+    if energy_delta > max(float(config.energy_tolerance_eV), graph_energy_window):
         return None
 
     mappings = _candidate_graph_mappings(
         left, right, max_mappings=config.max_graph_mappings
     )
     if not mappings:
+        return None
+    graph_energy_twin = graph_energy_window > 0.0 and energy_delta <= graph_energy_window
+    if energy_delta > float(config.energy_tolerance_eV) and not graph_energy_twin:
         return None
     left_coordinates = np.asarray(left.coordinates, dtype=float)
     right_coordinates = np.asarray(right.coordinates, dtype=float)
@@ -1955,7 +1968,7 @@ def relaxed_minimum_similarity(
                 )
             )
         )
-        if pair_rms > float(config.pair_distance_rms_A):
+        if pair_rms > float(config.pair_distance_rms_A) and not graph_energy_twin:
             continue
         full_displacements = _proper_aligned_displacements(
             left_coordinates,
@@ -1970,12 +1983,13 @@ def relaxed_minimum_similarity(
         full_rms = float(np.sqrt(np.mean(np.square(full_displacements))))
         core_rms = float(np.sqrt(np.mean(np.square(core_displacements))))
         max_displacement = float(max(full_displacements, default=0.0))
-        if full_rms > float(config.full_rmsd_A):
-            continue
-        if core_rms > float(config.core_rmsd_A):
-            continue
-        if max_displacement > float(config.max_displacement_A):
-            continue
+        if not graph_energy_twin:
+            if full_rms > float(config.full_rmsd_A):
+                continue
+            if core_rms > float(config.core_rmsd_A):
+                continue
+            if max_displacement > float(config.max_displacement_A):
+                continue
         wbo_rms = _wbo_mapping_rms(left, right, mapping)
         if (
             config.require_wbo_when_available
@@ -2157,6 +2171,7 @@ def write_minimum_clusters(
             "require_wbo_when_available": config.require_wbo_when_available,
             "allow_reflection": config.allow_reflection,
             "max_graph_mappings": config.max_graph_mappings,
+            "graph_energy_merge_eV": config.graph_energy_merge_eV,
         }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path

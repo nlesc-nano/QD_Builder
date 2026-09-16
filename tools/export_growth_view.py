@@ -38,6 +38,40 @@ from builder.nucleation.molecular_zb_growth import (  # noqa: E402
 )
 
 
+def basin_map(run_dirs, pack_yaml, growth_yaml):
+    """structure_id -> (basin_id, multiplicity, representative_id) using the driver's consolidation.
+
+    Runs ``consolidate_relaxed_minima`` (graph+energy merge included) on the
+    propagation-eligible endpoints of every (k,p) bin found in ``run_dirs``.
+    """
+    from builder.nucleation.geometry_pack import load_geometry_pack
+    from builder.nucleation.molecular_growth import (
+        GrowthConfig,
+        consolidate_relaxed_minima,
+        load_parents_from_run,
+    )
+    from builder.nucleation.spec import load_nucleation_spec
+
+    spec = load_nucleation_spec(str(pack_yaml))
+    pack = load_geometry_pack(pack_yaml)
+    cfg = GrowthConfig.from_yaml(growth_yaml).minimum_consolidation
+    out = {}
+    for run_dir in run_dirs:
+        index = Path(run_dir) / "index.csv"
+        if not index.is_file():
+            continue
+        ks = sorted({int(line.split(",")[0]) for line in index.read_text().splitlines()[1:] if line.strip()})
+        for k in ks:
+            parents = load_parents_from_run(Path(run_dir), k=k, spec=spec, pack=pack)
+            for p in sorted({x.p for x in parents}):
+                members = [x for x in parents if x.p == p and x.propagation_eligible]
+                for c in consolidate_relaxed_minima(members, cfg, spec):
+                    ids = [m.structure_id for m in c.members]
+                    for sid in ids:
+                        out[sid] = (c.representative.structure_id, len(ids))
+    return out
+
+
 def read_xyz(path: Path):
     lines = path.read_text().splitlines()
     n = int(lines[0].split()[0])
@@ -56,7 +90,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--top", type=int, default=0, help="frames per bin (0 = all)")
     ap.add_argument("--offpath", action="store_true", help="also export rejected / off-path endpoints")
+    ap.add_argument("--pack", type=Path, help="run_mace_mh1.yaml (with --growth: export one frame per relaxed basin instead of per endpoint)")
+    ap.add_argument("--growth", type=Path, help="growth_mace.yaml (consolidation thresholds)")
     args = ap.parse_args(argv)
+    basins = basin_map([args.run_dir] + list(args.parents), args.pack, args.growth) if args.pack and args.growth else None
 
     records = []
     for base in [args.run_dir] + list(args.parents):
@@ -81,6 +118,9 @@ def main(argv=None) -> int:
             if not eligible and not args.offpath:
                 continue
             sel = [r for r in recs if bool(r.get("propagation_eligible")) == eligible and r.get("energy_eV") is not None and r.get("xyz")]
+            if basins is not None and eligible:
+                # one frame per basin: the consolidation representative
+                sel = [r for r in sel if basins.get(r["structure_id"], (r["structure_id"], 1))[0] == r["structure_id"]]
             sel.sort(key=lambda r: float(r["energy_eV"]))
             if args.top:
                 sel = sel[: args.top]
@@ -96,11 +136,12 @@ def main(argv=None) -> int:
                 d = describe(sym, pos)
                 e = float(r["energy_eV"])
                 status = "in-path" if eligible else ("off-path:" + r.get("topology_status", "") if r.get("chemically_ok") else "failed:" + ",".join(sorted({v.split(":")[0] for v in r.get("violations", [])})))
-                comment = (f"rank={rank} id={r['structure_id']} E_eV={e:.6f} dE_eV={e - emin:.4f} status={status} "
+                mult = basins.get(r["structure_id"], (None, 1))[1] if (basins is not None and eligible) else 1
+                comment = (f"rank={rank} id={r['structure_id']} E_eV={e:.6f} dE_eV={e - emin:.4f} status={status} basin_multiplicity={mult} "
                            f"family={r['_family']} parent={r.get('parent_structure_id', '')} mu2={d['mu2']} mu3={d['mu3']} "
                            f"zb_score={d['zb_score']:.3f} se_cn={d['se_cn_strong']}")
                 frames.append(f"{len(sym)}\n{comment}\n" + "\n".join(f"{s} {x:.6f} {y:.6f} {z:.6f}" for s, (x, y, z) in zip(sym, pos)))
-                rows.append({"k": k, "p": p, "rank": rank, "structure_id": r["structure_id"], "E_eV": e, "dE_eV": round(e - emin, 4), "status": status,
+                rows.append({"k": k, "p": p, "rank": rank, "structure_id": r["structure_id"], "E_eV": e, "dE_eV": round(e - emin, 4), "status": status, "basin_multiplicity": mult,
                              "family": r["_family"], "parent": r.get("parent_structure_id", ""), "mu2": d["mu2"], "mu3": d["mu3"], "zb_score": round(d["zb_score"] or 0, 3), "file": f"k{k:03d}_p{p:03d}{suffix}.xyz"})
             (args.out / f"k{k:03d}_p{p:03d}{suffix}.xyz").write_text("\n".join(frames) + "\n")
     with (args.out / "summary.csv").open("w", newline="") as fh:

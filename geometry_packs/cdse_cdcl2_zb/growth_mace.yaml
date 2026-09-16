@@ -116,6 +116,11 @@ endpoint_diagnostic:
 minimum_consolidation:
   enabled: true
   energy_tolerance_eV: 0.01
+  # MACE: same bonding graph + energies within 10 meV = one basin, whatever
+  # the geometry (floppy same-graph conformers; measured on k=3: 10 in-path
+  # endpoints at p=1 are 2 graphs, 89 at p=3 are 36).  Geometric criteria
+  # below still decide pairs outside this window.
+  graph_energy_merge_eV: 0.010
   pair_distance_rms_A: 0.05
   core_rmsd_A: 0.10
   full_rmsd_A: 0.15

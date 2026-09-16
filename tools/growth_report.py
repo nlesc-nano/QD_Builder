@@ -49,6 +49,40 @@ from builder.nucleation.molecular_zb_growth import (  # noqa: E402
 )
 
 
+def basin_map(run_dirs, pack_yaml, growth_yaml):
+    """structure_id -> (basin_id, multiplicity, representative_id) using the driver's consolidation.
+
+    Runs ``consolidate_relaxed_minima`` (graph+energy merge included) on the
+    propagation-eligible endpoints of every (k,p) bin found in ``run_dirs``.
+    """
+    from builder.nucleation.geometry_pack import load_geometry_pack
+    from builder.nucleation.molecular_growth import (
+        GrowthConfig,
+        consolidate_relaxed_minima,
+        load_parents_from_run,
+    )
+    from builder.nucleation.spec import load_nucleation_spec
+
+    spec = load_nucleation_spec(str(pack_yaml))
+    pack = load_geometry_pack(pack_yaml)
+    cfg = GrowthConfig.from_yaml(growth_yaml).minimum_consolidation
+    out = {}
+    for run_dir in run_dirs:
+        index = Path(run_dir) / "index.csv"
+        if not index.is_file():
+            continue
+        ks = sorted({int(line.split(",")[0]) for line in index.read_text().splitlines()[1:] if line.strip()})
+        for k in ks:
+            parents = load_parents_from_run(Path(run_dir), k=k, spec=spec, pack=pack)
+            for p in sorted({x.p for x in parents}):
+                members = [x for x in parents if x.p == p and x.propagation_eligible]
+                for c in consolidate_relaxed_minima(members, cfg, spec):
+                    ids = [m.structure_id for m in c.members]
+                    for sid in ids:
+                        out[sid] = (c.representative.structure_id, len(ids))
+    return out
+
+
 def read_xyz(path: Path):
     lines = path.read_text().splitlines()
     n = int(lines[0].split()[0])
@@ -86,7 +120,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--site-tolerance", type=float, default=0.2)
     ap.add_argument("--gate", type=float, default=None, help="minimum family survival fraction for the last transition")
     ap.add_argument("--parents", type=Path, nargs="*", default=[], help="additional run dirs whose manifests hold the first parents (e.g. the k=1 seed run)")
+    ap.add_argument("--pack", type=Path, help="run_mace_mh1.yaml (with --growth: count relaxed basins, not endpoints)")
+    ap.add_argument("--growth", type=Path, help="growth_mace.yaml (consolidation thresholds)")
     args = ap.parse_args(argv)
+    basins = basin_map([args.run_dir] + list(args.parents), args.pack, args.growth) if args.pack and args.growth else None
 
     run = args.run_dir.expanduser().resolve()
     records: List[Dict[str, Any]] = []
@@ -130,6 +167,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         for r in parents:
             fam_members[r["_family"]].append(r)
         eligible_children = [c for c in children if c.get("propagation_eligible")]
+        if basins is not None:
+            # count basins, not endpoints: keep the consolidation representatives
+            eligible_children = [c for c in eligible_children if basins.get(c["structure_id"], (c["structure_id"], 1))[0] == c["structure_id"]]
         # bin minima at k+1 (eligible only)
         emin: Dict[int, float] = {}
         for c in eligible_children:
@@ -165,17 +205,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         for p in sorted({c["_p"] for c in children}):
             cs = [c for c in children if c["_p"] == p]
             causes = collections.Counter(failure_cause(c) for c in cs)
-            bins[p] = {"n": len(cs), "causes": dict(causes.most_common())}
+            n_basins = sum(1 for c in cs if c.get("propagation_eligible") and (basins is None or basins.get(c["structure_id"], (c["structure_id"], 1))[0] == c["structure_id"]))
+            bins[p] = {"n": len(cs), "basins": n_basins, "causes": dict(causes.most_common())}
         report["transitions"].append({"k": k, "k_child": k + 1, "n_families": len(fam_members), "survived": survived, "survival": survival, "families": fam_rows, "bins": bins})
 
-        lines += [f"## k={k} -> {k+1}", "", f"Se-skeleton families at k={k}: **{len(fam_members)}**, with a valid child: **{survived}** (survival {survival:.2f})", ""]
+        unit = "basins" if basins is not None else "endpoints"
+        lines += [f"## k={k} -> {k+1}", "", f"Se-skeleton families at k={k}: **{len(fam_members)}**, with a valid child: **{survived}** (survival {survival:.2f}); valid children counted as relaxed {unit}", ""]
         lines += ["| family | members (p) | attempted | valid | child skeletons | best child dE (eV) | zb parent -> child | mu2/p child |", "|---|---|---:|---:|---:|---:|---|---:|"]
         for r in fam_rows:
             lines.append(f"| {r['family']} | {r['n_members']} ({','.join(map(str, r['p_values']))}) | {r['attempted_children']} | {r['valid_children']} | {r['child_skeletons']} | "
                          f"{'-' if r['best_child_dE_eV'] is None else f'{r['best_child_dE_eV']:.3f}'} | {r['zb_parent']} -> {r['zb_child']} | {r['mu2_over_p_child'] if r['mu2_over_p_child'] is not None else '-'} |")
-        lines += ["", f"Outcomes at k={k+1} by p:", "", "| p | n | causes |", "|---|---:|---|"]
+        lines += ["", f"Outcomes at k={k+1} by p:", "", "| p | relaxed | in-path basins | causes (endpoints) |", "|---|---:|---:|---|"]
         for p, b in bins.items():
-            lines.append(f"| {p} | {b['n']} | " + ", ".join(f"{c}: {n}" for c, n in b["causes"].items()) + " |")
+            lines.append(f"| {p} | {b['n']} | {b['basins']} | " + ", ".join(f"{c}: {n}" for c, n in b["causes"].items()) + " |")
         lines.append("")
 
     text = "\n".join(lines)
