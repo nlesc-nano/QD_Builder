@@ -122,3 +122,24 @@ def test_se_skeleton_family_selection_spans_p(spec):
     assert "C_p2" in ids                      # second family kept
     assert "D_p2" not in ids                  # families_cap honoured
     assert "C_p3_off" not in ids              # off-path member not chosen while an in-path p exists
+
+
+def test_cl_seed_radii_follow_table_only_when_opted_in():
+    from builder.nucleation.molecular_zb_growth import _cdcl_seed_radii
+
+    pack = load_geometry_pack(PACK / "run_gxtb.yaml")
+    assert _cdcl_seed_radii(pack) == (2.45, 2.45)  # frozen g-xTB behaviour
+    pack.raw["cl_seed"] = {"from_table": True}
+    terminal, bridge = _cdcl_seed_radii(pack)
+    assert terminal == 2.31 and bridge == 2.47  # CdCl_terminal cn3 / CdCl_bridge cn3,cn2
+
+
+def test_growth_mace_yaml_loads():
+    from builder.nucleation.molecular_growth import GrowthConfig
+
+    growth = GrowthConfig.from_yaml(PACK / "growth_mace.yaml")
+    assert growth.child_full_opt == "MACE-MH-1" and growth.child_full_opt_cycles == 500
+    assert growth.family_mode == "se_skeleton"
+    assert growth.references is not None and growth.references.method == "MACE-MH-1"
+    win = growth.window_for(3)
+    assert win.family_mode == "se_skeleton" and win.energy_window_eV == 0.80

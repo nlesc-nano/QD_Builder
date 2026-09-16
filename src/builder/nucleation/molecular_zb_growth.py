@@ -1835,6 +1835,35 @@ def _cdcl_bond(pack: Any) -> float:
         return 2.50
 
 
+def _cdcl_seed_radii(pack: Any) -> Tuple[float, float]:
+    """(terminal, bridge) Cd-Cl seed radii for the geometric Cl placement.
+
+    Read from the pack's ``bonds`` embed table (``CdCl_terminal`` cn_cd=3 /
+    ``CdCl_bridge`` cn_cd=3, cn_other=2 -- the surface hosts that receive most
+    Cl) when the table opts in with ``cl_seed: {from_table: true}``, so the
+    seed follows whichever optimizer the table was mined from.  Otherwise
+    the single legacy radius ``_cdcl_bond`` (2.45 Å) is used for both, which
+    keeps the frozen g-xTB packs reproducible.
+    """
+
+    fallback = _cdcl_bond(pack)
+    bond_length = getattr(pack, "bond_length", None)
+    if not callable(bond_length):
+        return fallback, fallback
+    try:
+        raw = getattr(pack, "raw", None) or {}
+        table = raw.get("bonds") if isinstance(raw, dict) else None
+        seed_cfg = raw.get("cl_seed") if isinstance(raw, dict) else None
+        opt_in = bool(isinstance(seed_cfg, dict) and seed_cfg.get("from_table"))
+        if not table or not opt_in:
+            return fallback, fallback
+        terminal = float(bond_length("CdCl_terminal", 3, 1, default=fallback))
+        bridge = float(bond_length("CdCl_bridge", 3, 2, default=fallback))
+    except Exception:  # noqa: BLE001 - table shape not as expected
+        return fallback, fallback
+    return terminal, bridge
+
+
 def _perp_away_from(axis: np.ndarray, away: np.ndarray) -> np.ndarray:
     """Unit vector in the plane of ``away``, perpendicular to ``axis``."""
 
@@ -1990,7 +2019,7 @@ def place_cl_on_zb_core(
         if 0 <= int(index) < n_atoms:
             xyz[int(index)] = np.asarray(point, dtype=float)
     cation, anion, ligand = _species(spec)
-    radius = _cdcl_bond(pack)
+    radius_terminal, radius = _cdcl_seed_radii(pack)
     core_idx = [i for i in range(n_atoms) if state.atoms[i].symbol != ligand]
     if not core_idx:
         return xyz
@@ -2024,7 +2053,7 @@ def place_cl_on_zb_core(
                     push += vec / norm
             norm = float(np.linalg.norm(push))
             if norm > 1.0e-8:
-                candidates.append(xyz[host] + (push / norm) * radius)
+                candidates.append(xyz[host] + (push / norm) * radius_terminal)
         else:
             triangle = xyz[list(hosts[:3])]
             center = triangle.mean(axis=0)
