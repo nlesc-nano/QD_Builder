@@ -905,8 +905,21 @@ class GrowthStepResult:
     zb_stats: Any = None
 
 
-def bond_cutoffs_from_spec(spec: NucleationSpec) -> Dict[Tuple[str, str], float]:
-    """Cd–Se / Cd–Cl bond_max_distance pairs for distance graphs."""
+def bond_cutoffs_from_spec(
+    spec: NucleationSpec,
+    pack: Optional["GeometryPack"] = None,
+) -> Dict[Tuple[str, str], float]:
+    """Cd–Se / Cd–Cl cutoffs for post-relax distance graphs.
+
+    Defaults to the pack's ``graph_rules`` ``bond_max_distance`` (tuned on
+    g-xTB endpoints).  When ``pack`` is given and its ``relaxation`` block
+    resolves to the two-tier descriptor model (MACE backend, or
+    ``descriptor_cutoffs: two_tier``), the strong-bond tier from
+    ``mace_descriptors.MACE_CUTOFFS`` replaces them so that the relaxed
+    core graph, the topology gate and every CN-based rule are evaluated on
+    the same bonds the MACE/PBE pair distribution supports.  See
+    docs/nucleation/mace_descriptors.md.
+    """
 
     cut: Dict[Tuple[str, str], float] = {}
     for key, rule in (spec.graph_rules.pair_rules or {}).items():
@@ -922,7 +935,109 @@ def bond_cutoffs_from_spec(spec: NucleationSpec) -> Dict[Tuple[str, str], float]
     cut.setdefault(
         tuple(sorted((spec.precursor.center, spec.precursor.ligand))), 2.90
     )
+    if pack is not None and isinstance(getattr(pack, "raw", None), dict):
+        from .xtb_relax import XtbSettings, descriptor_bond_cutoffs
+
+        relaxation = pack.raw.get("relaxation")
+        if isinstance(relaxation, dict) and relaxation:
+            cut = descriptor_bond_cutoffs(XtbSettings.from_pack(relaxation), cut)
     return cut
+
+
+def descriptor_model_from_settings(settings: Any) -> str:
+    """``legacy`` or ``two_tier`` for a relaxation settings object."""
+
+    from .xtb_relax import descriptor_model
+
+    try:
+        return descriptor_model(settings)
+    except Exception:  # noqa: BLE001 - settings without the field
+        return "legacy"
+
+
+def classify_core_topology(
+    expected_core: Sequence[Tuple[int, int]],
+    final_core: Sequence[Tuple[int, int]],
+    symbols: Sequence[str],
+    *,
+    anion: str,
+    subgraph_gate: bool,
+) -> Tuple[str, int, int]:
+    """Compare the relaxed cation-anion graph with the construction graph.
+
+    Returns ``(status, n_lost, n_added)`` with status one of
+
+    * ``preserved`` -- identical edge sets;
+    * ``extended``  -- every construction edge survived and new contacts
+      appeared (only reported when ``subgraph_gate`` is true; otherwise it
+      is ``changed`` as in the g-xTB era);
+    * ``split``     -- the anion scaffold broke into several pieces;
+    * ``changed``   -- at least one construction bond was lost.
+    """
+
+    expected = {(min(a, b), max(a, b)) for a, b in expected_core}
+    final = {(min(a, b), max(a, b)) for a, b in final_core}
+    lost = expected - final
+    added = final - expected
+    if not lost and not added:
+        return "preserved", 0, 0
+    graph = nx.Graph()
+    graph.add_nodes_from(i for i, sym in enumerate(symbols) if sym != "Cl")
+    graph.add_edges_from(final)
+    anion_components = sum(
+        1
+        for comp in nx.connected_components(graph)
+        if any(symbols[i] == anion for i in comp)
+    )
+    if anion_components > 1:
+        return "split", len(lost), len(added)
+    if not lost and subgraph_gate:
+        return "extended", 0, len(added)
+    return "changed", len(lost), len(added)
+
+
+def prerelax_wall_violations(
+    symbols: Sequence[str],
+    coordinates: FloatArray,
+    spec: NucleationSpec,
+    *,
+    floors: Optional[Mapping[str, float]] = None,
+) -> List[str]:
+    """Forbidden-pair walls violated by an embedded start, before relaxing.
+
+    Uses ``pair_rules.min_distance`` for pairs whose bond is forbidden
+    (Cd-Cd, Se-Se, Cl-Se, Cl-Cl in the ZB pack) and, when given, the run's
+    ``artifact_min_distance`` floors -- whichever is larger.  Returns tags
+    like ``wall:Se-Se:3-7:2.95<3.80``; empty means the start may be relaxed.
+    """
+
+    walls: Dict[Tuple[str, str], float] = {}
+    for rule in (spec.graph_rules.pair_rules or {}).values():
+        if getattr(rule, "bond_allowed", False):
+            continue
+        dmin = getattr(rule, "min_distance", None)
+        if dmin is None:
+            continue
+        walls[tuple(sorted(rule.elements))] = float(dmin)
+    for key, value in (floors or {}).items():
+        pair = tuple(sorted(str(key).split("-")))
+        if len(pair) == 2:
+            walls[pair] = max(walls.get(pair, 0.0), float(value))
+    if not walls:
+        return []
+    xyz = np.asarray(coordinates, dtype=float)
+    out: List[str] = []
+    n = len(symbols)
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair = tuple(sorted((symbols[i], symbols[j])))
+            wall = walls.get(pair)
+            if wall is None:
+                continue
+            d = float(np.linalg.norm(xyz[i] - xyz[j]))
+            if d < wall:
+                out.append(f"wall:{pair[0]}-{pair[1]}:{i}-{j}:{d:.2f}<{wall:.2f}")
+    return out
 
 
 def parse_xyz(path: Path) -> Tuple[List[str], FloatArray, Dict[str, str]]:
@@ -1256,6 +1371,7 @@ def load_parents_from_run(
     k: int,
     spec: NucleationSpec,
     p_values: Optional[Sequence[int]] = None,
+    pack: Optional[GeometryPack] = None,
 ) -> List[ParentStructure]:
     """Load parents with a finite energy at fixed k.
 
@@ -1264,7 +1380,7 @@ def load_parents_from_run(
     """
 
     run_dir = Path(run_dir)
-    cutoffs = bond_cutoffs_from_spec(spec)
+    cutoffs = bond_cutoffs_from_spec(spec, pack)
     cation = spec.core.cation
     anion = spec.core.anion
     parents: List[ParentStructure] = []
@@ -2117,7 +2233,7 @@ def refine_parents_with_basin_hop(
     settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
     recon = (pack.raw or {}).get("reconstruction") or {}
     overlap_min_A = float(recon.get("overlap_min_A", 0.75))
-    cutoffs = bond_cutoffs_from_spec(map_spec)
+    cutoffs = bond_cutoffs_from_spec(map_spec, pack)
     consolidation = MinimumConsolidation(enabled=True, allow_reflection=True)
 
     by_bin: Dict[Tuple[int, int], List[int]] = defaultdict(list)
@@ -4025,7 +4141,7 @@ def grow_cores_from_parents(
     channels: List[GrowthChannelResult] = []
     parent_records: List[Dict[str, Any]] = []
     coord_seeds: Dict[Tuple[int, int], List[CoordSeed]] = defaultdict(list)
-    cutoffs = bond_cutoffs_from_spec(spec)
+    cutoffs = bond_cutoffs_from_spec(spec, pack)
     seed_serial = 0
     bin_serial: Dict[Tuple[int, int], int] = defaultdict(int)
     use_coord = bool(window.move_coord) and growth.use_coord_carry
@@ -5253,7 +5369,7 @@ def run_growth_step(
             p_filter=list(p_parents) if p_parents else "all",
         )
     parents_all = load_parents_from_run(
-        run_dir, k=k_from, spec=map_spec, p_values=p_parents
+        run_dir, k=k_from, spec=map_spec, p_values=p_parents, pack=pack
     )
     parents = select_parents(parents_all, growth, map_spec)
     # Refinement, not selection: this runs *after* the ranking above so a
@@ -5722,7 +5838,7 @@ def run_growth_step(
             for k, p in sorted(bin_ranks):
                 if k not in loaded_by_k:
                     loaded_by_k[k] = load_parents_from_run(
-                        out, k=k, spec=map_spec
+                        out, k=k, spec=map_spec, pack=pack
                     )
                 endpoints = [
                     parent for parent in loaded_by_k[k] if parent.p == p
@@ -6127,7 +6243,7 @@ def _opt_coord_seeds(
     if not coord_seeds:
         return
     settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
-    cutoffs = bond_cutoffs_from_spec(map_spec)
+    cutoffs = bond_cutoffs_from_spec(map_spec, pack)
     log = progress if isinstance(progress, GrowthLog) else None
     cation = map_spec.core.cation
     anion = map_spec.core.anion
@@ -6449,7 +6565,7 @@ def _opt_zb_seeds(
     if not zb_seeds:
         return
     settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
-    cutoffs = bond_cutoffs_from_spec(map_spec)
+    cutoffs = bond_cutoffs_from_spec(map_spec, pack)
     log = progress if isinstance(progress, GrowthLog) else None
     try:
         model = lattice_model(map_spec)
@@ -7081,7 +7197,12 @@ def _opt_zb_occupations(
     from .xtb_relax import XtbSettings, relax_structures
 
     settings = XtbSettings.from_pack(full_opt_relaxation_raw(pack, growth))
-    cutoffs = bond_cutoffs_from_spec(map_spec)
+    cutoffs = bond_cutoffs_from_spec(map_spec, pack)
+    # Topology gate: g-xTB archives keep the historical exact-edge-equality
+    # test; under the two-tier (MACE) descriptor model a child propagates when
+    # every construction Cd-Se strong bond survived -- added contacts are the
+    # normal PBE packing, lost bonds are a reconstruction (off-path/audit).
+    two_tier_gate = descriptor_model_from_settings(settings) == "two_tier"
     recon = (pack.raw or {}).get("reconstruction") or {}
     factor_starts = int(recon.get("factor_starts_per_graph", 3))
     xtb_starts = int(recon.get("xtb_starts_per_graph", 2))
@@ -7331,7 +7452,33 @@ def _opt_zb_occupations(
                 if zb_stats is not None:
                     zb_stats.clash_skip += 1
                 continue
+            # Pre-relax screen: a start that already violates the pack's
+            # forbidden-pair walls (Se-Se, Cd-Cd, Cl-Se, Cl-Cl min_distance)
+            # or the artifact floors will not become a valid child; it would
+            # only spend a relaxation on a dimer/collapse.  Same walls the
+            # construction graph obeys -- no new numbers.
+            screened = []
             for start_index, coordinates in starts:
+                bad = prerelax_wall_violations(
+                    list(isomer.symbols),
+                    np.asarray(coordinates, dtype=float),
+                    map_spec,
+                    floors=settings.artifact_min_distance or None,
+                )
+                if bad:
+                    if zb_stats is not None:
+                        zb_stats.prerelax_skip += 1
+                    if progress is not None:
+                        progress(
+                            f"[growth-screen] k={k} p={p} move=Z "
+                            f"occ={occupation.occupation_id} dec={decoration_index} "
+                            f"start={int(start_index)} dropped: {bad[0]}"
+                        )
+                    continue
+                screened.append((start_index, coordinates))
+            if not screened:
+                continue
+            for start_index, coordinates in screened:
                 sid = (
                     f"k{k:03d}_p{p:03d}_Z"
                     f"{occupation.occupation_id[-8:]}"
@@ -7524,6 +7671,7 @@ def _opt_zb_occupations(
             elapsed = elapsed_by_index.get(job_index, 0.0)
             violations: List[str] = []
             topology_status = "unavailable"
+            topology_lost = topology_added = 0
             core_rmsd = float("nan")
             final_edges: Tuple[Tuple[int, int], ...] = ()
             propagation_eligible = False
@@ -7581,10 +7729,14 @@ def _opt_zb_occupations(
                     == {map_spec.core.cation, map_spec.core.anion}
                 )
                 expected_core = tuple(sorted(occupation.core_edges))
-                topology_status = (
-                    "preserved"
-                    if final_core == expected_core
-                    else "changed"
+                topology_status, topology_lost, topology_added = (
+                    classify_core_topology(
+                        expected_core,
+                        final_core,
+                        isomer.symbols,
+                        anion=map_spec.core.anion,
+                        subgraph_gate=two_tier_gate,
+                    )
                 )
                 core_rmsd = _aligned_core_rmsd(
                     occupation.coordinates,
@@ -7598,7 +7750,7 @@ def _opt_zb_occupations(
                 propagation_eligible = bool(
                     chemically_ok
                     and xr.converged
-                    and topology_status == "preserved"
+                    and topology_status in {"preserved", "extended"}
                 )
             else:
                 violations.append(str(xr.error or "gxtb_failed"))
@@ -7701,6 +7853,9 @@ def _opt_zb_occupations(
                     "energy_eV": energy,
                     "xtb_converged": bool(xr.converged),
                     "topology_status": topology_status,
+                    "topology_lost_edges": int(topology_lost),
+                    "topology_added_edges": int(topology_added),
+                    "topology_gate": "subgraph" if two_tier_gate else "exact",
                     "propagation_eligible": propagation_eligible,
                     "chemically_ok": chemically_ok,
                     "core_rmsd_A": core_rmsd,

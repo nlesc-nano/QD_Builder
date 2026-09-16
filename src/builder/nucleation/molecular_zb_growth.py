@@ -393,6 +393,7 @@ class ZbGrowStats:
     children: int = 0
     attach_attempts: int = 0
     clash_skip: int = 0
+    prerelax_skip: int = 0
     opt_keep: int = 0
     opt_reject_embed: int = 0
     opt_fail: int = 0
@@ -407,7 +408,7 @@ class ZbGrowStats:
             f"Z lineage={self.snapped}/{self.parents} "
             f"missing={self.snap_fail} n4_reject={self.n4_reject} "
             f"children={self.children} attach_try={self.attach_attempts} "
-            f"clash_skip={self.clash_skip} "
+            f"clash_skip={self.clash_skip} prerelax_skip={self.prerelax_skip} "
             f"opt_keep={self.opt_keep} topology_changed={self.opt_reject_embed} "
             f"opt_fail={self.opt_fail} "
             f"ztype geminal_t={self.ztype_geminal_terminal} "
