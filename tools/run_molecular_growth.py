@@ -70,7 +70,13 @@ def _resolve_pack_files(
         pack_dir = pack_dir.expanduser().resolve()
         if not pack_dir.is_dir():
             raise SystemExit(f"--pack-dir is not a directory: {pack_dir}")
-        map_p = pack_dir / "run_gxtb.yaml"
+        if map_yaml is not None:
+            map_p = Path(map_yaml).expanduser()
+            if not map_p.is_file():
+                map_p = pack_dir / map_yaml
+            map_p = map_p.resolve()
+        else:
+            map_p = pack_dir / "run_gxtb.yaml"
         if not map_p.is_file():
             raise SystemExit(f"missing {map_p}")
         if growth_yaml is not None:
@@ -215,7 +221,11 @@ def main(argv: list[str] | None = None) -> int:
         "--map-yaml",
         type=Path,
         default=None,
-        help="(advanced) map/driver YAML; use --pack-dir instead",
+        help=(
+            "map/driver YAML.  With --pack-dir, a bare name such as "
+            "run_mace_mh1.yaml is resolved inside the pack folder.  "
+            "Default: <pack-dir>/run_gxtb.yaml"
+        ),
     )
     parser.add_argument(
         "--growth",

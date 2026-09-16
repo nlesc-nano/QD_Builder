@@ -1044,17 +1044,25 @@ def prerelax_wall_violations(
     *,
     floors: Optional[Mapping[str, float]] = None,
 ) -> List[str]:
-    """Forbidden-pair walls violated by an embedded start, before relaxing.
+    """Core-pair walls violated by an embedded start, before relaxing.
 
-    Uses ``pair_rules.min_distance`` for pairs whose bond is forbidden
-    (Cd-Cd, Se-Se, Cl-Se, Cl-Cl in the ZB pack) and, when given, the run's
-    ``artifact_min_distance`` floors -- whichever is larger.  Returns tags
-    like ``wall:Se-Se:3-7:2.95<3.80``; empty means the start may be relaxed.
+    Screens only the pairs that signal a collapsing core -- forbidden pairs
+    between core species (Cd-Cd, Se-Se in the ZB pack) -- against
+    ``pair_rules.min_distance`` and, when given, the run's
+    ``artifact_min_distance`` floors (whichever is larger).  Ligand contacts
+    (Cl-Cl, Cl-Se) are deliberately *not* screened: the geometric Cl seed
+    routinely places them inside the construction wall and relaxation
+    resolves that; the embedder's clash floor and the post-relax artifact
+    audit remain in charge there.  Returns tags like
+    ``wall:Se-Se:3-7:2.95<3.80``; empty means the start may be relaxed.
     """
 
+    core = {spec.core.cation, spec.core.anion}
     walls: Dict[Tuple[str, str], float] = {}
     for rule in (spec.graph_rules.pair_rules or {}).values():
         if getattr(rule, "bond_allowed", False):
+            continue
+        if not set(rule.elements) <= core:
             continue
         dmin = getattr(rule, "min_distance", None)
         if dmin is None:
@@ -1062,7 +1070,7 @@ def prerelax_wall_violations(
         walls[tuple(sorted(rule.elements))] = float(dmin)
     for key, value in (floors or {}).items():
         pair = tuple(sorted(str(key).split("-")))
-        if len(pair) == 2:
+        if len(pair) == 2 and set(pair) <= core:
             walls[pair] = max(walls.get(pair, 0.0), float(value))
     if not walls:
         return []
@@ -7768,11 +7776,10 @@ def _opt_zb_occupations(
                 if zb_stats is not None:
                     zb_stats.clash_skip += 1
                 continue
-            # Pre-relax screen: a start that already violates the pack's
-            # forbidden-pair walls (Se-Se, Cd-Cd, Cl-Se, Cl-Cl min_distance)
-            # or the artifact floors will not become a valid child; it would
-            # only spend a relaxation on a dimer/collapse.  Same walls the
-            # construction graph obeys -- no new numbers.
+            # Pre-relax screen: a start whose core already violates the
+            # pack's Se-Se / Cd-Cd walls (or the artifact floors) will not
+            # become a valid child; it would only spend a relaxation on a
+            # dimer/collapse.  Same walls the construction graph obeys.
             screened = []
             for start_index, coordinates in starts:
                 bad = prerelax_wall_violations(
@@ -7786,7 +7793,7 @@ def _opt_zb_occupations(
                         zb_stats.prerelax_skip += 1
                     if progress is not None:
                         progress(
-                            f"[growth-screen] k={k} p={p} move=Z "
+                            f"[growth] screen k={k} p={p} move=Z "
                             f"occ={occupation.occupation_id} dec={decoration_index} "
                             f"start={int(start_index)} dropped: {bad[0]}"
                         )

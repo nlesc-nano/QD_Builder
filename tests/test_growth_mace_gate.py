@@ -62,11 +62,16 @@ def test_prerelax_wall_screen(spec):
     dimer[1] = [2.4, 0, 0]
     tags = prerelax_wall_violations(symbols, dimer, spec)
     assert tags and tags[0].startswith("wall:Se-Se:0-1:2.40<3.80")
-    # artifact floors raise a wall when they are stricter
+    # ligand contacts are not screened (the Cl seed relaxes them away)
     close_cl = ok.copy()
-    close_cl[3] = [0.0, 2.75, 0.0]  # Cl-Se 2.75: above the 2.70 pair wall, below a 2.80 floor
+    close_cl[3] = [0.0, 2.4, 0.0]  # Cl-Se 2.40, inside the 2.70 construction wall
     assert prerelax_wall_violations(symbols, close_cl, spec) == []
-    assert prerelax_wall_violations(symbols, close_cl, spec, floors={"Cl-Se": 2.80})
+    assert prerelax_wall_violations(symbols, close_cl, spec, floors={"Cl-Se": 2.80}) == []
+    # core floors raise a wall when they are stricter than the pair rule
+    cd_close = np.array([[0, 0, 0], [4.3, 0, 0], [2.9, 1.5, 0], [8, 8, 8]])
+    cd_close = np.vstack([cd_close, [[2.9, -1.5, 0]]])
+    assert prerelax_wall_violations(symbols + ["Cd"], cd_close, spec) == []  # Cd-Cd 3.00 exactly at the wall
+    assert prerelax_wall_violations(symbols + ["Cd"], cd_close, spec, floors={"Cd-Cd": 3.10})
 
 
 def _occ(k, p, se_pts, cd_pts, oid):
