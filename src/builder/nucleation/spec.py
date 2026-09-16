@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -165,6 +165,60 @@ def _parse_min_ring_size(raw: object) -> Dict[str, int]:
             )
         parsed["-".join(sorted(parts))] = size
     return parsed
+
+
+_DECORATION_REGIME_OVERRIDES = frozenset({
+    "decoration_mode",
+    "bridge_target_count_window",
+    "selection_max_per_skeleton",
+    "bridge_target_max_emissions_per_skeleton",
+    "bridge_target_max_nodes_per_skeleton",
+})
+
+
+def _parse_decoration_policy(raw: object) -> Tuple[Tuple[str, Any], ...]:
+    """Validate ``graph_rules.decoration_policy`` and freeze it as item tuples.
+
+    Regimes may override only the generator knobs listed in
+    ``_DECORATION_REGIME_OVERRIDES`` plus ``max_bridge_load_var``; the legality
+    rules are the same in every regime by design.
+    """
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, Mapping):
+        raise TypeError("graph_rules.decoration_policy must be a mapping")
+    regimes = raw.get("regimes")
+    if not isinstance(regimes, list) or not regimes:
+        raise ValueError("decoration_policy.regimes must be a non-empty list")
+    p_max = raw.get("p_max") or {}
+    if not isinstance(p_max, Mapping):
+        raise TypeError("decoration_policy.p_max must be a mapping")
+    frozen_regimes = []
+    last_fraction = -1.0
+    for index, regime in enumerate(regimes):
+        if not isinstance(regime, Mapping):
+            raise TypeError("decoration_policy.regimes entries must be mappings")
+        name = str(regime.get("name") or f"regime{index}")
+        fraction = float(regime.get("max_p_fraction", float("inf")))
+        if fraction <= last_fraction:
+            raise ValueError(
+                "decoration_policy.regimes must have increasing max_p_fraction"
+            )
+        last_fraction = fraction
+        unknown = set(regime) - _DECORATION_REGIME_OVERRIDES - {
+            "name", "max_p_fraction", "max_bridge_load_var"
+        }
+        if unknown:
+            raise ValueError(
+                f"decoration_policy regime {name!r} has unsupported keys: "
+                f"{sorted(unknown)}"
+            )
+        frozen_regimes.append(tuple(sorted((str(k), v) for k, v in regime.items())))
+    return (
+        ("p_max", tuple(sorted((str(k), float(v)) for k, v in p_max.items()))),
+        ("regimes", tuple(frozen_regimes)),
+    )
 
 
 def _parse_pair_rules(raw: object) -> Dict[str, NucleationPairRule]:
@@ -689,6 +743,9 @@ def load_nucleation_spec(
                 ).strip().lower(),
                 bridge_first_max_automorphisms=int(
                     graph_rules_raw.get("bridge_first_max_automorphisms", 64)
+                ),
+                decoration_policy=_parse_decoration_policy(
+                    graph_rules_raw.get("decoration_policy")
                 ),
                 bridge_first_target_bridge_fraction=float(
                     graph_rules_raw.get(

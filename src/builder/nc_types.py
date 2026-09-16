@@ -502,6 +502,12 @@ class NucleationGraphRules:
     #: start at 3.7 bridges at k=5 where the best structures hold 8.4, so the
     #: optimiser has to build the rest.  0 disables the term.
     bridge_first_target_bridge_fraction: float = 0.0
+    #: p-regime decoration policy (see ``molecular_growth.decoration_regime``).
+    #: ``{"p_max": {"beta": 2.7, "slack": 1}, "regimes": [{"name", "max_p_fraction",
+    #: <graph_rules overrides>, "max_bridge_load_var"}, ...]}``.  Regimes are
+    #: matched in order by ``p / p_max(k) <= max_p_fraction``; the last regime
+    #: catches everything above.  Empty = one policy for all p (historical).
+    decoration_policy: Tuple[Tuple[str, Any], ...] = ()
     #: Steer the beam toward decorations that link more distinct Cd pairs.
     #: OFF by default: it correlates with compactness post hoc but is a poor
     #: objective (a mu3 whose hosts already share an anion scores zero), and

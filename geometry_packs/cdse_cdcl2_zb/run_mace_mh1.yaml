@@ -7,8 +7,9 @@ name: cdse_cdcl2_zb_mace_mh1
 
 include:
   - graph_rules.yaml
+  - decoration_policy_mace.yaml
   - motifs.yaml
-  - embed.yaml
+  - embed.yaml   # TODO: switch to embed_mace.yaml once mined from the full MACE re-opt
 
 cif: ../../examples/cifs/CdSe_zb.cif
 charges: {Cd: 2, Se: -2, Cl: -1}

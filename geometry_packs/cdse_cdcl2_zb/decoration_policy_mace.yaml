@@ -1,0 +1,30 @@
+# p-regime decoration policy for the MACE-MH-1 growth restart.
+#
+# Regimes are selected per (k,p) bin by p / p_max(k), p_max(k) = floor(beta*k^(2/3)) + slack
+# (the growth p-envelope).  They change only HOW MANY and WHICH legal shells are
+# generated per skeleton; every legality rule in graph_rules.yaml applies
+# unchanged in all regimes, and the decoration mode per k is not touched
+# (motif_bridge_first at k<=2, motif_bridge_target from k=3 -- mu3 stays
+# impossible at k>=3, decision 4 of 2026-09-16).
+#
+# STARTING VALUES.  The thresholds inside each regime (count window, shells,
+# bridge-load variance cap) are to be re-fitted from the MACE re-optimised
+# archive (train k<=8, validate k=9-10) before production; the regime
+# boundaries themselves (0.40 / 0.75) are the agreed starting definition.
+#
+#   low  : bridge-first near 2p -- only the maximal bridge count and one below,
+#          few shells, no variance cap (sparse, well separated bridges come
+#          from the ring-closing pair rule already in bridge_target).
+#   mid  : the historical behaviour (count window 2, 3 shells).
+#   high : distributed bridge load -- wider count window, more shells, and a
+#          cap on the per-Cd bridge-count variance so clustered bridges are
+#          not the only thing relaxed; mixed bridge/terminal shells are what
+#          the wider window produces.
+
+graph_rules:
+  decoration_policy:
+    p_max: {beta: 2.7, slack: 1}
+    regimes:
+      - {name: low,  max_p_fraction: 0.40, bridge_target_count_window: 1, selection_max_per_skeleton: 2}
+      - {name: mid,  max_p_fraction: 0.75, bridge_target_count_window: 2, selection_max_per_skeleton: 3}
+      - {name: high, max_p_fraction: 1.0e9, bridge_target_count_window: 3, selection_max_per_skeleton: 4, max_bridge_load_var: 0.60}

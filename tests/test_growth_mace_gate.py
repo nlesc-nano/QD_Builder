@@ -143,3 +143,47 @@ def test_growth_mace_yaml_loads():
     assert growth.references is not None and growth.references.method == "MACE-MH-1"
     win = growth.window_for(3)
     assert win.family_mode == "se_skeleton" and win.energy_window_eV == 0.80
+
+
+def test_decoration_regimes_resolve_per_bin():
+    from builder.nucleation.molecular_growth import decoration_regime
+
+    gxtb = load_nucleation_spec(PACK / "run_gxtb.yaml")
+    assert decoration_regime(5, 3, gxtb.graph_rules) is None  # no policy: historical behaviour
+    mace = load_nucleation_spec(PACK / "run_mace_mh1.yaml")
+    # p_max(5) = floor(2.7*5^(2/3)) + 1 = 8
+    low = decoration_regime(5, 2, mace.graph_rules)
+    mid = decoration_regime(5, 5, mace.graph_rules)
+    high = decoration_regime(5, 8, mace.graph_rules)
+    assert (low["name"], mid["name"], high["name"]) == ("low", "mid", "high")
+    assert low["p_max"] == 8 and abs(high["p_fraction"] - 1.0) < 1e-9
+    assert low["overrides"]["bridge_target_count_window"] == 1 and low["max_bridge_load_var"] is None
+    assert high["overrides"]["selection_max_per_skeleton"] == 4 and high["max_bridge_load_var"] == 0.60
+    # regimes never change the decoration mode (mu3 stays impossible at k>=3)
+    assert "decoration_mode" not in high["overrides"]
+
+
+def test_decoration_policy_rejects_unknown_regime_keys(tmp_path):
+    import yaml
+
+    from builder.nucleation.spec import _parse_decoration_policy
+
+    ok = {"p_max": {"beta": 2.7, "slack": 1}, "regimes": [{"name": "a", "max_p_fraction": 0.5}, {"name": "b"}]}
+    assert _parse_decoration_policy(ok)
+    with pytest.raises(ValueError, match="unsupported keys"):
+        _parse_decoration_policy({"regimes": [{"name": "a", "max_cn": {"Cd": 9}}]})
+    with pytest.raises(ValueError, match="increasing"):
+        _parse_decoration_policy({"regimes": [{"max_p_fraction": 0.7}, {"max_p_fraction": 0.4}]})
+
+
+def test_bridge_load_variance():
+    from types import SimpleNamespace
+
+    from builder.nucleation.molecular_growth import bridge_load_variance
+
+    # two Cd sharing one mu2 Cl and each carrying one terminal: loads (1,1) -> var 0
+    iso = SimpleNamespace(symbols=["Se", "Cd", "Cd", "Cl", "Cl", "Cl"], edges=[(0, 1), (0, 2), (1, 3), (2, 3), (1, 4), (2, 5)], graph=None)
+    assert bridge_load_variance(iso) == 0.0
+    # both bridges on one Cd pair vs. none elsewhere: loads (2,2,0) -> var > 0
+    iso = SimpleNamespace(symbols=["Se", "Cd", "Cd", "Cd", "Cl", "Cl"], edges=[(0, 1), (0, 2), (0, 3), (1, 4), (2, 4), (1, 5), (2, 5)], graph=None)
+    assert bridge_load_variance(iso) > 0.8

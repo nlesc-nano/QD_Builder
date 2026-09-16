@@ -37,6 +37,7 @@ NUCLEATION_GRAPH_RULE_KEYS: frozenset = frozenset({
     "require_bridge_maximal",
     # --- how decorations are generated -----------------------------------
     "decoration_mode",
+    "decoration_policy",
     "max_saturated_host_bridges",
     "bridge_first_p1_terminal_policy",
     "bridge_first_hard_max_bridges_per_cd",
@@ -695,6 +696,7 @@ class GeometryPack:
             "decoration_mode_from_k": int(
                 self.graph_rules.get("decoration_mode_from_k", 0)
             ),
+            "decoration_policy": self.graph_rules.get("decoration_policy"),
             "decoration_mode_at_or_above": str(
                 self.graph_rules.get("decoration_mode_at_or_above", "")
             ).strip().lower(),

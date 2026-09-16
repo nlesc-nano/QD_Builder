@@ -7227,12 +7227,89 @@ _EMBED_CTX: Dict[str, Any] = {}
 _ENUM_CTX: Dict[str, Any] = {}
 
 
-def _enum_init(pack: Any, spec: Any, limit: int) -> None:
+def decoration_regime(
+    k: int, p: int, graph_rules: Any
+) -> Optional[Dict[str, Any]]:
+    """Resolve the p-regime decoration policy for one (k,p) bin.
+
+    Returns ``None`` when the pack defines no policy, otherwise a dict with
+    ``name``, ``p_fraction``, ``overrides`` (graph_rules fields to replace
+    for this bin) and ``max_bridge_load_var`` (``None`` = no cap).  Regimes
+    never touch legality rules; they only change how many and which shells
+    are generated (docs/nucleation/mace_descriptors.md, plan 2026-09-16).
+    """
+
+    policy = dict(getattr(graph_rules, "decoration_policy", ()) or ())
+    regimes = policy.get("regimes") or ()
+    if not regimes:
+        return None
+    p_max_cfg = dict(policy.get("p_max") or ())
+    beta = float(p_max_cfg.get("beta", 2.7))
+    slack = float(p_max_cfg.get("slack", 1.0))
+    p_max = max(1.0, math.floor(beta * float(k) ** (2.0 / 3.0)) + slack)
+    fraction = float(p) / p_max
+    chosen = None
+    for regime in regimes:
+        entry = dict(regime)
+        if fraction <= float(entry.get("max_p_fraction", float("inf"))):
+            chosen = entry
+            break
+    if chosen is None:
+        chosen = dict(regimes[-1])
+    overrides = {
+        key: value
+        for key, value in chosen.items()
+        if key not in {"name", "max_p_fraction", "max_bridge_load_var"}
+    }
+    if "decoration_mode" in overrides:
+        # an explicit regime mode wins over the k-switch
+        overrides["decoration_mode_from_k"] = 0
+        overrides["decoration_mode_at_or_above"] = ""
+    return {
+        "name": str(chosen.get("name", "regime")),
+        "p_fraction": fraction,
+        "p_max": p_max,
+        "overrides": overrides,
+        "max_bridge_load_var": (
+            None
+            if chosen.get("max_bridge_load_var") is None
+            else float(chosen["max_bridge_load_var"])
+        ),
+    }
+
+
+def bridge_load_variance(isomer: Any, ligand: str = "Cl", cation: str = "Cd") -> float:
+    """Variance over Cd of the number of bridging (degree >= 2) Cl bonded to it."""
+
+    symbols = list(isomer.symbols)
+    graph = getattr(isomer, "graph", None)
+    if graph is None:
+        graph = nx.Graph()
+        graph.add_nodes_from(range(len(symbols)))
+        graph.add_edges_from(tuple(e) for e in isomer.edges)
+    loads = []
+    for i, sym in enumerate(symbols):
+        if sym != cation:
+            continue
+        loads.append(
+            sum(
+                1
+                for j in graph.neighbors(i)
+                if symbols[j] == ligand and graph.degree[j] >= 2
+            )
+        )
+    return float(np.var(loads)) if loads else 0.0
+
+
+def _enum_init(
+    pack: Any, spec: Any, limit: int, max_bridge_load_var: Optional[float] = None
+) -> None:
     """Per-process setup for shell enumeration."""
 
     _ENUM_CTX["pack"] = pack
     _ENUM_CTX["spec"] = spec
     _ENUM_CTX["limit"] = int(limit)
+    _ENUM_CTX["max_bridge_load_var"] = max_bridge_load_var
 
 
 def _enum_one(
@@ -7264,7 +7341,16 @@ def _enum_one(
         skeleton_coordinates=core_xyz,
         progress=None,
     )
-    decorations = _select_zb_decorations(graph_bin.isomers, _ENUM_CTX["limit"])
+    isomers = list(graph_bin.isomers)
+    cap = _ENUM_CTX.get("max_bridge_load_var")
+    if cap is not None and isomers:
+        # high-p regime: prefer distributed bridge load; keep the shells whose
+        # per-Cd bridge count variance is within the cap, unless that empties
+        # the skeleton (then keep the lowest-variance ones).
+        ranked = sorted(isomers, key=bridge_load_variance)
+        within = [iso for iso in ranked if bridge_load_variance(iso) <= float(cap)]
+        isomers = within or ranked[: max(1, int(_ENUM_CTX["limit"]))]
+    decorations = _select_zb_decorations(isomers, _ENUM_CTX["limit"])
     if not decorations:
         return [], 0, False
     n_core = len(symbols)
@@ -7519,17 +7605,39 @@ def _opt_zb_occupations(
             )
             for occupation in occupations
         ]
+        regime = decoration_regime(k, p, map_spec.graph_rules)
+        enum_spec = map_spec
+        enum_limit = decoration_limit
+        enum_var_cap: Optional[float] = None
+        if regime is not None:
+            overrides = dict(regime["overrides"])
+            if "selection_max_per_skeleton" in overrides:
+                enum_limit = int(overrides["selection_max_per_skeleton"]) or decoration_limit
+            if overrides:
+                enum_spec = dc_replace(
+                    map_spec,
+                    graph_rules=dc_replace(map_spec.graph_rules, **overrides),
+                )
+            enum_var_cap = regime["max_bridge_load_var"]
+            if log is not None:
+                log.line(
+                    f"    decoration regime={regime['name']} "
+                    f"p/p_max={regime['p_fraction']:.2f} (p_max={regime['p_max']:.0f}) "
+                    f"shells/skeleton={enum_limit} "
+                    f"overrides={ {k_: v for k_, v in overrides.items() if k_ != 'selection_max_per_skeleton'} } "
+                    f"max_bridge_load_var={enum_var_cap}"
+                )
         if embed_workers > 1 and len(enum_jobs) > 1:
             from concurrent.futures import ProcessPoolExecutor
 
             with ProcessPoolExecutor(
                 max_workers=embed_workers,
                 initializer=_enum_init,
-                initargs=(pack, map_spec, decoration_limit),
+                initargs=(pack, enum_spec, enum_limit, enum_var_cap),
             ) as pool:
                 enumerated = list(pool.map(_enum_one, enum_jobs, chunksize=4))
         else:
-            _enum_init(pack, map_spec, decoration_limit)
+            _enum_init(pack, enum_spec, enum_limit, enum_var_cap)
             enumerated = [_enum_one(job) for job in enum_jobs]
 
         for occupation, (shells, dropped, produced) in zip(occupations, enumerated):
