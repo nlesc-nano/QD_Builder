@@ -202,7 +202,7 @@ def select(tiers: Mapping[str, Dict[str, Any]], ks: Sequence[int], ps: Sequence[
         for r in b:
             if len([c for c in chosen if c["_bin"] == key and c["_stratum"] == "B"]) >= nb:
                 break
-            if r["construction_core_hash"] in seen:
+            if nb < 10**9 and r["construction_core_hash"] in seen:
                 continue
             seen.add(r["construction_core_hash"])
             chosen.append({**r, "_bin": key, "_stratum": "B", "namespace": "population"})
@@ -211,7 +211,7 @@ def select(tiers: Mapping[str, Dict[str, Any]], ks: Sequence[int], ps: Sequence[
         for r in c:
             if len([x for x in chosen if x["_bin"] == key and x["_stratum"] == "C"]) >= nc:
                 break
-            if r["final_core_hash"] in seen:
+            if nc < 10**9 and r["final_core_hash"] in seen:
                 continue
             seen.add(r["final_core_hash"])
             chosen.append({**r, "_bin": key, "_stratum": "C", "namespace": "population"})
@@ -285,6 +285,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--n-b", type=int, default=2)
     ap.add_argument("--n-c", type=int, default=2)
     ap.add_argument("--n-d", type=int, default=1)
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="ignore the per-bin quotas and take every AB/AC minimum plus every AD scaffold_lost diagnostic",
+    )
     ap.add_argument("--fmax", type=float, default=0.02)
     ap.add_argument("--max-steps", type=int, default=500)
     ap.add_argument("--python", default=MACE_PYTHON)
@@ -300,7 +305,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     fingerprint = pre["fingerprint"]
 
     tiers = load_tiers(args.tiers)
-    chosen = select(tiers, args.k, args.p, args.n_b, args.n_c, args.n_d)
+    big = 10**9
+    chosen = (
+        select(tiers, args.k, args.p, big, big, big)
+        if args.all
+        else select(tiers, args.k, args.p, args.n_b, args.n_c, args.n_d)
+    )
     if not chosen:
         raise SystemExit("selection is empty")
     minima = json.loads(args.minima.read_text())

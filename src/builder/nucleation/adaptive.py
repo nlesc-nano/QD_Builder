@@ -54,6 +54,13 @@ class AdaptiveConfig(PilotConfig):
     source_novelty_fraction: float = 0.0
     minimum_launched_cycles: int = 2
     import_source_cohorts: bool = False
+    #: Relaxation backend that produced the source archive's energies, when
+    #: the source protocol.json does not record one (merged archives do not).
+    #: Empty means "same backend as this run".  Set e.g. ``gxtb`` when a MACE
+    #: run grows from a g-xTB archive: imported rows are then labelled
+    #: ``energy_namespace``/``foreign_energy`` and may not occupy any k this
+    #: run searches, so mixed-backend energies are never ranked in one bin.
+    source_energy_namespace: str = ""
     phase_cycle_start: dict = field(default_factory=dict)
     enabled_phases: list = field(default_factory=lambda: ["A", "B", "C"])
     phase_a_k: list = field(default_factory=lambda: [4, 5, 6])
@@ -83,7 +90,11 @@ class AdaptiveConfig(PilotConfig):
             raise ValueError("invalid adaptive worker/call budget")
         if not (0 < value.launch_hours <= 46 and 0 < value.timeout_s <= 1800):
             raise ValueError("invalid adaptive deadline")
-        if not 1 <= value.max_steps <= 150:
+        # 150 was the g-xTB ceiling (it plateaus early and maxcycle endpoints
+        # are accepted).  MACE/BFGS needs a median ~80 and up to ~400 steps to
+        # reach fmax on k=7-10 clusters, and classify() drops unconverged
+        # endpoints, so the cap is 1000; timeout_s still bounds wall time.
+        if not 1 <= value.max_steps <= 1000:
             raise ValueError("invalid optimization cycle limit")
         if value.progress_interval_batches < 1:
             raise ValueError("progress_interval_batches must be positive")
@@ -251,6 +262,16 @@ class AdaptiveConfig(PilotConfig):
         if value.proposals_per_family_fixed < 3:
             raise ValueError("fixed-family budget must cover all fixed-k move classes")
         return value
+
+    def searched_k(self):
+        """k values this run relaxes new structures at (bins it will rank)."""
+
+        searched = set(self.phase_a_k if "A" in self.enabled_phases else [])
+        if "B" in self.enabled_phases:
+            searched.add(self.phase_b_k)
+        if "C" in self.enabled_phases:
+            searched.add(self.phase_c_k)
+        return searched
 
     def stage_limits(self):
         if self.operation_calls:
@@ -592,11 +613,48 @@ class AdaptivePilot(Pilot):
                 "adaptive_archive_merge_v1",
                 "adaptive_archive_policy_view_v1",
             }
+            # Energies from different relaxation backends live in different
+            # namespaces and must never be ranked in one bin.  Imported rows
+            # keep their own energy and are labelled with the backend that
+            # produced it; when that backend differs from (or is unknown
+            # relative to) this run's backend, no imported row may sit at a k
+            # this run will populate.  Parent selection at lower k still uses
+            # the imported energies -- that is the handoff's "historical /
+            # provisional" (tier C) use, and it is journaled as such.
+            current_backend = str(
+                (self.protocol.get("relaxation_backend") or {}).get("backend")
+                or "unknown"
+            )
+            source_backend = str(
+                (source_protocol.get("relaxation_backend") or {}).get("backend")
+                or self.config.source_energy_namespace
+                or current_backend
+            )
+            foreign = source_backend != current_backend
+            for row in rows:
+                row["energy_namespace"] = source_backend
+                row["foreign_energy"] = foreign
+            if foreign:
+                clashes = sorted(
+                    {int(row["k"]) for row in rows} & set(self.config.searched_k())
+                )
+                if clashes:
+                    raise ValueError(
+                        "source archive energies come from backend "
+                        f"{source_backend!r} but this run relaxes with "
+                        f"{current_backend!r}; imported rows exist at searched "
+                        f"k={clashes}, which would rank mixed energies in one bin. "
+                        "Use a source truncated below the searched k, or "
+                        "re-optimise it with the current backend first."
+                    )
             event = dict(
                 event="archive_import",
                 arm="experimental",
                 rows=rows,
                 preconsolidated=preconsolidated,
+                source_backend=source_backend,
+                current_backend=current_backend,
+                foreign_energy=foreign,
             )
             print(
                 f"[adaptive] importing {len(rows)} source minima "

@@ -1,0 +1,73 @@
+version: 3
+chemistry_adapter: cdse_cdcl2
+seed: 902101
+workers: 1
+max_calls: 200
+launch_hours: 6
+timeout_s: 1800
+max_steps: 500
+checkpoint_interval_batches: 5
+progress_interval_batches: 1
+
+# First MACE-MH-1 continuation: k=9 -> k=10 growth from the canonical g-xTB
+# k=9 archive at a probe budget.  Imported k<=9 rows carry g-xTB energies
+# (energy_namespace=gxtb, tier-C parent ranking); every k=10 bin is
+# MACE-only.  Relaxation/descriptors come from run_mace_mh1.yaml (two_tier).
+source_energy_namespace: gxtb
+
+enabled_phases: [C]
+phase_a_k: [5, 6]
+phase_b_k: 7
+phase_c_k: 10
+phase_cycle_start: {C: 0}
+min_cycles: 1
+max_cycles: 2
+
+p_max: {1: 3, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12, 10: 13}
+
+parent_p_by_k:
+  9: [9, 10, 11, 12]
+parent_roles_by_k:
+  9: [primary]
+proposal_p_by_k:
+  10: [10, 11, 12, 13]
+
+operation_calls:
+  10: {growth: 200}
+operation_calls_by_p:
+  10:
+    growth: {10: 50, 11: 50, 12: 50, 13: 50}
+
+family_slots: {9: 80, 10: 100}
+cohort_min_primary_families_by_p:
+  9: {9: 3, 10: 3, 11: 3, 12: 3}
+cohort_min_families_by_p: {}
+required_primary_families_by_p:
+  10: {10: 1, 11: 1, 12: 1}
+
+admission_fraction: 0.15
+admission_fraction_by_k: {9: 0.0, 10: 0.15}
+source_novelty_fraction: 0.0
+subfamilies_per_family: 3
+p_states_per_family: 4
+geometries_per_family: 2
+minimum_launched_cycles: 1
+
+primary_slots: 12
+audit_slots: 2
+audit_fraction: 0.10
+bridge_prior: 0.80
+proposals_per_move: 8
+proposals_per_parent: 32
+fixed_rounds: 0
+
+chemistry_options:
+  classification_mode: strict_k10_from_mixed_k9_lineages
+
+convergence_patience: 2
+new_families_per_100_calls: 2.0
+convergence_energy_window_eV: 1.0
+energy_improvement_eV: 0.05
+minimum_endpoint_fraction: 0.25
+proposals_per_family_fixed: 6
+proposals_per_family_growth: 10

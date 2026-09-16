@@ -521,6 +521,85 @@ def test_adaptive_archive_import_preserves_ids_without_self_routes(tmp_path):
     assert list(resumed.rows["experimental"]) == ["minimum_source"]
 
 
+def _foreign_source(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    proposal = example()
+    row = dict(
+        proposal.record(),
+        structure_id=proposal.id,
+        minimum_id="minimum_source",
+        energy_eV=-438000.0,
+        role="primary",
+        final=descriptors(proposal.symbols, proposal.edges, proposal.positions),
+        protocol="old-protocol",
+        source="old",
+        routes=["seed:root"],
+        occupations=[],
+        occupation_origins=[],
+    )
+    (source / "minima.json").write_text(
+        json.dumps({"control": {}, "experimental": {"minimum_source": row}})
+    )
+    return source
+
+
+def _adaptive(config, source, tmp_path):
+    return AdaptivePilot(
+        config,
+        PACK / "run_gxtb.yaml",
+        PACK / "growth_agnostic_k5.yaml",
+        source,
+        tmp_path / "adaptive",
+        backend=lambda *args: [],
+    )
+
+
+def test_adaptive_import_labels_energy_namespace_and_refuses_bin_mixing(tmp_path):
+    source = _foreign_source(tmp_path)
+    base = dict(
+        workers=1,
+        max_calls=5,
+        stage_calls={2: 1, 3: 1},
+        family_slots={2: 1, 3: 1},
+        p_max={1: 3, 2: 5, 3: 6},
+        enabled_phases=["B", "C"],
+        phase_b_k=2,
+        phase_c_k=3,
+    )
+    # same backend assumed when nothing says otherwise: import proceeds
+    pilot = _adaptive(AdaptiveConfig(**base), source, tmp_path)
+    pilot.setup()
+    pilot.initialize_source()
+    imported = pilot.rows["experimental"]["minimum_source"]
+    assert imported["foreign_energy"] is False
+    assert imported["energy_namespace"] == pilot.protocol["relaxation_backend"]["backend"]
+
+    # declared foreign backend, imported k=1 below the searched k=2,3: allowed
+    # and labelled
+    pilot = _adaptive(
+        AdaptiveConfig(**base, source_energy_namespace="gxtb"), source, tmp_path / "b"
+    )
+    pilot.setup()
+    pilot.initialize_source()
+    imported = pilot.rows["experimental"]["minimum_source"]
+    assert imported["foreign_energy"] is True
+    assert imported["energy_namespace"] == "gxtb"
+    assert imported["energy_eV"] == -438000.0
+    event = next(e for e in pilot.events if e["event"] == "archive_import")
+    assert event["source_backend"] == "gxtb" and event["foreign_energy"] is True
+
+    # declared foreign backend with an imported row at a searched k: refused
+    clash = dict(base, stage_calls={1: 1, 2: 1}, family_slots={1: 1, 2: 1},
+                 enabled_phases=["A", "B"], phase_a_k=[1], phase_b_k=2)
+    pilot = _adaptive(
+        AdaptiveConfig(**clash, source_energy_namespace="gxtb"), source, tmp_path / "c"
+    )
+    pilot.setup()
+    with pytest.raises(ValueError, match="mixed energies"):
+        pilot.initialize_source()
+
+
 def test_adaptive_import_uses_preconsolidated_merge_archive(tmp_path):
     source = tmp_path / "merged"
     source.mkdir()
