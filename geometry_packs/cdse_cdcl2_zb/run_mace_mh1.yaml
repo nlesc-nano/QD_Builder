@@ -9,7 +9,7 @@ include:
   - graph_rules.yaml
   - decoration_policy_mace.yaml
   - motifs.yaml
-  - embed.yaml   # TODO: switch to embed_mace.yaml once mined from the full MACE re-opt
+  - embed_mace.yaml   # mined from MACE/PBE endpoints (tools/mine_mace_embed_table.py); re-mine after the full re-opt
 
 cif: ../../examples/cifs/CdSe_zb.cif
 charges: {Cd: 2, Se: -2, Cl: -1}
