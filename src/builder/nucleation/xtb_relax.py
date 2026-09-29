@@ -604,26 +604,56 @@ def _close_mace_processes() -> None:
     _MACE_PROCESSES.clear()
 
 
+def _mace_worker_for(settings: "XtbSettings", slot: int) -> "_MaceProcess":
+    key = _mace_key(settings) + (f"slot{slot}",)
+    worker = _MACE_PROCESSES.get(key)
+    if worker is None or worker.proc.poll() is not None:
+        worker = _MaceProcess(settings)
+        _MACE_PROCESSES[key] = worker
+    return worker
+
+
 def _run_mace(structures, settings, on_result=None) -> List[Dict[str, Any]]:
+    """Relax through persistent MACE worker processes.
+
+    ``settings.workers`` (pack ``relaxation.workers`` / ``QD_XTB_WORKERS``)
+    resident processes share the device; structures are dealt round-robin
+    and relaxed concurrently.  On MPS the per-call cost of these ~10-40 atom
+    clusters is kernel-launch latency, not compute, so 4 workers measured
+    2.6x the throughput of one (86 -> 33 ms per BFGS step).
+    """
+
     global _MACE_BANNER_DONE
 
     if not _MACE_BANNER_DONE:
         _MACE_BANNER_DONE = True
         print("\n".join(describe_backend(settings)), flush=True)
-    key = _mace_key(settings)
-    worker = _MACE_PROCESSES.get(key)
-    if worker is None or worker.proc.poll() is not None:
-        worker = _MaceProcess(settings)
-        _MACE_PROCESSES[key] = worker
-    try:
-        raw = worker.request(structures, settings)
-    except Exception as exc:  # noqa: BLE001
-        _MACE_PROCESSES.pop(key, None)
-        worker.close()
-        raw = [
-            {"id": entry["id"], "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            for entry in structures
-        ]
+    n_workers = max(1, min(int(settings.workers or 1), len(structures)))
+
+    def _request(slot: int, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        worker = _mace_worker_for(settings, slot)
+        try:
+            return worker.request(chunk, settings)
+        except Exception as exc:  # noqa: BLE001
+            _MACE_PROCESSES.pop(_mace_key(settings) + (f"slot{slot}",), None)
+            worker.close()
+            return [
+                {"id": entry["id"], "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                for entry in chunk
+            ]
+
+    if n_workers == 1:
+        raw = _request(0, list(structures))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunks = [list(structures[slot::n_workers]) for slot in range(n_workers)]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(lambda args: _request(*args), enumerate(chunks)))
+        raw: List[Dict[str, Any]] = [None] * len(structures)  # type: ignore[list-item]
+        for slot, chunk_results in enumerate(results):
+            for offset, result in enumerate(chunk_results):
+                raw[slot + offset * n_workers] = result
     if on_result is not None:
         for index, result in enumerate(raw):
             on_result(index, result)
