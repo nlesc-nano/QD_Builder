@@ -823,6 +823,7 @@ def _balanced_positive_q_add_picks(
     from .facet_reconstruction import (
         _bridging_sites,
         _bulk_bond_length,
+        _interior_outer,
         _nn_cation_distance,
         _polar_111_facets,
     )
@@ -850,12 +851,13 @@ def _balanced_positive_q_add_picks(
     )
     host_111 = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
     if is_ii_vi:
+        # mu3/mu2 only over interior cations of the facet (no edges/vertices).
+        d_nn = _nn_cation_distance(ref_struct)
         host_normal = {
-            i: f.normal for f in cat_facets for i in f.outer
+            i: f.normal for f in cat_facets for i in _interior_outer(f.outer, pts, d_nn)
             if i in sub_records and deficit(i) >= 1
         }
         if host_normal:
-            d_nn = _nn_cation_distance(ref_struct)
             bond = _bulk_bond_length(ref_struct)
             for mu in (3, 2):
                 for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond):
