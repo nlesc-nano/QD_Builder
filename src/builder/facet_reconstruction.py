@@ -1,246 +1,56 @@
 # src/builder/facet_reconstruction.py
 """
-Polar-facet Lannoo reconstruction.
+Polar {111} surface reconstruction for zinc-blende II-VI / III-V nanocrystals.
 
-Works directly on the post-passivation structure (no stripping). Ligand bonds count
-toward CN in the Lannoo formula, so atoms bonded to ligands appear fully coordinated.
-The reconstruction targets residual dangling-bond character that global passivation
-could not resolve due to global charge-neutrality constraints.
+The step runs after charge-balance passivation and only when the facet seeds
+activate both a cation-rich {111} family and an anion-rich {-1-1-1} family.
+Facet polarity is read from the actual outer layer (outermost native species
+along each <111> direction), not from the sign of the Miller index.
 
 Algorithm:
-  Phase 1 — compute Lannoo facet charges on the passivated structure
-  Phase 2 — reconstruct each selected facet greedily, most-charged first:
-               anion-rich  (Q<0): remove a cation from the facet sublayer,
-                                  then cleanup newly undercoordinated anions
-               cation-rich (Q>0): strip cation-bound ligands, then remove a
-                                  low-CN surface cation
-             after every move: locally passivate only anions bonded to the
-                               removed cation
-             stop when |Q_facet_Lannoo| stops decreasing
-  Phase 3 — one final global charge-balance pass
-  Phase 4 — report before/after per facet
+  1. Anion-terminated {111} facets: remove sub-surface, fully coordinated
+     cations with no two vacancies nearest neighbours in the cation network
+     (uniform sqrt(3) x sqrt(3) pattern, maximum count).  Every anion left
+     two-coordinated by a vacancy becomes the reconstruction ligand (Cl).
+     Net charge per vacancy: -q_cat + n_conv * (q_lig - q_an)
+     (CdSe: -2 + 3 = +1, InAs: -3 + 6 = +3).
+     Surviving outer anions that are still nearest neighbours of each other
+     (charge-delocalising runs) are broken by converting alternating ones to
+     the ligand (minimum vertex cover), each adding q_lig - q_an.
+  2. Cation-terminated {111} facets: strip the one-bonded ligands that
+     passivated them after the build.
+  3. Compensate the accumulated positive charge by removing non-adjacent outer
+     cations on the cation-terminated facets, spread evenly (maximin).  Any
+     remainder smaller than one cation charge is balanced by adding ligands on
+     cation-facet sites: for II-VI mu3 hollows first, then mu2 bridges (on-top
+     only as a last resort); for III-V terminal on-top ligands.
 
-Lannoo formula (Harrison 1980, zinc-blende CN_bulk=4):
-  cation (formal>0): q_i = formal * (1 - CN/4)    [empty dangling bonds]
-  anion  (formal<0): q_i = (8+formal)*(1-CN/4) - (4-CN)*(2 - (8+formal)/4)
-                     which simplifies to: q_i = formal * (1 - CN/4)
-  → both species: q_i = formal * (1 - min(CN, 4) / 4)
-  → fully coordinated (CN≥4): q_i = 0 for any species
+Vacancy acceptance: after removal, a native anion must keep CN >= 2 (CN == 2
+converts it to the ligand) and a ligand must keep CN >= 1.  Cations on facet
+edges (bonded to a ligand or to the outer layer of another {111} facet) are
+avoided.  The same pattern is mapped onto all facets of a family with the
+cluster's own proper rotations whenever the cluster is symmetric.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
+import itertools
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial import cKDTree
 
-from .analysis import PairCuts, _pair_cut_calibrated, coord_numbers_bipartite, derive_pair_cuts_from_cif
+from .analysis import PairCuts, _pair_cut_calibrated, derive_pair_cuts_from_cif
 from .facets import detect_facets_from_nc
 from .nc_types import Facet, FacetReconstructionSpec, SurfaceReconstructionSpec, Plane
 
 CN_BULK = 4
-DEFAULT_LIGAND_CN_REF = 3
+LAYER_TOL = 0.4       # Å, half-thickness of one atomic (111) layer
+MIN_FACET_ATOMS = 6   # outer-layer atoms needed to call a <111> direction a facet
+SYM_TOL = 0.3         # Å, position tolerance when testing cluster rotations
+NN_FACTOR = 1.15      # cation-cation nearest-neighbour conflict radius / d_nn
 
-
-# --------------------------------------------------------------------------
-# Result dataclass
-# --------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class FacetCharge:
-    fid: int
-    hkl: Tuple[int, int, int]
-    n_surface: int    # atoms in this facet shell, including ligands
-    n_active: int     # atoms with non-zero Lannoo charge
-    q_formal: float   # split-weighted formal charge on this facet shell
-    q_lannoo: float   # split-weighted sum of Lannoo charges
-    q_per_active: float
-    termination: str  # "anion-rich" | "cation-rich" | "balanced"
-
-
-@dataclass(frozen=True)
-class PolarFacetReport:
-    fid: int
-    hkl: Tuple[int, int, int]
-    n_surface: int
-    n_cation_def: int
-    n_anion_def: int
-    q_cation: float
-    q_anion: float
-    q_net: float
-
-    @property
-    def polarity(self) -> str:
-        if self.q_net > 1e-9:
-            return "positive"
-        if self.q_net < -1e-9:
-            return "negative"
-        return "balanced"
-
-
-# --------------------------------------------------------------------------
-# Lannoo math
-# --------------------------------------------------------------------------
-
-def _cn_ref_for_symbol(sym: str, ligand: str) -> int:
-    return DEFAULT_LIGAND_CN_REF if sym == ligand else CN_BULK
-
-
-def _lannoo_atom_q(formal: int, cn: int, cn_ref: int) -> float:
-    """
-    Lannoo charge for a surface atom.
-    Ligand bonds count toward CN, so ligand-bonded atoms appear fully coordinated.
-    Generalized formula: q_i = formal * (1 - min(CN, CN_ref) / CN_ref)
-    """
-    cn_ref = max(1, int(cn_ref))
-    cn_eff = min(cn, cn_ref)
-    return float(formal) * (1.0 - cn_eff / cn_ref)
-
-
-def _lannoo_all_atoms(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    charges: Dict[str, int],
-    ligand: str,
-    pair_cuts: Optional[PairCuts],
-) -> NDArray[np.float64]:
-    """
-    Per-atom Lannoo charge array.
-    Ligands are included directly with their own CN reference. CN counts bonds
-    to ALL opposite-charge neighbors (native + ligands).
-    """
-    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-    q = np.zeros(len(symbols), dtype=float)
-    for i, sym in enumerate(symbols):
-        formal = int(charges.get(sym, 0))
-        if formal == 0:
-            continue
-        q[i] = _lannoo_atom_q(formal, int(cn[i]), _cn_ref_for_symbol(sym, ligand))
-    return q
-
-
-def _compute_facet_charges(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    facets: List[Facet],
-    planes: List[Plane],
-    charges: Dict[str, int],
-    ligand: str,
-    surf_tol: float,
-    atom_q: NDArray[np.float64],
-) -> List[FacetCharge]:
-    """Aggregate formal and Lannoo facet charges with split edge weighting."""
-    memberships: List[List[int]] = [[] for _ in range(len(pts))]
-    for fid, (n, d) in enumerate(planes):
-        for i in np.where((d - pts @ n) < surf_tol)[0]:
-            memberships[int(i)].append(fid)
-
-    rows: List[FacetCharge] = []
-    for fid, (facet, (n, d)) in enumerate(zip(facets, planes)):
-        shell_all = [int(i) for i in np.where((d - pts @ n) < surf_tol)[0]]
-        if not shell_all:
-            continue
-
-        q_formal = 0.0
-        for i in shell_all:
-            w = 1.0 / max(1, len(memberships[i]))
-            q_formal += w * float(charges.get(symbols[i], 0))
-
-        q_total = 0.0
-        n_active = 0
-        for i in shell_all:
-            qi = float(atom_q[i])
-            if abs(qi) < 1e-12:
-                continue
-            n_active += 1
-            w = 1.0 / max(1, len(memberships[i]))  # split: edge atoms count once globally
-            q_total += w * qi
-
-        q_per_active = q_total / n_active if n_active else 0.0
-        term = ("anion-rich" if q_total < -1e-9
-                else ("cation-rich" if q_total > 1e-9 else "balanced"))
-        rows.append(FacetCharge(
-            fid=fid,
-            hkl=(facet.h, facet.k, facet.l),
-            n_surface=len(shell_all),
-            n_active=n_active,
-            q_formal=q_formal,
-            q_lannoo=q_total,
-            q_per_active=q_per_active,
-            termination=term,
-        ))
-    return rows
-
-
-def _print_lannoo_table(
-    rows: List[FacetCharge],
-    header: str,
-    target_hkls: Set[Tuple[int, int, int]],
-) -> None:
-    print(f"\n=== LANNOO FACET CHARGES — {header} ===")
-    print("  fid      hkl    term          Nsurf Nact  Q_formal  Q_Lannoo  Q/act")
-    for r in rows:
-        sel = "  <-- selected" if r.hkl in target_hkls else ""
-        hkl_str = f"({r.hkl[0]} {r.hkl[1]} {r.hkl[2]})"
-        print(
-            f"  {r.fid:3d}  {hkl_str:>11s}  {r.termination:<12s}"
-            f"  {r.n_surface:4d}  {r.n_active:3d}"
-            f"  {r.q_formal:+8.3f}  {r.q_lannoo:+8.3f}  {r.q_per_active:+6.3f}{sel}"
-        )
-
-
-def _print_reconstruction_summary(
-    rows_before: List[FacetCharge],
-    rows_stripped: List[FacetCharge],
-    rows_after: List[FacetCharge],
-    rows_final: List[FacetCharge],
-    target_hkls: Set[Tuple[int, int, int]],
-    strip_log: Dict[Tuple[int, int, int], List[str]],
-    move_log: Dict[Tuple[int, int, int], List[str]],
-) -> None:
-    before_map = {r.hkl: r for r in rows_before}
-    stripped_map = {r.hkl: r for r in rows_stripped}
-    after_map = {r.hkl: r for r in rows_after}
-    final_map = {r.hkl: r for r in rows_final}
-
-    print("\n=== RECONSTRUCTION SUMMARY BY FACET ===")
-    print(
-        "        hkl    treatment        "
-        "Qf_pre Qf_strip Qf_treat Qf_final  "
-        "QL_pre QL_strip QL_treat QL_final  stripCl moves"
-    )
-    for hkl in sorted(target_hkls):
-        rb = before_map.get(hkl)
-        rs = stripped_map.get(hkl)
-        ra = after_map.get(hkl)
-        rf = final_map.get(hkl)
-        if rb is None:
-            continue
-
-        qf_b = rb.q_formal
-        qf_s = rs.q_formal if rs else float("nan")
-        qf_a = ra.q_formal if ra else float("nan")
-        qf_f = rf.q_formal if rf else float("nan")
-        ql_b = rb.q_lannoo
-        ql_s = rs.q_lannoo if rs else float("nan")
-        ql_a = ra.q_lannoo if ra else float("nan")
-        ql_f = rf.q_lannoo if rf else float("nan")
-        treatment = "cation-vacancy" if ql_b < 0 else "cation-removal"
-        hkl_str = f"({hkl[0]} {hkl[1]} {hkl[2]})"
-        print(
-            f"  {hkl_str:>11s}  {treatment:<15s}"
-            f"  {qf_b:+7.3f} {qf_s:+8.3f} {qf_a:+8.3f} {qf_f:+8.3f}"
-            f"  {ql_b:+7.3f} {ql_s:+8.3f} {ql_a:+8.3f} {ql_f:+8.3f}"
-            f"  {len(strip_log.get(hkl, [])):7d}"
-            f"  {len(move_log.get(hkl, [])):5d}"
-        )
-
-
-# --------------------------------------------------------------------------
-# Native scaffold utilities
-# --------------------------------------------------------------------------
 
 def _native_view(
     symbols: List[str],
@@ -269,20 +79,6 @@ def _native_facets_and_planes(
 
 def _total_q(symbols: List[str], charges: Dict[str, int]) -> int:
     return int(sum(int(charges.get(s, 0)) for s in symbols))
-
-
-def _hkl_family(hkl: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    return tuple(sorted((abs(int(hkl[0])), abs(int(hkl[1])), abs(int(hkl[2])))))
-
-
-def _native_core_species_from_struct(struct, charges: Dict[str, int], ligand: str) -> Set[str]:
-    if struct is not None and hasattr(struct, "sites"):
-        species = {str(site.specie.symbol) for site in struct.sites}
-    else:
-        organic = {"H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"}
-        species = {s for s, q in charges.items() if int(q) != 0 and s not in organic}
-    species.discard(ligand)
-    return species
 
 
 def _bulk_ideal_direction_sets(
@@ -367,225 +163,6 @@ def _bulk_cn_refs_from_struct(
         else:
             refs[sym] = CN_BULK
     return refs
-
-
-def _surface_recon_atom_q(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    charges: Dict[str, int],
-    pair_cuts: Optional[PairCuts],
-    active_species: Set[str],
-    cn_refs: Optional[Dict[str, int]] = None,
-) -> NDArray[np.float64]:
-    """Lannoo-style q_i = formal * (1 - min(CN,CNref)/CNref) for selected core species."""
-    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-    q = np.zeros(len(symbols), dtype=float)
-    for i, sym in enumerate(symbols):
-        if sym not in active_species:
-            continue
-        formal = int(charges.get(sym, 0))
-        if formal == 0:
-            continue
-        cn_ref = max(1, int((cn_refs or {}).get(sym, CN_BULK)))
-        q[i] = float(formal) * (1.0 - min(int(cn[i]), cn_ref) / cn_ref)
-    return q
-
-
-def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
-    memberships: List[List[int]] = [[] for _ in range(len(pts))]
-    for fid, (n, d) in enumerate(planes):
-        n = np.asarray(n, float)
-        for i in np.where((float(d) - pts @ n) < surf_tol)[0]:
-            memberships[int(i)].append(fid)
-    return memberships
-
-
-def _surface_recon_facet_rows(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    facets: List[Facet],
-    planes: List[Plane],
-    charges: Dict[str, int],
-    surf_tol: float,
-    atom_q: NDArray[np.float64],
-) -> List[FacetCharge]:
-    memberships = _facet_memberships(pts, planes, surf_tol)
-    rows: List[FacetCharge] = []
-    for fid, (facet, (n, d)) in enumerate(zip(facets, planes)):
-        shell = [int(i) for i in np.where((float(d) - pts @ n) < surf_tol)[0]]
-        if not shell:
-            continue
-        q_total = 0.0
-        n_active = 0
-        q_formal = 0.0
-        for i in shell:
-            w = 1.0 / max(1, len(memberships[i]))
-            q_formal += w * float(charges.get(symbols[i], 0))
-            qi = float(atom_q[i])
-            if abs(qi) > 1e-12:
-                n_active += 1
-                q_total += w * qi
-        term = "anion-rich" if q_total < -1e-9 else ("cation-rich" if q_total > 1e-9 else "balanced")
-        rows.append(FacetCharge(
-            fid=fid,
-            hkl=(facet.h, facet.k, facet.l),
-            n_surface=len(shell),
-            n_active=n_active,
-            q_formal=q_formal,
-            q_lannoo=q_total,
-            q_per_active=q_total / n_active if n_active else 0.0,
-            termination=term,
-        ))
-    return rows
-
-
-def _surface_recon_reports(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    facets: List[Facet],
-    planes: List[Plane],
-    charges: Dict[str, int],
-    surf_tol: float,
-    atom_q: NDArray[np.float64],
-) -> List[PolarFacetReport]:
-    memberships = _facet_memberships(pts, planes, surf_tol)
-    reports: List[PolarFacetReport] = []
-    for fid, (facet, (n, d)) in enumerate(zip(facets, planes)):
-        shell = [int(i) for i in np.where((float(d) - pts @ n) < surf_tol)[0]]
-        if not shell:
-            continue
-
-        n_cat = 0
-        n_an = 0
-        q_cat = 0.0
-        q_an = 0.0
-        for i in shell:
-            qi = float(atom_q[i])
-            if abs(qi) < 1e-12:
-                continue
-            if int(charges.get(symbols[i], 0)) > 0:
-                n_cat += 1
-            elif int(charges.get(symbols[i], 0)) < 0:
-                n_an += 1
-            w = 1.0 / max(1, len(memberships[i]))
-            if qi > 0:
-                q_cat += w * qi
-            else:
-                q_an += w * qi
-
-        reports.append(PolarFacetReport(
-            fid=fid,
-            hkl=(facet.h, facet.k, facet.l),
-            n_surface=len(shell),
-            n_cation_def=n_cat,
-            n_anion_def=n_an,
-            q_cation=q_cat,
-            q_anion=q_an,
-            q_net=q_cat + q_an,
-        ))
-    return reports
-
-
-def _print_polar_report(
-    reports: List[PolarFacetReport],
-    header: str,
-    target_hkls: Set[Tuple[int, int, int]],
-    before: Optional[Dict[Tuple[int, int, int], PolarFacetReport]] = None,
-) -> None:
-    print(f"\n=== POLAR FACET RESIDUAL CHARGE — {header} ===")
-    delta_col = "  ΔQ_net" if before is not None else ""
-    print(
-        "  fid      hkl    polarity    Nsurf  Cat_def  An_def"
-        "    Q_cat    Q_anion    Q_net" + delta_col + "   action"
-    )
-    for r in reports:
-        if r.hkl not in target_hkls and abs(r.q_net) < 1e-9:
-            continue
-        hkl_str = f"({r.hkl[0]} {r.hkl[1]} {r.hkl[2]})"
-        if r.q_net < -1e-9:
-            action = "swap anions"
-        elif r.q_net > 1e-9:
-            action = "add ligands"
-        else:
-            action = "-"
-        sel = " *" if r.hkl in target_hkls else ""
-        delta = ""
-        if before is not None:
-            rb = before.get(r.hkl)
-            dq = r.q_net - (rb.q_net if rb is not None else 0.0)
-            delta = f"  {dq:+7.3f}"
-        print(
-            f"  {r.fid:3d}  {hkl_str:>11s}  {r.polarity:<9s}"
-            f"  {r.n_surface:5d}  {r.n_cation_def:7d}  {r.n_anion_def:6d}"
-            f"  {r.q_cation:+7.3f}  {r.q_anion:+9.3f}  {r.q_net:+7.3f}"
-            f"{delta}   {action}{sel}"
-        )
-
-
-def _native_pair_cut(native_species: Set[str], charges: Dict[str, int], pair_cuts: Optional[PairCuts]) -> float:
-    native = sorted(s for s in native_species if charges.get(s, 0) != 0)
-    best = 0.0
-    for i, s1 in enumerate(native):
-        for s2 in native[i + 1:]:
-            if charges.get(s1, 0) * charges.get(s2, 0) < 0:
-                best = max(best, _pair_cut_calibrated(s1, s2, pair_cuts))
-    return best if best > 0 else 3.0
-
-
-def _auto_sublattice_min_separation(
-    points: NDArray[np.float64],
-    native_bond_cut: float,
-) -> float:
-    """
-    Minimum spacing for reconstruction swaps on one ionic sublattice.
-
-    The native cation-anion cutoff is too short for this purpose: nearest
-    anion-anion surface neighbors are second-neighbor distances in the crystal.
-    Use the candidate same-sublattice nearest-neighbor distance when available
-    and keep a conservative bond-cut based floor for small candidate sets.
-    """
-    pts = np.asarray(points, float)
-    floor = 1.75 * float(native_bond_cut)
-    if len(pts) < 2:
-        return floor
-    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
-    d[d < 1e-8] = np.inf
-    nearest = d.min(axis=1)
-    nearest = nearest[np.isfinite(nearest)]
-    if len(nearest) == 0:
-        return floor
-    return max(floor, 1.05 * float(np.median(nearest)))
-
-
-def _fps_indices(
-    points: NDArray[np.float64],
-    n_pick: int,
-    min_separation: float,
-    seed: int,
-) -> List[int]:
-    if n_pick <= 0 or len(points) == 0:
-        return []
-    rng = np.random.default_rng(seed)
-    pts_arr = np.asarray(points, float)
-    centroid = pts_arr.mean(axis=0)
-    first_pool = np.where(np.linalg.norm(pts_arr - centroid, axis=1) >= 0.0)[0]
-    first = int(first_pool[np.argmax(np.linalg.norm(pts_arr[first_pool] - centroid, axis=1))])
-    selected = [first]
-    remaining = set(range(len(points)))
-    remaining.remove(first)
-    while remaining and len(selected) < n_pick:
-        rem = np.array(sorted(remaining), dtype=int)
-        dmin = np.min(np.linalg.norm(pts_arr[rem, None, :] - pts_arr[np.array(selected)][None, :, :], axis=2), axis=1)
-        allowed = rem[dmin >= min_separation]
-        if len(allowed) == 0:
-            break
-        allowed_dmin = np.array([dmin[np.where(rem == idx)[0][0]] for idx in allowed])
-        max_d = float(np.max(allowed_dmin))
-        tied = allowed[np.where(np.abs(allowed_dmin - max_d) < 1e-9)[0]]
-        nxt = int(rng.choice(tied))
-        selected.append(nxt)
-        remaining.remove(nxt)
-    return selected
 
 
 def _greedy_independent_indices(points: NDArray[np.float64], min_separation: float) -> List[int]:
@@ -677,26 +254,6 @@ def _surface_outward_direction(idx: int, pts: NDArray[np.float64], planes: List[
         if nv > 1e-12:
             return vec / nv
     return nearest[1] if nearest is not None else np.array([0.0, 0.0, 1.0])
-
-
-def _missing_vectors_for_hosts(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    host_indices: List[int],
-    charges: Dict[str, int],
-    pair_cuts: Optional[PairCuts],
-    bulk_struct,
-) -> Dict[int, List[np.ndarray]]:
-    if not host_indices:
-        return {}
-    try:
-        from .neutral_ligand_posttreat import compute_missing_bond_vectors
-        mask = np.zeros(len(symbols), dtype=bool)
-        for i in host_indices:
-            mask[i] = True
-        return compute_missing_bond_vectors(symbols, pts, charges, pair_cuts, bulk_struct, mask)
-    except Exception:
-        return {}
 
 
 def _actual_opposite_bond_vectors(
@@ -833,432 +390,511 @@ def _ligand_add_positions_for_slots(
     return positions
 
 
-def _slot_points(slots: List[Tuple[int, np.ndarray]], pts: NDArray[np.float64]) -> NDArray[np.float64]:
-    if not slots:
-        return np.zeros((0, 3), float)
-    return np.asarray([pts[host_idx] for host_idx, _ in slots], float)
+# --------------------------------------------------------------------------
+# {111} reconstruction
+# --------------------------------------------------------------------------
+
+@dataclass
+class _Polar111:
+    hkl: Tuple[int, int, int]
+    normal: NDArray[np.float64]
+    kind: str              # "anion" | "cation" (outermost native species)
+    outer: List[int]       # outer-layer native atom indices
+    top: float             # projection of the outer layer on the normal
 
 
-def _choose_missing_vectors_for_host(
-    host_idx: int,
-    n_slots: int,
-    missing: Dict[int, List[np.ndarray]],
-    pts: NDArray[np.float64],
-    planes: List[Plane],
-    surf_tol: float,
-) -> List[np.ndarray]:
-    outward = _surface_outward_direction(host_idx, pts, planes, surf_tol)
-    vecs = missing.get(host_idx) or [outward]
-    cleaned = []
-    for v in vecs:
-        v = np.asarray(v, float)
-        if np.linalg.norm(v) < 1e-12:
+def _hkl_str(hkl: Tuple[int, int, int]) -> str:
+    return "(" + " ".join(str(int(v)) for v in hkl) + ")"
+
+
+def _zincblende_binary(struct, charges: Dict[str, int], ligand: str) -> Optional[Tuple[str, str]]:
+    """Return (cation, anion) for a binary cubic, tetrahedral (zinc-blende) CIF, else None."""
+    if struct is None or not hasattr(struct, "sites"):
+        return None
+    species = {str(site.specie.symbol) for site in struct.sites}
+    species.discard(ligand)
+    cations = sorted(s for s in species if int(charges.get(s, 0)) > 0)
+    anions = sorted(s for s in species if int(charges.get(s, 0)) < 0)
+    if len(cations) != 1 or len(anions) != 1:
+        return None
+    lat = struct.lattice
+    if not (abs(lat.a - lat.b) < 1e-3 and abs(lat.a - lat.c) < 1e-3
+            and all(abs(ang - 90.0) < 1e-2 for ang in lat.angles)):
+        return None
+    refs = _bulk_cn_refs_from_struct(struct, charges, {cations[0], anions[0]})
+    if refs.get(cations[0]) != CN_BULK or refs.get(anions[0]) != CN_BULK:
+        return None
+    return cations[0], anions[0]
+
+
+def _seeds_request_polar_111(facet_seeds: List[Facet]) -> bool:
+    """True when the seeds activate both a cation-rich and an anion-rich {111} family."""
+    cat = an = False
+    for f in facet_seeds or []:
+        if (abs(int(f.h)), abs(int(f.k)), abs(int(f.l))) != (1, 1, 1):
             continue
-        v = v / np.linalg.norm(v)
-        if float(np.dot(v, outward)) < 0.0:
-            v = -v
-        cleaned.append(v)
-    if not cleaned:
-        cleaned = [outward]
-    cleaned.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
-    while len(cleaned) < n_slots:
-        cleaned.append(outward)
-    return cleaned[:n_slots]
+        term = str(f.termination or "").strip().lower().replace("-", "_")
+        if term == "cation_rich":
+            cat = True
+        elif term == "anion_rich":
+            an = True
+    return cat and an
 
 
-def _build_compensation_slots(
+def _bond_graph(
     symbols: List[str],
     pts: NDArray[np.float64],
-    host_indices: List[int],
-    cn: NDArray[np.int_],
-    cn_refs: Dict[str, int],
-    missing: Dict[int, List[np.ndarray]],
-    planes: List[Plane],
-    surf_tol: float,
-) -> List[Tuple[int, np.ndarray]]:
-    slots: List[Tuple[int, np.ndarray]] = []
-    for host_idx in host_indices:
-        cn_ref = max(1, int(cn_refs.get(symbols[host_idx], CN_BULK)))
-        deficit = max(0, cn_ref - int(cn[host_idx]))
-        if deficit <= 0:
-            continue
-        vectors = missing.get(host_idx, [])
-        for vec in vectors[:deficit]:
-            slots.append((host_idx, vec))
-    return slots
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+) -> List[Set[int]]:
+    """Opposite-charge neighbour sets within the calibrated pair cutoffs."""
+    nb: List[Set[int]] = [set() for _ in symbols]
+    elems = sorted(set(symbols))
+    cuts: Dict[Tuple[str, str], float] = {}
+    for a in elems:
+        for b in elems:
+            if int(charges.get(a, 0)) * int(charges.get(b, 0)) < 0:
+                cuts[(a, b)] = _pair_cut_calibrated(a, b, pair_cuts)
+    if not cuts:
+        return nb
+    tree = cKDTree(pts)
+    for i, j in tree.query_pairs(max(cuts.values())):
+        cut = cuts.get((symbols[i], symbols[j]))
+        if cut is not None and float(np.linalg.norm(pts[i] - pts[j])) <= cut:
+            nb[i].add(j)
+            nb[j].add(i)
+    return nb
 
 
-def _select_compensation_slots(
-    slots: List[Tuple[int, np.ndarray]],
+def _polar_111_facets(
+    symbols: List[str],
     pts: NDArray[np.float64],
-    n_needed: int,
-    min_separation: float,
-    seed: int,
-) -> List[Tuple[int, np.ndarray]]:
-    if n_needed <= 0:
-        return []
-    rng = np.random.default_rng(seed)
-    available = list(slots)
-    selected: List[Tuple[int, np.ndarray]] = []
-    centroid = pts[[host for host, _ in available]].mean(axis=0) if available else np.zeros(3)
+    struct,
+    cation: str,
+    anion: str,
+) -> List[_Polar111]:
+    recip = np.asarray(struct.lattice.reciprocal_lattice.matrix, float)
+    native = np.array([i for i, s in enumerate(symbols) if s in (cation, anion)], dtype=int)
+    facets: List[_Polar111] = []
+    if len(native) == 0:
+        return facets
+    for hkl in itertools.product((1, -1), repeat=3):
+        n = np.asarray(hkl, float) @ recip
+        n /= np.linalg.norm(n)
+        proj = pts[native] @ n
+        top = float(proj.max())
+        layer = [int(native[k]) for k in np.where(proj > top - LAYER_TOL)[0]]
+        kinds = {symbols[i] for i in layer}
+        if len(layer) < MIN_FACET_ATOMS or len(kinds) != 1:
+            continue
+        facets.append(_Polar111(
+            hkl=tuple(int(v) for v in hkl),
+            normal=n,
+            kind="cation" if cation in kinds else "anion",
+            outer=layer,
+            top=top,
+        ))
+    return facets
 
-    while available and len(selected) < n_needed:
-        allowed: List[Tuple[int, np.ndarray]] = []
-        for slot in available:
-            host_idx = slot[0]
-            host_pos = pts[host_idx]
-            ok = True
-            for selected_host, _ in selected:
-                if host_idx == selected_host:
-                    continue
-                if float(np.linalg.norm(host_pos - pts[selected_host])) < min_separation:
-                    ok = False
-                    break
-            if ok:
-                allowed.append(slot)
+
+def _cluster_rotations(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    nb: List[Set[int]],
+    struct,
+    cation: str,
+    anion: str,
+    ligand: str,
+) -> List[Tuple[NDArray[np.float64], Dict[int, int]]]:
+    """
+    Proper cubic rotations that map the cluster's ionic sites onto themselves.
+
+    Sites are cations and anion positions (native anions plus ligands bridging
+    at least two cations, i.e. anions already converted by passivation), so
+    the test is insensitive to where charge balance put terminal ligands.
+    Returns (R_cart, index map) pairs; the identity is always included.
+    """
+    site_cls: Dict[int, int] = {}
+    for i, s in enumerate(symbols):
+        if s == cation:
+            site_cls[i] = 0
+        elif s == anion:
+            site_cls[i] = 1
+        elif s == ligand and sum(1 for j in nb[i] if symbols[j] == cation) >= 2:
+            site_cls[i] = 1
+    idx = np.array(sorted(site_cls), dtype=int)
+    cls = np.array([site_cls[i] for i in idx], dtype=int)
+    P = pts[idx]
+    center = P.mean(axis=0)
+    tree = cKDTree(P)
+    LT = np.asarray(struct.lattice.matrix, float).T   # columns = lattice vectors
+    LT_inv = np.linalg.inv(LT)
+
+    ops: List[Tuple[NDArray[np.float64], Dict[int, int]]] = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            Rf = np.zeros((3, 3))
+            for r, c in enumerate(perm):
+                Rf[r, c] = signs[r]
+            if np.linalg.det(Rf) < 0.5:
+                continue
+            R = LT @ Rf @ LT_inv
+            if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
+                continue
+            Q = (P - center) @ R.T + center
+            dist, hit = tree.query(Q)
+            if np.all(dist < SYM_TOL) and np.all(cls[hit] == cls):
+                ops.append((R, {int(idx[a]): int(idx[b]) for a, b in enumerate(hit)}))
+    return ops
+
+
+def _nn_cation_distance(struct) -> float:
+    """Cation-cation nearest-neighbour distance of the fcc sublattice (a / sqrt 2)."""
+    return float(struct.lattice.a) / np.sqrt(2.0)
+
+
+def _in_plane_basis(struct, normal: NDArray[np.float64]) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Two fcc nearest-neighbour vectors at 60 degrees lying in the (111) plane."""
+    L = np.asarray(struct.lattice.matrix, float)
+    vecs = []
+    for frac in itertools.permutations((0.5, 0.5, 0.0)):
+        for s1, s2 in itertools.product((1, -1), repeat=2):
+            f = np.array(frac, float)
+            nz = np.nonzero(f)[0]
+            f[nz[0]] *= s1
+            f[nz[1]] *= s2
+            v = f @ L
+            if abs(float(np.dot(v, normal))) < 1e-3:
+                vecs.append(v)
+    a1 = vecs[0]
+    d2 = float(np.dot(a1, a1))
+    a2 = next(v for v in vecs if abs(float(np.dot(a1, v)) - 0.5 * d2) < 1e-3)
+    return a1, a2
+
+
+def _colour_classes(
+    cands: List[int],
+    pts: NDArray[np.float64],
+    struct,
+    normal: NDArray[np.float64],
+) -> List[List[int]]:
+    """
+    Three-colour the triangular (111) cation layer: (i - j) mod 3 in the
+    in-plane lattice basis.  No two members of a class are nearest
+    neighbours.  Classes are returned largest first, ties broken by how
+    central the class is.
+    """
+    a1, a2 = _in_plane_basis(struct, normal)
+    basis = np.stack([a1, a2], axis=1)
+    r0 = pts[cands[0]]
+    classes: Dict[int, List[int]] = {0: [], 1: [], 2: []}
+    for c in cands:
+        ij, *_ = np.linalg.lstsq(basis, pts[c] - r0, rcond=None)
+        i, j = (int(round(v)) for v in ij)
+        classes[(i - j) % 3].append(c)
+    centroid = pts[cands].mean(axis=0)
+
+    def _key(k: int):
+        members = classes[k]
+        spread = float(np.linalg.norm(pts[members].mean(axis=0) - centroid)) if members else np.inf
+        return (-len(members), round(spread, 6), k)
+
+    return [classes[k] for k in sorted(classes, key=_key)]
+
+
+def _uniform_max_independent(
+    cands: List[int],
+    pts: NDArray[np.float64],
+    struct,
+    normal: NDArray[np.float64],
+    d_nn: float,
+) -> List[int]:
+    """
+    Maximum non-adjacent subset of cations in one (111) layer.
+
+    The triangular layer is three-coloured; each colour class is a perfectly
+    uniform sqrt(3) x sqrt(3) vacancy pattern with no nearest neighbours.  The
+    largest class is used unless an exact maximum independent set is larger.
+    """
+    if not cands:
+        return []
+    best = _colour_classes(cands, pts, struct, normal)[0]
+    exact_local = _maximum_independent_indices(pts[cands], NN_FACTOR * d_nn)
+    if len(exact_local) > len(best):
+        return [cands[k] for k in exact_local]
+    return list(best)
+
+
+def _fps_nonadjacent(
+    cands: List[int],
+    pts: NDArray[np.float64],
+    k: int,
+    d_nn: float,
+    existing: Optional[List[int]] = None,
+) -> List[int]:
+    """Pick up to k maximin-spread cations, none nearest neighbours of each other or of `existing`."""
+    existing = list(existing or [])
+    chosen: List[int] = []
+    if k <= 0 or not cands:
+        return chosen
+    centroid = pts[cands].mean(axis=0)
+    min_sep = NN_FACTOR * d_nn
+    while len(chosen) < k:
+        ref = existing + chosen
+        allowed = [
+            c for c in cands
+            if c not in chosen and c not in existing
+            and all(float(np.linalg.norm(pts[c] - pts[x])) >= min_sep for x in ref)
+        ]
         if not allowed:
             break
-
-        if selected:
-            selected_hosts = np.asarray([pts[host_idx] for host_idx, _ in selected], float)
-            scored = []
-            for slot in allowed:
-                host_idx, vec = slot
-                dist_to_selected = float(np.min(np.linalg.norm(selected_hosts - pts[host_idx], axis=1)))
-                radial = float(np.linalg.norm(pts[host_idx] - centroid))
-                outward = float(np.linalg.norm(np.asarray(vec, float)))
-                scored.append((dist_to_selected, radial, outward, -host_idx, slot))
-            best_dist = max(s[0] for s in scored)
-            tied = [s for s in scored if abs(s[0] - best_dist) < 1e-9]
-            chosen = tied[int(rng.integers(len(tied)))][-1]
+        if ref:
+            ref_pts = pts[ref]
+            best = max(allowed, key=lambda c: (
+                round(float(np.min(np.linalg.norm(ref_pts - pts[c], axis=1))), 6),
+                round(float(np.linalg.norm(pts[c] - centroid)), 6),
+                -c,
+            ))
         else:
-            scored = [
-                (float(np.linalg.norm(pts[slot[0]] - centroid)), float(np.linalg.norm(np.asarray(slot[1], float))), -slot[0], slot)
-                for slot in allowed
-            ]
-            best_radial = max(s[0] for s in scored)
-            tied = [s for s in scored if abs(s[0] - best_radial) < 1e-9]
-            chosen = tied[int(rng.integers(len(tied)))][-1]
-
-        selected.append(chosen)
-        available.remove(chosen)
-
-    return selected
+            best = max(allowed, key=lambda c: (round(float(np.linalg.norm(pts[c] - centroid)), 6), -c))
+        chosen.append(best)
+    return chosen
 
 
-def _ligand_add_positions_for_cations(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    cation_indices: List[int],
-    charges: Dict[str, int],
-    ligand: str,
-    pair_cuts: Optional[PairCuts],
-    planes: List[Plane],
-    surf_tol: float,
-    bulk_struct,
-) -> List[np.ndarray]:
-    if not cation_indices:
-        return []
-    missing = _missing_vectors_for_hosts(symbols, pts, cation_indices, charges, pair_cuts, bulk_struct)
-
-    positions: List[np.ndarray] = []
-    for i in cation_indices:
-        outward = _surface_outward_direction(i, pts, planes, surf_tol)
-        vecs = missing.get(i) or [outward]
-        vecs = [v / np.linalg.norm(v) for v in vecs if np.linalg.norm(v) > 1e-12]
-        if not vecs:
-            vecs = [outward]
-        vecs.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
-        vec = vecs[0]
-        if float(np.dot(vec, outward)) < 0:
-            vec = -vec
-        host = symbols[i]
-        bond_len = 0.84 * _pair_cut_calibrated(host, ligand, pair_cuts)
-        positions.append(np.asarray(pts[i], float) + bond_len * vec)
-    return positions
-
-
-# --------------------------------------------------------------------------
-# Phase 2: greedy per-facet reconstruction
-# --------------------------------------------------------------------------
-
-def _facet_q_lannoo_full(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    n: NDArray[np.float64],
-    d: float,
-    atom_q: NDArray[np.float64],
-    ligand: str,
-    surf_tol: float,
-) -> float:
-    """Full-weight (no split) Lannoo Q for one facet — used as greedy stopping criterion."""
-    shell = np.where((d - pts @ n) < surf_tol)[0]
-    return float(sum(atom_q[int(i)] for i in shell))
-
-
-def _remove_cation_and_cleanup_bonded_anions(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    idx: int,
-    cn_value: int,
-    charges: Dict[str, int],
-    ligand: str,
-    pair_cuts: Optional[PairCuts],
-) -> Tuple[List[str], NDArray[np.float64], List[str]]:
+def _symmetric_selection(
+    facets: List[_Polar111],
+    cands: Dict[int, List[int]],
+    ops: List[Tuple[NDArray[np.float64], Dict[int, int]]],
+    choose,
+) -> Optional[Dict[int, List[int]]]:
     """
-    Remove one cation vacancy, then only passivate native anions that were
-    bonded to that removed cation and became undercoordinated.
+    Choose sites on one reference facet and map them onto every other facet
+    of the group with cluster rotations.  Only reference candidates whose
+    images are candidates on all facets are eligible.  Returns None when the
+    cluster has no rotation relating the facets.
     """
-    old = symbols[idx]
-    xyz = pts[idx].copy()
-
-    bonded_anions = []
-    for j, sym in enumerate(symbols):
-        if j == idx or sym == ligand or int(charges.get(sym, 0)) >= 0:
-            continue
-        cutoff = _pair_cut_calibrated(old, sym, pair_cuts)
-        if float(np.linalg.norm(pts[j] - xyz)) <= cutoff:
-            bonded_anions.append(j)
-
-    symbols.pop(idx)
-    pts = np.delete(pts, idx, axis=0)
-
-    shifted = [j if j < idx else j - 1 for j in bonded_anions]
-    logs = [f"remove {old}#{idx}(CN={cn_value}, xyz=[{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}])"]
-
-    for j in shifted:
-        if j < 0 or j >= len(symbols) or symbols[j] == ligand:
-            continue
-        cn_after = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        if int(charges.get(symbols[j], 0)) < 0 and int(cn_after[j]) < CN_BULK:
-            old_anion = symbols[j]
-            symbols[j] = ligand
-            logs.append(f"local cleanup: {old_anion}#{j}(CN={int(cn_after[j])})→{ligand}")
-
-    return symbols, pts, logs
-
-
-def _strip_ligands_from_cation_rich_facets(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    rows: List[FacetCharge],
-    planes: List[Plane],
-    charges: Dict[str, int],
-    ligand: str,
-    target_hkls: Set[Tuple[int, int, int]],
-    surf_tol: float,
-    pair_cuts: Optional[PairCuts],
-    verbose: bool,
-) -> Tuple[List[str], NDArray[np.float64], Dict[Tuple[int, int, int], List[str]]]:
-    """
-    Remove all anion ligands attached to cations on selected cation-rich facets
-    before any vacancy reconstruction is attempted.
-    """
-    cation_rows = [r for r in rows if r.hkl in target_hkls and r.q_lannoo > 1e-9]
-    strip_log: Dict[Tuple[int, int, int], List[str]] = {r.hkl: [] for r in cation_rows}
-    if not cation_rows:
-        return symbols, pts, strip_log
-
-    ligand_indices = [i for i, s in enumerate(symbols) if s == ligand]
-    if not ligand_indices:
-        return symbols, pts, strip_log
-
-    remove_to_hkl: Dict[int, Tuple[int, int, int]] = {}
-    for row in cation_rows:
-        n, d = planes[row.fid]
-        facet_cations = [
-            int(i)
-            for i in np.where((d - pts @ n) < surf_tol)[0]
-            if symbols[int(i)] != ligand and int(charges.get(symbols[int(i)], 0)) > 0
+    best_result: Optional[Dict[int, List[int]]] = None
+    for ref in range(len(facets)):
+        maps: Dict[int, Dict[int, int]] = {}
+        ok = True
+        for f in range(len(facets)):
+            best_map = None
+            best_overlap = -1
+            target = set(cands[f])
+            for R, mp in ops:
+                if float(np.dot(R @ facets[ref].normal, facets[f].normal)) < 0.99:
+                    continue
+                overlap = sum(1 for c in cands[ref] if mp.get(c) in target)
+                if overlap > best_overlap:
+                    best_overlap, best_map = overlap, mp
+            if best_map is None:
+                ok = False
+                break
+            maps[f] = best_map
+        if not ok:
+            return None
+        eligible = [
+            c for c in cands[ref]
+            if all(maps[f].get(c) in set(cands[f]) for f in range(len(facets)))
         ]
-        for li in ligand_indices:
-            if li in remove_to_hkl:
-                continue
-            for ci in facet_cations:
-                cutoff = _pair_cut_calibrated(ligand, symbols[ci], pair_cuts)
-                if float(np.linalg.norm(pts[li] - pts[ci])) <= cutoff:
-                    remove_to_hkl[li] = row.hkl
-                    strip_log[row.hkl].append(
-                        f"strip {ligand}#{li} attached to {symbols[ci]}#{ci}"
-                    )
+        picked = choose(ref, eligible)
+        result = {f: [maps[f][c] for c in picked] for f in range(len(facets))}
+        if best_result is None or len(picked) > len(best_result[0]):
+            best_result = result
+    return best_result
+
+
+def _min_vertex_cover(nodes: List[int], pts: NDArray[np.float64], d_nn: float) -> List[int]:
+    """
+    Smallest set of nodes to convert so no two remaining nodes are nearest
+    neighbours (minimum vertex cover of the nearest-neighbour graph).  Exact
+    per connected component (up to 20 nodes; greedy beyond).  Among equal
+    covers, prefer converted nodes that are not adjacent to each other, which
+    gives alternating Se/Cl along chains.
+    """
+    cut = NN_FACTOR * d_nn
+    adj: Dict[int, Set[int]] = {a: set() for a in nodes}
+    for a, b in itertools.combinations(nodes, 2):
+        if float(np.linalg.norm(pts[a] - pts[b])) < cut:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    cover: List[int] = []
+    seen: Set[int] = set()
+    for start in sorted(nodes):
+        if start in seen:
+            continue
+        comp, stack = [], [start]
+        seen.add(start)
+        while stack:
+            x = stack.pop()
+            comp.append(x)
+            for y in adj[x]:
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+        comp.sort()
+        edges = [(a, b) for a in comp for b in adj[a] if a < b]
+        if not edges:
+            continue
+        if len(comp) <= 20:
+            best = None
+            for size in range(1, len(comp) + 1):
+                for subset in itertools.combinations(comp, size):
+                    chosen = set(subset)
+                    if all(a in chosen or b in chosen for a, b in edges):
+                        inner = sum(1 for a, b in edges if a in chosen and b in chosen)
+                        if best is None or inner < best[0]:
+                            best = (inner, list(subset))
+                if best is not None:
                     break
-
-    if not remove_to_hkl:
-        if verbose:
-            print("[recon-strip] no cation-rich facet ligands found to strip.")
-        return symbols, pts, strip_log
-
-    for li in sorted(remove_to_hkl, reverse=True):
-        if verbose:
-            hkl = remove_to_hkl[li]
-            print(f"[recon-strip] {hkl}: remove {ligand}#{li} before vacancy treatment")
-        symbols.pop(li)
-        pts = np.delete(pts, li, axis=0)
-
-    return symbols, pts, strip_log
-
-
-def _candidate_spacing(candidates: List[Tuple[int, float, int]], pts: NDArray[np.float64]) -> float:
-    """Nearest Cd-Cd spacing among facet candidates, expanded slightly to forbid adjacency."""
-    if len(candidates) < 2:
-        return 0.0
-    idx = [rec[2] for rec in candidates]
-    dmin = float("inf")
-    for a_pos, i in enumerate(idx):
-        for j in idx[a_pos + 1:]:
-            d = float(np.linalg.norm(pts[i] - pts[j]))
-            if 1e-9 < d < dmin:
-                dmin = d
-    return 1.05 * dmin if np.isfinite(dmin) else 0.0
-
-
-def _allowed_by_vacancy_spacing(
-    x: NDArray[np.float64],
-    vacancies: List[NDArray[np.float64]],
-    min_dist: float,
-) -> Tuple[bool, float]:
-    if not vacancies:
-        return True, float("inf")
-    nearest = min(float(np.linalg.norm(x - v)) for v in vacancies)
-    return nearest >= min_dist, nearest
-
-
-def _facet_cation_candidates(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    cn: NDArray[np.int_],
-    n: NDArray[np.float64],
-    d_fixed: float,
-    charges: Dict[str, int],
-    ligand: str,
-    surf_tol: float,
-    original_q_lannoo: float,
-) -> List[Tuple[int, float, int]]:
-    shell = [int(i) for i in np.where((d_fixed - pts @ n) < surf_tol)[0]]
-    if original_q_lannoo < 0:
-        outer_thr = 0.35 * surf_tol
-        cands = [
-            (int(cn[i]), float(d_fixed - np.dot(pts[i], n)), i)
-            for i in shell
-            if symbols[i] != ligand
-            and int(charges.get(symbols[i], 0)) > 0
-            and float(d_fixed - np.dot(pts[i], n)) >= outer_thr
-            and int(cn[i]) <= CN_BULK
-        ]
-        if cands:
-            return cands
-        return [
-            (int(cn[i]), float(d_fixed - np.dot(pts[i], n)), i)
-            for i in shell
-            if symbols[i] != ligand
-            and int(charges.get(symbols[i], 0)) > 0
-            and int(cn[i]) <= CN_BULK
-        ]
-
-    return [
-        (int(cn[i]), float(d_fixed - np.dot(pts[i], n)), i)
-        for i in shell
-        if symbols[i] != ligand
-        and int(charges.get(symbols[i], 0)) > 0
-        and int(cn[i]) < CN_BULK
-    ]
-
-
-def _reconstruct_facet_spaced(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    hkl: Tuple[int, int, int],
-    n: NDArray[np.float64],
-    d: float,
-    planes: List[Plane],
-    charges: Dict[str, int],
-    ligand: str,
-    surf_tol: float,
-    pair_cuts: Optional[PairCuts],
-    verbose: bool,
-    original_q_lannoo: float,
-) -> Tuple[List[str], NDArray[np.float64], List[str]]:
-    """
-    Apply spaced local cation-vacancy events on one facet. Neighboring Cd
-    vacancies are forbidden, and each accepted event must reduce |Q_Lannoo|.
-    """
-    moves: List[str] = []
-    d_fixed = float(d)
-    vacancy_coords: List[NDArray[np.float64]] = []
-
-    while True:
-        cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        atom_q = _lannoo_all_atoms(symbols, pts, charges, ligand, pair_cuts)
-        q_facet = _facet_q_lannoo_full(symbols, pts, n, d_fixed, atom_q, ligand, surf_tol)
-        cands = _facet_cation_candidates(
-            symbols, pts, cn, n, d_fixed, charges, ligand, surf_tol, original_q_lannoo
-        )
-        if not cands:
-            if verbose:
-                print(f"[recon] {hkl}: no Cd candidates remain.")
-            return symbols, pts, moves
-
-        min_spacing = _candidate_spacing(cands, pts)
-        trials = []
-        for cn_i, depth_i, idx_i in cands:
-            allowed, nearest = _allowed_by_vacancy_spacing(pts[idx_i], vacancy_coords, min_spacing)
-            if not allowed:
-                continue
-            trial_symbols = list(symbols)
-            trial_pts = pts.copy()
-            trial_symbols, trial_pts, trial_logs = _remove_cation_and_cleanup_bonded_anions(
-                trial_symbols, trial_pts, idx_i, cn_i, charges, ligand, pair_cuts
-            )
-            trial_q = _facet_q_lannoo_full(
-                trial_symbols,
-                trial_pts,
-                n,
-                d_fixed,
-                _lannoo_all_atoms(trial_symbols, trial_pts, charges, ligand, pair_cuts),
-                ligand,
-                surf_tol,
-            )
-            improvement = abs(q_facet) - abs(trial_q)
-            if improvement <= 1e-9:
-                continue
-            trials.append((nearest, improvement, -cn_i, -depth_i, idx_i, cn_i, depth_i, trial_q, trial_logs))
-
-        if not trials:
-            if verbose:
-                print(
-                    f"[recon] {hkl}: stop; no non-adjacent Cd vacancy improves "
-                    f"|Q_Lannoo|={abs(q_facet):.3f}."
-                )
-            return symbols, pts, moves
-
-        if vacancy_coords:
-            trials.sort(reverse=True)  # farthest first, then best improvement
+            cover.extend(best[1])
         else:
-            trials.sort(key=lambda rec: (rec[1], rec[2], rec[3]), reverse=True)
-
-        nearest, improvement, _neg_cn, _neg_depth, best_i, best_cn, best_depth, q_new, _logs = trials[0]
-        vacancy_xyz = pts[best_i].copy()
-        symbols, pts, move_logs = _remove_cation_and_cleanup_bonded_anions(
-            symbols, pts, best_i, best_cn, charges, ligand, pair_cuts
-        )
-        vacancy_coords.append(vacancy_xyz)
-        nearest_txt = "none" if not np.isfinite(nearest) else f"{nearest:.2f} Å"
-        move_logs[0] += (
-            f" | vacancy_spacing_min={min_spacing:.2f} Å nearest_prev={nearest_txt}"
-            f" | Q_Lannoo {q_facet:+.3f}→{q_new:+.3f}"
-        )
-        if original_q_lannoo < 0:
-            move_logs[0] += f" | anion-rich sublayer depth={best_depth:.2f} Å"
-
-        for move_str in move_logs:
-            if verbose:
-                print(f"[recon] {hkl}: {move_str}")
-            moves.append(move_str)
+            remaining = set(edges)
+            while remaining:
+                deg: Dict[int, int] = {}
+                for a, b in remaining:
+                    deg[a] = deg.get(a, 0) + 1
+                    deg[b] = deg.get(b, 0) + 1
+                v = max(sorted(deg), key=lambda x: deg[x])
+                cover.append(v)
+                remaining = {e for e in remaining if v not in e}
+    return cover
 
 
-# --------------------------------------------------------------------------
-# Main entry point
-# --------------------------------------------------------------------------
+def _bulk_bond_length(struct) -> float:
+    """Zinc-blende cation-anion bond length, a * sqrt(3) / 4."""
+    return float(struct.lattice.a) * np.sqrt(3.0) / 4.0
+
+
+def _bridging_sites(
+    host_normal: Dict[int, NDArray[np.float64]],
+    pts: NDArray[np.float64],
+    mu: int,
+    d_nn: float,
+    bond: float,
+) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
+    """
+    Candidate positions for a ligand bridging `mu` (3 or 2) mutually adjacent
+    free cations of one cation-terminated (111) facet, at the bulk bond length
+    from each host.  mu3 sits in a hollow; mu2 sits over the shared edge,
+    tilted toward the side with the most room.  Positions closer than
+    1.1 * bond to any non-host atom (e.g. the hollow above a sub-surface
+    anion) are rejected.
+    """
+    hosts = sorted(host_normal)
+    if len(hosts) < mu:
+        return []
+    tree = cKDTree(pts)
+    min_clear = 1.1 * bond
+    cut = NN_FACTOR * d_nn
+
+    def clearance(pos: NDArray[np.float64], hs: Tuple[int, ...]) -> float:
+        near = [j for j in tree.query_ball_point(pos, 2.0 * bond) if j not in hs]
+        return min((float(np.linalg.norm(pts[j] - pos)) for j in near), default=np.inf)
+
+    htree = cKDTree(pts[hosts])
+    pairs = sorted((hosts[a], hosts[b]) for a, b in htree.query_pairs(cut))
+    adj: Dict[int, Set[int]] = {h: set() for h in hosts}
+    for a, b in pairs:
+        if float(np.dot(host_normal[a], host_normal[b])) > 0.99:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    sites: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
+    if mu == 3:
+        for a in hosts:
+            for b, c in itertools.combinations(sorted(x for x in adj[a] if x > a), 2):
+                if c not in adj[b]:
+                    continue
+                n = host_normal[a]
+                cen = (pts[a] + pts[b] + pts[c]) / 3.0
+                h2 = bond * bond - float(np.sum((pts[a] - cen) ** 2))
+                if h2 <= 0:
+                    continue
+                pos = cen + np.sqrt(h2) * n
+                if clearance(pos, (a, b, c)) >= min_clear:
+                    sites.append((pos, (a, b, c)))
+    elif mu == 2:
+        for a in hosts:
+            for b in sorted(x for x in adj[a] if x > a):
+                n = host_normal[a]
+                mid = (pts[a] + pts[b]) / 2.0
+                h2 = bond * bond - float(np.sum((pts[a] - mid) ** 2))
+                if h2 <= 0:
+                    continue
+                e = (pts[b] - pts[a]) / np.linalg.norm(pts[b] - pts[a])
+                t = np.cross(n, e)
+                best = None
+                for deg in range(-60, 61, 5):
+                    th = np.radians(deg)
+                    pos = mid + np.sqrt(h2) * (np.cos(th) * n + np.sin(th) * t)
+                    clr = clearance(pos, (a, b))
+                    if best is None or clr > best[0] + 1e-9:
+                        best = (clr, pos)
+                if best is not None and best[0] >= min_clear:
+                    sites.append((best[1], (a, b)))
+    return sites
+
+
+def _pick_bridging_sites(
+    sites: List[Tuple[NDArray[np.float64], Tuple[int, ...]]],
+    n: int,
+    used_hosts: Set[int],
+    placed: List[NDArray[np.float64]],
+    avoid: List[NDArray[np.float64]],
+    bond: float,
+    host_facet: Dict[int, int],
+    facet_count: Dict[int, int],
+) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
+    """
+    Pick up to n sites with disjoint hosts, clear of placed ligands.  Each
+    pick goes to the facet with the fewest ligands so far (`facet_count` is
+    updated in place), maximin-spread within that facet.
+    """
+    chosen: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
+    used = set(used_hosts)
+    taken = list(placed)
+    min_clear = 1.1 * bond
+    while len(chosen) < n:
+        allowed = [
+            (pos, hs) for pos, hs in sites
+            if not (set(hs) & used)
+            and all(float(np.linalg.norm(pos - q)) >= min_clear for q in taken)
+        ]
+        if not allowed:
+            break
+        least = min(facet_count.get(host_facet[s[1][0]], 0) for s in allowed)
+        allowed = [s for s in allowed if facet_count.get(host_facet[s[1][0]], 0) == least]
+        ref = avoid + taken
+        if ref:
+            ref_arr = np.asarray(ref, float)
+            pos, hs = max(allowed, key=lambda s: (
+                round(float(np.min(np.linalg.norm(ref_arr - s[0], axis=1))), 6), tuple(-h for h in s[1])))
+        else:
+            pos, hs = allowed[0]
+        chosen.append((pos, hs))
+        used.update(hs)
+        taken.append(pos)
+        facet_count[host_facet[hs[0]]] = facet_count.get(host_facet[hs[0]], 0) + 1
+    return chosen
+
+
+def _anion_ok_after(
+    symbols: List[str],
+    cn_after: int,
+    idx: int,
+    anion: str,
+    ligand: str,
+    *,
+    min_native: int,
+) -> bool:
+    if symbols[idx] == ligand:
+        return cn_after >= 1
+    if symbols[idx] == anion:
+        return cn_after >= min_native
+    return True
+
 
 def reconstruct_polar_facets(
     symbols: List[str],
@@ -1271,419 +907,485 @@ def reconstruct_polar_facets(
     surf_tol: float,
     cif_path: str,
     spec: FacetReconstructionSpec | SurfaceReconstructionSpec,
-    charge_balance_fn,
-    verbose: bool,
-    write_all: bool,
-    prefix: str,
+    charge_balance_fn=None,
+    verbose: bool = False,
+    write_all: bool = False,
+    prefix: str = "nanocrystal",
+    ledger: Optional[dict] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
-    Simplified polar-facet reconstruction post-treatment.
+    Polar {111} reconstruction of zinc-blende II-VI / III-V nanocrystals.
 
-    The reconstruction runs after ordinary charge-balance passivation.  It
-    computes residual polar-facet charge from CN-deficient native ions, swaps a
-    sparse subset of native anions on negative polar facets to the reconstruction
-    ligand, and compensates each swap by adding one ligand to an available
-    positive polar surface site.
+    See the module docstring for the algorithm.  `charge_balance_fn`,
+    `write_all` and `prefix` are accepted for call-site compatibility.  When
+    `ledger` is a dict it is filled with a summary of the reconstruction.
     """
     if not spec.enabled:
         return symbols, pts
 
     recon_ligand = getattr(spec, "ligand", None) or ligand
-    configured_hkls: Set[Tuple[int, int, int]] = set(getattr(spec, "facets", ()) or ())
-    auto_facets = bool(getattr(spec, "auto_facets", False) or not configured_hkls)
-    target_reduction = float(getattr(spec, "target_reduction", 0.5))
-    seed = int(getattr(spec, "seed", 1337))
-    pair_cuts = derive_pair_cuts_from_cif(cif_path, charges, safety=1.00)
+    info: dict = {"status": "skipped", "ligand": recon_ligand}
+    if ledger is not None:
+        ledger.clear()
+        ledger.update(info)
 
-    print(f"\n{'='*60}")
-    print("[post-treatment:surface-reconstruction] Simplified polar reconstruction")
-    print(f"[recon] ligand={recon_ligand!r}  facets={'auto' if auto_facets else sorted(configured_hkls)}  "
-          f"target_reduction={target_reduction:.2f}")
-    print(f"[recon] Q_total = {_total_q(symbols, charges):+d}  (expected 0 after charge-balance passivation)")
-
-    native_species = _native_core_species_from_struct(struct, charges, recon_ligand)
-    if not native_species:
-        print("[recon] No native inorganic species found; skipping.")
-        print('='*60)
+    def _skip(msg: str):
+        print(f"[recon] {msg}; skipping.")
+        print("=" * 60)
+        if ledger is not None:
+            ledger["reason"] = msg
         return symbols, pts
 
-    # Detect native scaffold planes (geometry only; defines atom membership).
-    all_facets, all_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, recon_ligand, surf_tol
-    )
-    if not all_planes:
-        print("[recon] No facets detected on native scaffold; skipping.")
-        print('='*60)
-        return symbols, pts
-
-    active_species = set(native_species)
-    cn_refs = _bulk_cn_refs_from_struct(struct, charges, active_species)
-    atom_q = _surface_recon_atom_q(symbols, pts, charges, pair_cuts, active_species, cn_refs)
-    reports_before = _surface_recon_reports(
-        symbols, pts, all_facets, all_planes, charges, surf_tol, atom_q
-    )
-    configured_families = {_hkl_family(hkl) for hkl in configured_hkls} if configured_hkls else set()
-    target_hkls = {
-        r.hkl
-        for r in reports_before
-        if abs(r.q_net) > 1e-9 and (auto_facets or _hkl_family(r.hkl) in configured_families)
-    }
-    if not target_hkls:
-        print("[recon] No polar facets with residual CN-deficit charge found; skipping.")
-        print('='*60)
-        return symbols, pts
-    print(f"[recon] Treating polar facets: {sorted(target_hkls)}")
-    _print_polar_report(reports_before, "BEFORE reconstruction", target_hkls)
-
-    memberships = _facet_memberships(pts, all_planes, surf_tol)
-    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-
-    neg_fids = {
-        r.fid for r in reports_before
-        if r.hkl in target_hkls and r.q_net < -1e-9
-    }
-    pos_fids = {
-        r.fid for r in reports_before
-        if r.hkl in target_hkls and r.q_net > +1e-9
-    }
-
-    anion_candidates: List[int] = []
-    cation_candidates: List[int] = []
-    for i, sym in enumerate(symbols):
-        if sym not in native_species:
-            continue
-        q_formal = int(charges.get(sym, 0))
-        cn_ref = max(1, int(cn_refs.get(sym, CN_BULK)))
-        if q_formal == 0 or int(cn[i]) >= cn_ref:
-            continue
-        fids = set(memberships[i])
-        if q_formal < 0 and fids & neg_fids:
-            anion_candidates.append(i)
-        elif q_formal > 0 and fids & pos_fids:
-            cation_candidates.append(i)
-
-    if not anion_candidates:
-        print("[recon] No CN-deficient native anions found on negative polar facets; skipping.")
-        print('='*60)
-        return symbols, pts
-    if not cation_candidates:
-        print("[recon] No available cation-rich sites found for compensating ligand addition; skipping.")
-        print('='*60)
-        return symbols, pts
+    print(f"\n{'=' * 60}")
+    print("[post-treatment:surface-reconstruction] Polar {111} reconstruction (zinc blende)")
+    ignored = []
+    if getattr(spec, "facets", ()):
+        ignored.append("facets")
+    if abs(float(getattr(spec, "target_reduction", 0.5)) - 0.5) > 1e-9:
+        ignored.append("target_reduction")
+    if getattr(spec, "min_separation", None) is not None:
+        ignored.append("min_separation")
+    if ignored:
+        print(f"[recon] note: {', '.join(ignored)} no longer apply and are ignored.")
 
     ligand_charge = int(charges.get(recon_ligand, -1))
     if ligand_charge >= 0:
-        print(
-            f"[recon] Reconstruction ligand {recon_ligand!r} has charge {ligand_charge:+d}; "
-            "negative ligand charge is required for anion-swap compensation. Skipping."
+        return _skip(f"reconstruction ligand {recon_ligand!r} must be negatively charged")
+
+    pair = _zincblende_binary(struct, charges, recon_ligand)
+    if pair is None:
+        return _skip("only binary zinc-blende II-VI / III-V structures are supported")
+    cation, anion = pair
+    if not _seeds_request_polar_111(facet_seeds):
+        return _skip("needs both a cation_rich {111} and an anion_rich {-1-1-1} facet family")
+
+    q_cat = int(charges[cation])
+    q_an = int(charges[anion])
+    pts = np.asarray(pts, float)
+    symbols = list(symbols)
+    q0 = _total_q(symbols, charges)
+    print(f"[recon] {cation}{anion}: q_cat={q_cat:+d} q_an={q_an:+d} ligand={recon_ligand}({ligand_charge:+d})"
+          f"  Q_total before = {q0:+d}")
+
+    pair_cuts = derive_pair_cuts_from_cif(cif_path, charges, safety=1.00)
+    nb = _bond_graph(symbols, pts, charges, pair_cuts)
+    facets = _polar_111_facets(symbols, pts, struct, cation, anion)
+    an_facets = [f for f in facets if f.kind == "anion"]
+    cat_facets = [f for f in facets if f.kind == "cation"]
+    if not an_facets or not cat_facets:
+        return _skip(
+            f"found {len(an_facets)} anion- and {len(cat_facets)} cation-terminated {{111}} facets; need both"
         )
-        print('='*60)
-        return symbols, pts
-    add_charge_unit = abs(ligand_charge)
-    replacement_delta: Dict[int, float] = {}
-    swap_charge_delta: Dict[int, int] = {}
-    for i in anion_candidates:
-        formal_delta = ligand_charge - int(charges.get(symbols[i], 0))
-        if formal_delta <= 0:
-            continue
-        old_q = float(atom_q[i])
-        cn_ref = max(1, int(cn_refs.get(symbols[i], CN_BULK)))
-        lig_q = float(ligand_charge) * (1.0 - min(int(cn[i]), cn_ref) / cn_ref)
-        replacement_delta[i] = max(0.05, lig_q - old_q)
-        swap_charge_delta[i] = int(formal_delta)
-    anion_candidates = [i for i in anion_candidates if i in swap_charge_delta]
-    if not anion_candidates:
-        print(
-            f"[recon] No anion swaps produce positive compensation charge with ligand {recon_ligand!r}; skipping."
-        )
-        print('='*60)
-        return symbols, pts
+    print(f"[recon] anion-terminated {{111}}: {', '.join(_hkl_str(f.hkl) for f in an_facets)}")
+    print(f"[recon] cation-terminated {{111}}: {', '.join(_hkl_str(f.hkl) for f in cat_facets)}")
 
-    native_cut = _native_pair_cut(native_species, charges, pair_cuts)
-    min_separation = getattr(spec, "min_separation", None)
-    if min_separation is None:
-        min_separation = _auto_sublattice_min_separation(pts[anion_candidates], native_cut)
-    min_separation = float(min_separation)
+    ops = _cluster_rotations(symbols, pts, nb, struct, cation, anion, recon_ligand)
+    print(f"[recon] cluster proper rotations: {len(ops)}")
+    d_nn = _nn_cation_distance(struct)
 
-    cation_missing = _strict_missing_vectors_for_hosts(
-        symbols,
-        pts,
-        cation_candidates,
-        charges,
-        pair_cuts,
-        struct,
-        all_planes,
-        surf_tol,
-    )
-    compensation_slots = _build_compensation_slots(
-        symbols,
-        pts,
-        cation_candidates,
-        cn,
-        cn_refs,
-        cation_missing,
-        all_planes,
-        surf_tol,
-    )
-    capacity_slots = compensation_slots
-    compensation_capacity = len(capacity_slots) * add_charge_unit
-    if compensation_capacity <= 0:
-        print("[recon] No positive-facet missing coordination slots available for compensation; skipping.")
-        print('='*60)
-        return symbols, pts
+    base_symbols = list(symbols)
+    all_alive = np.ones(len(symbols), dtype=bool)
+    outer_facets_of: Dict[int, Set[int]] = {}
+    for fi, f in enumerate(facets):
+        for i in f.outer:
+            outer_facets_of.setdefault(i, set()).add(fi)
 
-    reports_by_fid = {r.fid: r for r in reports_before}
-    selected_anions: List[int] = []
-    plan_rows: List[Tuple[Tuple[int, int, int], float, int, int, int, int, int]] = []
-    neg_reports = sorted(
-        [reports_by_fid[fid] for fid in neg_fids],
-        key=lambda r: abs(r.q_net),
-        reverse=True,
-    )
+    def cn(i: int, alive: NDArray[np.bool_]) -> int:
+        return sum(1 for j in nb[i] if alive[j])
 
-    # 1. Pre-calculate candidates symmetrically for all negative facets
-    facet_data = {}
-    for report in neg_reports:
-        local_candidates = [
-            i for i in anion_candidates
-            if report.fid in memberships[i]
+    def touches_other_facet(c: int, own: int, alive: NDArray[np.bool_]) -> bool:
+        if outer_facets_of.get(c, set()) - {own}:
+            return True
+        return any(outer_facets_of.get(a, set()) - {own} for a in nb[c] if alive[a])
+
+    # ---- 1. anion-terminated facets: sub-surface cation vacancies ----------
+    an_cands: Dict[int, List[int]] = {}
+    for k, f in enumerate(an_facets):
+        own = facets.index(f)
+        below = f.top - LAYER_TOL
+        subs = sorted({
+            c for a in f.outer for c in nb[a]
+            if symbols[c] == cation and float(pts[c] @ f.normal) < below
+        })
+        an_cands[k] = [
+            c for c in subs
+            if cn(c, all_alive) == CN_BULK
+            and all(symbols[a] == anion for a in nb[c])
+            and not touches_other_facet(c, own, all_alive)
+            and all(_anion_ok_after(symbols, cn(a, all_alive) - 1, a, anion, recon_ligand, min_native=2)
+                    for a in nb[c])
         ]
-        if not local_candidates:
-            facet_data[report.fid] = {
-                "local_candidates": [],
-                "max_nonadjacent": [],
-            }
-            continue
-        
-        max_local_idx = _maximum_independent_indices(pts[local_candidates], min_separation)
-        max_nonadjacent = [local_candidates[k] for k in max_local_idx]
-        
-        facet_data[report.fid] = {
-            "local_candidates": local_candidates,
-            "max_nonadjacent": max_nonadjacent,
+
+    def choose_anion(k: int, eligible: List[int]) -> List[int]:
+        return _uniform_max_independent(eligible, pts, struct, an_facets[k].normal, d_nn)
+
+    an_max = _symmetric_selection(an_facets, an_cands, ops, choose_anion) if len(an_facets) > 1 else None
+    an_symmetric = an_max is not None
+    if an_max is None:
+        an_max = {k: choose_anion(k, an_cands[k]) for k in range(len(an_facets))}
+    n_vac_max = min(len(v) for v in an_max.values())
+
+    atom_tree = cKDTree(pts)
+    an_outer_sets = [set(f.outer) for f in an_facets]
+
+    def _edge_breaks(syms: List[str], alive: NDArray[np.bool_]) -> Dict[int, List[int]]:
+        """
+        Surviving outer anions of an anion-terminated facet that are nearest
+        neighbours of an under-coordinated anion off that facet (runs crossing
+        a facet edge).  These are converted so the run is broken on the facet.
+        """
+        out: Dict[int, List[int]] = {}
+        for k, f in enumerate(an_facets):
+            conv = []
+            for a in f.outer:
+                if not alive[a] or syms[a] != anion:
+                    continue
+                for b in atom_tree.query_ball_point(pts[a], NN_FACTOR * d_nn):
+                    if (b != a and b not in an_outer_sets[k] and alive[b] and syms[b] == anion
+                            and cn(b, alive) < CN_BULK):
+                        conv.append(a)
+                        break
+            out[k] = conv
+        return out
+
+    def _execute(n_vac: int) -> dict:
+        syms = list(base_symbols)
+        alive = all_alive.copy()
+        an_sel = {
+            k: v if len(v) == n_vac else _fps_nonadjacent(v, pts, n_vac, d_nn)
+            for k, v in an_max.items()
         }
 
-    # Group the negative facets by their HKL family
-    from collections import defaultdict
-    family_groups = defaultdict(list)
-    for report in neg_reports:
-        fam = _hkl_family(report.hkl)
-        family_groups[fam].append(report)
+        # Global CN validation (edges shared between facets); drop offenders.
+        removed_count: Dict[int, int] = {}
+        vacancies: List[int] = []
+        for k in range(len(an_facets)):
+            kept = []
+            for c in an_sel[k]:
+                trial = dict(removed_count)
+                for a in nb[c]:
+                    trial[a] = trial.get(a, 0) + 1
+                if all(_anion_ok_after(syms, cn(a, alive) - trial[a], a, anion, recon_ligand, min_native=2)
+                       for a in nb[c]):
+                    removed_count = trial
+                    kept.append(c)
+            an_sel[k] = kept
+            vacancies.extend(kept)
 
-    # Define capacity C
-    C = len(compensation_slots)
+        for c in vacancies:
+            alive[c] = False
+        converted = {k: 0 for k in range(len(an_facets))}
+        facet_of_vac = {c: k for k in an_sel for c in an_sel[k]}
+        dq_anion = -q_cat * len(vacancies)
+        for c in vacancies:
+            for a in nb[c]:
+                if alive[a] and syms[a] == anion and cn(a, alive) == 2:
+                    syms[a] = recon_ligand
+                    converted[facet_of_vac[c]] += 1
+                    dq_anion += ligand_charge - q_an
 
-    # Find the slot requirement ratio per swap to adjust S_max
-    first_idx = anion_candidates[0] if anion_candidates else None
-    charge_ratio = (swap_charge_delta[first_idx] // add_charge_unit) if first_idx is not None else 1
-    charge_ratio = max(1, charge_ratio)
+        # Break runs of adjacent surviving outer anions (charge delocalisation).
+        # Runs crossing a facet edge are broken on the facet side first; then
+        # alternating survivors are converted so no two are nearest neighbours.
+        edge_conv = _edge_breaks(syms, alive)
+        for k, conv in edge_conv.items():
+            for a in conv:
+                syms[a] = recon_ligand
+                dq_anion += ligand_charge - q_an
+        survivors = {
+            k: [a for a in f.outer if alive[a] and syms[a] == anion]
+            for k, f in enumerate(an_facets)
+        }
+        breaks = _symmetric_selection(
+            an_facets, survivors, ops,
+            lambda k, eligible: _min_vertex_cover(eligible, pts, d_nn),
+        ) if len(an_facets) > 1 else None
 
-    # Save target swaps for each facet using the capacity-bounded formula
-    final_target_swaps = {}
-    for fam, group in family_groups.items():
-        n_facets = len(group)
-        # Find the minimum candidate count among the equivalent facets in this family
-        A_min = len(facet_data[group[0].fid]["local_candidates"])
-        for r in group:
-            A_min = min(A_min, len(facet_data[r.fid]["local_candidates"]))
-        
-        # S_max is the absolute capacity-limited maximum swaps per negative polar facet
-        S_max = min(A_min, C // (n_facets * charge_ratio))
-        
-        # S_target is scaled by the target ratio
-        S_target = int(np.round(S_max * target_reduction))
-        S_target = max(0, min(S_max, S_target))
-        
-        for r in group:
-            final_target_swaps[r.fid] = S_target
+        def _still_adjacent(k: int, conv: List[int]) -> bool:
+            left = set(survivors[k]) - set(conv)
+            return bool(_min_vertex_cover(sorted(left), pts, d_nn))
 
-    # 2. Dynamic Iterative Batch Passivation & Reconstruction Loop
-    applied_swaps = {report.fid: [] for report in neg_reports}
-    picked_slots = []
-    
-    while True:
-        # Check active facets that still need swaps
-        active_facets = [
-            report for report in neg_reports
-            if len(applied_swaps[report.fid]) < final_target_swaps[report.fid]
-        ]
-        if not active_facets:
-            break
+        if breaks is None or any(_still_adjacent(k, breaks[k]) for k in breaks):
+            breaks = {k: _min_vertex_cover(survivors[k], pts, d_nn) for k in survivors}
+        for k, conv in breaks.items():
+            for a in conv:
+                syms[a] = recon_ligand
+                dq_anion += ligand_charge - q_an
+        n_breaks = {k: len(breaks[k]) + len(edge_conv[k]) for k in breaks}
+        q = q0 + dq_anion
 
-        # Symmetrically select 1 swap candidate per active facet in each family
-        batch_swaps = []
-        batch_selected_anions = set()
-        for report in active_facets:
-            fdata = facet_data[report.fid]
-            target = final_target_swaps[report.fid]
-            max_nonadjacent = fdata["max_nonadjacent"]
-            local_candidates = fdata["local_candidates"]
-            
-            # Pool: if we are within non-adjacent limits, use max_nonadjacent; otherwise, relax to local_candidates
-            if target <= len(max_nonadjacent):
-                pool = max_nonadjacent
-            else:
-                pool = local_candidates
-                
-            remaining_pool = [i for i in pool if i not in selected_anions and i not in batch_selected_anions]
-            if not remaining_pool:
+        # ---- 2. strip one-bonded ligands from cation-terminated facets -----
+        stripped = {k: 0 for k in range(len(cat_facets))}
+        cat_outer = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
+        for li, s in enumerate(syms):
+            if s != recon_ligand or not alive[li]:
                 continue
-                
-            # Farthest Point Selection relative to already swapped sites on this facet
-            swapped_on_facet = applied_swaps[report.fid]
-            if not swapped_on_facet:
-                # Pick point farthest from centroid of the facet
-                facet_pts = pts[local_candidates]
-                centroid = facet_pts.mean(axis=0) if len(facet_pts) > 0 else pts.mean(axis=0)
-                best_cand = max(remaining_pool, key=lambda idx: float(np.linalg.norm(pts[idx] - centroid)))
+            hosts = [j for j in nb[li] if alive[j] and syms[j] == cation]
+            if len(hosts) == 1 and hosts[0] in cat_outer:
+                alive[li] = False
+                stripped[cat_outer[hosts[0]]] += 1
+                q -= ligand_charge
+
+        # ---- 3. outer-cation vacancies on cation-terminated facets ---------
+        n_remove = q // q_cat if q > 0 else 0
+        base = n_remove // len(cat_facets)
+
+        def cat_candidates(k: int, allow_ligand_nb: bool) -> List[int]:
+            own = facets.index(cat_facets[k])
+            out = []
+            for c in cat_facets[k].outer:
+                if not alive[c] or touches_other_facet(c, own, alive):
+                    continue
+                live_nb = [a for a in nb[c] if alive[a]]
+                if not allow_ligand_nb and any(syms[a] == recon_ligand for a in live_nb):
+                    continue
+                if all(_anion_ok_after(syms, cn(a, alive) - 1, a, anion, recon_ligand, min_native=3)
+                       for a in live_nb):
+                    out.append(c)
+            return out
+
+        tier1 = {k: cat_candidates(k, False) for k in range(len(cat_facets))}
+        tier2 = {k: cat_candidates(k, True) for k in range(len(cat_facets))}
+
+        def choose_cation(k: int, eligible: List[int]) -> List[int]:
+            first = [c for c in eligible if c in set(tier1[k])]
+            if first:
+                # Spread inside one sqrt(3) colour class: lattice-aligned and densest.
+                for cls in _colour_classes(first, pts, struct, cat_facets[k].normal):
+                    if len(cls) >= base:
+                        return _fps_nonadjacent(cls, pts, base, d_nn)
+            picked = _fps_nonadjacent(first, pts, base, d_nn)
+            if len(picked) < base:
+                picked += _fps_nonadjacent(eligible, pts, base - len(picked), d_nn, existing=picked)
+            return picked
+
+        cat_sel: Dict[int, List[int]] = {k: [] for k in range(len(cat_facets))}
+        cat_symmetric = base == 0
+        if base > 0:
+            sym = _symmetric_selection(cat_facets, tier2, ops, choose_cation) if len(cat_facets) > 1 else None
+            if sym is not None and all(len(v) == base for v in sym.values()):
+                cat_sel, cat_symmetric = sym, True
             else:
-                # Farthest point from already swapped points
-                best_cand = max(
-                    remaining_pool,
-                    key=lambda idx: min(float(np.linalg.norm(pts[idx] - pts[s])) for s in swapped_on_facet)
-                )
-            
-            batch_swaps.append((report.fid, best_cand))
-            batch_selected_anions.add(best_cand)
+                cat_sel = {k: choose_cation(k, tier2[k]) for k in range(len(cat_facets))}
 
-        if not batch_swaps:
-            break
+        def add_one(k: int) -> bool:
+            for pool in (tier1[k], tier2[k]):
+                pick = _fps_nonadjacent(pool, pts, 1, d_nn, existing=cat_sel[k])
+                if pick:
+                    cat_sel[k].extend(pick)
+                    return True
+            return False
 
-        # Calculate compensating ligand additions for this batch
-        total_batch_charge = sum(swap_charge_delta[idx] for _, idx in batch_swaps)
-        needed_added_ligands = total_batch_charge // add_charge_unit
-        
-        # Select from remaining capacity slots
-        available_slots = [
-            slot for slot in capacity_slots
-            if slot not in picked_slots
-        ]
-        if len(available_slots) < needed_added_ligands:
-            break
-            
-        # Select slots using 3D FPS relative to already picked slots
-        batch_slots = []
-        for _ in range(needed_added_ligands):
-            rem_slots = [s for s in available_slots if s not in batch_slots]
-            if not rem_slots:
+        # Remainder removals (and any shortfall) go to the facets with fewest so far.
+        missing = n_remove - sum(len(v) for v in cat_sel.values())
+        while missing > 0:
+            order = sorted(range(len(cat_facets)), key=lambda k: (len(cat_sel[k]), k))
+            if not any(add_one(k) for k in order):
                 break
-            if not picked_slots and not batch_slots:
-                # First point: pick one with highest outwards radial distance
-                centroid = pts.mean(axis=0)
-                best_slot = max(rem_slots, key=lambda s: float(np.linalg.norm(pts[s[0]] - centroid)))
-            else:
-                # Pick slot farthest from already selected slots
-                ref_pts = np.asarray([pts[s[0]] for s in (picked_slots + batch_slots)], float)
-                best_slot = max(
-                    rem_slots,
-                    key=lambda s: float(np.min(np.linalg.norm(ref_pts - pts[s[0]], axis=1)))
+            missing -= 1
+
+        removed_cations = [c for v in cat_sel.values() for c in v]
+        for c in removed_cations:
+            alive[c] = False
+        q -= q_cat * len(removed_cations)
+
+        # Cation removals can leave new under-coordinated anions next to an
+        # anion-facet edge: break those runs too (compensated by ligands below).
+        for k, conv in _edge_breaks(syms, alive).items():
+            for a in conv:
+                syms[a] = recon_ligand
+                dq_anion += ligand_charge - q_an
+                q += ligand_charge - q_an
+                n_breaks[k] += 1
+
+        # ---- 4. remainder: add ligands on cation-facet sites ---------------
+        keep = np.where(alive)[0]
+        remap = {int(old): new for new, old in enumerate(keep)}
+        new_symbols = [syms[i] for i in keep]
+        new_pts = pts[keep].copy()
+        added = 0
+        n_add = q // (-ligand_charge) if q > 0 else 0
+        mu_added = {3: 0, 2: 0, 1: 0}
+        facet_count: Dict[int, int] = {k: 0 for k in range(len(cat_facets))}
+        if n_add > 0:
+            host_normal = {
+                remap[i]: f.normal
+                for f in cat_facets for i in f.outer
+                if alive[i] and cn(i, alive) < CN_BULK
+            }
+            host_facet = {
+                remap[i]: k
+                for k, f in enumerate(cat_facets) for i in f.outer
+                if alive[i] and cn(i, alive) < CN_BULK
+            }
+            bond = _bulk_bond_length(struct)
+            used_hosts: Set[int] = set()
+            placed: List[NDArray[np.float64]] = []
+            avoid = [pts[c] for c in removed_cations]
+
+            # II-VI: mu3 hollows first, then mu2 bridges; each free cation hosts
+            # one ligand.  III-V: terminal (mu1) ligands only.
+            for mu in ((3, 2) if q_cat == 2 else ()):
+                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond)
+                picked = _pick_bridging_sites(
+                    sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count
                 )
-            batch_slots.append(best_slot)
+                for pos, hs in picked:
+                    new_symbols.append(recon_ligand)
+                    new_pts = np.vstack([new_pts, pos])
+                    placed.append(pos)
+                    used_hosts.update(hs)
+                    added += 1
+                    mu_added[mu] += 1
 
-        if len(batch_slots) < needed_added_ligands:
+            # Last resort: on-top (mu1) on the remaining free cations.
+            if added < n_add:
+                hosts = [h for h in host_normal if h not in used_hosts]
+                planes: List[Plane] = [(f.normal, f.top) for f in facets]
+                missing_vecs = _strict_missing_vectors_for_hosts(
+                    new_symbols, new_pts, hosts, charges, pair_cuts, struct, planes, surf_tol
+                )
+                slots = [(h, vecs[0]) for h, vecs in missing_vecs.items() if vecs]
+                picked_slots: List[Tuple[int, np.ndarray]] = []
+                while slots and len(picked_slots) < n_add - added:
+                    ref = avoid + placed + [new_pts[h] for h, _ in picked_slots]
+                    least = min(facet_count[host_facet[h]] for h, _ in slots)
+                    pool = [sl for sl in slots if facet_count[host_facet[sl[0]]] == least]
+                    if ref:
+                        ref_arr = np.asarray(ref, float)
+                        best = max(pool, key=lambda s: (
+                            round(float(np.min(np.linalg.norm(ref_arr - new_pts[s[0]], axis=1))), 6), -s[0]))
+                    else:
+                        best = pool[0]
+                    facet_count[host_facet[best[0]]] += 1
+                    picked_slots.append(best)
+                    slots = [s for s in slots if s[0] != best[0]]
+                for pos in _ligand_add_positions_for_slots(new_symbols, new_pts, picked_slots, recon_ligand, pair_cuts):
+                    new_symbols.append(recon_ligand)
+                    new_pts = np.vstack([new_pts, np.asarray(pos, float)])
+                    added += 1
+                    mu_added[1] += 1
+
+        return {
+            "symbols": new_symbols,
+            "pts": new_pts,
+            "an_sel": an_sel,
+            "converted": converted,
+            "breaks": n_breaks,
+            "dq_anion": dq_anion,
+            "stripped": stripped,
+            "tier2": tier2,
+            "cat_sel": cat_sel,
+            "cat_symmetric": cat_symmetric,
+            "n_remove": n_remove,
+            "removed": len(removed_cations),
+            "n_add": n_add,
+            "added": added,
+            "mu_added": mu_added,
+            "added_by_facet": facet_count,
+            "q_final": _total_q(new_symbols, charges),
+        }
+
+    # Most vacancies per anion facet first; back off one per facet at a time
+    # until the cation-terminated facets can compensate the charge exactly.
+    # If no count balances, keep the attempt with the smallest residual charge
+    # (most vacancies on ties).
+    res = None
+    for n_vac in range(n_vac_max, -1, -1):
+        trial = _execute(n_vac)
+        if res is None or abs(trial["q_final"]) < abs(res["q_final"]):
+            res = trial
+        if trial["q_final"] == 0:
             break
+    n_vac_used = min(len(v) for v in res["an_sel"].values())
 
-        # Commit batch!
-        for fid, idx in batch_swaps:
-            applied_swaps[fid].append(idx)
-            selected_anions.append(idx)
-        picked_slots.extend(batch_slots)
+    print("\n=== {111} RECONSTRUCTION: anion-terminated facets ===")
+    print("        hkl  candidates  vacancies  anion->ligand  chain breaks")
+    for k, f in enumerate(an_facets):
+        print(f"  {_hkl_str(f.hkl):>11s}  {len(an_cands[k]):10d}  {len(res['an_sel'][k]):9d}"
+              f"  {res['converted'][k]:13d}  {res['breaks'][k]:12d}")
+    print(f"[recon] pattern mapped by symmetry: {'yes' if an_symmetric else 'no'}"
+          f" | ΔQ = {res['dq_anion']:+d}")
+    if n_vac_used < n_vac_max:
+        print(f"[recon] vacancies per facet reduced {n_vac_max} → {n_vac_used} so the "
+              f"cation-terminated facets can compensate the charge.")
 
-    # Populate final plan_rows for reporting
-    for report in neg_reports:
-        fdata = facet_data[report.fid]
-        applied = len(applied_swaps[report.fid])
-        chosen_charge = applied * add_charge_unit
-        max_charge = len(fdata["max_nonadjacent"]) * add_charge_unit
-        plan_rows.append((
-            report.hkl,
-            report.q_net,
-            final_target_swaps[report.fid],
-            len(fdata["max_nonadjacent"]),
-            max_charge,
-            chosen_charge,
-            applied,
-        ))
+    print("\n=== {111} RECONSTRUCTION: cation-terminated facets ===")
+    print("        hkl  stripped  candidates  removed  added")
+    for k, f in enumerate(cat_facets):
+        print(f"  {_hkl_str(f.hkl):>11s}  {res['stripped'][k]:8d}  {len(res['tier2'][k]):10d}"
+              f"  {len(res['cat_sel'][k]):7d}  {res['added_by_facet'][k]:5d}")
+    print(f"[recon] pattern mapped by symmetry: {'yes' if res['cat_symmetric'] else 'no'}"
+          f" | {cation} removed = {res['removed']} (requested {res['n_remove']})"
+          f" | {recon_ligand} added = {res['added']}"
+          f" (mu3 {res['mu_added'][3]}, mu2 {res['mu_added'][2]}, mu1 {res['mu_added'][1]})")
+    if res["added"] < res["n_add"]:
+        print(f"[recon] warning: only {res['added']} of {res['n_add']} compensating {recon_ligand} sites found.")
 
-    selected_charge_delta = sum(swap_charge_delta[idx] for idx in selected_anions)
-    picked_anions = selected_anions
-    needed_added_ligands = selected_charge_delta // add_charge_unit
+    out_symbols, out_pts = res["symbols"], res["pts"]
+    q_final = res["q_final"]
+    rebalance: Optional[dict] = None
+    if q_final != 0:
+        # The {111} facets cannot absorb the whole charge: hand the leftover to
+        # the regular charge balance (rebalancing mode, no structural prepass),
+        # which can also use {100} facets and edges.
+        from .passivation_iterative import charge_balance_iterative
 
-    if not picked_anions:
-        print(
-            f"[recon] Spacing constraint rejected all anion swaps "
-            f"(min_separation={min_separation:.2f} Å); skipping."
+        print(f"[recon] residual Q = {q_final:+d}; running charge balance on the leftover.")
+        _cb_facets, cb_planes = _native_facets_and_planes(
+            out_symbols, out_pts, struct, charges, facet_seeds, recon_ligand, surf_tol
         )
-        print('='*60)
-        return symbols, pts
-
-    print(f"\n=== SURFACE RECONSTRUCTION PLAN ===")
-    print(
-        "        hkl    Q_net_before  requested  max_nonadjacent"
-        "  max_ΔQ  selected_ΔQ  applied"
-    )
-    for hkl, q_before, requested, max_allowed, max_charge, chosen_charge, applied in plan_rows:
-        hkl_str = f"({hkl[0]} {hkl[1]} {hkl[2]})"
-        print(
-            f"  {hkl_str:>11s}  {q_before:+12.3f}"
-            f"  {requested:9d}  {max_allowed:15d}"
-            f"  {max_charge:6d}  {chosen_charge:11d}  {applied:7d}"
+        before = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
+        out_symbols, out_pts = charge_balance_iterative(
+            list(out_symbols), np.asarray(out_pts, float), charges, recon_ligand,
+            verbose, cb_planes, surf_tol, cif_path,
+            positive_q_strategy="add",
+            pair_cuts_override=pair_cuts,
+            prepass_mode="none",
         )
-    print(
-        f"[recon] compensation capacity: {len(capacity_slots)} missing-coordination "
-        f"{recon_ligand} slots "
-        f"= {-compensation_capacity:+d} charge"
-    )
-    print(
-        f"[recon] selected swaps: +{selected_charge_delta:d} charge; "
-        f"adding {needed_added_ligands:d} {recon_ligand} ligands "
-        f"({needed_added_ligands * ligand_charge:+d} charge)"
-    )
-    print(
-        f"[recon] applied total swaps={len(picked_anions)}, "
-        f"min_separation={min_separation:.2f} Å"
-    )
-
-    new_symbols = list(symbols)
-    new_pts = np.asarray(pts, float).copy()
-    for idx in picked_anions:
-        old = new_symbols[idx]
-        new_symbols[idx] = recon_ligand
-        if verbose:
-            print(f"[recon] swap {old}#{idx} CN={int(cn[idx])} -> {recon_ligand}")
-
-    add_positions = _ligand_add_positions_for_slots(
-        new_symbols, new_pts, picked_slots, recon_ligand, pair_cuts
-    )
-    if len(add_positions) != len(picked_slots):
+        after = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
+        rebalance = {
+            "residual_charge": int(q_final),
+            "ligands_added": int(after[recon_ligand] - before[recon_ligand]),
+            "cations_removed": int(before[cation] - after[cation]),
+            "anions_removed": int(before[anion] - after[anion]),
+        }
+        q_final = _total_q(out_symbols, charges)
         print(
-            f"[recon] Internal slot geometry issue: generated {len(add_positions)} ligand positions "
-            f"for {len(picked_slots)} selected slots; skipping."
+            f"[recon] charge balance: {recon_ligand} {rebalance['ligands_added']:+d}, "
+            f"{cation} {-rebalance['cations_removed']:+d}, {anion} {-rebalance['anions_removed']:+d}"
         )
-        print('='*60)
-        return symbols, pts
-    for (host_idx, _vec), pos in zip(picked_slots, add_positions):
-        new_symbols.append(recon_ligand)
-        new_pts = np.vstack([new_pts, np.asarray(pos, float)])
-        if verbose:
-            print(f"[recon] add {recon_ligand} on {symbols[host_idx]}#{host_idx}")
 
-    symbols, pts = new_symbols, new_pts
+    print(f"[recon] Done. Q_total = {q_final:+d}")
+    if q_final != 0:
+        print(f"[recon] warning: reconstruction left a net charge of {q_final:+d}.")
+    print("=" * 60)
 
-    post_facets, post_planes = _native_facets_and_planes(
-        symbols, pts, struct, charges, facet_seeds, recon_ligand, surf_tol
-    )
-    post_atom_q = _surface_recon_atom_q(symbols, pts, charges, pair_cuts, native_species, cn_refs)
-    reports_after = _surface_recon_reports(
-        symbols, pts, post_facets, post_planes, charges, surf_tol, post_atom_q
-    )
-    before_by_hkl = {r.hkl: r for r in reports_before}
-    _print_polar_report(reports_after, "AFTER reconstruction", target_hkls, before=before_by_hkl)
-
-    print(
-        f"[recon] Done. swapped={len(picked_anions)} added={len(add_positions)} "
-        f"Q_total={_total_q(symbols, charges):+d}"
-    )
-    print('='*60)
-
-    return symbols, pts
+    if ledger is not None:
+        ledger.update({
+            "status": "applied",
+            "cation": cation,
+            "anion": anion,
+            "anion_facets": [
+                {"hkl": list(f.hkl), "vacancies": len(res["an_sel"][k]),
+                 "anions_to_ligand": res["converted"][k], "chain_breaks": res["breaks"][k]}
+                for k, f in enumerate(an_facets)
+            ],
+            "cation_facets": [
+                {"hkl": list(f.hkl), "ligands_stripped": res["stripped"][k],
+                 "cations_removed": len(res["cat_sel"][k]),
+                 "ligands_added": res["added_by_facet"][k]}
+                for k, f in enumerate(cat_facets)
+            ],
+            "anion_side_charge_delta": int(res["dq_anion"]),
+            "ligands_stripped": int(sum(res["stripped"].values())),
+            "cations_removed": int(res["removed"]),
+            "ligands_added": int(res["added"]),
+            "ligands_added_by_mu": {f"mu{k}": int(v) for k, v in res["mu_added"].items()},
+            "symmetric": bool(an_symmetric and res["cat_symmetric"]),
+            "total_charge_before": int(q0),
+            "total_charge_after": int(q_final),
+        })
+        if rebalance is not None:
+            ledger["charge_balance_fallback"] = rebalance
+    return out_symbols, out_pts
