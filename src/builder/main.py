@@ -762,6 +762,7 @@ def _run_passivation_and_write_outputs(
         "surface_reconstruction",
         cfg.facet_reconstruction,
     )
+    surface_reconstruction_ledger: dict = {}
     if surface_reconstruction_spec.enabled:
         from functools import partial
         balance_fn = partial(
@@ -785,6 +786,7 @@ def _run_passivation_and_write_outputs(
             verbose=args.verbose,
             write_all=args.write_all,
             prefix=prefix,
+            ledger=surface_reconstruction_ledger,
         )
 
     if output_layer_planes is not None:
@@ -1009,6 +1011,8 @@ def _run_passivation_and_write_outputs(
         extra["z_type_displacement_ledger"] = z_type_displacement_ledger
     if alloying_ledger:
         extra["alloying_ledger"] = alloying_ledger
+    if surface_reconstruction_ledger:
+        extra["surface_reconstruction_ledger"] = surface_reconstruction_ledger
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     return syms, pts, ligand_exchange_charge_ledger

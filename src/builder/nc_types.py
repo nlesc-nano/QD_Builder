@@ -130,12 +130,14 @@ class ZTypeDisplacementPostTreatSpec:
 @dataclass(frozen=True)
 class SurfaceReconstructionSpec:
     """
-    Simplified polar-surface reconstruction post-treatment.
+    Polar {111} reconstruction of zinc-blende II-VI / III-V nanocrystals.
 
-    The step computes residual Lannoo-like facet charges after charge-balance
-    passivation, sparsely swaps native anions on negative polar facets to the
-    reconstruction ligand, and compensates each swap by adding one ligand to an
-    available cation-rich polar site.
+    Runs only when both a cation_rich {111} and an anion_rich {-1-1-1} family
+    are active: sub-surface cation vacancies on the anion-terminated facets
+    (two-coordinated anions become `ligand`), then ligand stripping and outer
+    cation removal on the cation-terminated facets to restore neutrality.
+    `facets`, `target_reduction`, `min_separation` and `distribution` are
+    parsed for backward compatibility but no longer used.
     """
     enabled: bool = False
     ligand: Optional[str] = None
