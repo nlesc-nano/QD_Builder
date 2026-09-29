@@ -782,13 +782,13 @@ def _priority3_balance_positive_q_remove(
 
     return False, symbols, pts
 
-def _zb_positive_q_add_picks(
+def _balanced_positive_q_add_picks(
     symbols: List[str],
     pts: NDArray[np.float64],
     *,
     sub: List[Tuple[int, np.ndarray, float, int, int, int]],
     merged_cif_sites: List[dict],
-    zb_pair: Tuple[str, str],
+    zb_pair: Optional[Tuple[str, str]],
     ref_struct,
     charges: Dict[str, int],
     ligand: str,
@@ -801,16 +801,24 @@ def _zb_positive_q_add_picks(
     add_count_facet: Dict[int, int],
     max_to_add: int,
     d_exclude: float,
+    position_ok=None,
 ) -> List[dict]:
     """
-    Deterministic, facet-balanced ligand additions for binary zinc-blende dots.
+    Deterministic, facet-balanced ligand additions (all materials).
 
-    Candidates: lattice virtual sites (mu1 on-top, mu2 where two cations share
-    a missing anion site) plus, for II-VI, mu3 hollows and mu2 bridges over
-    free cations of cation-terminated {111} facets.  Priority per pick:
-    no over-coordination, then site type (II-VI: mu3 > mu2 > mu1; III-V:
-    mu1 first), then the facet with the fewest additions so far, then the
-    site farthest from all ligands (maximin), then lowest host index.
+    Candidates are the bulk-lattice virtual sites of the missing anions
+    (multiplicity = number of cations sharing the site: mu1 on-top, mu2/mu3
+    bridges).  For binary zinc-blende II-VI dots, mu3 hollows and mu2 bridges
+    over free cations of cation-terminated {111} facets are added.
+
+    Priority per pick: largest remaining CN deficit among the site's hosts
+    (lowest CN first, updated after every pick), then
+      zinc-blende: no over-coordination, then site type (II-VI
+        mu3 > mu2 > mu1; III-V mu1 first);
+      other materials: net repair (cations raised toward bulk CN minus
+        cations pushed above it), then higher multiplicity;
+    then the facet with the fewest additions so far, then the site farthest
+    from all ligands (maximin), then lowest host index.
     """
     from .facet_reconstruction import (
         _bridging_sites,
@@ -819,8 +827,8 @@ def _zb_positive_q_add_picks(
         _polar_111_facets,
     )
 
-    cation, anion = zb_pair
-    is_ii_vi = int(charges.get(cation, 0)) == 2
+    is_ii_vi = zb_pair is not None and int(charges.get(zb_pair[0], 0)) == 2
+    is_iii_v = zb_pair is not None and not is_ii_vi
     sub_records = {rec[0]: rec for rec in sub}
 
     def deficit(h: int) -> int:
@@ -832,9 +840,14 @@ def _zb_positive_q_add_picks(
         hosts = [int(h) for h in site["hosts"]]
         if hosts[0] not in sub_records:
             continue
+        if position_ok is not None and not position_ok(np.asarray(site["pos"], float)):
+            continue
         cands.append({"pos": np.asarray(site["pos"], float), "hosts": tuple(hosts), "mu": len(hosts)})
 
-    cat_facets = [f for f in _polar_111_facets(symbols, pts, ref_struct, cation, anion) if f.kind == "cation"]
+    cat_facets = (
+        [f for f in _polar_111_facets(symbols, pts, ref_struct, *zb_pair) if f.kind == "cation"]
+        if zb_pair is not None else []
+    )
     host_111 = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
     if is_ii_vi:
         host_normal = {
@@ -849,16 +862,18 @@ def _zb_positive_q_add_picks(
                     cands.append({"pos": np.asarray(pos, float), "hosts": tuple(hs), "mu": mu})
 
     for c in cands:
-        _score, _gain, _touched, over = _trial_ligand_addition_score(
+        _score, _gain, touched, over = _trial_ligand_addition_score(
             symbols, pts, charges, ligand, pair_cuts, c["pos"],
             host_idx=c["hosts"][0], cn_before=cn_bi, pt_tree=pt_tree, bulk_map=bulk_map,
             max_search_cut=max(4.5, abs(_pair_cut_calibrated(symbols[c["hosts"][0]], ligand, pair_cuts)) + 1.0),
             ref_struct=ref_struct,
         )
         c["over"] = int(over)
+        # Cations raised toward bulk CN minus cations pushed above it.
+        c["net"] = int(touched) - 2 * int(over)
         c["rec"] = sub_records[c["hosts"][0]]
         c["inc"] = tuple(sorted(_incident_facets(c["hosts"][0], pts, frames, surf_tol))) or (c["rec"][5],)
-        c["type_rank"] = c["mu"] if is_ii_vi else -c["mu"]
+        c["type_rank"] = -c["mu"] if is_iii_v else c["mu"]
         # Balance per cation-{111} facet when the site sits on one, else per
         # incident Wulff facet.
         c["bal"] = ("111", host_111[c["hosts"][0]]) if c["hosts"][0] in host_111 else None
@@ -880,8 +895,15 @@ def _zb_positive_q_add_picks(
             elig.append((c, dmin))
         if not elig:
             break
-        best_level = max((c["over"] == 0, c["type_rank"]) for c, _ in elig)
-        elig = [(c, d) for c, d in elig if (c["over"] == 0, c["type_rank"]) == best_level]
+        # Lowest CN first, updated after every pick: the most under-
+        # coordinated remaining host of a site sets its priority.
+        need = lambda c: max(deficit(h) - use[h] for h in c["hosts"])
+        if zb_pair is not None:
+            level = lambda c: (need(c), c["over"] == 0, c["type_rank"])
+        else:
+            level = lambda c: (need(c), c["net"], c["type_rank"])
+        best_level = max(level(c) for c, _ in elig)
+        elig = [(c, d) for c, d in elig if level(c) == best_level]
 
         def balance(c: dict) -> float:
             if c["bal"] is not None:
@@ -941,8 +963,9 @@ def _priority3_balance_positive_q_add(
         except Exception as e:
             if verbose:
                 print(f"[debug:add] Reference CIF load failed for template directions: {e}. Using outward normals only.")
-    # Binary zinc-blende (II-VI / III-V) single-material dots use the
-    # deterministic, facet-balanced selection with mu3/mu2/mu1 site types.
+    # Binary zinc-blende (II-VI / III-V) single-material dots get the
+    # zinc-blende site policy (mu3/mu2/mu1); every material uses the
+    # deterministic, facet-balanced selection when lattice sites exist.
     zb_pair = None
     if ref_struct is not None and not stack_passivation:
         from .facet_reconstruction import _zincblende_binary
@@ -1054,15 +1077,19 @@ def _priority3_balance_positive_q_add(
                 if verbose:
                     print(f"[debug:add] compute_cif_virtual_sites failed for host tier: {e}. Falling back to standard normal.")
 
-        if zb_pair is not None:
+        if merged_cif_sites:
             q_now = _total_Q(symbols, charges)
             n_max = max(1, int(q_now // abs(charges.get(ligand, 1))))
-            picks = _zb_positive_q_add_picks(
+            position_ok = None
+            if stack_passivation and not include_sublayer:
+                position_ok = lambda pos: _ligand_position_allowed(pos, symbols, pts, ligand)
+            picks = _balanced_positive_q_add_picks(
                 symbols, pts,
                 sub=sub, merged_cif_sites=merged_cif_sites, zb_pair=zb_pair, ref_struct=ref_struct,
                 charges=charges, ligand=ligand, pair_cuts=pair_cuts, cn_bi=cn_bi, bulk_map=bulk_map,
                 pt_tree=pt_tree, frames=frames, surf_tol=surf_tol, add_count_facet=add_count_facet,
                 max_to_add=n_max, d_exclude=1.8 if include_sublayer else 3.0,
+                position_ok=position_ok,
             )
             if not picks:
                 continue
@@ -1863,6 +1890,10 @@ def charge_balance_iterative(
         )
         return symbols, pts
 
+    # Cycle guard: the same (Q, atom count, ligand count) state recurring means
+    # moves are being undone (e.g. added ligands pruned as orphans).
+    seen_states: Dict[Tuple[int, int, int], int] = defaultdict(int)
+
     while True:
         # Shared per-iteration state (with robust bipartite CN)
         frames = _build_facet_frames(planes)
@@ -1872,6 +1903,14 @@ def charge_balance_iterative(
         uv_cache: UVCache = {}
 
         Q = _total_Q(symbols, charges)
+        state = (Q, len(symbols), symbols.count(ligand))
+        seen_states[state] += 1
+        if seen_states[state] > 5:
+            print(
+                f"[halt] charge balance is cycling (Q={Q:+d}, {len(symbols)} atoms seen "
+                f"{seen_states[state]} times); stopping. Check ligand/cation bond cutoffs."
+            )
+            return _finish(symbols, pts)
         if verbose:
             print(f"\n[loop] Q={Q:+d} — reassessing priorities...")
 
