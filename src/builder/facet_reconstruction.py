@@ -704,17 +704,29 @@ def _symmetric_selection(
     return best_result
 
 
-def _min_vertex_cover(nodes: List[int], pts: NDArray[np.float64], d_nn: float) -> List[int]:
+def _min_vertex_cover(
+    nodes: List[int],
+    pts: NDArray[np.float64],
+    d_nn: float,
+    anchors: Optional[Set[int]] = None,
+) -> List[int]:
     """
     Smallest set of nodes to convert so no two remaining nodes are nearest
     neighbours (minimum vertex cover of the nearest-neighbour graph).  Exact
     per connected component (up to 20 nodes; greedy beyond).  Among equal
     covers, prefer converted nodes that are not adjacent to each other, which
-    gives alternating Se/Cl along chains.
+    gives alternating Se/Cl along chains (Se-Se-Se -> Se-Cl-Se), then covers
+    that convert more anchors.
+
+    With `anchors`, only adjacencies involving at least one anchor are broken
+    (runs touching the reconstructed facet), while non-anchor nodes may still
+    be converted to break them.
     """
     cut = NN_FACTOR * d_nn
     adj: Dict[int, Set[int]] = {a: set() for a in nodes}
     for a, b in itertools.combinations(nodes, 2):
+        if anchors is not None and a not in anchors and b not in anchors:
+            continue
         if float(np.linalg.norm(pts[a] - pts[b])) < cut:
             adj[a].add(b)
             adj[b].add(a)
@@ -744,8 +756,10 @@ def _min_vertex_cover(nodes: List[int], pts: NDArray[np.float64], d_nn: float) -
                     chosen = set(subset)
                     if all(a in chosen or b in chosen for a, b in edges):
                         inner = sum(1 for a, b in edges if a in chosen and b in chosen)
-                        if best is None or inner < best[0]:
-                            best = (inner, list(subset))
+                        on_anchor = sum(1 for a in chosen if anchors is None or a in anchors)
+                        key = (inner, -on_anchor)
+                        if best is None or key < best[0]:
+                            best = (key, list(subset))
                 if best is not None:
                     break
             cover.extend(best[1])
@@ -760,6 +774,22 @@ def _min_vertex_cover(nodes: List[int], pts: NDArray[np.float64], d_nn: float) -
                 cover.append(v)
                 remaining = {e for e in remaining if v not in e}
     return cover
+
+
+def _interior_outer(outer: List[int], pts: NDArray[np.float64], d_nn: float) -> Set[int]:
+    """
+    Outer-layer atoms of a (111) facet with all six in-plane nearest
+    neighbours present in the layer, i.e. not on a facet edge or vertex.
+    Bridging (mu2/mu3) ligands are only placed over these.
+    """
+    if not outer:
+        return set()
+    tree = cKDTree(pts[outer])
+    cut = NN_FACTOR * d_nn
+    return {
+        outer[k] for k in range(len(outer))
+        if len(tree.query_ball_point(pts[outer[k]], cut)) - 1 >= 6
+    }
 
 
 def _bulk_bond_length(struct) -> float:
@@ -1028,25 +1058,37 @@ def reconstruct_polar_facets(
     atom_tree = cKDTree(pts)
     an_outer_sets = [set(f.outer) for f in an_facets]
 
-    def _edge_breaks(syms: List[str], alive: NDArray[np.bool_]) -> Dict[int, List[int]]:
+    def _break_runs(syms: List[str], alive: NDArray[np.bool_]) -> Dict[int, List[int]]:
         """
-        Surviving outer anions of an anion-terminated facet that are nearest
-        neighbours of an under-coordinated anion off that facet (runs crossing
-        a facet edge).  These are converted so the run is broken on the facet.
+        Anions to convert so no surviving outer anion of an anion-terminated
+        facet is a nearest neighbour of another under-coordinated anion, on
+        the facet or across its edge.  Minimum alternating set per facet
+        (Se-Se-Se -> Se-Cl-Se), mapped by symmetry when possible.
         """
-        out: Dict[int, List[int]] = {}
+        nodes: Dict[int, List[int]] = {}
+        anchors: Dict[int, Set[int]] = {}
         for k, f in enumerate(an_facets):
-            conv = []
-            for a in f.outer:
-                if not alive[a] or syms[a] != anion:
-                    continue
+            anc = [a for a in f.outer if alive[a] and syms[a] == anion]
+            extra: Set[int] = set()
+            for a in anc:
                 for b in atom_tree.query_ball_point(pts[a], NN_FACTOR * d_nn):
                     if (b != a and b not in an_outer_sets[k] and alive[b] and syms[b] == anion
                             and cn(b, alive) < CN_BULK):
-                        conv.append(a)
-                        break
-            out[k] = conv
-        return out
+                        extra.add(b)
+            nodes[k] = sorted(set(anc) | extra)
+            anchors[k] = set(anc)
+
+        def cover(k: int, eligible: List[int]) -> List[int]:
+            return _min_vertex_cover(eligible, pts, d_nn, anchors=anchors[k] & set(eligible))
+
+        def clean(k: int, conv: List[int]) -> bool:
+            left = [x for x in nodes[k] if x not in set(conv)]
+            return not _min_vertex_cover(left, pts, d_nn, anchors=anchors[k] - set(conv))
+
+        res = _symmetric_selection(an_facets, nodes, ops, cover) if len(an_facets) > 1 else None
+        if res is None or not all(clean(k, res[k]) for k in res):
+            res = {k: cover(k, nodes[k]) for k in nodes}
+        return res
 
     def _execute(n_vac: int) -> dict:
         syms = list(base_symbols)
@@ -1084,34 +1126,15 @@ def reconstruct_polar_facets(
                     converted[facet_of_vac[c]] += 1
                     dq_anion += ligand_charge - q_an
 
-        # Break runs of adjacent surviving outer anions (charge delocalisation).
-        # Runs crossing a facet edge are broken on the facet side first; then
-        # alternating survivors are converted so no two are nearest neighbours.
-        edge_conv = _edge_breaks(syms, alive)
-        for k, conv in edge_conv.items():
+        # Break runs of adjacent surviving outer anions (charge delocalisation),
+        # on the facet and across its edges, with a minimal alternating set.
+        n_breaks = {k: 0 for k in range(len(an_facets))}
+        for k, conv in _break_runs(syms, alive).items():
             for a in conv:
-                syms[a] = recon_ligand
-                dq_anion += ligand_charge - q_an
-        survivors = {
-            k: [a for a in f.outer if alive[a] and syms[a] == anion]
-            for k, f in enumerate(an_facets)
-        }
-        breaks = _symmetric_selection(
-            an_facets, survivors, ops,
-            lambda k, eligible: _min_vertex_cover(eligible, pts, d_nn),
-        ) if len(an_facets) > 1 else None
-
-        def _still_adjacent(k: int, conv: List[int]) -> bool:
-            left = set(survivors[k]) - set(conv)
-            return bool(_min_vertex_cover(sorted(left), pts, d_nn))
-
-        if breaks is None or any(_still_adjacent(k, breaks[k]) for k in breaks):
-            breaks = {k: _min_vertex_cover(survivors[k], pts, d_nn) for k in survivors}
-        for k, conv in breaks.items():
-            for a in conv:
-                syms[a] = recon_ligand
-                dq_anion += ligand_charge - q_an
-        n_breaks = {k: len(breaks[k]) + len(edge_conv[k]) for k in breaks}
+                if syms[a] == anion:
+                    syms[a] = recon_ligand
+                    dq_anion += ligand_charge - q_an
+                    n_breaks[k] += 1
         q = q0 + dq_anion
 
         # ---- 2. strip one-bonded ligands from cation-terminated facets -----
@@ -1138,11 +1161,28 @@ def reconstruct_polar_facets(
         n_remove = q // q_cat if q > 0 else 0
         base = n_remove // len(cat_facets)
 
+        # Surviving outer anions of the anion-terminated facets: a cation
+        # removal must not leave a fresh under-coordinated anion next to them
+        # (that would re-create a run and force another anion -> ligand swap).
+        anchor_pts = [
+            pts[a] for f in an_facets for a in f.outer if alive[a] and syms[a] == anion
+        ]
+        anchor_tree = cKDTree(np.asarray(anchor_pts)) if anchor_pts else None
+
+        def joins_run(c: int) -> bool:
+            if anchor_tree is None:
+                return False
+            for a in nb[c]:
+                if alive[a] and syms[a] == anion and cn(a, alive) == CN_BULK:
+                    if anchor_tree.query_ball_point(pts[a], NN_FACTOR * d_nn):
+                        return True
+            return False
+
         def cat_candidates(k: int, allow_ligand_nb: bool) -> List[int]:
             own = facets.index(cat_facets[k])
             out = []
             for c in cat_facets[k].outer:
-                if not alive[c] or touches_other_facet(c, own, alive):
+                if not alive[c] or touches_other_facet(c, own, alive) or joins_run(c):
                     continue
                 live_nb = [a for a in nb[c] if alive[a]]
                 if not allow_ligand_nb and any(syms[a] == recon_ligand for a in live_nb):
@@ -1199,12 +1239,13 @@ def reconstruct_polar_facets(
 
         # Cation removals can leave new under-coordinated anions next to an
         # anion-facet edge: break those runs too (compensated by ligands below).
-        for k, conv in _edge_breaks(syms, alive).items():
+        for k, conv in _break_runs(syms, alive).items():
             for a in conv:
-                syms[a] = recon_ligand
-                dq_anion += ligand_charge - q_an
-                q += ligand_charge - q_an
-                n_breaks[k] += 1
+                if syms[a] == anion:
+                    syms[a] = recon_ligand
+                    dq_anion += ligand_charge - q_an
+                    q += ligand_charge - q_an
+                    n_breaks[k] += 1
 
         # ---- 4. remainder: add ligands on cation-facet sites ---------------
         keep = np.where(alive)[0]
@@ -1216,11 +1257,17 @@ def reconstruct_polar_facets(
         mu_added = {3: 0, 2: 0, 1: 0}
         facet_count: Dict[int, int] = {k: 0 for k in range(len(cat_facets))}
         if n_add > 0:
-            host_normal = {
+            free_hosts = {
                 remap[i]: f.normal
                 for f in cat_facets for i in f.outer
                 if alive[i] and cn(i, alive) < CN_BULK
             }
+            # Bridging sites only over interior cations (no facet edges).
+            interior = set().union(*(_interior_outer(f.outer, pts, d_nn) for f in cat_facets))
+            host_normal = {remap[i]: n for i, n in (
+                (i, f.normal) for f in cat_facets for i in f.outer
+                if alive[i] and cn(i, alive) < CN_BULK and i in interior
+            )}
             host_facet = {
                 remap[i]: k
                 for k, f in enumerate(cat_facets) for i in f.outer
@@ -1248,7 +1295,7 @@ def reconstruct_polar_facets(
 
             # Last resort: on-top (mu1) on the remaining free cations.
             if added < n_add:
-                hosts = [h for h in host_normal if h not in used_hosts]
+                hosts = [h for h in free_hosts if h not in used_hosts]
                 planes: List[Plane] = [(f.normal, f.top) for f in facets]
                 missing_vecs = _strict_missing_vectors_for_hosts(
                     new_symbols, new_pts, hosts, charges, pair_cuts, struct, planes, surf_tol
