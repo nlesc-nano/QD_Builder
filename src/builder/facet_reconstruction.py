@@ -17,8 +17,8 @@ Algorithm:
      Surviving outer anions that are still nearest neighbours of each other
      (charge-delocalising runs) are broken by converting alternating ones to
      the ligand (minimum vertex cover), each adding q_lig - q_an.
-  2. Cation-terminated {111} facets: strip the one-bonded ligands that
-     passivated them after the build.
+  2. Cation-terminated {111} facets: strip the ligands that passivated them
+     after the build (on-top, bridging or hollow, above the outer layer).
   3. Compensate the accumulated positive charge by removing non-adjacent outer
      cations on the cation-terminated facets, spread evenly (maximin).  Any
      remainder smaller than one cation charge is balanced by adding ligands on
@@ -1120,11 +1120,19 @@ def reconstruct_polar_facets(
         for li, s in enumerate(syms):
             if s != recon_ligand or not alive[li]:
                 continue
+            # Any ligand added on top of a cation-terminated facet (mu1 on-top,
+            # mu2 bridge, mu3 hollow): all hosts on that facet's outer layer and
+            # sitting above it.  Lattice-site ligands in the layer below stay.
             hosts = [j for j in nb[li] if alive[j] and syms[j] == cation]
-            if len(hosts) == 1 and hosts[0] in cat_outer:
-                alive[li] = False
-                stripped[cat_outer[hosts[0]]] += 1
-                q -= ligand_charge
+            if not hosts or any(h not in cat_outer for h in hosts):
+                continue
+            k = cat_outer[hosts[0]]
+            f = cat_facets[k]
+            if any(cat_outer[h] != k for h in hosts) or float(pts[li] @ f.normal) < f.top + LAYER_TOL:
+                continue
+            alive[li] = False
+            stripped[k] += 1
+            q -= ligand_charge
 
         # ---- 3. outer-cation vacancies on cation-terminated facets ---------
         n_remove = q // q_cat if q > 0 else 0
