@@ -782,204 +782,6 @@ def _priority3_balance_positive_q_remove(
 
     return False, symbols, pts
 
-def _balanced_positive_q_add_picks(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    *,
-    sub: List[Tuple[int, np.ndarray, float, int, int, int]],
-    merged_cif_sites: List[dict],
-    zb_pair: Optional[Tuple[str, str]],
-    ref_struct,
-    charges: Dict[str, int],
-    ligand: str,
-    pair_cuts: Optional[PairCuts],
-    cn_bi: NDArray[np.int_],
-    bulk_map: Optional[Dict[str, int]],
-    pt_tree: cKDTree,
-    frames: List[Plane],
-    surf_tol: float,
-    add_count_facet: Dict[int, int],
-    max_to_add: int,
-    d_exclude: float,
-    position_ok=None,
-) -> List[dict]:
-    """
-    Deterministic, facet-balanced ligand additions (all materials).
-
-    Candidates are the bulk-lattice virtual sites of the missing anions
-    (multiplicity = number of cations sharing the site: mu1 on-top, mu2/mu3
-    bridges).  For binary zinc-blende II-VI dots, mu3 hollows and mu2 bridges
-    over free cations of cation-terminated {111} facets are added.
-
-    Bridges are budgeted: one is only taken if the free cations left after it
-    can still host every ligand still needed (at worst as mu1), so the charge
-    balance stays reachable and no cation exceeds bulk CN.
-
-    Priority per pick: largest remaining CN deficit among the site's hosts
-    (lowest CN first, updated after every pick), then
-      zinc-blende: no over-coordination, then site type (II-VI
-        mu3 > mu2 > mu1; III-V mu1 first);
-      other materials: net repair (cations raised toward bulk CN minus
-        cations pushed above it), then higher multiplicity;
-    then the facet with the fewest additions so far, then the site farthest
-    from all ligands (maximin), then lowest host index.
-    """
-    from .facet_reconstruction import (
-        _ligand_separation,
-        _bridging_sites,
-        _bulk_bond_length,
-        _nn_cation_distance,
-        _polar_111_facets,
-    )
-
-    is_ii_vi = zb_pair is not None and int(charges.get(zb_pair[0], 0)) == 2
-    is_iii_v = zb_pair is not None and not is_ii_vi
-    sub_records = {rec[0]: rec for rec in sub}
-
-    def deficit(h: int) -> int:
-        target = int(bulk_map.get(symbols[h], 4) if bulk_map is not None else 4)
-        return max(0, target - int(cn_bi[h]))
-
-    cands: List[dict] = []
-    for site in merged_cif_sites:
-        hosts = [int(h) for h in site["hosts"]]
-        if hosts[0] not in sub_records:
-            continue
-        if position_ok is not None and not position_ok(np.asarray(site["pos"], float)):
-            continue
-        cands.append({"pos": np.asarray(site["pos"], float), "hosts": tuple(hosts), "mu": len(hosts)})
-
-    cat_facets = (
-        [f for f in _polar_111_facets(symbols, pts, ref_struct, *zb_pair) if f.kind == "cation"]
-        if zb_pair is not None else []
-    )
-    host_111 = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
-    if is_ii_vi:
-        # mu3/mu2 only between cations of the facet with the same CN (one
-        # missing bond); sites too close to existing ligands are rejected.
-        d_nn = _nn_cation_distance(ref_struct)
-        ligand_now = {j for j, sym in enumerate(symbols) if sym == ligand}
-        cations_now = {j for j, sym in enumerate(symbols) if int(charges.get(sym, 0)) > 0}
-        host_normal = {
-            i: f.normal for f in cat_facets for i in f.outer
-            if i in sub_records and deficit(i) == 1
-        }
-        if host_normal:
-            bond = _bulk_bond_length(ref_struct)
-            for mu in (3, 2):
-                for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond, ligand_now, cations_now):
-                    cands.append({"pos": np.asarray(pos, float), "hosts": tuple(hs), "mu": mu})
-
-    for c in cands:
-        _score, _gain, touched, over = _trial_ligand_addition_score(
-            symbols, pts, charges, ligand, pair_cuts, c["pos"],
-            host_idx=c["hosts"][0], cn_before=cn_bi, pt_tree=pt_tree, bulk_map=bulk_map,
-            max_search_cut=max(4.5, abs(_pair_cut_calibrated(symbols[c["hosts"][0]], ligand, pair_cuts)) + 1.0),
-            ref_struct=ref_struct,
-        )
-        c["over"] = int(over)
-        # Cations raised toward bulk CN minus cations pushed above it.
-        c["net"] = int(touched) - 2 * int(over)
-        c["rec"] = sub_records[c["hosts"][0]]
-        c["inc"] = tuple(sorted(_incident_facets(c["hosts"][0], pts, frames, surf_tol))) or (c["rec"][5],)
-        c["type_rank"] = -c["mu"] if is_iii_v else c["mu"]
-        # Balance per cation-{111} facet when the site sits on one, else per
-        # incident Wulff facet.
-        c["bal"] = ("111", host_111[c["hosts"][0]]) if c["hosts"][0] in host_111 else None
-
-    taken: List[NDArray[np.float64]] = [pts[i] for i, sym in enumerate(symbols) if sym == ligand]
-    bridge_sep = _ligand_separation(_bulk_bond_length(ref_struct))
-    use: Dict[int, int] = defaultdict(int)
-    counts = defaultdict(int, add_count_facet)
-    counts_111: Dict[int, int] = defaultdict(int)
-    added_on_facet: Dict[tuple, List[NDArray[np.float64]]] = {}
-    # Ligands already added on a cation-{111} facet in earlier passes (they sit
-    # above its outer layer): later passes spread relative to them too.
-    for k, f in enumerate(cat_facets):
-        outer = set(f.outer)
-        for j, sym in enumerate(symbols):
-            if sym != ligand or float(pts[j] @ f.normal) <= f.top + 0.1:
-                continue
-            host_d, host_i = min(
-                (float(np.linalg.norm(pts[i] - pts[j])), i) for i in f.outer
-            )
-            if host_i in outer and host_d <= _pair_cut_calibrated(symbols[host_i], ligand, pair_cuts):
-                added_on_facet.setdefault(("111", k), []).append(pts[j])
-                counts_111[k] += 1
-    picks: List[dict] = []
-    # Cations that can still take a terminal ligand: the budget for bridges.
-    mu1_hosts = {c["hosts"][0] for c in cands if c["mu"] == 1}
-
-    def free_capacity(extra_hosts=()) -> int:
-        extra = set(extra_hosts)
-        return sum(
-            max(0, deficit(h) - use[h] - (1 if h in extra else 0)) for h in mu1_hosts
-        )
-
-    while len(picks) < max_to_add:
-        taken_arr = np.asarray(taken, float) if taken else None
-        remaining_after = max_to_add - len(picks) - 1
-        elig = []
-        for c in cands:
-            if any(use[h] + 1 > deficit(h) for h in c["hosts"]):
-                continue
-            # A bridge must leave enough free cations for every ligand still
-            # needed (at worst as mu1); otherwise prefer lower-mu sites.
-            if c["mu"] >= 2 and free_capacity(c["hosts"]) < remaining_after:
-                continue
-            dmin = float(np.min(np.linalg.norm(taken_arr - c["pos"], axis=1))) if taken_arr is not None else np.inf
-            if dmin < (max(d_exclude, bridge_sep) if c["mu"] >= 2 else d_exclude):
-                continue
-            elig.append((c, dmin))
-        if not elig:
-            break
-        # Lowest CN first, updated after every pick: the most under-
-        # coordinated remaining host of a site sets its priority.
-        need = lambda c: max(deficit(h) - use[h] for h in c["hosts"])
-        if zb_pair is not None:
-            level = lambda c: (need(c), c["over"] == 0, c["type_rank"])
-        else:
-            level = lambda c: (need(c), c["net"], c["type_rank"])
-        best_level = max(level(c) for c, _ in elig)
-        elig = [(c, d) for c, d in elig if level(c) == best_level]
-
-        def balance(c: dict) -> float:
-            if c["bal"] is not None:
-                return float(counts_111[c["bal"][1]])
-            return float(np.mean([counts[f] for f in c["inc"]]))
-
-        least = min(balance(c) for c, _ in elig)
-        elig = [(c, d) for c, d in elig if balance(c) == least]
-        # Spread the added ligands of a facet among themselves first (maximin
-        # to earlier additions on the same facet); once every free site is a
-        # nearest neighbour of an addition (crowded facets), break the tie by
-        # the least local crowding (sum of 1/d^3 to the facet's additions)
-        # instead of atom order, then by distance to all ligands.
-        def spread_key(cd):
-            c, d_all = cd
-            same = added_on_facet.get(c["bal"], []) if c["bal"] is not None else []
-            if same:
-                d = np.linalg.norm(np.asarray(same) - c["pos"], axis=1)
-                d_same, crowd = float(d.min()), float(np.sum(1.0 / np.maximum(d, 1e-6) ** 3))
-            else:
-                d_same, crowd = np.inf, 0.0
-            return (round(d_same, 2), -round(crowd, 6), round(d_all, 6), tuple(-h for h in c["hosts"]))
-
-        best, dmin = max(elig, key=spread_key)
-        cands = [x for x in cands if x is not best]
-        picks.append(dict(best, dmin_3d=dmin))
-        taken.append(best["pos"])
-        if best["bal"] is not None:
-            added_on_facet.setdefault(best["bal"], []).append(best["pos"])
-        for h in best["hosts"]:
-            use[h] += 1
-        for f in best["inc"]:
-            counts[f] += 1
-        if best["bal"] is not None:
-            counts_111[best["bal"][1]] += 1
-    return picks
-
-
 
 # ---------- PRIORITY 3C: Q>0 — add anion ligands (outer-only; UNIQUE>EDGE>VERTEX) ----------
 def _priority3_balance_positive_q_add(
@@ -1070,6 +872,55 @@ def _priority3_balance_positive_q_add(
     if not by_def:
         return False, symbols, pts
     # Prioritize largest deficit first for physical structural stability
+    # Shared ligand-site selector (builder.ligand_sites): one set of rules for
+    # every material and for the reconstruction; lowest CN first is handled
+    # inside, so all under-coordinated hosts are passed at once.
+    if ref_struct is not None:
+        from .ligand_sites import select_ligand_sites
+
+        q_now = _total_Q(symbols, charges)
+        n_max = max(1, int(q_now // abs(charges.get(ligand, 1))))
+        position_ok = None
+        if stack_passivation and not include_sublayer:
+            position_ok = lambda pos: _ligand_position_allowed(pos, symbols, pts, ligand)
+        rec_of = {rec[0]: rec for rec in sites}
+        picks = select_ligand_sites(
+            symbols, pts,
+            host_deficit={i: int(rec[3]) for i, rec in rec_of.items()},
+            n_needed=n_max, struct=ref_struct, charges=charges, ligand=ligand,
+            pair_cuts=pair_cuts, planes=planes_raw, surf_tol=surf_tol, zb_pair=zb_pair,
+            bulk_map=bulk_map, position_ok=position_ok,
+            min_ligand_dist=1.8 if include_sublayer else 3.0,
+        )
+        if picks:
+            mu_count: Dict[int, int] = defaultdict(int)
+            for rank_num, c in enumerate(picks, start=1):
+                primary_host = c["hosts"][0]
+                cn_before = int(cn_bi[primary_host])
+                symbols.append(ligand)
+                pts = np.vstack([pts, c["pos"]])
+                if atom_regions is not None:
+                    atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
+                _record_uv_allfacets(primary_host, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                inc = _incident_facets(primary_host, pts, frames, surf_tol) or [rec_of[primary_host][5]]
+                for add_fid in inc:
+                    add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
+                for h in c["hosts"]:
+                    host_taken[h] = host_taken.get(h, 0) + 1
+                mu_count[c["mu"]] += 1
+                if verbose:
+                    print(
+                        f"  [batch:add] rank #{rank_num}: place {ligand} mu{c['mu']} on "
+                        f"{symbols[primary_host]}#{primary_host} (CN={cn_before}, facet={c['facet']}, "
+                        f"deficit={rec_of[primary_host][3]})"
+                    )
+            mu_txt = ", ".join(f"mu{k}={v}" for k, v in sorted(mu_count.items(), reverse=True))
+            print(
+                f"[batch:add] Added {len(picks)} '{ligand}' ligand(s) in this pass ({mu_txt}) | "
+                f"Q: {q_now:+d} → {_total_Q(symbols, charges):+d}"
+            )
+            return True, symbols, pts
+
     ordered_defs = sorted(by_def.keys(), reverse=True)
 
     # Try deficits in descending order; within each, try roles VERTEX(2)→EDGE(1)→UNIQUE(0)
@@ -1131,49 +982,6 @@ def _priority3_balance_positive_q_add(
             except Exception as e:
                 if verbose:
                     print(f"[debug:add] compute_cif_virtual_sites failed for host tier: {e}. Falling back to standard normal.")
-
-        if merged_cif_sites:
-            q_now = _total_Q(symbols, charges)
-            n_max = max(1, int(q_now // abs(charges.get(ligand, 1))))
-            position_ok = None
-            if stack_passivation and not include_sublayer:
-                position_ok = lambda pos: _ligand_position_allowed(pos, symbols, pts, ligand)
-            picks = _balanced_positive_q_add_picks(
-                symbols, pts,
-                sub=sub, merged_cif_sites=merged_cif_sites, zb_pair=zb_pair, ref_struct=ref_struct,
-                charges=charges, ligand=ligand, pair_cuts=pair_cuts, cn_bi=cn_bi, bulk_map=bulk_map,
-                pt_tree=pt_tree, frames=frames, surf_tol=surf_tol, add_count_facet=add_count_facet,
-                max_to_add=n_max, d_exclude=1.8 if include_sublayer else 3.0,
-                position_ok=position_ok,
-            )
-            if not picks:
-                continue
-            mu_count: Dict[int, int] = defaultdict(int)
-            for rank_num, c in enumerate(picks, start=1):
-                primary_host = c["hosts"][0]
-                cn_before = int(cn_bi[primary_host])
-                symbols.append(ligand)
-                pts = np.vstack([pts, c["pos"]])
-                if atom_regions is not None:
-                    atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
-                _record_uv_allfacets(primary_host, pts, frames, surf_tol, uv_taken, edit_count_facet)
-                for add_fid in c["inc"]:
-                    add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
-                for h in c["hosts"]:
-                    host_taken[h] = host_taken.get(h, 0) + 1
-                mu_count[c["mu"]] += 1
-                if verbose:
-                    print(
-                        f"  [batch:add] rank #{rank_num}: place {ligand} mu{c['mu']} on "
-                        f"{symbols[primary_host]}#{primary_host} (CN={cn_before}, facet={c['rec'][5]}, "
-                        f"deficit={def_tier}, dmin_3d={c['dmin_3d']:.2f})"
-                    )
-            mu_txt = ", ".join(f"mu{k}={v}" for k, v in sorted(mu_count.items(), reverse=True))
-            print(
-                f"[batch:add] Added {len(picks)} '{ligand}' ligand(s) in this pass ({mu_txt}) | "
-                f"Q: {q_now:+d} → {_total_Q(symbols, charges):+d}"
-            )
-            return True, symbols, pts
 
         if merged_cif_sites:
             # We have exact crystallographic virtual sites (single and bridges)
