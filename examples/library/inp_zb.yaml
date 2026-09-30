@@ -6,7 +6,7 @@ phase: zinc-blende
 cif: ../cifs/InP_zb.cif
 native_elements: [In, P]           # formula order; everything else is a ligand
 centres: [In, P]
-sizes: {start: 0.5, stop: 6.0, step: 0.25}   # unit cells, cubic
+sizes: {start: 0.5, stop: 3.0, step: 0.25}   # unit cells, cubic ({111}-only dots grow fast)
 positive_q_mode: add
 reconstruction: auto               # auto: add a {111}-reconstructed variant when it applies
 min_core_atoms: 20
