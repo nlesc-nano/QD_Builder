@@ -47,7 +47,7 @@ from .nc_types import Facet, FacetReconstructionSpec, SurfaceReconstructionSpec,
 
 CN_BULK = 4
 LAYER_TOL = 0.4       # Å, half-thickness of one atomic (111) layer
-MIN_FACET_ATOMS = 6   # outer-layer atoms needed to call a <111> direction a facet
+MIN_FACET_ATOMS = 3   # outer-layer atoms needed to call a <111> direction a facet (smallest (111) triangle)
 SYM_TOL = 0.3         # Å, position tolerance when testing cluster rotations
 NN_FACTOR = 1.15      # cation-cation nearest-neighbour conflict radius / d_nn
 LIGAND_SEP = 0.95     # min bridging-ligand to ligand distance / bulk anion-anion distance (a/sqrt 2)
@@ -1175,7 +1175,11 @@ def reconstruct_polar_facets(
 
         # ---- 2. strip one-bonded ligands from cation-terminated facets -----
         stripped = {k: 0 for k in range(len(cat_facets))}
-        cat_outer = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
+        # Cations on an edge shared by two cation-terminated facets belong to both.
+        cat_outer: Dict[int, Set[int]] = {}
+        for k, f in enumerate(cat_facets):
+            for i in f.outer:
+                cat_outer.setdefault(i, set()).add(k)
         for li, s in enumerate(syms):
             if s != recon_ligand or not alive[li]:
                 continue
@@ -1185,12 +1189,15 @@ def reconstruct_polar_facets(
             hosts = [j for j in nb[li] if alive[j] and syms[j] == cation]
             if not hosts or any(h not in cat_outer for h in hosts):
                 continue
-            k = cat_outer[hosts[0]]
-            f = cat_facets[k]
-            if any(cat_outer[h] != k for h in hosts) or float(pts[li] @ f.normal) < f.top + LAYER_TOL:
+            shared = set.intersection(*(cat_outer[h] for h in hosts))
+            above = [
+                k for k in sorted(shared)
+                if float(pts[li] @ cat_facets[k].normal) >= cat_facets[k].top + LAYER_TOL
+            ]
+            if not above:
                 continue
             alive[li] = False
-            stripped[k] += 1
+            stripped[above[0]] += 1
             q -= ligand_charge
 
         # ---- 3. outer-cation vacancies on cation-terminated facets ---------
@@ -1275,6 +1282,11 @@ def reconstruct_polar_facets(
                 for f in cat_facets for i in f.outer
                 if alive[i] and cn(i, alive) < CN_BULK
             }
+            host_deficit = {
+                remap[i]: CN_BULK - cn(i, alive)
+                for f in cat_facets for i in f.outer
+                if alive[i] and cn(i, alive) < CN_BULK
+            }
             # Bridging (mu3/mu2) only between cations with the same CN (one
             # missing bond); sites too close to existing ligands are rejected.
             host_normal = {
@@ -1310,29 +1322,49 @@ def reconstruct_polar_facets(
                     added += 1
                     mu_added[mu] += 1
 
-            # Last resort: on-top (mu1) on the remaining free cations.
+            # Last resort: terminal (mu1) ligands on the remaining free cations,
+            # lowest CN first; a cation takes up to its missing bonds (one per
+            # missing bond direction), keeping the ligand spacing when possible.
             if added < n_add:
-                hosts = [h for h in free_hosts if h not in used_hosts]
+                left = {h: host_deficit[h] - (1 if h in used_hosts else 0) for h in free_hosts}
+                hosts = [h for h, d in left.items() if d > 0]
                 planes: List[Plane] = [(f.normal, f.top) for f in facets]
                 missing_vecs = _strict_missing_vectors_for_hosts(
                     new_symbols, new_pts, hosts, charges, pair_cuts, struct, planes, surf_tol
                 )
-                slots = [(h, vecs[0]) for h, vecs in missing_vecs.items() if vecs]
+                slots = [(h, np.asarray(v, float)) for h, vecs in missing_vecs.items() for v in vecs[:left[h]]]
+
+                def slot_pos(sl) -> NDArray[np.float64]:
+                    h, v = sl
+                    blen = 0.84 * _pair_cut_calibrated(new_symbols[h], recon_ligand, pair_cuts)
+                    return new_pts[h] + blen * v / np.linalg.norm(v)
+
+                sep = _ligand_separation(bond)
+                ligand_pos = [new_pts[k] for k, sym in enumerate(new_symbols) if sym == recon_ligand]
                 picked_slots: List[Tuple[int, np.ndarray]] = []
+                picked_pos: List[NDArray[np.float64]] = []
                 while slots and len(picked_slots) < n_add - added:
-                    ref = avoid + placed + [new_pts[h] for h, _ in picked_slots]
-                    least = min(facet_count[host_facet[h]] for h, _ in slots)
-                    pool = [sl for sl in slots if facet_count[host_facet[sl[0]]] == least]
+                    near = ligand_pos + placed + picked_pos
+                    spaced = [sl for sl in slots
+                              if all(float(np.linalg.norm(slot_pos(sl) - q)) >= sep for q in near)]
+                    pool = spaced or slots
+                    top_need = max(left[sl[0]] for sl in pool)
+                    pool = [sl for sl in pool if left[sl[0]] == top_need]
+                    least = min(facet_count[host_facet[h]] for h, _ in pool)
+                    pool = [sl for sl in pool if facet_count[host_facet[sl[0]]] == least]
+                    ref = avoid + placed + picked_pos
                     if ref:
                         ref_arr = np.asarray(ref, float)
-                        best = max(pool, key=lambda s: (
-                            round(float(np.min(np.linalg.norm(ref_arr - new_pts[s[0]], axis=1))), 6), -s[0]))
+                        best = max(pool, key=lambda sl: (
+                            round(float(np.min(np.linalg.norm(ref_arr - slot_pos(sl), axis=1))), 6), -sl[0]))
                     else:
                         best = pool[0]
                     facet_count[host_facet[best[0]]] += 1
                     picked_slots.append(best)
-                    slots = [s for s in slots if s[0] != best[0]]
-                for pos in _ligand_add_positions_for_slots(new_symbols, new_pts, picked_slots, recon_ligand, pair_cuts):
+                    picked_pos.append(slot_pos(best))
+                    left[best[0]] -= 1
+                    slots = [sl for sl in slots if sl is not best and left[sl[0]] > 0]
+                for pos in picked_pos:
                     new_symbols.append(recon_ligand)
                     new_pts = np.vstack([new_pts, np.asarray(pos, float)])
                     added += 1

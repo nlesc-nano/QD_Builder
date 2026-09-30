@@ -893,6 +893,19 @@ def _balanced_positive_q_add_picks(
     counts = defaultdict(int, add_count_facet)
     counts_111: Dict[int, int] = defaultdict(int)
     added_on_facet: Dict[tuple, List[NDArray[np.float64]]] = {}
+    # Ligands already added on a cation-{111} facet in earlier passes (they sit
+    # above its outer layer): later passes spread relative to them too.
+    for k, f in enumerate(cat_facets):
+        outer = set(f.outer)
+        for j, sym in enumerate(symbols):
+            if sym != ligand or float(pts[j] @ f.normal) <= f.top + 0.1:
+                continue
+            host_d, host_i = min(
+                (float(np.linalg.norm(pts[i] - pts[j])), i) for i in f.outer
+            )
+            if host_i in outer and host_d <= _pair_cut_calibrated(symbols[host_i], ligand, pair_cuts):
+                added_on_facet.setdefault(("111", k), []).append(pts[j])
+                counts_111[k] += 1
     picks: List[dict] = []
     # Cations that can still take a terminal ligand: the budget for bridges.
     mu1_hosts = {c["hosts"][0] for c in cands if c["mu"] == 1}
@@ -938,12 +951,19 @@ def _balanced_positive_q_add_picks(
         least = min(balance(c) for c, _ in elig)
         elig = [(c, d) for c, d in elig if balance(c) == least]
         # Spread the added ligands of a facet among themselves first (maximin
-        # to earlier additions on the same facet), then away from all ligands.
+        # to earlier additions on the same facet); once every free site is a
+        # nearest neighbour of an addition (crowded facets), break the tie by
+        # the least local crowding (sum of 1/d^3 to the facet's additions)
+        # instead of atom order, then by distance to all ligands.
         def spread_key(cd):
             c, d_all = cd
             same = added_on_facet.get(c["bal"], []) if c["bal"] is not None else []
-            d_same = min((float(np.linalg.norm(c["pos"] - q)) for q in same), default=np.inf)
-            return (round(d_same, 3), round(d_all, 6), tuple(-h for h in c["hosts"]))
+            if same:
+                d = np.linalg.norm(np.asarray(same) - c["pos"], axis=1)
+                d_same, crowd = float(d.min()), float(np.sum(1.0 / np.maximum(d, 1e-6) ** 3))
+            else:
+                d_same, crowd = np.inf, 0.0
+            return (round(d_same, 2), -round(crowd, 6), round(d_all, 6), tuple(-h for h in c["hosts"]))
 
         best, dmin = max(elig, key=spread_key)
         cands = [x for x in cands if x is not best]
