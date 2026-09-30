@@ -150,7 +150,7 @@ class SurfaceReconstructionSpec:
     # Cations removed on the cation-{111} facets: "max" (as many as the
     # charge allows, rest as ligands), "mirror" (as many as the cation
     # vacancies made on the {-1-1-1} facets, rest as ligands), or "auto"
-    # (mirror for III-V, max for II-VI).
+    # (mirror, for II-VI and III-V).
     cation_removal: str = "auto"
 
 
