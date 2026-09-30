@@ -16,7 +16,9 @@ Algorithm:
      (CdSe: -2 + 3 = +1, InAs: -3 + 6 = +3).
      Surviving outer anions that are still nearest neighbours of each other
      (charge-delocalising runs) are broken by converting alternating ones to
-     the ligand (minimum vertex cover), each adding q_lig - q_an.
+     the ligand (minimum vertex cover), each adding q_lig - q_an.  On the
+     smallest facets this means: one anion -> ligand; three anions -> two
+     ligands; larger facets follow the vacancy + run rules.
   2. Cation-terminated {111} facets: strip the ligands that passivated them
      after the build (on-top, bridging or hollow, above the outer layer),
      never taking a cation below terrace CN (bulk - 1).
@@ -1040,6 +1042,16 @@ def reconstruct_polar_facets(
         for k, conv in _break_runs(syms, alive).items():
             for a in conv:
                 if syms[a] == anion:
+                    syms[a] = recon_ligand
+                    dq_anion += ligand_charge - q_an
+                    n_breaks[k] += 1
+        # Smallest facets: a single outer anion (an apex over three cations)
+        # becomes the ligand; a three-anion facet is already broken to one
+        # anion by the rule above.
+        for k, f in enumerate(an_facets):
+            if len(f.outer) == 1:
+                a = f.outer[0]
+                if alive[a] and syms[a] == anion:
                     syms[a] = recon_ligand
                     dq_anion += ligand_charge - q_an
                     n_breaks[k] += 1
