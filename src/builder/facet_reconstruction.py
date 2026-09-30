@@ -782,6 +782,16 @@ def _bulk_bond_length(struct) -> float:
     return float(struct.lattice.a) * np.sqrt(3.0) / 4.0
 
 
+def _cation_shell_separator(bond: float) -> float:
+    """
+    Bonded / non-bonded cation-anion separator for zinc blende: midway
+    between the first shell (the bond, a*sqrt(3)/4) and the second shell
+    (a*sqrt(11)/4), i.e. 3.88 A for CdSe.  An added ligand closer than this
+    to a cation counts as bonded to it.
+    """
+    return 0.5 * bond * (1.0 + np.sqrt(11.0 / 3.0))
+
+
 def _bridging_sites(
     host_normal: Dict[int, NDArray[np.float64]],
     pts: NDArray[np.float64],
@@ -795,32 +805,39 @@ def _bridging_sites(
     Candidate positions for a ligand bridging `mu` (3 or 2) mutually adjacent
     free cations of one cation-terminated (111) facet, at the bulk bond length
     from each host.  mu3 sits in a hollow; mu2 sits over the shared edge,
-    tilted toward the side with the most room.  Positions closer than
-    1.1 * bond to any non-host atom (e.g. the hollow above a sub-surface
-    anion), or closer than LIGAND_SEP * bond to an existing ligand
-    (`ligand_idx`) or to a cation that is not a host (`cation_idx`), are
-    rejected.  The cation rule keeps a tilted mu2 from leaning over a third
-    cation and bonding to it beyond its CN.
+    tilted toward the side with the most room.  A site is rejected when it
+    is closer than
+      * 1.1 * bond to an anion (e.g. the hollow above a sub-surface anion),
+      * LIGAND_SEP * bond to an existing ligand (`ligand_idx`),
+      * the bulk shell separator (`_cation_shell_separator`, midway between
+        the first- and second-shell cation-anion distances) to any cation
+        that is not a host (`cation_idx`): closer than that the ligand is
+        effectively bonded to it, beyond its CN.
+    On a flat cation-(111) terrace the last rule leaves no room for mu2 (every
+    tilt that clears the anion below leans over a third cation), so terraces
+    get mu3 hollows and mu1; mu2 remains where the geometry allows it.
     """
     hosts = sorted(host_normal)
     if len(hosts) < mu:
         return []
     tree = cKDTree(pts)
-    min_clear = 1.1 * bond
+    min_clear = 1.0   # clearance() is a ratio: distance / required distance
     cut = NN_FACTOR * d_nn
     ligand_idx = ligand_idx or set()
     cation_idx = cation_idx or set()
+    need_other = 1.1 * bond
+    need_ligand = LIGAND_SEP * bond
+    need_cation = _cation_shell_separator(bond)
 
     def clearance(pos: NDArray[np.float64], hs: Tuple[int, ...]) -> float:
-        """Distance margin, normalised so >= min_clear means acceptable."""
+        """Smallest distance/required-distance ratio to a non-host atom (>= 1 is acceptable)."""
         worst = np.inf
-        for j in tree.query_ball_point(pos, 2.0 * bond):
+        for j in tree.query_ball_point(pos, 1.05 * need_cation + 0.5):
             if j in hs:
                 continue
             d = float(np.linalg.norm(pts[j] - pos))
-            if j in ligand_idx or j in cation_idx:
-                d *= 1.1 / LIGAND_SEP   # ligands and non-host cations need LIGAND_SEP * bond
-            worst = min(worst, d)
+            need = need_cation if j in cation_idx else (need_ligand if j in ligand_idx else need_other)
+            worst = min(worst, d / need)
         return worst
 
     htree = cKDTree(pts[hosts])
