@@ -31,7 +31,9 @@ def expand_facets(s: Structure, seeds: list[Facet], proper_only: bool = True) ->
         scope = getattr(f, "scope", "family")
         if scope == "facet":
             continue
-        n0 = unit_normal(s, (f.h, f.k, f.l))  # use your existing helper
+        # Rotate the reciprocal vector itself (not the unit normal): its
+        # coefficients in the reciprocal basis are integers for any lattice size.
+        n0 = s.lattice.reciprocal_lattice.get_cartesian_coords((f.h, f.k, f.l))
         for op in ops:
             R = op.rotation_matrix
             if proper_only and np.linalg.det(R) < 0.999:   # filter improper (rotoinversions/reflections)
@@ -53,7 +55,7 @@ def expand_facets(s: Structure, seeds: list[Facet], proper_only: bool = True) ->
         explicit_keys = {(f.h, f.k, f.l) for f in explicit}
         required: set[tuple[int, int, int]] = set()
         for f in explicit:
-            n0 = unit_normal(s, (f.h, f.k, f.l))
+            n0 = s.lattice.reciprocal_lattice.get_cartesian_coords((f.h, f.k, f.l))
             for op in ops:
                 R = op.rotation_matrix
                 if proper_only and np.linalg.det(R) < 0.999:
