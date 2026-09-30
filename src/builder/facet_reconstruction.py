@@ -47,7 +47,7 @@ from .nc_types import Facet, FacetReconstructionSpec, SurfaceReconstructionSpec,
 
 CN_BULK = 4
 LAYER_TOL = 0.4       # Å, half-thickness of one atomic (111) layer
-MIN_FACET_ATOMS = 3   # outer-layer atoms needed to call a <111> direction a facet (smallest (111) triangle)
+MIN_FACET_ATOMS = 1   # any <111> direction whose outermost native layer is one species is a polar facet
 SYM_TOL = 0.3         # Å, position tolerance when testing cluster rotations
 NN_FACTOR = 1.15      # cation-cation nearest-neighbour conflict radius / d_nn
 LIGAND_SEP = 0.95     # min bridging-ligand to ligand distance / bulk anion-anion distance (a/sqrt 2)
@@ -312,83 +312,6 @@ def _match_missing_ideal_dirs(
     missing = [np.asarray(ideal_dirs[k], float) for k in range(len(ideal_dirs)) if k not in assigned]
     score -= 0.25 * abs(len(missing) - max(0, len(ideal_dirs) - len(actual_vecs)))
     return missing, score
-
-
-def _strict_missing_vectors_for_hosts(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    host_indices: List[int],
-    charges: Dict[str, int],
-    pair_cuts: Optional[PairCuts],
-    bulk_struct,
-    planes: List[Plane],
-    surf_tol: float,
-) -> Dict[int, List[np.ndarray]]:
-    """
-    Missing first-shell directions from the bulk coordination polyhedron.
-
-    This intentionally has no radial/outward fallback and never flips a vector:
-    if a crystallographic missing slot cannot be identified, the host is not
-    used for reconstruction ligand compensation.
-    """
-    direction_cache: Dict[str, List[List[np.ndarray]]] = {}
-    result: Dict[int, List[np.ndarray]] = {}
-    for host_idx in host_indices:
-        host_sym = symbols[host_idx]
-        if host_sym not in direction_cache:
-            direction_cache[host_sym] = _bulk_ideal_direction_sets(host_sym, bulk_struct, charges)
-        direction_sets = direction_cache[host_sym]
-        if not direction_sets:
-            continue
-
-        actual = _actual_opposite_bond_vectors(symbols, pts, host_idx, charges, pair_cuts)
-        if not actual:
-            continue
-
-        best_missing: List[np.ndarray] = []
-        best_score = -float("inf")
-        for ideal_dirs in direction_sets:
-            missing, score = _match_missing_ideal_dirs(actual, ideal_dirs)
-            if score > best_score:
-                best_score = score
-                best_missing = missing
-
-        if not best_missing:
-            continue
-
-        outward = _surface_outward_direction(host_idx, pts, planes, surf_tol)
-        outward_slots = []
-        for vec in best_missing:
-            vec = np.asarray(vec, float)
-            norm = np.linalg.norm(vec)
-            if norm < 1e-12:
-                continue
-            vec = vec / norm
-            if float(np.dot(vec, outward)) > 0.05:
-                outward_slots.append(vec)
-        if outward_slots:
-            outward_slots.sort(key=lambda v: float(np.dot(v, outward)), reverse=True)
-            result[host_idx] = outward_slots
-    return result
-
-
-def _ligand_add_positions_for_slots(
-    symbols: List[str],
-    pts: NDArray[np.float64],
-    slots: List[Tuple[int, np.ndarray]],
-    ligand: str,
-    pair_cuts: Optional[PairCuts],
-) -> List[np.ndarray]:
-    positions: List[np.ndarray] = []
-    for host_idx, vec in slots:
-        vec = np.asarray(vec, float)
-        if np.linalg.norm(vec) < 1e-12:
-            continue
-        vec = vec / np.linalg.norm(vec)
-        host = symbols[host_idx]
-        bond_len = 0.84 * _pair_cut_calibrated(host, ligand, pair_cuts)
-        positions.append(np.asarray(pts[host_idx], float) + bond_len * vec)
-    return positions
 
 
 # --------------------------------------------------------------------------
@@ -894,58 +817,6 @@ def _bridging_sites(
     return sites
 
 
-def _pick_bridging_sites(
-    sites: List[Tuple[NDArray[np.float64], Tuple[int, ...]]],
-    n: int,
-    used_hosts: Set[int],
-    placed: List[NDArray[np.float64]],
-    avoid: List[NDArray[np.float64]],
-    bond: float,
-    host_facet: Dict[int, int],
-    facet_count: Dict[int, int],
-    mu1_hosts: Optional[Set[int]] = None,
-) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
-    """
-    Pick up to n sites with disjoint hosts, clear of placed ligands.  Each
-    pick goes to the facet with the fewest ligands so far (`facet_count` is
-    updated in place), maximin-spread within that facet.
-
-    Budget: with `mu1_hosts` (cations that could still take a terminal
-    ligand), a bridging site is only taken if the free cations left after it
-    can still host every ligand still needed, at worst as mu1.  This keeps
-    the charge balance reachable without pushing any cation above bulk CN,
-    while preferring the higher-coordinated site whenever it fits.
-    """
-    chosen: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
-    used = set(used_hosts)
-    taken = list(placed)
-    min_clear = _ligand_separation(bond)
-    while len(chosen) < n:
-        remaining_after = n - len(chosen) - 1
-        allowed = [
-            (pos, hs) for pos, hs in sites
-            if not (set(hs) & used)
-            and all(float(np.linalg.norm(pos - q)) >= min_clear for q in taken)
-            and (mu1_hosts is None or len(mu1_hosts - used - set(hs)) >= remaining_after)
-        ]
-        if not allowed:
-            break
-        least = min(facet_count.get(host_facet[s[1][0]], 0) for s in allowed)
-        allowed = [s for s in allowed if facet_count.get(host_facet[s[1][0]], 0) == least]
-        ref = avoid + taken
-        if ref:
-            ref_arr = np.asarray(ref, float)
-            pos, hs = max(allowed, key=lambda s: (
-                round(float(np.min(np.linalg.norm(ref_arr - s[0], axis=1))), 6), tuple(-h for h in s[1])))
-        else:
-            pos, hs = allowed[0]
-        chosen.append((pos, hs))
-        used.update(hs)
-        taken.append(pos)
-        facet_count[host_facet[hs[0]]] = facet_count.get(host_facet[hs[0]], 0) + 1
-    return chosen
-
-
 def _anion_ok_after(
     symbols: List[str],
     cn_after: int,
@@ -1277,98 +1148,29 @@ def reconstruct_polar_facets(
         mu_added = {3: 0, 2: 0, 1: 0}
         facet_count: Dict[int, int] = {k: 0 for k in range(len(cat_facets))}
         if n_add > 0:
-            free_hosts = {
-                remap[i]: f.normal
-                for f in cat_facets for i in f.outer
-                if alive[i] and cn(i, alive) < CN_BULK
-            }
+            # Same rules as the build passivation (builder.ligand_sites):
+            # capacity, site types, geometry, lowest CN first, facet balance.
+            from .ligand_sites import select_ligand_sites
+
             host_deficit = {
                 remap[i]: CN_BULK - cn(i, alive)
                 for f in cat_facets for i in f.outer
                 if alive[i] and cn(i, alive) < CN_BULK
             }
-            # Bridging (mu3/mu2) only between cations with the same CN (one
-            # missing bond); sites too close to existing ligands are rejected.
-            host_normal = {
-                remap[i]: f.normal
-                for f in cat_facets for i in f.outer
-                if alive[i] and cn(i, alive) == CN_BULK - 1
-            }
-            ligand_now = {k for k, sym in enumerate(new_symbols) if sym == recon_ligand}
-            cations_now = {k for k, sym in enumerate(new_symbols) if sym == cation}
-            host_facet = {
-                remap[i]: k
-                for k, f in enumerate(cat_facets) for i in f.outer
-                if alive[i] and cn(i, alive) < CN_BULK
-            }
-            bond = _bulk_bond_length(struct)
-            used_hosts: Set[int] = set()
-            placed: List[NDArray[np.float64]] = []
-            avoid = [pts[c] for c in removed_cations]
-
-            # II-VI: mu3 hollows first, then mu2 bridges; each free cation hosts
-            # one ligand.  III-V: terminal (mu1) ligands only.
-            for mu in ((3, 2) if q_cat == 2 else ()):
-                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond, ligand_now, cations_now)
-                picked = _pick_bridging_sites(
-                    sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count,
-                    mu1_hosts=set(free_hosts),
-                )
-                for pos, hs in picked:
-                    new_symbols.append(recon_ligand)
-                    new_pts = np.vstack([new_pts, pos])
-                    placed.append(pos)
-                    used_hosts.update(hs)
-                    added += 1
-                    mu_added[mu] += 1
-
-            # Last resort: terminal (mu1) ligands on the remaining free cations,
-            # lowest CN first; a cation takes up to its missing bonds (one per
-            # missing bond direction), keeping the ligand spacing when possible.
-            if added < n_add:
-                left = {h: host_deficit[h] - (1 if h in used_hosts else 0) for h in free_hosts}
-                hosts = [h for h, d in left.items() if d > 0]
-                planes: List[Plane] = [(f.normal, f.top) for f in facets]
-                missing_vecs = _strict_missing_vectors_for_hosts(
-                    new_symbols, new_pts, hosts, charges, pair_cuts, struct, planes, surf_tol
-                )
-                slots = [(h, np.asarray(v, float)) for h, vecs in missing_vecs.items() for v in vecs[:left[h]]]
-
-                def slot_pos(sl) -> NDArray[np.float64]:
-                    h, v = sl
-                    blen = 0.84 * _pair_cut_calibrated(new_symbols[h], recon_ligand, pair_cuts)
-                    return new_pts[h] + blen * v / np.linalg.norm(v)
-
-                sep = _ligand_separation(bond)
-                ligand_pos = [new_pts[k] for k, sym in enumerate(new_symbols) if sym == recon_ligand]
-                picked_slots: List[Tuple[int, np.ndarray]] = []
-                picked_pos: List[NDArray[np.float64]] = []
-                while slots and len(picked_slots) < n_add - added:
-                    near = ligand_pos + placed + picked_pos
-                    spaced = [sl for sl in slots
-                              if all(float(np.linalg.norm(slot_pos(sl) - q)) >= sep for q in near)]
-                    pool = spaced or slots
-                    top_need = max(left[sl[0]] for sl in pool)
-                    pool = [sl for sl in pool if left[sl[0]] == top_need]
-                    least = min(facet_count[host_facet[h]] for h, _ in pool)
-                    pool = [sl for sl in pool if facet_count[host_facet[sl[0]]] == least]
-                    ref = avoid + placed + picked_pos
-                    if ref:
-                        ref_arr = np.asarray(ref, float)
-                        best = max(pool, key=lambda sl: (
-                            round(float(np.min(np.linalg.norm(ref_arr - slot_pos(sl), axis=1))), 6), -sl[0]))
-                    else:
-                        best = pool[0]
-                    facet_count[host_facet[best[0]]] += 1
-                    picked_slots.append(best)
-                    picked_pos.append(slot_pos(best))
-                    left[best[0]] -= 1
-                    slots = [sl for sl in slots if sl is not best and left[sl[0]] > 0]
-                for pos in picked_pos:
-                    new_symbols.append(recon_ligand)
-                    new_pts = np.vstack([new_pts, np.asarray(pos, float)])
-                    added += 1
-                    mu_added[1] += 1
+            picks = select_ligand_sites(
+                new_symbols, new_pts,
+                host_deficit=host_deficit, n_needed=n_add, struct=struct, charges=charges,
+                ligand=recon_ligand, pair_cuts=pair_cuts,
+                planes=[(f.normal, f.top) for f in cat_facets], surf_tol=surf_tol,
+                zb_pair=(cation, anion), bulk_map={cation: CN_BULK, anion: CN_BULK},
+                avoid=[pts[c] for c in removed_cations],
+            )
+            for pk in picks:
+                new_symbols.append(recon_ligand)
+                new_pts = np.vstack([new_pts, pk["pos"]])
+                added += 1
+                mu_added[pk["mu"] if pk["mu"] in mu_added else 3] += 1
+                facet_count[pk["facet"]] += 1
 
         return {
             "symbols": new_symbols,
