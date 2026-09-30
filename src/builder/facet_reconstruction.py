@@ -903,7 +903,7 @@ def reconstruct_polar_facets(
     q_an = int(charges[anion])
     removal_policy = str(getattr(spec, "cation_removal", "auto") or "auto").lower()
     if removal_policy == "auto":
-        removal_policy = "mirror" if q_cat == 3 else "max"
+        removal_policy = "mirror"
     pts = np.asarray(pts, float)
     symbols = list(symbols)
     q0 = _total_q(symbols, charges)
