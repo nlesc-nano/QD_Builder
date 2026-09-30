@@ -1,0 +1,27 @@
+# CsPbBr3 cubic perovskite size series for the QDSpace library.
+# The preset mirrors the webapp Builder's ABX3 default recipe (Cs-centred {100} cubes).
+material: CsPbBr3
+family: ABX3
+phase: cubic perovskite
+cif: cifs/CsPbBr3_cubic.cif
+native_elements: [Cs, Pb, Br]
+centres: [Cs]
+sizes: [1, 2, 3, 4, 5, 6]            # unit cells; half-integer sizes give PbX2-terminated cubes that need added ligands
+positive_q_mode: remove
+reconstruction: never
+min_core_atoms: 20
+min_interatomic_distance: 1.8      # Å
+out_dir: out
+
+preset:
+  charges: {Cs: 1, Pb: 2, Br: -1, Cl: -1}
+  passivation:
+    ligand: Cl
+    surf_tol: 2.0
+    prepass_mode: role-aware
+    prepass_min_cn_terrace: 3
+    prepass_min_cn_edge: 2
+    prepass_min_cn_vertex: 1
+  facets:
+    - {hkl: "100", scope: family, gamma: 1.0}
+  symmetry: {proper_rotations_only: true}
