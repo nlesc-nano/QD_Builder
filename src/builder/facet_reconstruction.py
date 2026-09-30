@@ -789,6 +789,7 @@ def _bridging_sites(
     d_nn: float,
     bond: float,
     ligand_idx: Optional[Set[int]] = None,
+    cation_idx: Optional[Set[int]] = None,
 ) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
     """
     Candidate positions for a ligand bridging `mu` (3 or 2) mutually adjacent
@@ -797,7 +798,9 @@ def _bridging_sites(
     tilted toward the side with the most room.  Positions closer than
     1.1 * bond to any non-host atom (e.g. the hollow above a sub-surface
     anion), or closer than LIGAND_SEP * bond to an existing ligand
-    (`ligand_idx`), are rejected.
+    (`ligand_idx`) or to a cation that is not a host (`cation_idx`), are
+    rejected.  The cation rule keeps a tilted mu2 from leaning over a third
+    cation and bonding to it beyond its CN.
     """
     hosts = sorted(host_normal)
     if len(hosts) < mu:
@@ -806,6 +809,7 @@ def _bridging_sites(
     min_clear = 1.1 * bond
     cut = NN_FACTOR * d_nn
     ligand_idx = ligand_idx or set()
+    cation_idx = cation_idx or set()
 
     def clearance(pos: NDArray[np.float64], hs: Tuple[int, ...]) -> float:
         """Distance margin, normalised so >= min_clear means acceptable."""
@@ -814,8 +818,8 @@ def _bridging_sites(
             if j in hs:
                 continue
             d = float(np.linalg.norm(pts[j] - pos))
-            if j in ligand_idx:
-                d *= 1.1 / LIGAND_SEP   # ligands need LIGAND_SEP * bond
+            if j in ligand_idx or j in cation_idx:
+                d *= 1.1 / LIGAND_SEP   # ligands and non-host cations need LIGAND_SEP * bond
             worst = min(worst, d)
         return worst
 
@@ -1252,6 +1256,7 @@ def reconstruct_polar_facets(
                 if alive[i] and cn(i, alive) == CN_BULK - 1
             }
             ligand_now = {k for k, sym in enumerate(new_symbols) if sym == recon_ligand}
+            cations_now = {k for k, sym in enumerate(new_symbols) if sym == cation}
             host_facet = {
                 remap[i]: k
                 for k, f in enumerate(cat_facets) for i in f.outer
@@ -1265,7 +1270,7 @@ def reconstruct_polar_facets(
             # II-VI: mu3 hollows first, then mu2 bridges; each free cation hosts
             # one ligand.  III-V: terminal (mu1) ligands only.
             for mu in ((3, 2) if q_cat == 2 else ()):
-                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond, ligand_now)
+                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond, ligand_now, cations_now)
                 picked = _pick_bridging_sites(
                     sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count,
                     mu1_hosts=set(free_hosts),
