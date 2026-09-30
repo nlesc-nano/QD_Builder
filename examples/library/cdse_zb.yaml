@@ -11,6 +11,7 @@ positive_q_mode: add
 reconstruction: auto               # auto: add a {111}-reconstructed variant when it applies
 min_core_atoms: 20
 min_interatomic_distance: 1.8      # Å
+min_anion_fraction_kept: 0.5       # reconstructed variants keep >= this share of the clean anions
 out_dir: out
 
 preset:
