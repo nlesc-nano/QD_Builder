@@ -1,7 +1,6 @@
 # PbSe rock-salt size series for the QDSpace library.
-# The preset mirrors the webapp Builder's IV-VI default recipe ({100} gamma 0.8,
-# {111} cation-rich gamma 1.0); from 2.75 cells {100} goes to gamma 1.0, since
-# the 0.8 cut gives poor shapes at larger sizes.
+# The preset mirrors the webapp Builder's IV-VI default recipe ({100} gamma 1.0,
+# {111} cation-rich gamma 1.0).
 material: PbSe
 family: IV-VI
 phase: rock-salt
@@ -25,12 +24,6 @@ preset:
     prepass_min_cn_edge: 2
     prepass_min_cn_vertex: 1
   facets:
-    - {hkl: "100", scope: family, gamma: 0.8}
+    - {hkl: "100", scope: family, gamma: 1.0}
     - {hkl: "111", scope: family, termination: cation_rich, gamma: 1.0}
   symmetry: {proper_rotations_only: true}
-
-preset_overrides:
-  - min_unit_cells: 2.75
-    facets:
-      - {hkl: "100", scope: family, gamma: 1.0}
-      - {hkl: "111", scope: family, termination: cation_rich, gamma: 1.0}
