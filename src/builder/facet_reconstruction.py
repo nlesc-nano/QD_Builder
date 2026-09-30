@@ -50,6 +50,7 @@ LAYER_TOL = 0.4       # Å, half-thickness of one atomic (111) layer
 MIN_FACET_ATOMS = 6   # outer-layer atoms needed to call a <111> direction a facet
 SYM_TOL = 0.3         # Å, position tolerance when testing cluster rotations
 NN_FACTOR = 1.15      # cation-cation nearest-neighbour conflict radius / d_nn
+LIGAND_SEP = 1.3      # min bridging-ligand to ligand distance / bond (≈ Cl-Cl in CdCl2)
 
 
 def _native_view(
@@ -776,22 +777,6 @@ def _min_vertex_cover(
     return cover
 
 
-def _interior_outer(outer: List[int], pts: NDArray[np.float64], d_nn: float) -> Set[int]:
-    """
-    Outer-layer atoms of a (111) facet with all six in-plane nearest
-    neighbours present in the layer, i.e. not on a facet edge or vertex.
-    Bridging (mu2/mu3) ligands are only placed over these.
-    """
-    if not outer:
-        return set()
-    tree = cKDTree(pts[outer])
-    cut = NN_FACTOR * d_nn
-    return {
-        outer[k] for k in range(len(outer))
-        if len(tree.query_ball_point(pts[outer[k]], cut)) - 1 >= 6
-    }
-
-
 def _bulk_bond_length(struct) -> float:
     """Zinc-blende cation-anion bond length, a * sqrt(3) / 4."""
     return float(struct.lattice.a) * np.sqrt(3.0) / 4.0
@@ -803,6 +788,7 @@ def _bridging_sites(
     mu: int,
     d_nn: float,
     bond: float,
+    ligand_idx: Optional[Set[int]] = None,
 ) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
     """
     Candidate positions for a ligand bridging `mu` (3 or 2) mutually adjacent
@@ -810,7 +796,8 @@ def _bridging_sites(
     from each host.  mu3 sits in a hollow; mu2 sits over the shared edge,
     tilted toward the side with the most room.  Positions closer than
     1.1 * bond to any non-host atom (e.g. the hollow above a sub-surface
-    anion) are rejected.
+    anion), or closer than LIGAND_SEP * bond to an existing ligand
+    (`ligand_idx`), are rejected.
     """
     hosts = sorted(host_normal)
     if len(hosts) < mu:
@@ -818,10 +805,19 @@ def _bridging_sites(
     tree = cKDTree(pts)
     min_clear = 1.1 * bond
     cut = NN_FACTOR * d_nn
+    ligand_idx = ligand_idx or set()
 
     def clearance(pos: NDArray[np.float64], hs: Tuple[int, ...]) -> float:
-        near = [j for j in tree.query_ball_point(pos, 2.0 * bond) if j not in hs]
-        return min((float(np.linalg.norm(pts[j] - pos)) for j in near), default=np.inf)
+        """Distance margin, normalised so >= min_clear means acceptable."""
+        worst = np.inf
+        for j in tree.query_ball_point(pos, 2.0 * bond):
+            if j in hs:
+                continue
+            d = float(np.linalg.norm(pts[j] - pos))
+            if j in ligand_idx:
+                d *= 1.1 / LIGAND_SEP   # ligands need LIGAND_SEP * bond
+            worst = min(worst, d)
+        return worst
 
     htree = cKDTree(pts[hosts])
     pairs = sorted((hosts[a], hosts[b]) for a, b in htree.query_pairs(cut))
@@ -885,7 +881,7 @@ def _pick_bridging_sites(
     chosen: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
     used = set(used_hosts)
     taken = list(placed)
-    min_clear = 1.1 * bond
+    min_clear = LIGAND_SEP * bond
     while len(chosen) < n:
         allowed = [
             (pos, hs) for pos, hs in sites
@@ -1239,12 +1235,14 @@ def reconstruct_polar_facets(
                 for f in cat_facets for i in f.outer
                 if alive[i] and cn(i, alive) < CN_BULK
             }
-            # Bridging sites only over interior cations (no facet edges).
-            interior = set().union(*(_interior_outer(f.outer, pts, d_nn) for f in cat_facets))
-            host_normal = {remap[i]: n for i, n in (
-                (i, f.normal) for f in cat_facets for i in f.outer
-                if alive[i] and cn(i, alive) < CN_BULK and i in interior
-            )}
+            # Bridging (mu3/mu2) only between cations with the same CN (one
+            # missing bond); sites too close to existing ligands are rejected.
+            host_normal = {
+                remap[i]: f.normal
+                for f in cat_facets for i in f.outer
+                if alive[i] and cn(i, alive) == CN_BULK - 1
+            }
+            ligand_now = {k for k, sym in enumerate(new_symbols) if sym == recon_ligand}
             host_facet = {
                 remap[i]: k
                 for k, f in enumerate(cat_facets) for i in f.outer
@@ -1258,7 +1256,7 @@ def reconstruct_polar_facets(
             # II-VI: mu3 hollows first, then mu2 bridges; each free cation hosts
             # one ligand.  III-V: terminal (mu1) ligands only.
             for mu in ((3, 2) if q_cat == 2 else ()):
-                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond)
+                sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond, ligand_now)
                 picked = _pick_bridging_sites(
                     sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count
                 )

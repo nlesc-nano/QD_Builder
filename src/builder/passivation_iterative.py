@@ -821,9 +821,9 @@ def _balanced_positive_q_add_picks(
     from all ligands (maximin), then lowest host index.
     """
     from .facet_reconstruction import (
+        LIGAND_SEP,
         _bridging_sites,
         _bulk_bond_length,
-        _interior_outer,
         _nn_cation_distance,
         _polar_111_facets,
     )
@@ -851,16 +851,18 @@ def _balanced_positive_q_add_picks(
     )
     host_111 = {i: k for k, f in enumerate(cat_facets) for i in f.outer}
     if is_ii_vi:
-        # mu3/mu2 only over interior cations of the facet (no edges/vertices).
+        # mu3/mu2 only between cations of the facet with the same CN (one
+        # missing bond); sites too close to existing ligands are rejected.
         d_nn = _nn_cation_distance(ref_struct)
+        ligand_now = {j for j, sym in enumerate(symbols) if sym == ligand}
         host_normal = {
-            i: f.normal for f in cat_facets for i in _interior_outer(f.outer, pts, d_nn)
-            if i in sub_records and deficit(i) >= 1
+            i: f.normal for f in cat_facets for i in f.outer
+            if i in sub_records and deficit(i) == 1
         }
         if host_normal:
             bond = _bulk_bond_length(ref_struct)
             for mu in (3, 2):
-                for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond):
+                for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond, ligand_now):
                     cands.append({"pos": np.asarray(pos, float), "hosts": tuple(hs), "mu": mu})
 
     for c in cands:
@@ -881,6 +883,7 @@ def _balanced_positive_q_add_picks(
         c["bal"] = ("111", host_111[c["hosts"][0]]) if c["hosts"][0] in host_111 else None
 
     taken: List[NDArray[np.float64]] = [pts[i] for i, sym in enumerate(symbols) if sym == ligand]
+    bridge_sep = LIGAND_SEP * _bulk_bond_length(ref_struct)
     use: Dict[int, int] = defaultdict(int)
     counts = defaultdict(int, add_count_facet)
     counts_111: Dict[int, int] = defaultdict(int)
@@ -892,7 +895,7 @@ def _balanced_positive_q_add_picks(
             if any(use[h] + 1 > deficit(h) for h in c["hosts"]):
                 continue
             dmin = float(np.min(np.linalg.norm(taken_arr - c["pos"], axis=1))) if taken_arr is not None else np.inf
-            if dmin < d_exclude:
+            if dmin < (max(d_exclude, bridge_sep) if c["mu"] >= 2 else d_exclude):
                 continue
             elig.append((c, dmin))
         if not elig:
