@@ -811,6 +811,10 @@ def _balanced_positive_q_add_picks(
     bridges).  For binary zinc-blende II-VI dots, mu3 hollows and mu2 bridges
     over free cations of cation-terminated {111} facets are added.
 
+    Bridges are budgeted: one is only taken if the free cations left after it
+    can still host every ligand still needed (at worst as mu1), so the charge
+    balance stays reachable and no cation exceeds bulk CN.
+
     Priority per pick: largest remaining CN deficit among the site's hosts
     (lowest CN first, updated after every pick), then
       zinc-blende: no over-coordination, then site type (II-VI
@@ -888,11 +892,25 @@ def _balanced_positive_q_add_picks(
     counts = defaultdict(int, add_count_facet)
     counts_111: Dict[int, int] = defaultdict(int)
     picks: List[dict] = []
+    # Cations that can still take a terminal ligand: the budget for bridges.
+    mu1_hosts = {c["hosts"][0] for c in cands if c["mu"] == 1}
+
+    def free_capacity(extra_hosts=()) -> int:
+        extra = set(extra_hosts)
+        return sum(
+            max(0, deficit(h) - use[h] - (1 if h in extra else 0)) for h in mu1_hosts
+        )
+
     while len(picks) < max_to_add:
         taken_arr = np.asarray(taken, float) if taken else None
+        remaining_after = max_to_add - len(picks) - 1
         elig = []
         for c in cands:
             if any(use[h] + 1 > deficit(h) for h in c["hosts"]):
+                continue
+            # A bridge must leave enough free cations for every ligand still
+            # needed (at worst as mu1); otherwise prefer lower-mu sites.
+            if c["mu"] >= 2 and free_capacity(c["hosts"]) < remaining_after:
                 continue
             dmin = float(np.min(np.linalg.norm(taken_arr - c["pos"], axis=1))) if taken_arr is not None else np.inf
             if dmin < (max(d_exclude, bridge_sep) if c["mu"] >= 2 else d_exclude):
