@@ -859,6 +859,7 @@ def _balanced_positive_q_add_picks(
         # missing bond); sites too close to existing ligands are rejected.
         d_nn = _nn_cation_distance(ref_struct)
         ligand_now = {j for j, sym in enumerate(symbols) if sym == ligand}
+        cations_now = {j for j, sym in enumerate(symbols) if int(charges.get(sym, 0)) > 0}
         host_normal = {
             i: f.normal for f in cat_facets for i in f.outer
             if i in sub_records and deficit(i) == 1
@@ -866,7 +867,7 @@ def _balanced_positive_q_add_picks(
         if host_normal:
             bond = _bulk_bond_length(ref_struct)
             for mu in (3, 2):
-                for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond, ligand_now):
+                for pos, hs in _bridging_sites(host_normal, pts, mu, d_nn, bond, ligand_now, cations_now):
                     cands.append({"pos": np.asarray(pos, float), "hosts": tuple(hs), "mu": mu})
 
     for c in cands:
