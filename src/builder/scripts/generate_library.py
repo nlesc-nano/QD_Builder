@@ -98,12 +98,17 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     posq = cfg.get("positive_q_mode", "add")
     min_core = int(cfg.get("min_core_atoms", 20))
     min_dist = float(cfg.get("min_interatomic_distance", 1.8))
+    # A reconstructed variant must keep this fraction of its clean parent's
+    # native anions (tiny dots can lose most anions to the ligand).
+    min_anion_kept = float(cfg.get("min_anion_fraction_kept", 0.5))
+    anions = [e for e in native_order if int(charges.get(e, 0)) < 0]
     reconstruction = cfg.get("reconstruction", "auto")
     out_root = Path(out_dir or (cfg_path.parent / cfg.get("out_dir", "out"))).resolve() / material
     out_root.mkdir(parents=True, exist_ok=True)
     revision = _qd_builder_revision()
 
     kept: Dict[str, dict] = {}   # fingerprint -> record
+    by_id: Dict[str, dict] = {}  # id -> record
     review: List[dict] = []
 
     def consider(centre: str, size: float, surface: str, recipe: dict, res: Optional[dict], parent: Optional[str]):
@@ -129,6 +134,11 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
         dmin = min_distance(res["pts"])
         if dmin < min_dist:
             reasons.append(f"min distance {dmin:.2f} Å")
+        if parent and parent in by_id and anions:
+            before = sum(by_id[parent]["core"].get(e, 0) for e in anions)
+            after = sum(desc["core"].get(e, 0) for e in anions)
+            if before and after < min_anion_kept * before:
+                reasons.append(f"keeps {after}/{before} anions of its clean parent")
         if desc["centre"] != centre:
             reasons.append(f"centre detected as {desc['centre']}")
         if reasons:
@@ -162,6 +172,7 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             extra={"parent": parent} if parent else None,
         )
         kept[fp] = rec
+        by_id[rec["id"]] = rec
         target = out_root / rec["id"]
         target.mkdir(parents=True, exist_ok=True)
         _write_xyz(target / "start.xyz", res["symbols"], res["pts"], rec["id"])
