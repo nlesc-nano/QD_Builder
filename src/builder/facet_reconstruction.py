@@ -1161,28 +1161,11 @@ def reconstruct_polar_facets(
         n_remove = q // q_cat if q > 0 else 0
         base = n_remove // len(cat_facets)
 
-        # Surviving outer anions of the anion-terminated facets: a cation
-        # removal must not leave a fresh under-coordinated anion next to them
-        # (that would re-create a run and force another anion -> ligand swap).
-        anchor_pts = [
-            pts[a] for f in an_facets for a in f.outer if alive[a] and syms[a] == anion
-        ]
-        anchor_tree = cKDTree(np.asarray(anchor_pts)) if anchor_pts else None
-
-        def joins_run(c: int) -> bool:
-            if anchor_tree is None:
-                return False
-            for a in nb[c]:
-                if alive[a] and syms[a] == anion and cn(a, alive) == CN_BULK:
-                    if anchor_tree.query_ball_point(pts[a], NN_FACTOR * d_nn):
-                        return True
-            return False
-
         def cat_candidates(k: int, allow_ligand_nb: bool) -> List[int]:
             own = facets.index(cat_facets[k])
             out = []
             for c in cat_facets[k].outer:
-                if not alive[c] or touches_other_facet(c, own, alive) or joins_run(c):
+                if not alive[c] or touches_other_facet(c, own, alive):
                     continue
                 live_nb = [a for a in nb[c] if alive[a]]
                 if not allow_ligand_nb and any(syms[a] == recon_ligand for a in live_nb):
@@ -1237,15 +1220,9 @@ def reconstruct_polar_facets(
             alive[c] = False
         q -= q_cat * len(removed_cations)
 
-        # Cation removals can leave new under-coordinated anions next to an
-        # anion-facet edge: break those runs too (compensated by ligands below).
-        for k, conv in _break_runs(syms, alive).items():
-            for a in conv:
-                if syms[a] == anion:
-                    syms[a] = recon_ligand
-                    dq_anion += ligand_charge - q_an
-                    q += ligand_charge - q_an
-                    n_breaks[k] += 1
+        # Anions left three-coordinated under a removed cation-{111} cation sit
+        # below the cation facet, not on the anion-terminated facet: they do not
+        # form runs there, so no further anion -> ligand swaps are made.
 
         # ---- 4. remainder: add ligands on cation-facet sites ---------------
         keep = np.where(alive)[0]
