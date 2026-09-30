@@ -934,10 +934,16 @@ def parse_yaml_config(path: str) -> Config:
             scope_by[(h, k, l)] = scope
             term = f.get("termination")
             if term is not None:
-                term_s = str(term).strip().lower()
-                if term_s not in {"cation_rich", "anion_rich"}:
-                    raise ValueError("facet termination must be 'cation_rich' or 'anion_rich'")
-                term_by[(h, k, l)] = term_s
+                term_s = str(term).strip().lower().replace("-", "_")
+                if term_s in {"", "none", "null", "stoichiometric"}:
+                    term_by[(h, k, l)] = None   # non-polar facet: no termination to impose
+                elif term_s in {"cation_rich", "anion_rich"}:
+                    term_by[(h, k, l)] = term_s
+                else:
+                    raise ValueError(
+                        f"facet {hkl_raw}: termination {term!r} must be 'cation_rich', "
+                        "'anion_rich' or 'stoichiometric'"
+                    )
             else:
                 term_by[(h, k, l)] = None
 
