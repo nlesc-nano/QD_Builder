@@ -872,21 +872,30 @@ def _pick_bridging_sites(
     bond: float,
     host_facet: Dict[int, int],
     facet_count: Dict[int, int],
+    mu1_hosts: Optional[Set[int]] = None,
 ) -> List[Tuple[NDArray[np.float64], Tuple[int, ...]]]:
     """
     Pick up to n sites with disjoint hosts, clear of placed ligands.  Each
     pick goes to the facet with the fewest ligands so far (`facet_count` is
     updated in place), maximin-spread within that facet.
+
+    Budget: with `mu1_hosts` (cations that could still take a terminal
+    ligand), a bridging site is only taken if the free cations left after it
+    can still host every ligand still needed, at worst as mu1.  This keeps
+    the charge balance reachable without pushing any cation above bulk CN,
+    while preferring the higher-coordinated site whenever it fits.
     """
     chosen: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
     used = set(used_hosts)
     taken = list(placed)
     min_clear = LIGAND_SEP * bond
     while len(chosen) < n:
+        remaining_after = n - len(chosen) - 1
         allowed = [
             (pos, hs) for pos, hs in sites
             if not (set(hs) & used)
             and all(float(np.linalg.norm(pos - q)) >= min_clear for q in taken)
+            and (mu1_hosts is None or len(mu1_hosts - used - set(hs)) >= remaining_after)
         ]
         if not allowed:
             break
@@ -1258,7 +1267,8 @@ def reconstruct_polar_facets(
             for mu in ((3, 2) if q_cat == 2 else ()):
                 sites = _bridging_sites(host_normal, new_pts, mu, d_nn, bond, ligand_now)
                 picked = _pick_bridging_sites(
-                    sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count
+                    sites, n_add - added, used_hosts, placed, avoid, bond, host_facet, facet_count,
+                    mu1_hosts=set(free_hosts),
                 )
                 for pos, hs in picked:
                     new_symbols.append(recon_ligand)
