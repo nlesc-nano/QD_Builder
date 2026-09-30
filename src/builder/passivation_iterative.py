@@ -892,6 +892,7 @@ def _balanced_positive_q_add_picks(
     use: Dict[int, int] = defaultdict(int)
     counts = defaultdict(int, add_count_facet)
     counts_111: Dict[int, int] = defaultdict(int)
+    added_on_facet: Dict[tuple, List[NDArray[np.float64]]] = {}
     picks: List[dict] = []
     # Cations that can still take a terminal ligand: the budget for bridges.
     mu1_hosts = {c["hosts"][0] for c in cands if c["mu"] == 1}
@@ -936,10 +937,20 @@ def _balanced_positive_q_add_picks(
 
         least = min(balance(c) for c, _ in elig)
         elig = [(c, d) for c, d in elig if balance(c) == least]
-        best, dmin = max(elig, key=lambda cd: (round(cd[1], 6), tuple(-h for h in cd[0]["hosts"])))
+        # Spread the added ligands of a facet among themselves first (maximin
+        # to earlier additions on the same facet), then away from all ligands.
+        def spread_key(cd):
+            c, d_all = cd
+            same = added_on_facet.get(c["bal"], []) if c["bal"] is not None else []
+            d_same = min((float(np.linalg.norm(c["pos"] - q)) for q in same), default=np.inf)
+            return (round(d_same, 3), round(d_all, 6), tuple(-h for h in c["hosts"]))
+
+        best, dmin = max(elig, key=spread_key)
         cands = [x for x in cands if x is not best]
         picks.append(dict(best, dmin_3d=dmin))
         taken.append(best["pos"])
+        if best["bal"] is not None:
+            added_on_facet.setdefault(best["bal"], []).append(best["pos"])
         for h in best["hosts"]:
             use[h] += 1
         for f in best["inc"]:
