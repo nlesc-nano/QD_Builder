@@ -13,6 +13,9 @@ checked (neutral, no atom clashes, minimum core size) and written as
     <out>/<material>/<id>/record.json
     <out>/<material>/review.csv  and  review.md   (every build, incl. rejects)
 
+Optional `preset_overrides: [{min_unit_cells: X, <preset key>: ...}]` replaces
+preset keys (e.g. facets) for sizes >= X.
+
 Usage:
     python -m builder.scripts.generate_library examples/library/cdse_zb.yaml [--out DIR]
 """
@@ -186,6 +189,11 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
         for centre in cfg["centres"]:
             for size in _sizes(cfg["sizes"]):
                 recipe = copy.deepcopy(preset)
+                # Size-dependent recipe changes, e.g. {min_unit_cells: 2.75, facets: [...]}:
+                # every override whose threshold the size reaches replaces those preset keys.
+                for ov in cfg.get("preset_overrides", []):
+                    if size >= float(ov["min_unit_cells"]) - 1e-9:
+                        recipe.update(copy.deepcopy({k: v for k, v in ov.items() if k != "min_unit_cells"}))
                 recipe["size_unit_cells"] = [size, size, size]
                 recipe["construction_origin"] = {"center_on_species": centre}
                 tag = f"{centre}_{size}"
