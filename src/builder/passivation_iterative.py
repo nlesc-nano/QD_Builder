@@ -825,7 +825,7 @@ def _balanced_positive_q_add_picks(
     from all ligands (maximin), then lowest host index.
     """
     from .facet_reconstruction import (
-        LIGAND_SEP,
+        _ligand_separation,
         _bridging_sites,
         _bulk_bond_length,
         _nn_cation_distance,
@@ -888,7 +888,7 @@ def _balanced_positive_q_add_picks(
         c["bal"] = ("111", host_111[c["hosts"][0]]) if c["hosts"][0] in host_111 else None
 
     taken: List[NDArray[np.float64]] = [pts[i] for i, sym in enumerate(symbols) if sym == ligand]
-    bridge_sep = LIGAND_SEP * _bulk_bond_length(ref_struct)
+    bridge_sep = _ligand_separation(_bulk_bond_length(ref_struct))
     use: Dict[int, int] = defaultdict(int)
     counts = defaultdict(int, add_count_facet)
     counts_111: Dict[int, int] = defaultdict(int)
