@@ -716,6 +716,10 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
     if distribution != "fps":
         raise ValueError("post_treatment.surface_reconstruction.distribution currently supports only 'fps'")
 
+    cation_removal = str(raw.get("cation_removal", "auto")).strip().lower()
+    if cation_removal not in {"auto", "max", "mirror"}:
+        raise ValueError("post_treatment.surface_reconstruction.cation_removal must be auto, max or mirror")
+
     return SurfaceReconstructionSpec(
         enabled=True,
         ligand=str(raw.get("ligand", default_ligand)),
@@ -725,6 +729,7 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
         min_separation=min_separation,
         distribution=distribution,
         seed=int(raw.get("seed", 1337)),
+        cation_removal=cation_removal,
     )
 
 

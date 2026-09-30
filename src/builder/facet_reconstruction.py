@@ -901,9 +901,13 @@ def reconstruct_polar_facets(
 
     q_cat = int(charges[cation])
     q_an = int(charges[anion])
+    removal_policy = str(getattr(spec, "cation_removal", "auto") or "auto").lower()
+    if removal_policy == "auto":
+        removal_policy = "mirror" if q_cat == 3 else "max"
     pts = np.asarray(pts, float)
     symbols = list(symbols)
     q0 = _total_q(symbols, charges)
+    print(f"[recon] cation removal on cation-{{111}}: {removal_policy}")
     print(f"[recon] {cation}{anion}: q_cat={q_cat:+d} q_an={q_an:+d} ligand={recon_ligand}({ligand_charge:+d})"
           f"  Q_total before = {q0:+d}")
 
@@ -1090,6 +1094,10 @@ def reconstruct_polar_facets(
 
         # ---- 3. outer-cation vacancies on cation-terminated facets ---------
         n_remove = q // q_cat if q > 0 else 0
+        if removal_policy == "mirror":
+            # Remove as many cations as vacancies were made on the anion side;
+            # the rest of the charge goes to ligands.
+            n_remove = min(n_remove, len(vacancies))
         base = n_remove // len(cat_facets)
 
         def cat_candidates(k: int, allow_ligand_nb: bool) -> List[int]:
@@ -1287,6 +1295,7 @@ def reconstruct_polar_facets(
     if ledger is not None:
         ledger.update({
             "status": "applied",
+            "cation_removal": removal_policy,
             "cation": cation,
             "anion": anion,
             "anion_facets": [
