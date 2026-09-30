@@ -50,7 +50,7 @@ LAYER_TOL = 0.4       # Å, half-thickness of one atomic (111) layer
 MIN_FACET_ATOMS = 6   # outer-layer atoms needed to call a <111> direction a facet
 SYM_TOL = 0.3         # Å, position tolerance when testing cluster rotations
 NN_FACTOR = 1.15      # cation-cation nearest-neighbour conflict radius / d_nn
-LIGAND_SEP = 1.3      # min bridging-ligand to ligand distance / bond (≈ Cl-Cl in CdCl2)
+LIGAND_SEP = 0.95     # min bridging-ligand to ligand distance / bulk anion-anion distance (a/sqrt 2)
 
 
 def _native_view(
@@ -782,6 +782,13 @@ def _bulk_bond_length(struct) -> float:
     return float(struct.lattice.a) * np.sqrt(3.0) / 4.0
 
 
+def _ligand_separation(bond: float) -> float:
+    """Minimum distance between an added bridging ligand and any other ligand:
+    LIGAND_SEP x the zinc-blende anion-anion distance (a/sqrt 2 = bond*sqrt(8/3)),
+    4.12 A for CdSe."""
+    return LIGAND_SEP * bond * np.sqrt(8.0 / 3.0)
+
+
 def _cation_shell_separator(bond: float) -> float:
     """
     Bonded / non-bonded cation-anion separator for zinc blende: midway
@@ -808,7 +815,10 @@ def _bridging_sites(
     tilted toward the side with the most room.  A site is rejected when it
     is closer than
       * 1.1 * bond to an anion (e.g. the hollow above a sub-surface anion),
-      * LIGAND_SEP * bond to an existing ligand (`ligand_idx`),
+      * LIGAND_SEP x the bulk anion-anion distance to an existing ligand
+        (`ligand_idx`): added ligands sit on anion-like sites and keep the
+        anion-sublattice spacing (a border mu2 leaning over an edge ligand of
+        the neighbouring facet is rejected and that ligand goes on as mu1),
       * the bulk shell separator (`_cation_shell_separator`, midway between
         the first- and second-shell cation-anion distances) to any cation
         that is not a host (`cation_idx`): closer than that the ligand is
@@ -826,7 +836,7 @@ def _bridging_sites(
     ligand_idx = ligand_idx or set()
     cation_idx = cation_idx or set()
     need_other = 1.1 * bond
-    need_ligand = LIGAND_SEP * bond
+    need_ligand = _ligand_separation(bond)
     need_cation = _cation_shell_separator(bond)
 
     def clearance(pos: NDArray[np.float64], hs: Tuple[int, ...]) -> float:
@@ -909,7 +919,7 @@ def _pick_bridging_sites(
     chosen: List[Tuple[NDArray[np.float64], Tuple[int, ...]]] = []
     used = set(used_hosts)
     taken = list(placed)
-    min_clear = LIGAND_SEP * bond
+    min_clear = _ligand_separation(bond)
     while len(chosen) < n:
         remaining_after = n - len(chosen) - 1
         allowed = [
