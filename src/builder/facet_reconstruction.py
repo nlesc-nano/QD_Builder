@@ -18,7 +18,8 @@ Algorithm:
      (charge-delocalising runs) are broken by converting alternating ones to
      the ligand (minimum vertex cover), each adding q_lig - q_an.
   2. Cation-terminated {111} facets: strip the ligands that passivated them
-     after the build (on-top, bridging or hollow, above the outer layer).
+     after the build (on-top, bridging or hollow, above the outer layer),
+     never taking a cation below terrace CN (bulk - 1).
   3. Compensate the accumulated positive charge by removing non-adjacent outer
      cations on the cation-terminated facets, spread evenly (maximin).  Any
      remainder smaller than one cation charge is balanced by adding ligands on
@@ -1066,6 +1067,10 @@ def reconstruct_polar_facets(
                 if float(pts[li] @ cat_facets[k].normal) >= cat_facets[k].top + LAYER_TOL
             ]
             if not above:
+                continue
+            # Never strip a cation below terrace CN (bulk - 1): edge/vertex
+            # cations missing two bonds keep a ligand.
+            if any(cn(h, alive) - 1 < CN_BULK - 1 for h in hosts):
                 continue
             alive[li] = False
             stripped[above[0]] += 1
