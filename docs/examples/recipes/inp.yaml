@@ -1,0 +1,15 @@
+# InP zinc-blende dot, 2 unit cells, In-centred ({111}-only tetrahedral shape).
+charges: {In: 3, P: -3, Cl: -1}
+size_unit_cells: [2.0, 2.0, 2.0]
+construction_origin: {center_on_species: In}
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+  prepass_mode: role-aware
+  prepass_min_cn_terrace: 3
+  prepass_min_cn_edge: 2
+  prepass_min_cn_vertex: 1
+facets:
+  - {hkl: "111",    scope: family, termination: cation_rich, gamma: 0.8}
+  - {hkl: "-1-1-1", scope: family, termination: anion_rich,  gamma: 1.6}
+symmetry: {proper_rotations_only: true}

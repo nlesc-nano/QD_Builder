@@ -138,6 +138,21 @@ def derive_pair_cuts_from_cif(
 
             rc[key] = cutoff * safety
 
+    # Anion ligands not in the CIF (e.g. Cl on a PbSe dot) sit on native anion
+    # lattice sites: never let their cation cutoff fall below the calibrated
+    # cation-native-anion cutoff, or ligands on lattice sites count as unbonded
+    # (and get pruned as orphans).
+    for lig, q_lig in charges.items():
+        if int(q_lig) >= 0 or lig in elems:
+            continue
+        for a in elems:
+            if int(charges.get(a, 0)) <= 0:
+                continue
+            native = [rc[_pair_key(a, b)] for b in elems
+                      if int(charges.get(b, 0)) < 0 and _pair_key(a, b) in rc]
+            if native:
+                rc[_pair_key(a, lig)] = max(_pair_cut(a, lig), max(native))
+
     return PairCuts(rc=rc)
 
 

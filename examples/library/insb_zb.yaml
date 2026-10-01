@@ -1,0 +1,29 @@
+# InSb zinc-blende size series for the QDSpace library.
+# The preset mirrors the webapp Builder's III-V default recipe ({111}-only dots grow fast: up to 3 cells).
+material: InSb
+family: III-V
+phase: zinc-blende
+cif: cifs/InSb_zb.cif
+native_elements: [In, Sb]
+centres: [In, Sb]
+sizes: {start: 0.5, stop: 3.0, step: 0.25}   # unit cells, cubic
+positive_q_mode: add
+reconstruction: auto
+min_core_atoms: 20
+min_interatomic_distance: 1.8      # Å
+min_anion_fraction_kept: 0.5       # reconstructed variants keep >= this share of the clean anions
+out_dir: out
+
+preset:
+  charges: {In: 3, Sb: -3, Cl: -1}
+  passivation:
+    ligand: Cl
+    surf_tol: 2.0
+    prepass_mode: role-aware
+    prepass_min_cn_terrace: 3
+    prepass_min_cn_edge: 2
+    prepass_min_cn_vertex: 1
+  facets:
+    - {hkl: "111", scope: family, termination: cation_rich, gamma: 0.8}
+    - {hkl: "-1-1-1", scope: family, termination: anion_rich, gamma: 1.6}
+  symmetry: {proper_rotations_only: true}

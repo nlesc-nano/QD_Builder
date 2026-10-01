@@ -820,6 +820,15 @@ def _priority3_balance_positive_q_add(
         except Exception as e:
             if verbose:
                 print(f"[debug:add] Reference CIF load failed for template directions: {e}. Using outward normals only.")
+    # Binary zinc-blende (II-VI / III-V) single-material dots get the
+    # zinc-blende site policy (mu3/mu2/mu1); every material uses the
+    # deterministic, facet-balanced selection when lattice sites exist.
+    zb_pair = None
+    if ref_struct is not None and not stack_passivation:
+        from .facet_reconstruction import _zincblende_binary
+        zb_pair = _zincblende_binary(ref_struct, charges, ligand)
+        if zb_pair is not None and {sym for sym in symbols if sym != ligand} != set(zb_pair):
+            zb_pair = None
     edges_by_facet = verts_by_facet = None
     edge_tol = max(0.25 * surf_tol, 0.35)
     vertex_tol = max(0.75 * surf_tol, 0.75)
@@ -863,6 +872,55 @@ def _priority3_balance_positive_q_add(
     if not by_def:
         return False, symbols, pts
     # Prioritize largest deficit first for physical structural stability
+    # Shared ligand-site selector (builder.ligand_sites): one set of rules for
+    # every material and for the reconstruction; lowest CN first is handled
+    # inside, so all under-coordinated hosts are passed at once.
+    if ref_struct is not None:
+        from .ligand_sites import select_ligand_sites
+
+        q_now = _total_Q(symbols, charges)
+        n_max = max(1, int(q_now // abs(charges.get(ligand, 1))))
+        position_ok = None
+        if stack_passivation and not include_sublayer:
+            position_ok = lambda pos: _ligand_position_allowed(pos, symbols, pts, ligand)
+        rec_of = {rec[0]: rec for rec in sites}
+        picks = select_ligand_sites(
+            symbols, pts,
+            host_deficit={i: int(rec[3]) for i, rec in rec_of.items()},
+            n_needed=n_max, struct=ref_struct, charges=charges, ligand=ligand,
+            pair_cuts=pair_cuts, planes=planes_raw, surf_tol=surf_tol, zb_pair=zb_pair,
+            bulk_map=bulk_map, position_ok=position_ok,
+            min_ligand_dist=1.8 if include_sublayer else 3.0,
+        )
+        if picks:
+            mu_count: Dict[int, int] = defaultdict(int)
+            for rank_num, c in enumerate(picks, start=1):
+                primary_host = c["hosts"][0]
+                cn_before = int(cn_bi[primary_host])
+                symbols.append(ligand)
+                pts = np.vstack([pts, c["pos"]])
+                if atom_regions is not None:
+                    atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
+                _record_uv_allfacets(primary_host, pts, frames, surf_tol, uv_taken, edit_count_facet)
+                inc = _incident_facets(primary_host, pts, frames, surf_tol) or [rec_of[primary_host][5]]
+                for add_fid in inc:
+                    add_count_facet[add_fid] = add_count_facet.get(add_fid, 0) + 1
+                for h in c["hosts"]:
+                    host_taken[h] = host_taken.get(h, 0) + 1
+                mu_count[c["mu"]] += 1
+                if verbose:
+                    print(
+                        f"  [batch:add] rank #{rank_num}: place {ligand} mu{c['mu']} on "
+                        f"{symbols[primary_host]}#{primary_host} (CN={cn_before}, facet={c['facet']}, "
+                        f"deficit={rec_of[primary_host][3]})"
+                    )
+            mu_txt = ", ".join(f"mu{k}={v}" for k, v in sorted(mu_count.items(), reverse=True))
+            print(
+                f"[batch:add] Added {len(picks)} '{ligand}' ligand(s) in this pass ({mu_txt}) | "
+                f"Q: {q_now:+d} → {_total_Q(symbols, charges):+d}"
+            )
+            return True, symbols, pts
+
     ordered_defs = sorted(by_def.keys(), reverse=True)
 
     # Try deficits in descending order; within each, try roles VERTEX(2)→EDGE(1)→UNIQUE(0)
@@ -1695,6 +1753,10 @@ def charge_balance_iterative(
         )
         return symbols, pts
 
+    # Cycle guard: the same (Q, atom count, ligand count) state recurring means
+    # moves are being undone (e.g. added ligands pruned as orphans).
+    seen_states: Dict[Tuple[int, int, int], int] = defaultdict(int)
+
     while True:
         # Shared per-iteration state (with robust bipartite CN)
         frames = _build_facet_frames(planes)
@@ -1704,6 +1766,14 @@ def charge_balance_iterative(
         uv_cache: UVCache = {}
 
         Q = _total_Q(symbols, charges)
+        state = (Q, len(symbols), symbols.count(ligand))
+        seen_states[state] += 1
+        if seen_states[state] > 5:
+            print(
+                f"[halt] charge balance is cycling (Q={Q:+d}, {len(symbols)} atoms seen "
+                f"{seen_states[state]} times); stopping. Check ligand/cation bond cutoffs."
+            )
+            return _finish(symbols, pts)
         if verbose:
             print(f"\n[loop] Q={Q:+d} — reassessing priorities...")
 
