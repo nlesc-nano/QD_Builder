@@ -1,6 +1,9 @@
 # src/builder/facet_reconstruction.py
 """
-Polar {111} surface reconstruction for zinc-blende II-VI / III-V nanocrystals.
+Polar {111} surface reconstruction for zinc-blende II-VI / III-V nanocrystals,
+and the same reconstruction on the polar (001)/(00-1) facets of wurtzite: both
+are close-packed layers of one species with one bond per atom along the normal,
+so the vacancy pattern, ligand rules and charge bookkeeping are identical.
 
 The step runs after charge-balance passivation and only when the facet seeds
 activate both a cation-rich {111} family and an anion-rich {-1-1-1} family.
@@ -334,8 +337,23 @@ def _hkl_str(hkl: Tuple[int, int, int]) -> str:
     return "(" + " ".join(str(int(v)) for v in hkl) + ")"
 
 
-def _zincblende_binary(struct, charges: Dict[str, int], ligand: str) -> Optional[Tuple[str, str]]:
-    """Return (cation, anion) for a binary cubic, tetrahedral (zinc-blende) CIF, else None."""
+def _lattice_kind(struct) -> Optional[str]:
+    """ "zb" for a cubic cell, "wz" for a hexagonal one (a = b, gamma = 120), else None."""
+    if struct is None or not hasattr(struct, "lattice"):
+        return None
+    lat = struct.lattice
+    al, be, ga = lat.angles
+    if abs(lat.a - lat.b) < 1e-3 and abs(al - 90.0) < 1e-2 and abs(be - 90.0) < 1e-2:
+        if abs(lat.a - lat.c) < 1e-3 and abs(ga - 90.0) < 1e-2:
+            return "zb"
+        if abs(ga - 120.0) < 1e-2:
+            return "wz"
+    return None
+
+
+def _tetrahedral_binary(struct, charges: Dict[str, int], ligand: str,
+                        kinds: Tuple[str, ...] = ("zb", "wz")) -> Optional[Tuple[str, str]]:
+    """Return (cation, anion) for a binary tetrahedral CIF of one of `kinds`, else None."""
     if struct is None or not hasattr(struct, "sites"):
         return None
     species = {str(site.specie.symbol) for site in struct.sites}
@@ -344,9 +362,7 @@ def _zincblende_binary(struct, charges: Dict[str, int], ligand: str) -> Optional
     anions = sorted(s for s in species if int(charges.get(s, 0)) < 0)
     if len(cations) != 1 or len(anions) != 1:
         return None
-    lat = struct.lattice
-    if not (abs(lat.a - lat.b) < 1e-3 and abs(lat.a - lat.c) < 1e-3
-            and all(abs(ang - 90.0) < 1e-2 for ang in lat.angles)):
+    if _lattice_kind(struct) not in kinds:
         return None
     refs = _bulk_cn_refs_from_struct(struct, charges, {cations[0], anions[0]})
     if refs.get(cations[0]) != CN_BULK or refs.get(anions[0]) != CN_BULK:
@@ -354,11 +370,27 @@ def _zincblende_binary(struct, charges: Dict[str, int], ligand: str) -> Optional
     return cations[0], anions[0]
 
 
-def _seeds_request_polar_111(facet_seeds: List[Facet]) -> bool:
-    """True when the seeds activate both a cation-rich and an anion-rich {111} family."""
+def _zincblende_binary(struct, charges: Dict[str, int], ligand: str) -> Optional[Tuple[str, str]]:
+    """Return (cation, anion) for a binary cubic, tetrahedral (zinc-blende) CIF, else None."""
+    return _tetrahedral_binary(struct, charges, ligand, kinds=("zb",))
+
+
+def _polar_directions(struct) -> List[Tuple[int, int, int]]:
+    """Miller indices of the polar close-packed facets: <111> (zinc blende), <001> (wurtzite)."""
+    if _lattice_kind(struct) == "wz":
+        return [(0, 0, 1), (0, 0, -1)]
+    return [tuple(v) for v in itertools.product((1, -1), repeat=3)]
+
+
+def _seeds_request_polar_111(facet_seeds: List[Facet], struct=None) -> bool:
+    """True when the seeds activate both a cation-rich and an anion-rich polar family
+    ({111} in zinc blende, {001} in wurtzite)."""
+    wz = _lattice_kind(struct) == "wz"
     cat = an = False
     for f in facet_seeds or []:
-        if (abs(int(f.h)), abs(int(f.k)), abs(int(f.l))) != (1, 1, 1):
+        hkl = (abs(int(f.h)), abs(int(f.k)), abs(int(f.l)))
+        polar = (hkl[0] == hkl[1] == 0 and hkl[2] > 0) if wz else hkl == (1, 1, 1)
+        if not polar:
             continue
         term = str(f.termination or "").strip().lower().replace("-", "_")
         if term == "cation_rich":
@@ -405,7 +437,7 @@ def _polar_111_facets(
     facets: List[_Polar111] = []
     if len(native) == 0:
         return facets
-    for hkl in itertools.product((1, -1), repeat=3):
+    for hkl in _polar_directions(struct):
         n = np.asarray(hkl, float) @ recip
         n /= np.linalg.norm(n)
         proj = pts[native] @ n
@@ -458,31 +490,51 @@ def _cluster_rotations(
     LT_inv = np.linalg.inv(LT)
 
     ops: List[Tuple[NDArray[np.float64], Dict[int, int]]] = []
+    for Rf in _lattice_rotations(struct):
+        R = LT @ Rf @ LT_inv
+        if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
+            continue
+        Q = (P - center) @ R.T + center
+        dist, hit = tree.query(Q)
+        if np.all(dist < SYM_TOL) and np.all(cls[hit] == cls):
+            ops.append((R, {int(idx[a]): int(idx[b]) for a, b in enumerate(hit)}))
+    return ops
+
+
+def _lattice_rotations(struct) -> List[NDArray[np.float64]]:
+    """Proper rotations of the lattice, as integer matrices on fractional coordinates."""
+    out: List[NDArray[np.float64]] = []
+    if _lattice_kind(struct) == "wz":
+        # 6/mmm proper rotations: entries in {-1, 0, 1}, det +1, orthogonal in Cartesian
+        # (the orthogonality test in the caller drops the rest).
+        for entries in itertools.product((-1, 0, 1), repeat=9):
+            Rf = np.array(entries, float).reshape(3, 3)
+            if abs(np.linalg.det(Rf) - 1.0) < 1e-9:
+                out.append(Rf)
+        return out
     for perm in itertools.permutations(range(3)):
         for signs in itertools.product((1, -1), repeat=3):
             Rf = np.zeros((3, 3))
             for r, c in enumerate(perm):
                 Rf[r, c] = signs[r]
-            if np.linalg.det(Rf) < 0.5:
-                continue
-            R = LT @ Rf @ LT_inv
-            if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
-                continue
-            Q = (P - center) @ R.T + center
-            dist, hit = tree.query(Q)
-            if np.all(dist < SYM_TOL) and np.all(cls[hit] == cls):
-                ops.append((R, {int(idx[a]): int(idx[b]) for a, b in enumerate(hit)}))
-    return ops
+            if np.linalg.det(Rf) >= 0.5:
+                out.append(Rf)
+    return out
 
 
 def _nn_cation_distance(struct) -> float:
-    """Cation-cation nearest-neighbour distance of the fcc sublattice (a / sqrt 2)."""
+    """Cation-cation nearest-neighbour distance: a / sqrt 2 (fcc, zinc blende), a (wurtzite)."""
+    if _lattice_kind(struct) == "wz":
+        return float(struct.lattice.a)
     return float(struct.lattice.a) / np.sqrt(2.0)
 
 
 def _in_plane_basis(struct, normal: NDArray[np.float64]) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Two fcc nearest-neighbour vectors at 60 degrees lying in the (111) plane."""
+    """Two cation nearest-neighbour vectors at 60 degrees lying in the polar plane
+    (fcc vectors in (111) for zinc blende; a and a + b in (001) for wurtzite)."""
     L = np.asarray(struct.lattice.matrix, float)
+    if _lattice_kind(struct) == "wz":
+        return L[0], L[0] + L[1]
     vecs = []
     for frac in itertools.permutations((0.5, 0.5, 0.0)):
         for s1, s2 in itertools.product((1, -1), repeat=2):
@@ -704,7 +756,15 @@ def _min_vertex_cover(
 
 
 def _bulk_bond_length(struct) -> float:
-    """Zinc-blende cation-anion bond length, a * sqrt(3) / 4."""
+    """Cation-anion bond length: a * sqrt(3) / 4 (zinc blende); shortest
+    cation-anion distance in the cell (wurtzite)."""
+    if _lattice_kind(struct) == "wz":
+        dm = struct.distance_matrix
+        species = [str(site.specie.symbol) for site in struct.sites]
+        pairs = [dm[i, j] for i in range(len(species)) for j in range(len(species))
+                 if species[i] != species[j] and dm[i, j] > 0.1]
+        if pairs:
+            return float(min(pairs))
     return float(struct.lattice.a) * np.sqrt(3.0) / 4.0
 
 
@@ -877,7 +937,10 @@ def reconstruct_polar_facets(
         return symbols, pts
 
     print(f"\n{'=' * 60}")
-    print("[post-treatment:surface-reconstruction] Polar {111} reconstruction (zinc blende)")
+    kind = _lattice_kind(struct)
+    polar = "{001}" if kind == "wz" else "{111}"
+    print(f"[post-treatment:surface-reconstruction] Polar {polar} reconstruction "
+          f"({'wurtzite' if kind == 'wz' else 'zinc blende'})")
     ignored = []
     if getattr(spec, "facets", ()):
         ignored.append("facets")
@@ -892,11 +955,13 @@ def reconstruct_polar_facets(
     if ligand_charge >= 0:
         return _skip(f"reconstruction ligand {recon_ligand!r} must be negatively charged")
 
-    pair = _zincblende_binary(struct, charges, recon_ligand)
+    pair = _tetrahedral_binary(struct, charges, recon_ligand)
     if pair is None:
-        return _skip("only binary zinc-blende II-VI / III-V structures are supported")
+        return _skip("only binary zinc-blende or wurtzite II-VI / III-V structures are supported")
     cation, anion = pair
-    if not _seeds_request_polar_111(facet_seeds):
+    if not _seeds_request_polar_111(facet_seeds, struct):
+        if kind == "wz":
+            return _skip("needs both a cation_rich (001) and an anion_rich (00-1) facet")
         return _skip("needs both a cation_rich {111} and an anion_rich {-1-1-1} facet family")
 
     q_cat = int(charges[cation])

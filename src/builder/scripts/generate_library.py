@@ -13,6 +13,9 @@ checked (neutral, no atom clashes, minimum core size) and written as
     <out>/<material>/<id>/record.json
     <out>/<material>/review.csv  and  review.md   (every build, incl. rejects)
 
+Optional `isotropic_cells: true` makes a size of N span N * min(a, b, c)
+along every lattice axis (for non-cubic cells such as wurtzite).
+
 Optional `preset_overrides: [{min_unit_cells: X, <preset key>: ...}]` replaces
 preset keys (e.g. facets) for sizes >= X.
 
@@ -36,6 +39,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import yaml
 
+from pymatgen.core import Structure
+
+from ..io_utils import center_coords
 from ..library_record import describe_structure, make_record, min_distance, read_xyz_first_frame
 from ..main import main as builder_main
 
@@ -66,13 +72,17 @@ def _sizes(spec) -> List[float]:
 
 
 def _build(cif: str, recipe: dict, positive_q_mode: str, workdir: Path) -> Optional[dict]:
-    """Run the builder in-process; return symbols, coordinates, manifest and log."""
+    """
+    Run the builder in-process; return symbols, coordinates (centred at the
+    centre of mass), the index of the atom the cut was centred on (at the
+    construction origin; None if it was removed), manifest and log.
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     yml = workdir / "recipe.yaml"
     yml.write_text(yaml.safe_dump(recipe, sort_keys=False))
     out = workdir / "out.xyz"
     log = io.StringIO()
-    argv = [cif, str(yml), "-o", str(out), "--center", "--positive-q-mode", positive_q_mode]
+    argv = [cif, str(yml), "-o", str(out), "--positive-q-mode", positive_q_mode]
     try:
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             rc = builder_main(argv)
@@ -83,9 +93,16 @@ def _build(cif: str, recipe: dict, positive_q_mode: str, workdir: Path) -> Optio
     if rc not in (0, None) or not out.exists():
         return {"error": f"builder exit code {rc}", "log": log.getvalue()}
     symbols, pts = read_xyz_first_frame(str(out))
+    pts = np.asarray(pts, float).reshape(-1, 3)
+    centre_index = None
+    if len(pts):
+        d_origin = np.linalg.norm(pts, axis=1)
+        centre_index = int(np.argmin(d_origin)) if d_origin.min() <= 0.1 else None
+        pts = center_coords(pts)
     manifest_path = workdir / "out.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    return {"symbols": symbols, "pts": pts, "manifest": manifest, "log": log.getvalue()}
+    return {"symbols": symbols, "pts": pts, "centre_index": centre_index, "manifest": manifest,
+            "log": log.getvalue()}
 
 
 def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
@@ -106,6 +123,11 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     min_anion_kept = float(cfg.get("min_anion_fraction_kept", 0.5))
     anions = [e for e in native_order if int(charges.get(e, 0)) < 0]
     reconstruction = cfg.get("reconstruction", "auto")
+    # Non-cubic cells (wurtzite): `isotropic_cells: true` scales the replica
+    # counts so a size of N spans N * min(a, b, c) along every axis; otherwise
+    # N cells along each axis stretch the dot by c/a.
+    lengths = np.array(Structure.from_file(cif).lattice.abc, dtype=float)
+    cell_scale = lengths.min() / lengths if cfg.get("isotropic_cells", False) else np.ones(3)
     out_root = Path(out_dir or (cfg_path.parent / cfg.get("out_dir", "out"))).resolve() / material
     out_root.mkdir(parents=True, exist_ok=True)
     revision = _qd_builder_revision()
@@ -126,7 +148,8 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             row["status"] = f"rejected: {res['error']}"
             review.append(row)
             return None
-        desc = describe_structure(res["symbols"], res["pts"], native_order=native_order, charges=charges)
+        desc = describe_structure(res["symbols"], res["pts"], native_order=native_order, charges=charges,
+                                  centre_index=res["centre_index"])
         row.update(formula=desc["formula"], d_nm=desc["size"]["d_nm"], n_atoms=desc["n_atoms"],
                    Q=desc["total_charge"])
         reasons = []
@@ -142,7 +165,9 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             after = sum(desc["core"].get(e, 0) for e in anions)
             if before and after < min_anion_kept * before:
                 reasons.append(f"keeps {after}/{before} anions of its clean parent")
-        if desc["centre"] != centre:
+        if res["centre_index"] is None:
+            reasons.append("no atom at the construction origin")
+        elif desc["centre"] != centre:
             reasons.append(f"centre detected as {desc['centre']}")
         if reasons:
             row["status"] = "rejected: " + "; ".join(reasons)
@@ -194,7 +219,7 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
                 for ov in cfg.get("preset_overrides", []):
                     if size >= float(ov["min_unit_cells"]) - 1e-9:
                         recipe.update(copy.deepcopy({k: v for k, v in ov.items() if k != "min_unit_cells"}))
-                recipe["size_unit_cells"] = [size, size, size]
+                recipe["size_unit_cells"] = [round(float(size * f), 6) for f in cell_scale]
                 recipe["construction_origin"] = {"center_on_species": centre}
                 tag = f"{centre}_{size}"
                 clean = consider(centre, size, "clean", recipe,
