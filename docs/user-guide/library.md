@@ -46,6 +46,7 @@ preset:                           # a complete builder recipe
 | `native_elements` | required | elements of the inorganic core, in formula order |
 | `centres` | required | species to centre on (`construction_origin.center_on_species`) |
 | `sizes` | required | list, or `{start, stop, step}` (inclusive), in unit cells |
+| `isotropic_cells` | `false` | scale the cell counts so a size N spans N × min(a, b, c) along every axis (non-cubic cells such as wurtzite) |
 | `preset` | required | the builder recipe; `size_unit_cells` and the centre are filled in |
 | `preset_overrides` | none | size-dependent changes, see below |
 | `positive_q_mode` | `add` | passed to the builder |
@@ -80,7 +81,9 @@ Every structure is then checked. It is rejected if:
 - it carries a net charge;
 - its core has fewer than `min_core_atoms` atoms;
 - two atoms are closer than `min_interatomic_distance`;
-- it is centred on a different species than requested;
+- it is centred on a different species than requested (the centre is the atom
+  at the construction origin, so polar sites such as wurtzite's, whose core
+  centroid lies up to ~1 Å off that atom along c, are attributed correctly);
 - it is a reconstruction that kept less than `min_anion_fraction_kept` of
   its parent's anions.
 
@@ -115,4 +118,12 @@ The repository ships configurations for all QDSpace templates in
   stoichiometric {110});
 - zinc-blende III–V (Ga and In pnictides);
 - rock-salt IV–VI (PbS, PbSe, PbTe);
-- cubic CsPbX₃ perovskites, centred on Cs.
+- cubic CsPbX₃ perovskites, centred on Cs;
+- wurtzite CdSe (`cdse_wz.yaml`): six {100} prism facets plus the polar
+  (001) cation-rich / (00-1) anion-rich pair, which take the same
+  reconstruction as zinc-blende {111} / {-1-1-1}.
+
+Variant recipes of a series (e.g. `inp_zb_100.yaml`, the III–V default plus
+a cation-rich {100} at γ = 1.2) write to their own output directory and are
+served from `builder_<tag>/` next to the default `builder/`; the webapp
+ingest keeps one copy of a structure that two recipes produce.

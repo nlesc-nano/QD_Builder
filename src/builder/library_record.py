@@ -171,11 +171,22 @@ def describe_structure(
     *,
     native_order: Sequence[str],
     charges: Dict[str, float],
+    centre_index: Optional[int] = None,
 ) -> dict:
-    """Everything computable from coordinates alone (the core of a record)."""
+    """
+    Everything computable from coordinates alone (the core of a record).
+
+    `centre_index` names the atom the cut was centred on, when known (builder
+    output).  Polar sites such as wurtzite's leave the core centroid up to ~1 Å
+    off that atom along c, beyond what `centre_species` can attribute.
+    """
     comp = composition(symbols)
     native = set(native_order)
-    centre, centre_d = centre_species(symbols, pts, native)
+    if centre_index is None:
+        centre, centre_d = centre_species(symbols, pts, native)
+    else:
+        centre = symbols[centre_index]
+        centre_d = float(np.linalg.norm(pts[centre_index] - _core(symbols, pts, native).mean(axis=0)))
     return {
         "formula": formula(comp, native_order),
         "composition": comp,

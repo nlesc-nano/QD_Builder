@@ -50,6 +50,23 @@ and the reason is written to the ledger. The reconstruction ligand must
 carry a negative charge; if it is absent from the `charges` block it is
 registered as a monovalent anion.
 
+### Wurtzite
+
+The same step runs on binary wurtzite cells (hexagonal, $a = b$,
+$\gamma = 120°$, both species four-fold coordinated). Perpendicular to $c$
+the wurtzite stacking has the same single-species, close-packed layers as
+zinc blende perpendicular to ⟨111⟩, with one bond per atom along the normal,
+so the (001) and ($00\bar1$) facets are the counterparts of (111) and
+($\bar1\bar1\bar1$). The polar directions are then $(0\,0\,\pm1)$ instead of the
+eight ⟨111⟩, the recipe must carry an (001) seed with `termination:
+cation_rich` and one with `termination: anion_rich`, the in-plane cation
+lattice is spanned by $\mathbf a$ and $\mathbf a + \mathbf b$ (cation-cation
+distance $a$), the bond length is the shortest cation-anion distance of the
+cell, and the cluster rotations are the proper rotations of the hexagonal
+lattice. Everything below (vacancy pattern, ligand conversion, cation
+removal and ligand addition) is unchanged. The {100} prism facets are
+non-polar and are not touched.
+
 ## Reading polarity from the structure
 
 Polarity is determined from the atoms the particle actually exposes, never
