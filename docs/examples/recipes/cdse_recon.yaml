@@ -1,0 +1,20 @@
+# CdSe zinc-blende dot, 2 unit cells, Se-centred, with the {111} reconstruction.
+charges: {Cd: 2, Se: -2, Cl: -1}
+size_unit_cells: [2.0, 2.0, 2.0]
+construction_origin: {center_on_species: Se}
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+  prepass_mode: role-aware
+  prepass_min_cn_terrace: 3
+  prepass_min_cn_edge: 2
+  prepass_min_cn_vertex: 1
+facets:
+  - {hkl: "100",    scope: family, termination: cation_rich, gamma: 1.0}
+  - {hkl: "111",    scope: family, termination: cation_rich, gamma: 1.0}
+  - {hkl: "-1-1-1", scope: family, termination: anion_rich,  gamma: 1.0}
+symmetry: {proper_rotations_only: true}
+post_treatment:
+  surface_reconstruction:
+    enabled: true
+    ligand: Cl

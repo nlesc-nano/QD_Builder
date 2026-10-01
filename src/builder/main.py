@@ -561,6 +561,42 @@ def _surface_charge_for_signed_hkl(struct: Structure, hkl, charges) -> int:
     ))
 
 
+def _exposed_charge_for_wulff_hkl(struct: Structure, hkl, charges) -> int:
+    """
+    Charge of the layer a Wulff facet with outward normal ``hkl`` exposes.
+
+    Bond-based, so independent of the CIF origin/setting: the exposed layer
+    is the species whose atoms lose the fewest bonds across the surface
+    (e.g. zinc-blende {111}: the atoms with one bond pointing out).  When
+    every species loses the same number (rock-salt {111}), fall back to the
+    topmost unit-cell layer along the opposite normal.
+    """
+    n = unit_normal(struct, hkl)
+    dmin = min(
+        float(nb.nn_distance)
+        for site in struct.sites
+        for nb in struct.get_neighbors(site, 6.0)
+    )
+    out_bonds: dict[str, int] = {}
+    for site in struct.sites:
+        up = sum(
+            1 for nb in struct.get_neighbors(site, 1.15 * dmin)
+            if float(np.dot(nb.coords - site.coords, n)) > 1e-3 * float(nb.nn_distance)
+        )
+        sp = str(site.specie.symbol)
+        if up > 0:
+            out_bonds[sp] = min(up, out_bonds.get(sp, up))
+    if out_bonds:
+        fewest = min(out_bonds.values())
+        exposed = [sp for sp, k in out_bonds.items() if k == fewest]
+        if len(exposed) == 1:
+            return int(charges.get(exposed[0], 0)) * sum(
+                1 for site in struct.sites if str(site.specie.symbol) == exposed[0]
+            )
+    # Wulff halfspaces expose the layer that is topmost along the opposite normal.
+    return _surface_charge_for_signed_hkl(struct, tuple(-int(x) for x in hkl), charges)
+
+
 def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) -> List[Facet]:
     resolved: List[Facet] = []
     for f in seeds:
@@ -581,18 +617,23 @@ def _resolve_facet_terminations(struct: Structure, seeds: List[Facet], charges) 
             # recipe. Wulff halfspaces expose the layer opposite the plane
             # normal, so only flip the construction normal; do not choose
             # between the two signed terminations.
-            chosen = hkl
+            chosen = (-hkl[0], -hkl[1], -hkl[2])
         else:
             candidates = [hkl, (-hkl[0], -hkl[1], -hkl[2])]
-            scored = [(cand, _surface_charge_for_signed_hkl(struct, cand, charges)) for cand in candidates]
+            scored = [(cand, _exposed_charge_for_wulff_hkl(struct, cand, charges)) for cand in candidates]
+            if scored[0][1] == scored[1][1]:
+                # Both signs expose the same layer by bonds (e.g. perovskite
+                # {111}): keep the unit-cell projection rule.
+                scored = [
+                    (cand, _surface_charge_for_signed_hkl(struct, tuple(-x for x in cand), charges))
+                    for cand in candidates
+                ]
             if term == "cation_rich":
                 chosen, _q = max(scored, key=lambda rec: rec[1])
             elif term == "anion_rich":
                 chosen, _q = min(scored, key=lambda rec: rec[1])
             else:
                 chosen = hkl_in
-        # Bulk slab scoring uses max projection; Wulff halfspaces expose the opposite polar layer.
-        chosen = (-chosen[0], -chosen[1], -chosen[2])
         resolved.append(Facet(chosen[0], chosen[1], chosen[2], f.gamma, termination=term, scope=scope))
     return resolved
 
@@ -762,6 +803,7 @@ def _run_passivation_and_write_outputs(
         "surface_reconstruction",
         cfg.facet_reconstruction,
     )
+    surface_reconstruction_ledger: dict = {}
     if surface_reconstruction_spec.enabled:
         from functools import partial
         balance_fn = partial(
@@ -785,6 +827,7 @@ def _run_passivation_and_write_outputs(
             verbose=args.verbose,
             write_all=args.write_all,
             prefix=prefix,
+            ledger=surface_reconstruction_ledger,
         )
 
     if output_layer_planes is not None:
@@ -1009,6 +1052,8 @@ def _run_passivation_and_write_outputs(
         extra["z_type_displacement_ledger"] = z_type_displacement_ledger
     if alloying_ledger:
         extra["alloying_ledger"] = alloying_ledger
+    if surface_reconstruction_ledger:
+        extra["surface_reconstruction_ledger"] = surface_reconstruction_ledger
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     return syms, pts, ligand_exchange_charge_ledger
