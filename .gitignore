@@ -55,3 +55,4 @@ examples/out/*
 /*.zip
 cache/
 size_cell_scan/
+examples/library/out/
