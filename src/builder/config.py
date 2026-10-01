@@ -716,6 +716,10 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
     if distribution != "fps":
         raise ValueError("post_treatment.surface_reconstruction.distribution currently supports only 'fps'")
 
+    cation_removal = str(raw.get("cation_removal", "auto")).strip().lower()
+    if cation_removal not in {"auto", "max", "mirror"}:
+        raise ValueError("post_treatment.surface_reconstruction.cation_removal must be auto, max or mirror")
+
     return SurfaceReconstructionSpec(
         enabled=True,
         ligand=str(raw.get("ligand", default_ligand)),
@@ -725,6 +729,7 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
         min_separation=min_separation,
         distribution=distribution,
         seed=int(raw.get("seed", 1337)),
+        cation_removal=cation_removal,
     )
 
 
@@ -929,10 +934,16 @@ def parse_yaml_config(path: str) -> Config:
             scope_by[(h, k, l)] = scope
             term = f.get("termination")
             if term is not None:
-                term_s = str(term).strip().lower()
-                if term_s not in {"cation_rich", "anion_rich"}:
-                    raise ValueError("facet termination must be 'cation_rich' or 'anion_rich'")
-                term_by[(h, k, l)] = term_s
+                term_s = str(term).strip().lower().replace("-", "_")
+                if term_s in {"", "none", "null", "stoichiometric"}:
+                    term_by[(h, k, l)] = None   # non-polar facet: no termination to impose
+                elif term_s in {"cation_rich", "anion_rich"}:
+                    term_by[(h, k, l)] = term_s
+                else:
+                    raise ValueError(
+                        f"facet {hkl_raw}: termination {term!r} must be 'cation_rich', "
+                        "'anion_rich' or 'stoichiometric'"
+                    )
             else:
                 term_by[(h, k, l)] = None
 

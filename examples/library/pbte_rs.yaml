@@ -1,0 +1,29 @@
+# PbTe rock-salt size series for the QDSpace library.
+# The preset mirrors the webapp Builder's IV-VI default recipe ({100} gamma 1.0,
+# {111} cation-rich gamma 1.0).
+material: PbTe
+family: IV-VI
+phase: rock-salt
+cif: cifs/PbTe_rs.cif
+native_elements: [Pb, Te]
+centres: [Pb, Te]
+sizes: {start: 0.5, stop: 4.0, step: 0.25}   # unit cells, cubic
+positive_q_mode: add
+reconstruction: never
+min_core_atoms: 20
+min_interatomic_distance: 1.8      # Å
+out_dir: out
+
+preset:
+  charges: {Pb: 2, Te: -2, Cl: -1}
+  passivation:
+    ligand: Cl
+    surf_tol: 2.0
+    prepass_mode: role-aware
+    prepass_min_cn_terrace: 3
+    prepass_min_cn_edge: 2
+    prepass_min_cn_vertex: 1
+  facets:
+    - {hkl: "100", scope: family, gamma: 1.0}
+    - {hkl: "111", scope: family, termination: cation_rich, gamma: 1.0}
+  symmetry: {proper_rotations_only: true}
