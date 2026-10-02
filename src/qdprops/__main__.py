@@ -21,7 +21,8 @@ from .run import Settings, run_record
 
 def _settings(args) -> Settings:
     s = Settings(head=args.head, device=args.device, dtype=args.dtype, fmax=args.fmax,
-                 hessian=args.hessian, xtb_ip_ea=not args.no_ip_ea, solvation_checks=args.solvation_checks)
+                 hessian=args.hessian, xtb_ip_ea=not args.no_ip_ea, solvation_checks=args.solvation_checks,
+                 sites_hessian_max_atoms=args.site_hessians, sites_solvation=args.site_solvation)
     if args.model:
         s.model = args.model
     return s
@@ -43,6 +44,11 @@ def main(argv=None) -> int:
         p.add_argument("--no-ip-ea", action="store_true", help="skip the charged xtb single points")
         p.add_argument("--solvation-checks", action="store_true",
                        help="also compute ddCOSMO (eps 2.4, 80) and ALPB solvation per structure, as checks")
+        p.add_argument("--site-hessians", type=int, default=Settings.sites_hessian_max_atoms, metavar="N",
+                       help="binding-site map: a MACE Hessian per site class for dots of up to N atoms "
+                            "(default 0: reuse the first desorption step's thermal part)")
+        p.add_argument("--site-solvation", choices=("scf", "frozen"), default=Settings.sites_solvation,
+                       help="binding-site map solvation: a GFN2-xTB single point per site (scf) or the dot's charges")
         p.add_argument("--cif", default=None, help="bulk CIF (default: resolved from record.origin.cif)")
         p.add_argument("--force", action="store_true", help="ignore cached step results")
         if name == "batch":

@@ -52,6 +52,7 @@ dynamic-library directories it needs from `QDPROPS_XTB_LIBS`
 | `stability` | MACE-MH-1 | decomposition into bulk MA and MX_q monomers, binding against MA and MX_q monomers: ΔE, ΔE + ΔZPE, ΔG(T) |
 | `detachment` | MACE-MH-1 | stepwise Z-type MX_q removal by a beam search: ΔE and ΔG(T) per step, every symmetry-distinct first site with its facet/edge/vertex location, the equilibrium shell ⟨k⟩(T, Δμ_MXq) |
 | `solvation` | GFN2-xTB | Generalized Born solvation of the dot, every stripped state and the monomers, as a function of ε; ddCOSMO and ALPB checks |
+| `sites` | MACE-MH-1 + GFN2-xTB | per symmetry-distinct surface unit: relaxed product, harmonic free energy and GB solvation, symmetry orbit, faceted shape for the binding-site map |
 | `report` | — | `ground_state.html` (interactive, the webapp's Properties tab) and `ground_state.png` |
 
 Bonds are opposite-charge pairs closer than 1.2 times the bulk cation–anion
@@ -248,6 +249,44 @@ chemical potential, μ(MA) = G°(molecule) + ΔG_solv + Δμ_prec + k_BT ln c. I
 models a monomer that is really bound in a molecular precursor. The
 concentration term is the ideal-dilution entropy and scales with T; the
 offset does not. The free energies are tabulated from 50 to 1500 K.
+
+**Binding-site map.** This panel sits beside the stepwise desorption panel. It
+colours the Cd and Cl of every desorbable unit of the intact dot by the
+cheapest removal they take part in:
+
+$$\Delta G_\mathrm{site}(T, \varepsilon, c) = G^\mathrm{sol}(\mathrm{dot} - \mathrm{unit})
+- G^\mathrm{sol}(\mathrm{dot}) + \mu_{\mathrm{MX}_q}(T, \varepsilon, c)$$
+
+- **Inputs per product.** For each of the symmetry-distinct units (25 for
+  Cd68Se55Cl26) the `sites` step takes the relaxed product from the
+  desorption cache; no new relaxations are needed. It runs one GFN2-xTB
+  single point per product for the Generalized Born charges.
+- **Thermal part.** By default it is not computed per site. It is taken from
+  the first step of the desorption path, shifted by each site's own energy:
+  G(dot − unit_i) ≈ G(dot − unit₁) + E_i − E₁. So no Hessians are needed
+  beyond the path's.
+- **Accuracy check.** Validated against per-site Hessians on Cd68Se55Cl26 (25
+  sites, exact spread 0.88 eV at 300 K, ε = 2.4, 10 mM): RMS 0.04 eV, maximum
+  0.08 eV, rank correlation 0.994.
+- **Options.**
+  - `--site-hessians N` computes the exact per-site Hessians for dots of up
+    to N atoms.
+  - `--site-solvation frozen` also skips the per-site single points, reusing
+    the intact dot's charges re-neutralised. It is cheaper but coarser: RMS
+    0.12 eV, rank correlation 0.90.
+- **Symmetry numbers.** They are left out (σ = 1): a site is a labelled
+  position, and its multiplicity is what the map shows. On Cd16Se13Cl6 the
+  site value equals the ladder ΔG₁ minus kT ln(σ₀/σ₁).
+- **Controls.** The panel can show ΔG in solution, with ε, [MX_q] and T
+  controls, or the electronic vacuum ΔE.
+- **3D view.** Orthographic, with van der Waals spheres.
+- **2D view.** Each surface atom is placed by its direction from the centre
+  (azimuth θ, latitude φ, [001] at the poles), as in Figure 3 of
+  Nanoscale 15, 7410 (2023). The field is a Gaussian-weighted average of the
+  site values (σ = 7°). The white lines are the edges of the faceted shape:
+  the recipe's facet families, expanded with the crystal's proper rotations,
+  each plane placed at the outermost native atom.
+- **PNG.** The static summary shows the 2D map of the vacuum ΔE.
 
 The ligand-shell map belongs to this section, not the vacuum one, because
 ligand exchange is an equilibrium with the solution. The vacuum section shows
