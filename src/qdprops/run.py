@@ -30,17 +30,19 @@ REPO = Path(__file__).resolve().parents[2]
 CIF_DIRS = [REPO / "examples/library/cifs", REPO / "examples/cifs"]
 # Steps whose results a step reads (their hashes enter its cache key).
 DEPS = {
-    "relax": [], "structure": ["relax"], "hessian": ["relax", "structure"], "electronic": ["relax", "structure"],
+    "relax": [], "structure": ["relax"], "hessian": ["relax", "structure"],
+    "vibspec": ["relax", "structure", "hessian"], "electronic": ["relax", "structure"],
     "stability": ["structure", "hessian"], "detachment": ["structure", "hessian"],
     "solvation": ["relax", "detachment"],
-    "report": ["relax", "structure", "hessian", "stability", "detachment", "solvation"],
+    "report": ["relax", "structure", "hessian", "vibspec", "stability", "detachment", "solvation"],
 }
 # Source files whose content enters a step's cache key (engine versions are in the provenance).
 CODE_DEPS = {
     "relax": ["steps/relax.py"], "structure": ["steps/structure.py"], "hessian": ["steps/hessian.py"],
+    "vibspec": ["steps/vibspec.py"],
     "electronic": ["steps/electronic.py"], "stability": ["steps/stability.py", "references.py"],
     "detachment": ["steps/detachment.py", "references.py"], "solvation": ["steps/solvation.py"],
-    "report": ["steps/report.py", "solution.py", "dashboards.py"],
+    "report": ["steps/report.py", "steps/vibplots.py", "solution.py", "dashboards.py"],
 }
 FORMAL_CHARGES = {
     "Cd": 2, "Zn": 2, "Pb": 2, "Hg": 2, "In": 3, "Ga": 3, "Al": 3, "Cs": 1, "Rb": 1,
@@ -62,6 +64,10 @@ class Settings:
     fd_step: float = 0.01            # Å
     temperatures: List[float] = field(default_factory=lambda: [float(t) for t in range(50, 801, 25)])
     vdos_sigma: float = 5.0          # cm-1, Gaussian broadening
+    vibspec_step: float = 0.1        # amu^1/2 Å, normal-coordinate displacement for the derivatives
+    vibspec_field: float = 0.02      # V/Å, finite field for the polarisability
+    vibspec_max_atoms: int = 300
+    vibspec_workers: int = 0         # concurrent single-threaded g-xTB runs (0: cpu count - 2, at most 12)
     xtb_method: str = "gfn2"        # gfn2 | gxtb
     solvation_checks: bool = False   # also run ddCOSMO (eps 2.4, 80) and ALPB checks per structure
     xtb_ip_ea: bool = True
@@ -82,6 +88,8 @@ class Settings:
             "hessian": {**mace, "hessian": self.hessian, "analytic_max_atoms": self.analytic_max_atoms,
                         "fd_step": self.fd_step, "temperatures": self.temperatures,
                         "vdos_sigma": self.vdos_sigma},
+            "vibspec": {**mace, "method": "gxtb", "acc": "0.01", "step": self.vibspec_step,
+                        "field": self.vibspec_field, "max_atoms": self.vibspec_max_atoms, "cif": "record"},
             "electronic": {"method": self.xtb_method, "ip_ea": self.xtb_ip_ea, "gradient": self.xtb_gradient},
             "stability": {**mace, "temperatures": self.temperatures, "cif": "record"},
             "detachment": {**mace, "fmax": self.fmax, "max_steps": self.detach_max_steps,
@@ -175,8 +183,8 @@ def _step_inputs(ctx: Context, step: str) -> dict:
 
 def run_record(record_dir: Path, steps: Sequence[str] = STEPS, settings: Optional[Settings] = None,
                cif: Optional[str] = None, force: bool = False, log: Callable[[str], None] = print) -> dict:
-    from .steps import detachment, electronic, hessian, relax, report, solvation, stability, structure
-    impl = {"relax": relax.run, "structure": structure.run, "hessian": hessian.run,
+    from .steps import detachment, electronic, hessian, relax, report, solvation, stability, structure, vibspec
+    impl = {"relax": relax.run, "structure": structure.run, "hessian": hessian.run, "vibspec": vibspec.run,
             "electronic": electronic.run, "stability": stability.run, "detachment": detachment.run,
             "solvation": solvation.run, "report": report.run}
     settings = settings or Settings()
