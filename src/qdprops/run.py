@@ -39,10 +39,10 @@ DEPS = {
 # Source files whose content enters a step's cache key (engine versions are in the provenance).
 CODE_DEPS = {
     "relax": ["steps/relax.py"], "structure": ["steps/structure.py"], "hessian": ["steps/hessian.py"],
-    "vibspec": ["steps/vibspec.py"],
+    "vibspec": ["steps/vibspec.py", "bulk.py"],
     "electronic": ["steps/electronic.py"], "stability": ["steps/stability.py", "references.py"],
     "detachment": ["steps/detachment.py", "references.py"], "solvation": ["steps/solvation.py"],
-    "report": ["steps/report.py", "steps/vibplots.py", "solution.py", "dashboards.py"],
+    "report": ["steps/report.py", "steps/vibplots.py", "bulk.py", "solution.py", "dashboards.py"],
 }
 FORMAL_CHARGES = {
     "Cd": 2, "Zn": 2, "Pb": 2, "Hg": 2, "In": 3, "Ga": 3, "Al": 3, "Cs": 1, "Rb": 1,

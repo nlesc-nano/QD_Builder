@@ -312,56 +312,9 @@ def raman_invariants(dalpha):
 
 
 def bulk_gamma(cif, settings):
-    """MACE Gamma-point optical frequencies (cm⁻¹) of the cell-relaxed primitive cell (no LO–TO splitting), cached."""
-    from ..engines import resolve_device
-    from ..references import REFS_DIR
-    dev = resolve_device(settings.device)
-    src = {"head": settings.head, "model": Path(settings.model).name, "device": dev,
-           "dtype": "float32" if dev == "mps" else settings.dtype,
-           "cif": hashlib.sha256(Path(cif).read_bytes()).hexdigest()[:16], "v": 1}
-    path = REFS_DIR / settings.head / "gamma" / (hashlib.sha256(json.dumps(src, sort_keys=True).encode())
-                                                 .hexdigest()[:12] + ".json")
-    if path.is_file():
-        return json.loads(path.read_text())["optical_cm1"]
-    out = _bulk_gamma(cif, settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"key": src, "cif": Path(cif).name, "optical_cm1": out}))
-    return out
-
-
-def _bulk_gamma(cif, settings):
-    from ase.filters import FrechetCellFilter
-    from ase.optimize import BFGS
-    from pymatgen.core import Structure
-    from pymatgen.io.ase import AseAtomsAdaptor
-    from ..engines import mace_calculator
-    from .hessian import EIG_TO_CM1
-
-    atoms = AseAtomsAdaptor.get_atoms(Structure.from_file(str(cif)).get_primitive_structure())
-    for key in list(atoms.arrays):
-        if key not in ("numbers", "positions"):
-            del atoms.arrays[key]
-    atoms.info = {}
-    atoms.calc = mace_calculator(settings.head, settings.model, settings.device, settings.dtype)
-    BFGS(FrechetCellFilter(atoms), logfile=None).run(fmax=1e-3, steps=1000)
-    n, d = len(atoms), 0.01
-    pos0 = atoms.get_positions().copy()
-    h = np.zeros((3 * n, 3 * n))
-    for k in range(3 * n):           # displacing an atom of the primitive cell moves its whole sublattice: q = 0
-        i, a = divmod(k, 3)
-        f = []
-        for s in (1.0, -1.0):
-            p = pos0.copy()
-            p[i, a] += s * d
-            atoms.set_positions(p)
-            f.append(atoms.get_forces().ravel())
-        h[:, k] = -(f[0] - f[1]) / (2 * d)
-    atoms.set_positions(pos0)
-    w = 1 / np.sqrt(np.repeat(atoms.get_masses(), 3))
-    lam = np.linalg.eigvalsh(0.5 * (h + h.T) * w[:, None] * w[None, :])
-    nu = np.sign(lam) * np.sqrt(np.abs(lam)) * EIG_TO_CM1
-    acoustic = np.argsort(np.abs(nu))[:3]           # the three acoustic modes are those nearest zero
-    return sorted(float(x) for i, x in enumerate(nu) if i not in set(acoustic))
+    """MACE Gamma-point optical frequencies (cm⁻¹) of the bulk (qdprops.bulk, cached)."""
+    from ..bulk import mace_bulk
+    return mace_bulk(cif, settings)["optical_cm1"]
 
 
 def mode_class(freq, core, surface, ligand, breathing, ir_rel, raman_rel, omega_to):

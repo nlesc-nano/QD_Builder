@@ -175,17 +175,21 @@ def captions(v):
 
 
 def key_rows(v):
+    """Rows (label_html, label_tex, value_html, value_tex, definition_html, definition_tex)."""
     sm = v["summary"]
-    rows = [("Point group", "Point group", f"{sm['point_group']}", "symmetry of the relaxed dot"),
+    rows = [("Point group", "Point group", sm["point_group"], sm["point_group"], "symmetry of the relaxed dot",
+             "symmetry of the relaxed dot"),
             ("Polarisability α<sub>iso</sub>", "Polarisability $\\alpha_\\mathrm{iso}$", f"{sm['alpha_iso_A3']:.0f} Å³",
-             "g-xTB, finite field")]
+             f"{sm['alpha_iso_A3']:.0f} Å³", "⅓ tr α, g-xTB, finite field", "g-xTB, finite field")]
     if sm.get("top_ir"):
         nu, irr, a = sm["top_ir"][0]
-        rows.append(("Strongest IR peak", "Strongest IR peak", f"{nu:.0f} cm⁻¹ ({irr})", f"{a:.0f} km/mol"))
+        rows.append(("Strongest IR peak", "Strongest IR peak", f"{nu:.0f} cm<sup>−1</sup> ({_irrep_html(irr)})",
+                     f"{nu:.0f} cm$^{{-1}}$ ({_irrep_tex(irr)})", f"A = {a:.0f} km/mol", f"{a:.0f} km/mol"))
     if sm.get("top_raman"):
         nu, irr, s = sm["top_raman"][0]
-        rows.append(("Strongest Raman activity", "Strongest Raman activity", f"{nu:.0f} cm⁻¹ ({irr})",
-                     f"{s:.0f} Å⁴/amu, non-resonant"))
+        rows.append(("Strongest Raman activity", "Strongest Raman activity",
+                     f"{nu:.0f} cm<sup>−1</sup> ({_irrep_html(irr)})", f"{nu:.0f} cm$^{{-1}}$ ({_irrep_tex(irr)})",
+                     f"S = {s:.0f} Å<sup>4</sup>/amu, non-resonant", f"{s:.0f} Å$^4$/amu"))
     return rows
 
 

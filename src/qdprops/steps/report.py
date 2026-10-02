@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import html
 import json
+from pathlib import Path
 import re
 import textwrap
 
@@ -110,7 +111,11 @@ def _data(ctx) -> dict:
         "rec": ctx.record,
         "vib": r.get("vibspec") if r.get("vibspec", {}).get("modes") else None,
     }
-    d["bond_rows"], d["bulk_bond"] = _bond_rows(ctx)
+    d["bond_rows"], d["bulk_bond_cif"] = _bond_rows(ctx)
+    d["bulk_mace"], d["bulk_exp"] = _bulk_bonds(ctx)
+    core = [x for (cat, _l), v in d["bond_rows"] if cat == "core" for x in v["relaxed"]]
+    ref = d["bulk_mace"] or d["bulk_bond_cif"]
+    d["core_strain"] = 100 * (np.mean(core) / ref - 1) if core and ref else None
     u = d["stab"].get("summary", {}).get("units")
     if u:
         q = u["q"]
@@ -118,6 +123,19 @@ def _data(ctx) -> dict:
         d["unit_mx"] = f"{u['M']}{u['X']}{q if q > 1 else ''}" if u["X"] else None
         d["n_ma"], d["m_mx"] = u["n_MA"], u["m_MXq"]
     return d
+
+
+def _bulk_bonds(ctx):
+    """(MACE-MH-1 bulk bond Å or None, (experimental bond Å, reference) or None)."""
+    from ..bulk import experimental_bond, mace_bulk
+    if ctx.cif is None:
+        return None, None
+    try:
+        mace = mace_bulk(ctx.cif, ctx.settings)["bond_A"]
+    except Exception as exc:  # reference line only
+        print(f"[qdprops]   report: MACE bulk reference failed ({exc})")
+        mace = None
+    return mace, experimental_bond(Path(ctx.cif).stem)
 
 
 def _half_coverage_300(det):
@@ -165,10 +183,11 @@ def _captions(d) -> dict:
         "bonds": ("Bond lengths", "Bond lengths",
                   "Every bond, by site: core (both atoms with bulk coordination), surface (at least one "
                   "under-coordinated atom) and ligand. Filled circles: relaxed; grey diamonds: builder start "
-                  "(bulk positions). Dashed line: bulk bond d<sub>0</sub> of the CIF.",
+                  "(bulk positions). Dashed: bulk bond d<sub>0</sub> of MACE-MH-1 (cell-relaxed bulk, same model); "
+                  "dotted: experimental bulk bond.",
                   "Every bond, by site: core (both atoms with bulk coordination), surface (at least one "
                   "under-coordinated atom) and ligand. Filled circles: relaxed; grey diamonds: builder start "
-                  "(bulk positions). Dashed line: bulk bond $d_0$ of the CIF."),
+                  "(bulk positions). Dashed: bulk $d_0$ of MACE-MH-1 (cell-relaxed bulk); dotted: experiment."),
         "cn": ("Coordination numbers", "Coordination numbers",
                "Atoms per coordination number: opposite-charge neighbours closer than 1.2 d<sub>0</sub> (native "
                "pairs) or 1.25 × the covalent-radius sum (ligands), at the start (outlines) and after relaxation "
@@ -268,40 +287,62 @@ def _captions(d) -> dict:
 
 
 def _key_numbers(d) -> list:
-    """(label_html, label_tex, value, definition) rows."""
+    """Rows (label_html, label_tex, value_html, value_tex, definition_html, definition_tex)."""
     rel, st, hs = d["relax"], d["structure"]["summary"], d["hess"]
     th = d["thermo"]
     i300 = th["T"].index(300.0) if 300.0 in th["T"] else None
+    ma, mx = d.get("unit_ma", "MA"), d.get("unit_mx") or "MX"
+    mah, mat, mxh, mxt = formula_html(ma), formula_tex(ma), formula_html(mx), formula_tex(mx)
+    n, m = d.get("n_ma", 0), d.get("m_mx", 0)
+    same = lambda t: (t, t)
     rows = [
-        ("Relaxation energy", "Relaxation energy", f"{rel['relaxation_energy_meV_atom']:.0f} meV/atom",
-         "E(relaxed) − E(start), per atom"),
-        ("RMSD start → relaxed", "RMSD start → relaxed", f"{rel['rmsd_A']:.2f} Å", "after optimal superposition"),
-        ("Bond topology", "Bond topology", "preserved" if st["topology_preserved"] else
-         f"{st['bonds_broken']} broken / {st['bonds_formed']} formed", "relaxed vs start bond graph"),
-        ("Core strain", "Core strain", f"{st['core_strain_pct']:+.1f} %" if st.get("core_strain_pct") is not None
-         else "—", "mean core bond vs bulk d₀"),
-        ("Imaginary modes", "Imaginary modes", f"{hs['n_imaginary']}", "none at a true minimum"),
-        ("ZPE", "ZPE", f"{hs['zpe_eV']:.3f} eV", "zero-point energy, ½ Σ ħω_k"),
+        (*same("Relaxation energy"), *same(f"{rel['relaxation_energy_meV_atom']:.0f} meV/atom"),
+         "[E<sub>relaxed</sub> − E<sub>start</sub>] / N, MACE-MH-1",
+         r"$(E_\mathrm{relaxed} - E_\mathrm{start})/N$"),
+        (*same("RMSD start → relaxed"), *same(f"{rel['rmsd_A']:.2f} Å"),
+         "after optimal superposition (Kabsch)", "after optimal superposition"),
+        (*same("Bond topology"), *same("preserved" if st["topology_preserved"] else
+                                       f"{st['bonds_broken']} broken / {st['bonds_formed']} formed"),
+         "relaxed vs start bond graph", "relaxed vs start bond graph"),
+    ]
+    if d.get("core_strain") is not None:
+        ref_h = "MACE-MH-1 bulk d<sub>0</sub>" if d.get("bulk_mace") else "CIF bulk d<sub>0</sub>"
+        rows.append((*same("Core strain"), *same(f"{d['core_strain']:+.1f} %"),
+                     f"⟨d<sub>core</sub>⟩ / d<sub>0</sub> − 1, against the {ref_h}",
+                     r"$\langle d_\mathrm{core}\rangle/d_0 - 1$"))
+    rows += [
+        (*same("Imaginary modes"), *same(f"{hs['n_imaginary']}"), "none at a true minimum", "none at a true minimum"),
+        (*same("ZPE"), *same(f"{hs['zpe_eV']:.3f} eV"), "ZPE = ½ Σ<sub>k</sub> ħω<sub>k</sub>",
+         r"$\frac{1}{2}\Sigma_k\hbar\omega_k$"),
     ]
     if i300 is not None:
-        rows.append(("S<sub>vib</sub> (300 K)", "$S_\\mathrm{vib}$ (300 K)", f"{th['S_vib_meV_K'][i300]:.2f} meV/K",
-                     "harmonic vibrational entropy"))
-        rows.append(("F<sub>vib</sub> (300 K)", "$F_\\mathrm{vib}$ (300 K)", f"{th['F_vib_eV'][i300]:.3f} eV",
-                     "U_vib − T S_vib"))
+        rows.append(("S<sub>vib</sub> (300 K)", "$S_\\mathrm{vib}$ (300 K)", *same(f"{th['S_vib_meV_K'][i300]:.2f} meV/K"),
+                     "vibrational entropy (quasi-RRHO)", "vibrational entropy (quasi-RRHO)"))
+        rows.append(("F<sub>vib</sub> (300 K)", "$F_\\mathrm{vib}$ (300 K)", *same(f"{th['F_vib_eV'][i300]:.3f} eV"),
+                     "F<sub>vib</sub> = U<sub>vib</sub> − T S<sub>vib</sub>",
+                     r"$F_\mathrm{vib} = U_\mathrm{vib} - TS_\mathrm{vib}$"))
     sb = d["stab"].get("summary", {})
     if "decomposition_dG_300K_per_MA_eV" in sb:
+        dot_h = f"({mah})<sub>{n}</sub>({mxh})<sub>{m}</sub>"
         rows.append(("ΔG<sub>dec</sub> (300 K)", "$\\Delta G_\\mathrm{dec}$ (300 K)",
-                     f"{sb['decomposition_dG_300K_per_MA_eV']:+.3f} eV per {d['unit_ma']}",
-                     "vs bulk + ligands at 1 M (panel h)"))
+                     f"{sb['decomposition_dG_300K_per_MA_eV']:+.3f} eV per {mah}",
+                     f"{sb['decomposition_dG_300K_per_MA_eV']:+.3f} eV per {mat}",
+                     f"[G({dot_h}) − {n} G({mah}, bulk) − {m} G({mxh}, 1 M)] / {n}: against bulk {mah} and "
+                     f"free {mxh}, vacuum",
+                     f"[G(dot) − {n} G({mat}, bulk) − {m} G({mxt}, 1 M)] / {n}"))
         rows.append(("ΔG<sub>bind</sub> (300 K)", "$\\Delta G_\\mathrm{bind}$ (300 K)",
-                     f"{sb['binding_dG_300K_per_unit_eV']:+.3f} eV per unit", "vs monomers at 1 M (panel i)"))
+                     *same(f"{sb['binding_dG_300K_per_unit_eV']:+.3f} eV per unit"),
+                     f"[G({dot_h}) − {n} G({mah}, 1 M) − {m} G({mxh}, 1 M)] / {n + m}: against the "
+                     f"{mah} and {mxh} monomers, vacuum",
+                     f"[G(dot) − {n} G({mat}, 1 M) − {m} G({mxt}, 1 M)] / {n + m}"))
     ds = d["det"].get("summary", {})
     if ds.get("dE_eV"):
         g = ds["dG_300K_eV"][0]
-        mx = d["unit_mx"]
-        rows.append((f"First {formula_html(mx)} detachment", f"First {formula_tex(mx)} detachment",
-                     f"ΔE {ds['dE_eV'][0]:+.2f} eV" + (f", ΔG {g:+.2f} eV" if g is not None else ""),
-                     "cheapest unit, 300 K, 1 M (panel j)"))
+        val = f"ΔE {ds['dE_eV'][0]:+.2f} eV" + (f", ΔG {g:+.2f} eV" if g is not None else "")
+        rows.append((f"First {mxh} detachment", f"First {mxt} detachment", *same(val),
+                     f"ΔE<sub>1</sub> = E(dot<sub>1</sub>) + E({mxh}) − E(dot<sub>0</sub>), cheapest unit; "
+                     f"ΔG at 300 K, {mxh} at 1 M, vacuum",
+                     r"$\Delta E_1$, cheapest unit; $\Delta G$ at 300 K, 1 M"))
     if d.get("vib"):
         rows += vibplots.key_rows(d["vib"])
     return rows
@@ -310,6 +351,19 @@ def _key_numbers(d) -> list:
 # --------------------------------------------------------------------------
 # Plotly (HTML)
 # --------------------------------------------------------------------------
+
+def _bulk_lines(d, html_):
+    """Reference lines of the bond plot: (x, label, dash, colour, y offset)."""
+    out = []
+    sub = (lambda t: f"<sub>{t}</sub>") if html_ else (lambda t: f"$_{{{t}}}$")
+    if d.get("bulk_mace"):
+        out.append((d["bulk_mace"], f"bulk d{sub('0')}, MACE-MH-1 = {d['bulk_mace']:.3f} Å", "dash", INK, 0.6))
+    elif d.get("bulk_bond_cif"):
+        out.append((d["bulk_bond_cif"], f"bulk d{sub('0')}, CIF = {d['bulk_bond_cif']:.3f} Å", "dash", INK, 0.6))
+    if d.get("bulk_exp"):
+        out.append((d["bulk_exp"][0], f"experiment = {d['bulk_exp'][0]:.3f} Å", "dot", INK2, 0.0))
+    return out
+
 
 def _layout(xt, yt, **kw):
     axis = dict(gridcolor=GRID, zeroline=False, linecolor=INK3, ticks="outside", tickcolor=INK3,
@@ -360,13 +414,12 @@ def _plotly_figures(d) -> dict:
                         marker=dict(size=9, color=SITE[cat], line=dict(color=SURFACE, width=1.5)),
                         hovertemplate=f"{label}, relaxed<br>%{{text}}: %{{x:.3f}} Å<extra></extra>")
         shown.add(cat)
-    bulk = d["bulk_bond"]
     fig.update_layout(**_layout("bond length (Å)", "", yaxis=dict(tickvals=list(range(len(labels))), ticktext=labels,
-                                                                   range=[-0.6, len(labels) - 0.4])))
-    if bulk:
-        fig.add_vline(x=bulk, line=dict(color=INK, width=1.5, dash="dash"))
-        fig.add_annotation(x=bulk, y=len(labels) - 0.45, text=f"bulk d<sub>0</sub> = {bulk:.3f} Å", showarrow=False,
-                           xanchor="left", xshift=6, font=dict(color=INK, size=11))
+                                                                   range=[-0.6, len(labels) + 0.4])))
+    for x0, text, dash, col, y0 in _bulk_lines(d, html_=True):
+        fig.add_vline(x=x0, line=dict(color=col, width=1.5, dash=dash))
+        fig.add_annotation(x=x0, y=len(labels) - 0.45 + y0, text=text, showarrow=False, xanchor="left", xshift=6,
+                           font=dict(color=col, size=11))
     figs["bonds"] = fig
 
     cn = d["structure"]["cn_hist"]
@@ -534,18 +587,16 @@ for (const [id, f] of Object.entries(FIGS)) {{
 
 SECTIONS = [
     ("Structure &amp; relaxation", ["relax", "bonds", "cn"], ""),
-    ("Vibrations &amp; thermochemistry", ["vdos_element", "vdos_role", "thermo_e", "thermo_s"],
+    ("Vibrations &amp; thermochemistry",
+     ["vdos_element", "vdos_role", "ir", "raman", "modemap", "thermo_e", "thermo_s"],
      "Harmonic normal modes of the analytic MACE-MH-1 Hessian at the relaxed geometry, with translations and "
-     "rotations projected out. Hover a curve for its value and definition."),
-    ("Vibrational spectra", ["ir", "raman", "modemap"],
-     "Hybrid scheme: frequencies and normal modes from MACE-MH-1, IR and Raman intensities from g-xTB dipole and "
-     "polarisability derivatives along those modes (finite differences, static finite field). Hover a peak or a "
-     "mode marker for its symmetry, intensities, depolarisation ratio and where its amplitude sits."),
-    ("Stability &amp; ligands", ["stability", "binding", "detach", "map"],
+     "rotations projected out. IR and Raman intensities: g-xTB dipole and polarisability derivatives along those "
+     "modes (finite differences, static finite field). Hover a curve or a peak for its value and definition."),
+    ("Stability &amp; ligands in vacuum", ["stability", "binding", "detach"],
      "References computed with the same MACE head: bulk {ma} (cell-relaxed, phonons) and the {ma} and {mx} "
-     "monomers as ideal-gas solutes at 1 M (harmonic vibrations, rigid-rotor rotation; the dot is treated the "
-     "same way). Solvation and L-type binding of the released {mx} are not included, so detachment free energies "
-     "are upper bounds."),
+     "monomers as ideal gases at a 1 M standard state (harmonic vibrations, rigid-rotor rotation; the dot is treated "
+     "the same way). No solvent: everything here is in vacuum; the next section adds solvation and finite "
+     "concentrations, and the equilibrium ligand shell."),
 ]
 
 
@@ -563,11 +614,11 @@ def _write_html(ctx, d, figs, caps, keys, solution=None) -> None:
                          f"<div class='cap'>{caps[i][2]}</div></div>" for i in ids)
         body.append(f"<h2>{title}</h2><div class='grid'>{panels}</div>"
                     + (f"<div class='note'>{note.format(ma=ma, mx=mx)}</div>" if note else ""))
-    payload = {k: json.loads(plotly.io.to_json(f)) for k, f in figs.items()}
+    shown = {i for _t, ids, _n in SECTIONS for i in ids}
+    payload = {k: json.loads(plotly.io.to_json(f)) for k, f in figs.items() if k in shown}
     rec = d["rec"]
     head = ctx.results["relax"].get("provenance", {}).get("head", "")
-    keys_html = "".join(f"<tr><td>{a}</td><td class='v'>{html.escape(v)}</td><td class='d'>{html.escape(dd)}</td></tr>"
-                        for a, _b, v, dd in keys)
+    keys_html = "".join(f"<tr><td>{k[0]}</td><td class='v'>{k[2]}</td><td class='d'>{k[4]}</td></tr>" for k in keys)
     page = PAGE.format(
         title_text=html.escape(f"{rec.get('formula', '')} ground state"),
         title=f"{formula_html(rec.get('formula', ''))} · {html.escape(rec.get('material', ''))} "
@@ -583,6 +634,17 @@ def _write_html(ctx, d, figs, caps, keys, solution=None) -> None:
 # --------------------------------------------------------------------------
 # Matplotlib (PNG)
 # --------------------------------------------------------------------------
+
+def _cells(d):
+    """PNG panel order (letters follow it): structure, vibrations and spectra, vacuum stability, solution, keys."""
+    c = ["relax", "bonds", "cn", "vdos_element", "vdos_role"]
+    if d.get("vib"):
+        c += ["ir", "raman", "modemap"]
+    c += ["thermo_e", "thermo_s", "stability", "binding", "detach"]
+    if d.get("solution"):
+        c += ["sol_dec", "sol_bind", "sol_iso", "sol_map"]
+    return c + ["keys"]
+
 
 def _style_axes(ax):
     ax.grid(True, color=GRID, lw=0.6)
@@ -628,6 +690,11 @@ def _solution_captions(d) -> dict:
                     "", f"Equilibrium number of {mxt} units lost, ⟨k⟩, against the {mxt} concentration in solution at "
                         f"$\\varepsilon$ = 2.4 (Boltzmann average over the evaluated configurations, each with its own "
                         "solvation and vibrational free energy along the removal path)."),
+        "sol_map": ("", "Equilibrium ligand shell in solution",
+                    "", f"⟨k⟩, the mean number of {mxt} units lost, against [{mxt}] and T at $\\varepsilon$ = 2.4: a "
+                        "Boltzmann average over every configuration evaluated by the desorption search (symmetry-"
+                        "weighted, so configurational entropy is included). Right: concentrated solution, shell intact; "
+                        "left: dilute, units desorb."),
     }
 
 
@@ -664,6 +731,22 @@ def _solution_panels(axes, d) -> None:
         ax.plot(lc, kk, color=col, lw=2.2, label=f"{tsel:.0f} K")
     ax.set(xlabel=f"log$_{{10}}$([{mxt}] / M)", ylabel=f"⟨k⟩ {mxt} removed", ylim=(-0.3, ex["units"]["m"] + 0.3))
     _legend_above(ax, ncol=2)
+    if "sol_map" in axes:
+        from matplotlib.colors import LinearSegmentedColormap
+        ax = axes["sol_map"][0]
+        lc = np.arange(-20, 0.01, 0.25)
+        z = np.array([mean_removed(ex, 2.4, 10 ** v) for v in lc]).T          # (T, c)
+        kmax = max(d_["k"] for d_ in ex["dots"])
+        cmap = LinearSegmentedColormap.from_list("seq", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
+        im = ax.pcolormesh(lc, T, z, cmap=cmap, vmin=0, vmax=kmax, shading="nearest", rasterized=True)
+        cb = ax.figure.colorbar(im, ax=ax, fraction=0.05, pad=0.02)
+        cb.set_label(rf"$\langle k\rangle$ {mxt} removed", color=INK2)
+        cb.outline.set_edgecolor(GRID)
+        cb.ax.tick_params(colors=INK2, labelsize=8.5)
+        if kmax > 1:
+            ax.contour(lc, T, z, levels=np.arange(0.5, kmax, 1.0), colors="white", linewidths=0.6, alpha=0.8)
+        ax.set(xlabel=f"log$_{{10}}$([{mxt}] / M)", ylabel="T (K)", ylim=(T[0], 900))
+        ax.grid(False)
 
 
 def _write_png(ctx, d, caps, keys) -> None:
@@ -679,21 +762,19 @@ def _write_png(ctx, d, caps, keys) -> None:
                          "axes.labelsize": 9})
     sol = d.get("solution")
     vib = d.get("vib")
-    nrow = 4 + bool(sol) + bool(vib)
+    nrow = -(-len(_cells(d)) // 3)
     fig = plt.figure(figsize=(17, 6 * nrow), facecolor="white")
     gs = GridSpec(2 * nrow, 3, figure=fig, height_ratios=[3, 1.1] * nrow, hspace=0.32, wspace=0.27,
                   left=0.05, right=0.975, top=1 - 0.065 * 4 / nrow, bottom=0.012)
     rec = d["rec"]
-    fig.text(0.05, 0.985, f"{formula_tex(rec.get('formula', ''))} · {rec.get('material', '')} {rec.get('phase', '')}",
+    fig.text(0.05, 1 - 0.36 / fig.get_figheight(), f"{formula_tex(rec.get('formula', ''))} · {rec.get('material', '')} {rec.get('phase', '')}",
              fontsize=16, fontweight="bold", color=INK, va="top")
     head = ctx.results["relax"].get("provenance", {}).get("head", "")
-    fig.text(0.05, 0.971, f"{rec.get('id', '')} — ground state from MACE-MH-1 ({head})", fontsize=10, color=INK2,
+    fig.text(0.05, 1 - 0.70 / fig.get_figheight(), f"{rec.get('id', '')} — ground state from MACE-MH-1 ({head})", fontsize=10, color=INK2,
              va="top")
 
-    cells = ["relax", "bonds", "cn", "vdos_element", "vdos_role", "thermo_e", "thermo_s", "stability", "binding",
-             "detach", "map", "keys"] + (["sol_dec", "sol_bind", "sol_iso"] if sol else []) \
-        + (["ir", "raman", "modemap"] if vib else [])
-    letters = "abcdefghijklmnopqr"
+    cells = _cells(d)
+    letters = "abcdefghijklmnopqrstuvwx"
     if sol:
         caps = dict(caps)
         caps.update(_solution_captions(d))
@@ -733,10 +814,10 @@ def _write_png(ctx, d, caps, keys) -> None:
                    edgecolors="white", linewidths=0.8, zorder=4)
     ax.set_yticks(range(len(labels)), labels)
     ax.set_ylim(-0.7, len(labels) - 0.3)
-    if d["bulk_bond"]:
-        ax.axvline(d["bulk_bond"], color=INK, lw=1.2, ls="--", zorder=2)
-        ax.text(d["bulk_bond"], len(labels) - 0.35, f"  bulk $d_0$ = {d['bulk_bond']:.3f} Å", color=INK,
-                fontsize=8.5, va="top", ha="left")
+    ax.set_ylim(-0.7, len(labels) + 0.5)
+    for x0, text, dash, col, y0 in _bulk_lines(d, html_=False):
+        ax.axvline(x0, color=col, lw=1.2, ls="--" if dash == "dash" else ":", zorder=2)
+        ax.text(x0, len(labels) - 0.35 + y0, f"  {text}", color=col, fontsize=8.5, va="top", ha="left")
     ax.set_xlabel("bond length (Å)")
     _legend_above(ax, ncol=4, handles=[
         Line2D([], [], marker="o", ls="", color=SITE["core"]),
@@ -852,6 +933,7 @@ def _write_png(ctx, d, caps, keys) -> None:
         ax.set(xlabel="units removed k", ylabel="eV")
         _legend_above(ax, ncol=3)
 
+    if det.get("steps") and "map" in axes:
         ax = axes["map"][0]
         mp = det["map"]
         z = np.asarray(mp["k_mean"], float)
@@ -876,15 +958,15 @@ def _write_png(ctx, d, caps, keys) -> None:
     # l  key numbers
     ax = axes["keys"][0]
     ax.axis("off")
-    ax.set_title(f"{letters[11]}   Key numbers", loc="left", pad=26)
+    ax.set_title(f"{letters[cells.index('keys')]}   Key numbers", loc="left", pad=26)
     y0 = 1.02
     step = min(0.085, 1.0 / max(len(keys), 1))
-    for _a_html, a_tex, v, dd in keys:
-        ax.text(0.0, y0, a_tex, fontsize=8.8, color=INK2, va="top", transform=ax.transAxes)
-        ax.text(0.46, y0, v, fontsize=8.8, color=INK, fontweight="bold", va="top", transform=ax.transAxes)
+    for k in keys:
+        ax.text(0.0, y0, k[1], fontsize=8.8, color=INK2, va="top", transform=ax.transAxes)
+        ax.text(0.46, y0, k[3], fontsize=8.8, color=INK, fontweight="bold", va="top", transform=ax.transAxes)
         y0 -= step
-    axes["keys"][1].text(0, 1.0, _wrap("Free energies at 300 K and a 1 M standard state; definitions and formulas "
-                                       "in the captions of panels f–k.", 80),
+    axes["keys"][1].text(0, 1.0, _wrap("Free energies at 300 K and a 1 M standard state, in vacuum; definitions in "
+                                       "the interactive page and in the panel captions.", 80),
                          va="top", fontsize=8.3, color=INK2, transform=axes["keys"][1].transAxes)
 
     if sol:
@@ -916,4 +998,4 @@ def run(ctx) -> dict:
     _write_html(ctx, d, figs, caps, keys, solution)
     _write_png(ctx, d, caps, keys)
     return {"summary": {"html": "ground_state.html", "png": "ground_state.png", "figures": sorted(figs)},
-            "key_numbers": [[k[1], k[2], k[3]] for k in keys]}
+            "key_numbers": [[k[1], k[3], k[5]] for k in keys]}
