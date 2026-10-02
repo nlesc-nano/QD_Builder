@@ -228,10 +228,36 @@ With $G_i^\mathrm{sol}(T,\varepsilon) = G_i^\circ(T) + \Delta G_{\mathrm{solv},i
   and the dissolution temperature $T_\mathrm{diss}$ where it reaches zero;
 - the stepwise ladder $\Delta G_k = G^\mathrm{sol}(\mathrm{dot}_k) - G^\mathrm{sol}(\mathrm{dot}_{k-1}) + \mu(\mathrm{MX}_q)$.
 
-The "In solution" section of `ground_state.html` evaluates these live, with
-sliders for ε (or a named ALPB solvent, or the gas phase), the MX_q and MA
-concentrations, a precursor shift of the MA monomer and T. The free energies
-are tabulated from 50 to 1500 K.
+The "Stability & ligands in solution" section of `ground_state.html`
+evaluates these live. Each panel has its own controls, only for the
+quantities that enter it:
+
+| Panel | Controls |
+|---|---|
+| ΔG_dec(T) | solvent model / ε, [MX_q] (MA is the bulk solid) |
+| ΔG_bind(T), T_diss | solvent / ε, [MA] monomer, [MX_q], precursor stabilisation |
+| Stepwise ladder | solvent / ε, [MX_q], T |
+| Desorption isotherm ⟨k⟩([MX_q]) | solvent / ε, T |
+| Equilibrium ligand shell ⟨k⟩([MX_q], T) | solvent / ε |
+
+The solvent model is Generalized Born with ε from a slider, a named ALPB
+solvent, or the gas phase.
+
+The precursor stabilisation Δμ_prec is a constant offset in the monomer
+chemical potential, μ(MA) = G°(molecule) + ΔG_solv + Δμ_prec + k_BT ln c. It
+models a monomer that is really bound in a molecular precursor. The
+concentration term is the ideal-dilution entropy and scales with T; the
+offset does not. The free energies are tabulated from 50 to 1500 K.
+
+The ligand-shell map belongs to this section, not the vacuum one, because
+ligand exchange is an equilibrium with the solution. The vacuum section shows
+ΔG_dec, ΔG_bind and the ΔE/ΔG desorption ladder at a 1 M standard state.
+
+The bond-length plot compares the dot with the MACE-MH-1 bulk bond (the CIF
+cell-relaxed with the same model, `qdprops.bulk`) and with the experimental
+bulk bond. For CdSe the model gives 2.686 Å and experiment 2.620 Å (zinc
+blende, a = 6.05 Å; wurtzite a = 4.299 Å, c = 7.010 Å; Landolt–Börnstein).
+The core strain is quoted against the MACE value.
 
 ## Synthesis dashboard
 
@@ -245,13 +271,15 @@ $c_i = e^{-\Delta G_i^\circ/kT} c_\mathrm{MA}^{n_i} c_\mathrm{MX}^{m_i}$ with
 $\Delta G_i^\circ = G_i^\mathrm{sol} - n_iG_\mathrm{MA}^\mathrm{sol} - m_iG_\mathrm{MX}^\mathrm{sol}$
 and the mass balances $C_\mathrm{MA} = c_\mathrm{MA} + \sum n_ic_i$,
 $C_\mathrm{MX} = c_\mathrm{MX} + \sum m_ic_i$ are solved for the free monomers
-(Newton in log space, continued from high T). Optionally bulk MA precipitates
+(nested bisection in log space, continued from high T). Optionally bulk MA precipitates
 once $c_\mathrm{MA}$ exceeds its solubility
 $c_\mathrm{sat} = e^{-(G_\mathrm{MA}^\mathrm{sol} - G_\mathrm{bulk})/kT}$.
 The page shows the yield of each dot family against T (with the dissolution
 onset), the populations against the $[\mathrm{MX}_q]/[\mathrm{MA}]$ ratio,
 the free monomers and the supersaturation $S = c_\mathrm{MA}/c_\mathrm{sat}$,
-and the ligand coverage, all with sliders.
+and the ligand coverage. Each panel has its own controls: solvent, total
+[MA], [MX_q]/[MA] ratio, precursor stabilisation and bulk precipitation. The
+ratio scan takes T in place of the ratio.
 
 The monomers are the bare MA and MX_q molecules; real precursors (metal
 carboxylates, phosphine chalcogenides) are more stable, which the precursor
