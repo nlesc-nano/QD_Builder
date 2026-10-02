@@ -776,6 +776,139 @@ def _choose_outward_vectors(
 # Top-level orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
+def neutral_ligand_host_sites(
+    cur_syms: List[str],
+    cur_pts: NDArray,
+    cfg: Config,
+    bulk_struct,
+    planes: List[Plane],
+    native_species: Optional[set[str]] = None,
+    *,
+    target: str = "both",
+    target_symbol: Optional[str] = None,
+    cuts: Optional[PairCuts] = None,
+) -> List[dict]:
+    """
+    Free L-type sites a neutral-ligand pass can fill, one per host atom.
+
+    Undercoordinated native surface atoms (CN below bulk, counting X-type
+    ligands as neighbours) give CIF virtual sites; sites already holding a
+    ligand atom are dropped, and each host keeps at most one site.  The
+    builder UI reports ``len()`` of this list as the available count.
+    """
+    charges = cfg.charges
+    surf_tol = cfg.passivation.surf_tol
+    if native_species is None:
+        native_species = _native_core_species(cfg, bulk_struct)
+    cur_pts = np.asarray(cur_pts, float)
+
+    surf_mask, bulk_cn = _find_undercoordinated_surface_sites(
+        cur_syms, cur_pts, charges, planes, surf_tol, cuts
+    )
+    neutral_surf_mask, neutral_shell_tol = _neutral_ligand_surface_mask(
+        cur_pts, planes, surf_tol, native_species, charges, cuts
+    )
+    cn_refs = _bulk_cn_refs_from_struct(bulk_struct, charges, native_species, bulk_cn)
+
+    # Compute actual CN
+    cn = coord_numbers_bipartite(cur_syms, cur_pts, charges, pair_cuts=cuts)
+
+    # --- Identify eligible native inorganic sites for this pass ---
+    eligible_indices: List[int] = []
+    for i in np.where(neutral_surf_mask)[0]:
+        sym = cur_syms[i]
+        if sym not in native_species:
+            continue
+        if target_symbol and sym != target_symbol:
+            continue
+        q_i = charges.get(sym, 0)
+        if q_i == 0:
+            continue
+        deficit = int(cn_refs.get(sym, bulk_cn.get(sym, 0))) - int(cn[i])
+        if deficit <= 0:
+            continue
+        # Filter by target
+        site_type = "cation" if q_i > 0 else "anion"
+        if target not in (site_type, "both"):
+            continue
+        # Each deficit slot → one "virtual site" entry
+        for _ in range(deficit):
+            eligible_indices.append(i)
+
+    if not eligible_indices:
+        print(f"  → No eligible sites found. Skipping.")
+        return []
+
+    # eligible_indices may have duplicates (one per deficit slot)
+    # Build a mapping: atom_idx → how many times it appears
+    from collections import Counter
+    slot_counts = Counter(eligible_indices)
+    unique_eligible = list(slot_counts.keys())
+    print(f"  → {len(unique_eligible)} eligible atoms  "
+          f"({sum(slot_counts.values())} total slots; neutral shell={neutral_shell_tol:.2f} Å)")
+
+    # Compute unified CIF-Intersection virtual sites
+    eligible_mask = np.zeros(len(cur_syms), bool)
+    for i in unique_eligible:
+        eligible_mask[i] = True
+
+    merged_cif_sites = []
+    if bulk_struct is not None:
+        try:
+            merged_cif_sites = compute_cif_virtual_sites(
+                cur_syms,
+                cur_pts,
+                charges,
+                cuts,
+                bulk_struct,
+                eligible_mask,
+                planes,
+                neutral_shell_tol,
+            )
+        except Exception as e:
+            print(f"  [warning] compute_cif_virtual_sites failed: {e}. Skipping.")
+            return []
+
+    if not merged_cif_sites:
+        print("  → No strict virtual sites available. Skipping.")
+        return []
+
+    before_occupied_filter = len(merged_cif_sites)
+    merged_cif_sites = [
+        site for site in merged_cif_sites
+        if not _virtual_site_occupied_by_ligand(
+            site["pos"], cur_syms, cur_pts, native_species
+        )
+    ]
+    n_filtered = before_occupied_filter - len(merged_cif_sites)
+    if n_filtered:
+        print(
+            f"  → Skipped {n_filtered} virtual sites already occupied by "
+            "post-treatment/native ligands"
+        )
+
+    if not merged_cif_sites:
+        print("  → No unoccupied strict virtual sites available. Skipping.")
+        return []
+
+    # Option 1: Strictly Limit to One Ligand Per Surface Atom (Maximum Steric Protection)
+    # Ensure that each surface host atom is associated with at most one selected virtual site.
+    unique_host_sites = []
+    passivated_hosts = set()
+    for site in merged_cif_sites:
+        if any(h in passivated_hosts for h in site["hosts"]):
+            continue
+        unique_host_sites.append(site)
+        for h in site["hosts"]:
+            passivated_hosts.add(h)
+
+    if not unique_host_sites:
+        print("  → No independent virtual sites available after steric host filtering. Skipping.")
+        return []
+
+    return unique_host_sites
+
+
 def run_neutral_ligand_posttreatment(
     syms: List[str],
     pts: NDArray,
@@ -841,20 +974,8 @@ def run_neutral_ligand_posttreatment(
               f"target={pass_spec.target!r}  smiles={pass_spec.smiles!r}  "
               f"ratio={pass_spec.ratio:.2f}  dist={pass_spec.distribution}")
 
-        # Recompute surface mask and bulk CN on current structure
         cur_syms = work_syms
         cur_pts  = np.asarray(work_pts, float)
-
-        surf_mask, bulk_cn = _find_undercoordinated_surface_sites(
-            cur_syms, cur_pts, charges, planes, surf_tol, cuts
-        )
-        neutral_surf_mask, neutral_shell_tol = _neutral_ligand_surface_mask(
-            cur_pts, planes, surf_tol, native_species, charges, cuts
-        )
-        cn_refs = _bulk_cn_refs_from_struct(bulk_struct, charges, native_species, bulk_cn)
-
-        # Compute actual CN
-        cn = coord_numbers_bipartite(cur_syms, cur_pts, charges, pair_cuts=cuts)
 
         # Prepare ligand molecule once.  It remains neutral: no ionic transform.
         try:
@@ -868,97 +989,13 @@ def run_neutral_ligand_posttreatment(
         anchor_atom_idx, anchor_center, anchor_vec, anchor_name = _detect_neutral_anchor(mol)
         print(f"  → Neutral anchor: {anchor_name} atom_index={anchor_atom_idx}")
 
-        # --- Identify eligible native inorganic sites for this pass ---
-        eligible_indices: List[int] = []
-        for i in np.where(neutral_surf_mask)[0]:
-            sym = cur_syms[i]
-            if sym not in native_species:
-                continue
-            if getattr(pass_spec, "target_symbol", None) and sym != pass_spec.target_symbol:
-                continue
-            q_i = charges.get(sym, 0)
-            if q_i == 0:
-                continue
-            deficit = int(cn_refs.get(sym, bulk_cn.get(sym, 0))) - int(cn[i])
-            if deficit <= 0:
-                continue
-            # Filter by target
-            site_type = "cation" if q_i > 0 else "anion"
-            if pass_spec.target not in (site_type, "both"):
-                continue
-            # Each deficit slot → one "virtual site" entry
-            for _ in range(deficit):
-                eligible_indices.append(i)
-
-        if not eligible_indices:
-            print(f"  → No eligible sites found. Skipping.")
-            continue
-
-        # eligible_indices may have duplicates (one per deficit slot)
-        # Build a mapping: atom_idx → how many times it appears
-        from collections import Counter
-        slot_counts = Counter(eligible_indices)
-        unique_eligible = list(slot_counts.keys())
-        print(f"  → {len(unique_eligible)} eligible atoms  "
-              f"({sum(slot_counts.values())} total slots; neutral shell={neutral_shell_tol:.2f} Å)")
-
-        # Compute unified CIF-Intersection virtual sites
-        eligible_mask = np.zeros(len(cur_syms), bool)
-        for i in unique_eligible:
-            eligible_mask[i] = True
-
-        merged_cif_sites = []
-        if bulk_struct is not None:
-            try:
-                merged_cif_sites = compute_cif_virtual_sites(
-                    cur_syms,
-                    cur_pts,
-                    charges,
-                    cuts,
-                    bulk_struct,
-                    eligible_mask,
-                    planes,
-                    neutral_shell_tol,
-                )
-            except Exception as e:
-                print(f"  [warning] compute_cif_virtual_sites failed: {e}. Skipping pass.")
-                continue
-
-        if not merged_cif_sites:
-            print("  → No strict virtual sites available. Skipping.")
-            continue
-
-        before_occupied_filter = len(merged_cif_sites)
-        merged_cif_sites = [
-            site for site in merged_cif_sites
-            if not _virtual_site_occupied_by_ligand(
-                site["pos"], cur_syms, cur_pts, native_species
-            )
-        ]
-        n_filtered = before_occupied_filter - len(merged_cif_sites)
-        if n_filtered:
-            print(
-                f"  → Skipped {n_filtered} virtual sites already occupied by "
-                "post-treatment/native ligands"
-            )
-
-        if not merged_cif_sites:
-            print("  → No unoccupied strict virtual sites available. Skipping.")
-            continue
-
-        # Option 1: Strictly Limit to One Ligand Per Surface Atom (Maximum Steric Protection)
-        # Ensure that each surface host atom is associated with at most one selected virtual site.
-        unique_host_sites = []
-        passivated_hosts = set()
-        for site in merged_cif_sites:
-            if any(h in passivated_hosts for h in site["hosts"]):
-                continue
-            unique_host_sites.append(site)
-            for h in site["hosts"]:
-                passivated_hosts.add(h)
-
+        unique_host_sites = neutral_ligand_host_sites(
+            cur_syms, cur_pts, cfg, bulk_struct, planes, native_species,
+            target=pass_spec.target,
+            target_symbol=getattr(pass_spec, "target_symbol", None),
+            cuts=cuts,
+        )
         if not unique_host_sites:
-            print("  → No independent virtual sites available after steric host filtering. Skipping.")
             continue
 
         total_unique = len(unique_host_sites)

@@ -384,12 +384,6 @@ def _place_exchange_ligand(
     e_z = np.cross(e_x, e_y)
     E = np.column_stack([e_x, e_y, e_z])
 
-    # Target frame in QD space
-    f_y = n_surf
-    f_arb = np.array([1.0, 0.0, 0.0]) if abs(f_y[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    f_x_0 = _unit(f_arb - np.dot(f_arb, f_y) * f_y)
-    f_z_0 = np.cross(f_x_0, f_y)
-
     # Search for neighboring cations for bidentate coordination reward
     env_symbols = [_z_to_symbol(z) for z in env_z]
     cation_metals = {"Pb", "Cd", "Zn", "In", "Ga", "Cs", "Na", "K", "Ba", "Sr", "Ca", "Mg"}
@@ -405,23 +399,38 @@ def _place_exchange_ligand(
         if 1.5 <= dist <= r_search:
             neighbor_cation_pts.append(env_pos[idx])
 
-    # 360-degree scan
-    phis = np.deg2rad(np.arange(0, 360, 10.0))
+    # Candidate poses: spin about the surface normal, plus the same spin about
+    # normals tilted toward six azimuths, so a ligand on a crowded site can lean
+    # away from ligands already placed next to it.
+    spin_step = float(getattr(args_ns, "coarse_step_deg", 10.0))
+    tilts = [float(t) for t in getattr(args_ns, "tilt_deg", (0.0, 20.0, 40.0))]
+    phis = np.deg2rad(np.arange(0, 360, spin_step))
+    f_arb = np.array([1.0, 0.0, 0.0]) if abs(n_surf[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t_x = _unit(f_arb - np.dot(f_arb, n_surf) * n_surf)
+    t_z = np.cross(t_x, n_surf)
+    axes = [n_surf]
+    for tilt in tilts:
+        if tilt <= 0.0:
+            continue
+        th = np.deg2rad(tilt)
+        for psi in np.deg2rad(np.arange(0, 360, 60.0)):
+            lean = np.cos(psi) * t_x + np.sin(psi) * t_z
+            axes.append(_unit(np.cos(th) * n_surf + np.sin(th) * lean))
     candidate_poses = []
-    for phi in phis:
-        f_x = np.cos(phi) * f_x_0 + np.sin(phi) * f_z_0
-        f_z = np.cross(f_x, f_y)
-        F = np.column_stack([f_x, f_y, f_z])
-        R = F @ E.T
-        placed_coords = (R @ coords_translated.T).T + dpos
-        candidate_poses.append(placed_coords)
-
-    # Exclude hosts from environment for steric checks
-    exclude_mask = np.zeros(len(env_z), bool)
-    hosts_to_exclude = site_config.get("hosts", [])
-    for h in hosts_to_exclude:
-        if h is not None and 0 <= int(h) < len(exclude_mask):
-            exclude_mask[int(h)] = True
+    pose_tilt = []
+    for ax_i, f_y in enumerate(axes):
+        f_arb = np.array([1.0, 0.0, 0.0]) if abs(f_y[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        f_x_0 = _unit(f_arb - np.dot(f_arb, f_y) * f_y)
+        f_z_0 = np.cross(f_x_0, f_y)
+        for phi in phis:
+            f_x = np.cos(phi) * f_x_0 + np.sin(phi) * f_z_0
+            f_z = np.cross(f_x, f_y)
+            F = np.column_stack([f_x, f_y, f_z])
+            R = F @ E.T
+            candidate_poses.append((R @ coords_translated.T).T + dpos)
+            pose_tilt.append(float(np.degrees(np.arccos(np.clip(np.dot(f_y, n_surf), -1.0, 1.0)))))
+    poses = np.asarray(candidate_poses, float)          # (n_pose, n_atom, 3)
+    n_pose, n_atom = poses.shape[0], poses.shape[1]
 
     # Track valid coordination partners of this site
     hosts_to_exclude = set(site_config.get("hosts", []))
@@ -439,83 +448,60 @@ def _place_exchange_ligand(
         dents.add(d2)
 
     base_size = int(site_config.get("base_size", len(env_pos)))
-    original_indices = np.arange(len(env_z))
     from scipy.spatial import cKDTree
-    
-    pose_scores = []
-    
-    tree = None
+
+    scores = np.zeros(n_pose, float)
     if len(env_pos) > 0:
+        # Every environment atom within reach of a vdW contact counts: a fixed
+        # k-nearest query lets the surface atoms hide the neighbouring ligands.
+        env_vdw = np.array([_get_vdw(int(z)) for z in env_z] + [0.0], float)
+        lig_vdw = np.array([_get_vdw(int(z)) for z in numbers], float)
+        reach = float(lig_vdw.max() + env_vdw[:-1].max())
+        k_val = min(24, len(env_pos))
         tree = cKDTree(env_pos)
+        dists, indices = tree.query(poses.reshape(-1, 3), k=k_val, distance_upper_bound=reach)
+        dists = dists.reshape(n_pose, n_atom, k_val)
+        indices = indices.reshape(n_pose, n_atom, k_val)
+        found = indices < len(env_pos)
+        rsum = lig_vdw[None, :, None] + env_vdw[np.where(found, indices, len(env_pos))]
+        partner_ids = np.array([int(h) for h in coord_partners if h is not None], int)
+        is_partner = np.isin(indices, partner_ids)
+        is_dent = np.zeros(n_atom, bool)
+        is_dent[list(dents)] = True
+        coordination = is_partner & is_dent[None, :, None]
+        counted = found & ~coordination
+        overlap = np.where(counted, rsum - sterics_margin - dists, 0.0)
+        overlap[overlap < 0.0] = 0.0
+        # Ligand-ligand overlap is as unphysical as ligand-core overlap; the
+        # old 100x discount let carboxylate oxygens interpenetrate.
+        collision_penalty = 1000.0 * np.sum(overlap ** 2, axis=(1, 2))
+        gap = np.where(counted, dists - rsum, np.inf)
+        clearance = np.minimum(gap.min(axis=2), 1.0)
+        scores = clearance.min(axis=1) - collision_penalty
 
-    for pose_coords in candidate_poses:
-        score = 0.0
-        collision_penalty = 0.0
-        
-        if tree is not None:
-            # Query the closest k neighbors to avoid shadowing/occlusion of colliding atoms by the coordination partner
-            k_val = min(8, len(env_pos))
-            dists, indices = tree.query(pose_coords, k=k_val)
-            if k_val == 1:
-                dists = dists[:, np.newaxis]
-                indices = indices[:, np.newaxis]
-                
-            clearance = []
-            for a in range(len(numbers)):
-                r_vdw_lig = _get_vdw(int(numbers[a]))
-                min_clearance_for_atom = 999.0
-                
-                for step in range(k_val):
-                    env_idx = int(indices[a, step])
-                    dist_val = dists[a, step]
-                    
-                    env_atomic_num = env_z[env_idx]
-                    r_vdw_env = _get_vdw(int(env_atomic_num))
-                    d_threshold = r_vdw_lig + r_vdw_env - sterics_margin
-                    
-                    overlap = d_threshold - dist_val
-                    if overlap > 0.0:
-                        # Ignore coordination bonds between dents and their coordination metal partners
-                        if env_idx in coord_partners and a in dents:
-                            pass
-                        else:
-                            if env_idx < base_size:
-                                collision_penalty += 1000.0 * (overlap ** 2)
-                            else:
-                                collision_penalty += 10.0 * (overlap ** 2)
-                                
-                    is_coordination = (env_idx in coord_partners and a in dents)
-                    if not is_coordination:
-                        min_clearance_for_atom = min(min_clearance_for_atom, dist_val - (r_vdw_lig + r_vdw_env))
-                        
-                clearance.append(min_clearance_for_atom)
-                
-            score = float(np.min(clearance))
+    # Coordination reward for bidentate
+    if d2 is not None and neighbor_cation_pts:
+        c_pts = np.asarray(neighbor_cation_pts, float)
+        min_c_dist = np.linalg.norm(poses[:, d2, None, :] - c_pts[None, :, :], axis=2).min(axis=1)
+        scores += 2.0 * np.exp(-((min_c_dist - 2.4) ** 2) / (2 * (0.6 ** 2)))
 
-        # Coordination reward for bidentate
-        if d2 is not None and neighbor_cation_pts:
-            d2_coord = pose_coords[d2]
-            min_c_dist = min(float(np.linalg.norm(d2_coord - c_pt)) for c_pt in neighbor_cation_pts)
-            coordination_reward = 2.0 * np.exp(-((min_c_dist - 2.4) ** 2) / (2 * (0.6 ** 2)))
-            score += coordination_reward
+    # Neighbor tail repulsion penalty
+    if other_site_positions.size and neighbor_repulsion > 0.0:
+        if other_site_positions.ndim == 1:
+            other_site_positions = other_site_positions.reshape(1, 3)
+        other_dirs = other_site_positions - dpos
+        other_norms = np.linalg.norm(other_dirs, axis=1)
+        other_dirs = other_dirs[other_norms > 1e-12] / other_norms[other_norms > 1e-12, None]
+        if len(other_dirs):
+            tails = poses.mean(axis=1) - dpos
+            tails /= np.maximum(np.linalg.norm(tails, axis=1, keepdims=True), 1e-12)
+            alignments = np.clip(tails @ other_dirs.T, 0.0, None)
+            scores -= neighbor_repulsion * np.sum(alignments ** 2, axis=1)
 
-        # Neighbor tail repulsion penalty
-        if other_site_positions.size and neighbor_repulsion > 0.0:
-            if other_site_positions.ndim == 1:
-                other_site_positions = other_site_positions.reshape(1, 3)
-            other_dirs = other_site_positions - dpos
-            other_norms = np.linalg.norm(other_dirs, axis=1)
-            other_dirs = other_dirs[other_norms > 1e-12] / other_norms[other_norms > 1e-12, None]
-            if len(other_dirs):
-                tail_vec = _unit(np.mean(pose_coords, axis=0) - dpos)
-                alignments = np.dot(other_dirs, tail_vec)
-                alignments[alignments < 0.0] = 0.0
-                score -= neighbor_repulsion * np.sum(alignments ** 2)
+    # Prefer the upright pose when tilting buys nothing.
+    scores -= 0.002 * np.asarray(pose_tilt, float)
 
-        score -= collision_penalty
-        pose_scores.append(score)
-
-    best_idx = int(np.argmax(pose_scores))
+    best_idx = int(np.argmax(scores))
     return numbers, candidate_poses[best_idx]
 
 
@@ -788,6 +774,39 @@ def rebalance_ligand_exchange_charge(
     return work_syms, work_pts
 
 
+def _clashing_exchange_sites(
+    placed: List[Tuple[np.ndarray, np.ndarray]],
+    sterics_margin: float,
+) -> List[int]:
+    """Indices of placed ligands with a heavy atom inside a neighbour's vdW shell."""
+    from scipy.spatial import cKDTree
+
+    owner, coords, radii = [], [], []
+    for i, (nums, xyz) in enumerate(placed):
+        for z, r in zip(nums, xyz):
+            if int(z) > 1:
+                owner.append(i)
+                coords.append(r)
+                radii.append(_get_vdw(int(z)))
+    if len(coords) < 2:
+        return []
+    owner = np.asarray(owner)
+    radii = np.asarray(radii)
+    coords = np.asarray(coords, float)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(2.0 * float(radii.max()) - sterics_margin, output_type="ndarray")
+    if len(pairs) == 0:
+        return []
+    a, b = pairs[:, 0], pairs[:, 1]
+    d = np.linalg.norm(coords[a] - coords[b], axis=1)
+    hit = (owner[a] != owner[b]) & (d < radii[a] + radii[b] - sterics_margin)
+    severity: Dict[int, float] = defaultdict(float)
+    for ia, ib, overlap in zip(owner[a][hit], owner[b][hit], (radii[a] + radii[b] - sterics_margin - d)[hit]):
+        severity[int(ia)] += float(overlap)
+        severity[int(ib)] += float(overlap)
+    return sorted(severity, key=lambda i: -severity[i])
+
+
 def run_ligand_exchange_posttreatment(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -843,6 +862,7 @@ def run_ligand_exchange_posttreatment(
     class _Args:
         sterics_mode = spec.sterics_mode
         coarse_step_deg = 10.0
+        tilt_deg = (0.0, 20.0, 40.0)
         neighbor_repulsion = 0.5
         sterics_margin = 0.4
 
@@ -1046,6 +1066,28 @@ def run_ligand_exchange_posttreatment(
             for i in batch:
                 sc = site_configs[i]
                 placed[i] = _place_exchange_ligand(sc, env_pos, env_z, _Args)
+
+        # Batches only see ligands placed before them, so an early ligand can
+        # take the space a later neighbour needed.  Re-place every clashing
+        # ligand against the full shell until no heavy-atom overlap remains.
+        for refine_idx in range(int(getattr(spec, "refinement_passes", 2) or 0)):
+            clashing = _clashing_exchange_sites(placed, _Args.sterics_margin)
+            if not clashing:
+                break
+            print(f"  → Refinement {refine_idx + 1}: re-placing {len(clashing)} clashing ligands")
+            for i in clashing:
+                env_pos_parts = [base_pts]
+                env_z_parts = [base_z]
+                for j, (nums_j, coords_j) in enumerate(placed):
+                    if j != i and len(nums_j) > 0:
+                        env_pos_parts.append(np.asarray(coords_j, float))
+                        env_z_parts.append(np.asarray(nums_j, int))
+                placed[i] = _place_exchange_ligand(
+                    site_configs[i], np.vstack(env_pos_parts), np.concatenate(env_z_parts), _Args
+                )
+        remaining = _clashing_exchange_sites(placed, _Args.sterics_margin)
+        if remaining:
+            print(f"  [warning] {len(remaining)} exchanged ligands keep a heavy-atom contact inside vdW - margin with a neighbour (site spacing too tight for a clean fit)")
 
         new_syms = list(base_syms)
         new_pts = base_pts.copy()
