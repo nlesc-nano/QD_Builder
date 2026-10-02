@@ -91,7 +91,13 @@ def _parse_hkl(t: str):
 
 
 def facet_shape(ctx, pts_native_c):
-    """Faceted shape from the recipe's facet families: faces [{label, normal, vertices}] (centred frame)."""
+    """
+    Faceted shape from the recipe's facet families: faces [{label, normal, vertices}] (centred frame).
+    Polar families (a family and its inverse both in the recipe, e.g. {111} / {-1-1-1}) are named by
+    their termination, as the builder and the detachment step do: a plane whose outer layer of the
+    builder geometry is cation-rich takes the label of the recipe's cation-rich entry.  The sign of
+    the crystallographic hkl depends on the CIF's origin and is not used for the name.
+    """
     from pymatgen.core import Structure
     from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
     from scipy.spatial import HalfspaceIntersection
@@ -102,6 +108,11 @@ def facet_shape(ctx, pts_native_c):
     B = st.lattice.reciprocal_lattice_crystallographic.matrix
     rots = [o.rotation_matrix for o in SpacegroupAnalyzer(st).get_point_group_operations(cartesian=True)
             if np.linalg.det(o.rotation_matrix) > 0]
+    nat = [i for i, x in enumerate(ctx.symbols) if x in set(ctx.native)]
+    p_start = ctx.start_pts[nat] - ctx.start_pts[nat].mean(0)
+    cation = ctx.native[0] if ctx.charges.get(ctx.native[0], 0) > 0 else ctx.native[-1]
+    is_cat = np.array([ctx.symbols[i] == cation for i in nat])
+    term = {str(f["hkl"]): str(f.get("termination", "")) for f in facets}
     planes = []
     for f in facets:
         n0 = np.array(_parse_hkl(str(f["hkl"]))) @ B
@@ -113,7 +124,14 @@ def facet_shape(ctx, pts_native_c):
             if key in seen:
                 continue
             seen.add(key)
-            planes.append((f"{{{f['hkl']}}}", nv, float((pts_native_c @ nv).max())))
+            label = str(f["hkl"])
+            inverse = "".join(str(-h) for h in _parse_hkl(label))
+            if inverse in term and term[inverse] != term[label]:
+                proj = p_start @ nv
+                layer = proj > proj.max() - 0.5
+                cat_rich = is_cat[layer].sum() >= (~is_cat[layer]).sum()
+                label = next((h for h in (label, inverse) if ("cation" in term[h]) == cat_rich), label)
+            planes.append((f"{{{label}}}", nv, float((pts_native_c @ nv).max())))
     hs = np.array([[*nv, -d] for _l, nv, d in planes])
     try:
         verts = HalfspaceIntersection(hs, np.zeros(3)).intersections
