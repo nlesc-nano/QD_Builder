@@ -42,6 +42,7 @@ user-guide/recipes
 user-guide/core-shell
 user-guide/heterostructures
 user-guide/library
+user-guide/properties
 ```
 
 ```{toctree}
