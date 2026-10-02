@@ -34,14 +34,15 @@ DEPS = {
     "vibspec": ["relax", "structure", "hessian"], "electronic": ["relax", "structure"],
     "stability": ["structure", "hessian"], "detachment": ["structure", "hessian"],
     "solvation": ["relax", "detachment"],
-    "report": ["relax", "structure", "hessian", "vibspec", "stability", "detachment", "solvation"],
+    "sites": ["relax", "structure", "hessian", "detachment", "solvation"],
+    "report": ["relax", "structure", "hessian", "vibspec", "stability", "detachment", "solvation", "sites"],
 }
 # Source files whose content enters a step's cache key (engine versions are in the provenance).
 CODE_DEPS = {
     "relax": ["steps/relax.py"], "structure": ["steps/structure.py"], "hessian": ["steps/hessian.py"],
     "vibspec": ["steps/vibspec.py", "bulk.py"],
     "electronic": ["steps/electronic.py"], "stability": ["steps/stability.py", "references.py"],
-    "detachment": ["steps/detachment.py", "references.py"], "solvation": ["steps/solvation.py"],
+    "detachment": ["steps/detachment.py", "references.py"], "solvation": ["steps/solvation.py"], "sites": ["steps/sites.py"],
     "report": ["steps/report.py", "steps/vibplots.py", "bulk.py", "solution.py", "dashboards.py"],
 }
 FORMAL_CHARGES = {
@@ -75,6 +76,9 @@ class Settings:
     detach_max_steps: int = 4        # stepwise MX_q removals
     detach_max_candidates: int = 12  # symmetry-unique sites relaxed per step
     detach_thermo_max_atoms: int = 300  # Hessians of the products up to this size
+    sites_hessian_max_atoms: int = 0    # per-site Hessians for the binding-site map up to this size (0: never;
+                                        # otherwise the first path step's thermal part is used for every site)
+    sites_solvation: str = "scf"        # scf: a GFN2-xTB single point per site | frozen: the intact dot's charges
     mu_grid: List[float] = field(default_factory=lambda: [round(-3.0 + 0.02 * i, 4) for i in range(201)])
 
     def for_step(self, step: str) -> dict:
@@ -97,6 +101,8 @@ class Settings:
                            "thermo_max_atoms": self.detach_thermo_max_atoms, "mu_grid": self.mu_grid,
                            "temperatures": self.temperatures},
             "solvation": {"method": "gfn2", "checks": self.solvation_checks},
+            "sites": {**mace, "method": "gfn2", "thermo_max_atoms": self.detach_thermo_max_atoms,
+                      "hessian_max_atoms": self.sites_hessian_max_atoms, "solvation": self.sites_solvation},
             "report": {},
         }[step]
 
@@ -183,10 +189,10 @@ def _step_inputs(ctx: Context, step: str) -> dict:
 
 def run_record(record_dir: Path, steps: Sequence[str] = STEPS, settings: Optional[Settings] = None,
                cif: Optional[str] = None, force: bool = False, log: Callable[[str], None] = print) -> dict:
-    from .steps import detachment, electronic, hessian, relax, report, solvation, stability, structure, vibspec
+    from .steps import detachment, electronic, hessian, relax, report, sites, solvation, stability, structure, vibspec
     impl = {"relax": relax.run, "structure": structure.run, "hessian": hessian.run, "vibspec": vibspec.run,
             "electronic": electronic.run, "stability": stability.run, "detachment": detachment.run,
-            "solvation": solvation.run, "report": report.run}
+            "solvation": solvation.run, "sites": sites.run, "report": report.run}
     settings = settings or Settings()
     ctx = load_context(record_dir, settings, cif)
     wanted = [s for s in STEPS if s in set(steps)]

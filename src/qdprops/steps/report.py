@@ -110,6 +110,7 @@ def _data(ctx) -> dict:
         "hess": r["hessian"]["summary"], "stab": r.get("stability", {}), "det": r.get("detachment", {}),
         "rec": ctx.record,
         "vib": r.get("vibspec") if r.get("vibspec", {}).get("modes") else None,
+        "sites": r.get("sites"),
     }
     d["bond_rows"], d["bulk_bond_cif"] = _bond_rows(ctx)
     d["bulk_mace"], d["bulk_exp"] = _bulk_bonds(ctx)
@@ -283,6 +284,13 @@ def _captions(d) -> dict:
             f"search, configurational entropy included.{half_t}")
     if d.get("vib"):
         c.update(vibplots.captions(d["vib"]))
+    if (d.get("sites") or {}).get("classes"):
+        c["sites"] = ("Binding-site map", f"{mxt} binding-site map (vacuum ΔE)", "",
+                      f"Surface atoms by direction from the centre (azimuth θ, latitude φ, [001] at the poles); field: "
+                      f"Gaussian-weighted average (σ = 7°) of the single-unit removal energy "
+                      f"$\\Delta E_\\mathrm{{site}}$ = E(dot − unit) + E({mxt}) − E(dot), MACE-MH-1, vacuum. White: "
+                      "facet edges. Black dots: atoms of a desorbable unit. The interactive page adds a 3D view and "
+                      "the free energy in solution.")
     return c
 
 
@@ -635,12 +643,68 @@ def _write_html(ctx, d, figs, caps, keys, solution=None) -> None:
 # Matplotlib (PNG)
 # --------------------------------------------------------------------------
 
+def _sites_png(ax, sd, fig):
+    """2D (theta, phi) map of the vacuum site energies with the facet edges (mirrors the dashboard)."""
+    from matplotlib.colors import LinearSegmentedColormap
+    sym, pos, role = sd["dot"]["symbols"], np.asarray(sd["dot"]["positions"]), sd["dot"]["role"]
+    n = len(sym)
+    val = [None] * n
+    for c in sd["classes"]:
+        for unit in c["orbit"]:
+            for a in unit:
+                val[a] = c["dE_eV"] if val[a] is None else min(val[a], c["dE_eV"])
+    dirs = pos / np.linalg.norm(pos, axis=1)[:, None]
+    ang = lambda d: (np.arctan2(d[..., 1], d[..., 0]), np.arcsin(np.clip(d[..., 2], -1, 1)))
+    surf = [a for a in range(n) if role[a] != "core"]
+    on = [a for a in surf if val[a] is not None]
+    gt, gp = np.linspace(-np.pi, np.pi, 361), np.linspace(-np.pi / 2, np.pi / 2, 181)
+    T, P = np.meshgrid(gt, gp)
+    g = np.stack([np.cos(P) * np.cos(T), np.cos(P) * np.sin(T), np.sin(P)], -1)
+    c = np.einsum("ijk,ak->ija", g, dirs[on])
+    th = np.arccos(np.clip(c, -1, 1))
+    w = np.exp(-0.5 * (th / 0.13) ** 2)
+    z = (w * np.array([val[a] for a in on])).sum(-1) / w.sum(-1)
+    z[c.max(-1) < np.cos(0.32)] = np.nan
+    cmap = LinearSegmentedColormap.from_list("seq", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
+    lo, hi = float(np.nanmin(z)), float(np.nanmax(z))
+    if hi - lo < 0.1:                                     # (nearly) equal sites: centre them, no rounding noise
+        mid = 0.5 * (lo + hi)
+        lo, hi = mid - 0.05, mid + 0.05
+    ax.set_facecolor("#efeeea")                           # bare surface (no desorbable unit nearby)
+    im = ax.pcolormesh(gt, gp, z, cmap=cmap, vmin=lo, vmax=hi, shading="gouraud", rasterized=True)
+    cb = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.02)
+    cb.set_label(r"$\Delta E_\mathrm{site}$ (eV)", color=INK2)
+    cb.outline.set_edgecolor(GRID)
+    cb.ax.tick_params(colors=INK2, labelsize=8.5)
+    for f in sd["faces"]:
+        V = np.asarray(f["vertices"])
+        for e in range(len(V)):
+            seg = V[e] + (V[(e + 1) % len(V)] - V[e]) * np.linspace(0, 1, 41)[:, None]
+            t, p = ang(seg / np.linalg.norm(seg, axis=1)[:, None])
+            cut = np.where(np.abs(np.diff(t)) > np.pi)[0] + 1
+            for tt, pp in zip(np.split(t, cut), np.split(p, cut)):
+                ax.plot(tt, pp, color="white", lw=1.4)
+        t, p = ang(np.asarray(f["normal"]))
+        i, j = int(round((t + np.pi) / (2 * np.pi) * 360)), int(round((p + np.pi / 2) / np.pi * 180))
+        from matplotlib import patheffects
+        ax.text(t, p, f["label"].strip("{}"), color=INK, fontsize=8.5, ha="center", va="center", fontweight="bold",
+                path_effects=[patheffects.withStroke(linewidth=2.5, foreground="white")])
+    t, p = ang(dirs[surf])
+    ax.scatter(t, p, s=[10 if sym[a] == "Cl" else 14 for a in surf],
+               c=["#0b0b0b" if val[a] is not None else INK3 for a in surf],
+               marker="o", edgecolors="white", linewidths=0.5, zorder=4)
+    ax.set(xlim=(-np.pi, np.pi), ylim=(-np.pi / 2, np.pi / 2), xlabel="θ (azimuth, rad)", ylabel="φ (latitude, rad)")
+    ax.grid(False)
+
+
 def _cells(d):
     """PNG panel order (letters follow it): structure, vibrations and spectra, vacuum stability, solution, keys."""
     c = ["relax", "bonds", "cn", "vdos_element", "vdos_role"]
     if d.get("vib"):
         c += ["ir", "raman", "modemap"]
     c += ["thermo_e", "thermo_s", "stability", "binding", "detach"]
+    if (d.get("sites") or {}).get("classes"):
+        c += ["sites"]
     if d.get("solution"):
         c += ["sol_dec", "sol_bind", "sol_iso", "sol_map"]
     return c + ["keys"]
@@ -933,6 +997,9 @@ def _write_png(ctx, d, caps, keys) -> None:
         ax.set(xlabel="units removed k", ylabel="eV")
         _legend_above(ax, ncol=3)
 
+    if "sites" in axes:
+        _sites_png(axes["sites"][0], d["sites"], fig)
+
     if det.get("steps") and "map" in axes:
         ax = axes["map"][0]
         mp = det["map"]
@@ -977,6 +1044,8 @@ def _write_png(ctx, d, caps, keys) -> None:
     for key, (ax, _c) in axes.items():
         if key != "keys" and ax.get_visible():
             _style_axes(ax)
+            if key == "sites":
+                ax.grid(False)
     fig.savefig(ctx.props / "ground_state.png", dpi=150)
     plt.close(fig)
 
@@ -992,7 +1061,7 @@ def run(ctx) -> dict:
     solution = None
     if ex is not None:
         (ctx.props / "solution.json").write_text(json.dumps(ex))
-        sec_html, sec_js = solution_section(ex)
+        sec_html, sec_js = solution_section(ex, ctx.results.get("sites"))
         solution = (sec_html, JS_LIB + sec_js)
         d["solution"] = ex
     _write_html(ctx, d, figs, caps, keys, solution)
