@@ -3,8 +3,9 @@
 Summary figures for one dot: props/ground_state.html (interactive Plotly, the
 webapp's Properties tab) and props/ground_state.png (static, matplotlib).
 
-Eleven panels in three groups (structure and relaxation, vibrations and
-thermochemistry, stability and ligands), each with a caption that defines
+Panels in four groups (structure and relaxation, vibrations and
+thermochemistry, vibrational spectra when the vibspec step ran, stability and
+ligands), each with a caption that defines
 what is plotted and how to read it, plus a table of key numbers.  The relaxed
 geometry itself is not drawn (the webapp viewer shows it) and electronic
 properties are left to the DFT panels.
@@ -24,6 +25,7 @@ import textwrap
 import numpy as np
 
 from ..dashboards import CONTROLS_CSS
+from . import vibplots
 
 SITE = {"core": "#2a78d6", "surface": "#eb6834", "ligand": "#1baf7a"}
 ELEMENT_SLOTS = ["#4a3aa7", "#e87ba4", "#008300"]
@@ -106,6 +108,7 @@ def _data(ctx) -> dict:
         "structure": r["structure"], "vdos": spectra["vdos"], "thermo": spectra["thermo"],
         "hess": r["hessian"]["summary"], "stab": r.get("stability", {}), "det": r.get("detachment", {}),
         "rec": ctx.record,
+        "vib": r.get("vibspec") if r.get("vibspec", {}).get("modes") else None,
     }
     d["bond_rows"], d["bulk_bond"] = _bond_rows(ctx)
     u = d["stab"].get("summary", {}).get("units")
@@ -259,6 +262,8 @@ def _captions(d) -> dict:
             f"Mean number ⟨k⟩ of {mxt} units lost in equilibrium with {mxt} in solution at μ = μ°(T) + Δμ, "
             f"Δμ = $k_BT\\ln(c/1\\,\\mathrm{{M}})$: Boltzmann average over every configuration evaluated by the "
             f"search, configurational entropy included.{half_t}")
+    if d.get("vib"):
+        c.update(vibplots.captions(d["vib"]))
     return c
 
 
@@ -297,6 +302,8 @@ def _key_numbers(d) -> list:
         rows.append((f"First {formula_html(mx)} detachment", f"First {formula_tex(mx)} detachment",
                      f"ΔE {ds['dE_eV'][0]:+.2f} eV" + (f", ΔG {g:+.2f} eV" if g is not None else ""),
                      "cheapest unit, 300 K, 1 M (panel j)"))
+    if d.get("vib"):
+        rows += vibplots.key_rows(d["vib"])
     return rows
 
 
@@ -480,6 +487,8 @@ def _plotly_figures(d) -> dict:
                                                  "removed<extra></extra>"))
         fig.update_layout(**_layout(f"Δμ({mx}) = k<sub>B</sub>T ln(c / 1 M)  (eV)", "T (K)"))
         figs["map"] = fig
+    if d.get("vib"):
+        figs.update(vibplots.plotly_figs(d["vib"], SITE, _layout, INK, INK3, d["elements"]))
     return figs
 
 
@@ -528,6 +537,10 @@ SECTIONS = [
     ("Vibrations &amp; thermochemistry", ["vdos_element", "vdos_role", "thermo_e", "thermo_s"],
      "Harmonic normal modes of the analytic MACE-MH-1 Hessian at the relaxed geometry, with translations and "
      "rotations projected out. Hover a curve for its value and definition."),
+    ("Vibrational spectra", ["ir", "raman", "modemap"],
+     "Hybrid scheme: frequencies and normal modes from MACE-MH-1, IR and Raman intensities from g-xTB dipole and "
+     "polarisability derivatives along those modes (finite differences, static finite field). Hover a peak or a "
+     "mode marker for its symmetry, intensities, depolarisation ratio and where its amplitude sits."),
     ("Stability &amp; ligands", ["stability", "binding", "detach", "map"],
      "References computed with the same MACE head: bulk {ma} (cell-relaxed, phonons) and the {ma} and {mx} "
      "monomers as ideal-gas solutes at 1 M (harmonic vibrations, rigid-rotor rotation; the dot is treated the "
@@ -665,7 +678,8 @@ def _write_png(ctx, d, caps, keys) -> None:
                          "axes.titlesize": 10.5, "axes.titleweight": "bold", "axes.titlecolor": INK,
                          "axes.labelsize": 9})
     sol = d.get("solution")
-    nrow = 5 if sol else 4
+    vib = d.get("vib")
+    nrow = 4 + bool(sol) + bool(vib)
     fig = plt.figure(figsize=(17, 6 * nrow), facecolor="white")
     gs = GridSpec(2 * nrow, 3, figure=fig, height_ratios=[3, 1.1] * nrow, hspace=0.32, wspace=0.27,
                   left=0.05, right=0.975, top=1 - 0.065 * 4 / nrow, bottom=0.012)
@@ -677,8 +691,9 @@ def _write_png(ctx, d, caps, keys) -> None:
              va="top")
 
     cells = ["relax", "bonds", "cn", "vdos_element", "vdos_role", "thermo_e", "thermo_s", "stability", "binding",
-             "detach", "map", "keys"] + (["sol_dec", "sol_bind", "sol_iso"] if sol else [])
-    letters = "abcdefghijklmno"
+             "detach", "map", "keys"] + (["sol_dec", "sol_bind", "sol_iso"] if sol else []) \
+        + (["ir", "raman", "modemap"] if vib else [])
+    letters = "abcdefghijklmnopqr"
     if sol:
         caps = dict(caps)
         caps.update(_solution_captions(d))
@@ -874,6 +889,8 @@ def _write_png(ctx, d, caps, keys) -> None:
 
     if sol:
         _solution_panels(axes, d)
+    if vib:
+        vibplots.png_panels(axes, vib, SITE, INK, INK3, _legend_above)
 
     for key, (ax, _c) in axes.items():
         if key != "keys" and ax.get_visible():

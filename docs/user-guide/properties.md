@@ -47,6 +47,7 @@ dynamic-library directories it needs from `QDPROPS_XTB_LIBS`
 | `relax` | MACE-MH-1 | BFGS (then FIRE if needed) to `fmax` = 0.01 eV/Å; relaxation energy, RMSD and largest displacement from the start geometry |
 | `structure` | — | bond graph of start and relaxed geometry, ligand detachment or migration, CN histograms, core/surface atoms, ligand binding modes (μ1/μ2/μ3), bond-length distributions for core and shell, core strain against the bulk bond |
 | `hessian` | MACE-MH-1 | harmonic frequencies, imaginary modes, ZPE, U_vib, S_vib, Cv and F_vib from 50 to 800 K, vibrational density of states (total, per element, per core/surface/ligand) |
+| `vibspec` | MACE-MH-1 + g-xTB | IR intensities and non-resonant Raman activities, depolarisation ratios, point group and irreps of the modes, mode character (core/surface/ligand, breathing), bulk Γ-point optical frequency |
 | `electronic` | GFN2-xTB | total energy, HOMO, LUMO and orbital gap, partial charges, dipole moment, the xtb force at the MACE minimum, vertical IP and EA (`xtb --vipea`) and the fundamental gap IP − EA |
 | `stability` | MACE-MH-1 | decomposition into bulk MA and MX_q monomers, binding against MA and MX_q monomers: ΔE, ΔE + ΔZPE, ΔG(T) |
 | `detachment` | MACE-MH-1 | stepwise Z-type MX_q removal by a beam search: ΔE and ΔG(T) per step, every symmetry-distinct first site with its facet/edge/vertex location, the equilibrium shell ⟨k⟩(T, Δμ_MXq) |
@@ -69,8 +70,82 @@ The IP and EA come from `xtb --vipea`: the IPEA-xTB ΔSCC with its empirical
 shift. GFN2 absolute orbital levels are shifted, so a plain ΔSCF with GFN2
 overestimates both (13.0 and 7.5 eV for Cd16Se13Cl6 against 6.3 and 1.3 eV).
 Their difference, the fundamental gap, is more meaningful than the orbital
-gap. Polarisabilities are not computed: `--alpha` is ignored with `--gxtb`,
-and `--ptb --alpha` crashes in the installed xtb.
+gap.
+
+## Vibrational spectra
+
+Peak positions are the MACE-MH-1 harmonic frequencies; g-xTB supplies only the
+response derivatives. For each normal mode k the dot is displaced to
+x₀ ± h e_k/√m (h = 0.1 amu^½ Å) and g-xTB is run in a static field ±F
+(F = 0.02 V/Å) along x, y and z, six runs per geometry. The dipole μ is the
+mean of each ± pair, the polarisability α_ij = [μ_i(+F e_j) − μ_i(−F e_j)]/2F,
+and central differences give ∂μ/∂Q_k and ∂α/∂Q_k:
+
+- IR intensity A_k = (N_A π/3c) |∂μ/∂Q_k|², in km/mol;
+- Raman activity S_k = 45a′² + 7γ′², with a′ = tr(α′)/3 and
+  γ′² = ½[(α′xx − α′yy)² + (α′yy − α′zz)² + (α′zz − α′xx)² + 6(α′xy² + α′yz² + α′xz²)];
+- depolarisation ratio ρ_k = 3γ′²/(45a′² + 4γ′²), below ¾ only for totally
+  symmetric modes;
+- Stokes intensity (ν₀ − ν_k)⁴/ν_k · S_k/(1 − e^(−hcν_k/k_BT)) at 532 nm and 300 K.
+
+Points to know about g-xTB here:
+
+- `--efield` is in V/Å, not atomic units as `--help` says: with V/Å the
+  induced dipole and the energy change −½αF² give the same α (1038 bohr³,
+  154 Å³, for Cd16Se13Cl6).
+- The flag needs a space (`--efield 0,0,0.02`); `--efield=…` is silently ignored.
+- `--alpha` does nothing with `--gxtb`, and GFN2 rejects fields in xtb, so the
+  finite field with g-xTB is the only route.
+- Each run starts from the field-free wavefunction of the undisplaced dot. A
+  restart file from a field run gave a slightly asymmetric α.
+- g-xTB is not at its own minimum at the MACE geometry (gradient norm
+  ≈ 0.1 Eh/bohr for Cd16Se13Cl6). This is the usual hybrid compromise for
+  intensities; the value is recorded.
+
+The derivatives are computed along the MACE modes as the hessian step gives
+them, and checkpointed per mode. Symmetry adaptation is applied afterwards as
+a rotation, so it never invalidates the checkpoint.
+
+- **Grouping.** Modes within 0.5 cm⁻¹ of the lowest mode of a set form one
+  (near-)degenerate set; sets do not chain.
+- **Projection.** Within each set, projection operators of the point group
+  (pymatgen, tolerance 0.1 Å) give one subspace per irreducible
+  representation.
+- **Alignment.** The basis of each subspace is chosen closest to the original
+  modes, so accidentally near-degenerate modes of the same irrep are not mixed.
+- **Labels.** For C1, Cs, C2, C2v, C3, C3v, D2d and Td the modes get irrep
+  labels (C2v in Mulliken's convention, with the plane holding more atoms as
+  σv′(yz)). For other groups only the totally symmetric modes are flagged. On Cd16Se13Cl6 (Td) the selection rules hold to
+numerical precision: only T₂ modes carry IR intensity (other modes
+< 10⁻⁵ km/mol), A₂ and T₁ modes have no Raman activity, and ρ = 0 for A₁.
+Halving h changes intensities by < 0.6 %, and halving F changes Raman
+activities by up to 3 %.
+
+Each mode is also described by:
+
+- the shares of its mass-weighted amplitude on core, surface and ligand atoms
+  and on each element;
+- its radial share;
+- its overlap with a uniform breathing of the dot.
+
+The class is descriptive:
+
+- *breathing*: overlap ≥ 0.3;
+- *M–X ligand*: ligand share > 0.5;
+- in the optical range, ν ≥ 0.75 ν_TO: *core optical* (core share ≥ 0.4) or
+  *surface optical*;
+- otherwise *core acoustic-like* or *surface / torsional*.
+
+ν_TO is the bulk Γ-point optical frequency from MACE force constants of the
+relaxed primitive cell. It is the TO frequency only: LO–TO splitting needs
+Born charges and the long-range dipole term, which MACE does not have.
+
+The spectra are non-resonant. Measured QD Raman spectra are usually resonant
+and dominated by the LO mode and its overtones (Fröhlich coupling), so
+compare peak positions and symmetries, not relative intensities. The cost is
+6(2(3N − 6) + 1) + 1 g-xTB single points: 46 s for Cd16Se13Cl6 and about
+1.5 h for Cd68Se55Cl26 on 12 concurrent single-threaded runs. Per-mode
+results are checkpointed in `vibspec_cache.json`.
 
 ## Energetics
 
@@ -193,6 +268,9 @@ props/
 ├── relax.json         one file per step: summary, details, provenance,
 ├── structure.json     and the hash of its inputs
 ├── hessian.json
+├── vibspec.json       IR/Raman per mode, point group, irreps, mode character
+├── vibspec_modes.npz  symmetry-adapted modes, ∂μ/∂Q and ∂α/∂Q
+├── vibspec_cache.json checkpoint of the per-mode g-xTB derivatives
 ├── electronic.json
 ├── stability.json
 ├── detachment.json
