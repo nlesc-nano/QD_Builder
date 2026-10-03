@@ -42,7 +42,13 @@ import yaml
 from pymatgen.core import Structure
 
 from ..io_utils import center_coords
-from ..library_record import describe_structure, make_record, min_distance, read_xyz_first_frame
+from ..library_record import (
+    bulk_volume_per_atom,
+    describe_structure,
+    make_record,
+    min_distance,
+    read_xyz_first_frame,
+)
 from ..main import main as builder_main
 
 
@@ -128,6 +134,7 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     # N cells along each axis stretch the dot by c/a.
     lengths = np.array(Structure.from_file(cif).lattice.abc, dtype=float)
     cell_scale = lengths.min() / lengths if cfg.get("isotropic_cells", False) else np.ones(3)
+    bulk_volume = bulk_volume_per_atom(cif)
     out_root = Path(out_dir or (cfg_path.parent / cfg.get("out_dir", "out"))).resolve() / material
     out_root.mkdir(parents=True, exist_ok=True)
     revision = _qd_builder_revision()
@@ -149,7 +156,7 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             review.append(row)
             return None
         desc = describe_structure(res["symbols"], res["pts"], native_order=native_order, charges=charges,
-                                  centre_index=res["centre_index"])
+                                  centre_index=res["centre_index"], bulk_volume=bulk_volume)
         row.update(formula=desc["formula"], d_nm=desc["size"]["d_nm"], n_atoms=desc["n_atoms"],
                    Q=desc["total_charge"])
         reasons = []
