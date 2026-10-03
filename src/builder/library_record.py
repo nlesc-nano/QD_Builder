@@ -11,7 +11,7 @@ structures with their builder twins) and the record layout itself.
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -82,29 +82,111 @@ def centre_species(
     return label, float(d[k])
 
 
+# Elements with about the solvent's electron density: invisible to SAXS unless
+# native to the core (P in InP is seen, P in a phosphonate is not).
+ORGANIC_ELEMENTS = frozenset({"H", "B", "C", "N", "O", "F", "Si", "P"})
+
+_ELEMENTS = (
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
+    "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb "
+    "Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn"
+).split()
+_Z = {e: i + 1 for i, e in enumerate(_ELEMENTS)}
+
+
+def bulk_volume_per_atom(cif_path: str) -> Dict[str, float]:
+    """Volume per atom (Å^3) of the bulk crystal in `cif_path`, keyed by each of its elements."""
+    from pymatgen.core import Structure
+    st = Structure.from_file(str(cif_path))
+    v = float(st.volume) / len(st)
+    return {el.symbol: v for el in st.composition.elements}
+
+
+def _sphere_form_factor(q: NDArray[np.float64], radius: float) -> NDArray[np.float64]:
+    x = np.maximum(q * radius, 1e-8)
+    return (3.0 * (np.sin(x) - x * np.cos(x)) / x ** 3) ** 2
+
+
+def debye_intensity(pts: NDArray[np.float64], weights: NDArray[np.float64], q: NDArray[np.float64],
+                    bin_width: float = 0.02) -> NDArray[np.float64]:
+    """Debye intensity sum_ij w_i w_j sin(q r_ij)/(q r_ij) from a histogram of pair distances."""
+    from scipy.spatial.distance import cdist
+    r_max = 2.0 * float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).max()) + 2.0 * bin_width
+    n_bins = int(r_max / bin_width) + 2
+    hist = np.zeros(n_bins)
+    block = max(1, int(2e7 // len(pts)))
+    for i0 in range(0, len(pts), block):
+        idx = (cdist(pts[i0:i0 + block], pts) / bin_width).astype(np.int64).ravel()
+        w = (weights[i0:i0 + block, None] * weights[None, :]).ravel()
+        hist += np.bincount(idx, weights=w, minlength=n_bins)[:n_bins]
+    centres = (np.arange(n_bins) + 0.5) * bin_width
+    return (hist[None, :] * np.sinc(np.outer(q, centres) / np.pi)).sum(axis=1)
+
+
 def size_descriptors(
     symbols: Sequence[str],
     pts: NDArray[np.float64],
     native: Iterable[str],
-) -> Dict[str, float]:
+    bulk_volume: Optional[Mapping[str, float]] = None,
+) -> Dict[str, object]:
     """
-    Core (native atoms only) size descriptors in nm.
+    Size descriptors in nm, defined as an experiment would measure them.
 
-    d_nm       equivalent-sphere diameter from the radius of gyration,
-               2 * sqrt(5/3) * Rg: robust to shape and relaxation; the
-               library's filter value.
-    d_max_nm   largest centroid distance, doubled.
-    d_hull_nm  diameter of the sphere with the core convex-hull volume.
+    d_nm          SAXS diameter, the library's filter value: the homogeneous
+                  sphere fitted to the first lobe of the Debye intensity of
+                  the SAXS-visible atoms (core plus inorganic shell such as
+                  halides; organics match the solvent and are invisible),
+                  each weighted by its atomic number.
+    d_volume_nm   diameter of the sphere holding the core atoms at bulk
+                  density (`bulk_volume`: Å^3 per atom by element, see
+                  `bulk_volume_per_atom`); compares with sizes from elemental
+                  analysis.  None without `bulk_volume`.
+    axes_nm       diameters of the homogeneous ellipsoid with the same
+                  electron-density gyration tensor, longest first.
+    aspect_ratio  longest / shortest of `axes_nm` (1 for spheres and cubes).
+    d_max_nm      largest core-atom distance from the core centroid, doubled.
+    d_hull_nm     diameter of the sphere with the core convex-hull volume.
     """
-    core = _core(symbols, pts, native)
-    out = {"n_core": int(len(core))}
-    if len(core) < 2:
-        return {**out, "d_nm": 0.0, "d_max_nm": 0.0, "d_hull_nm": 0.0}
+    native = set(native)
+    syms = list(symbols)
+    pts = np.asarray(pts, float)
+    is_core = np.array([s in native for s in syms])
+    core = pts[is_core] if is_core.any() else pts
+    out: Dict[str, object] = {"n_core": int(is_core.sum())}
+    empty = {"d_nm": 0.0, "d_volume_nm": None, "axes_nm": [0.0, 0.0, 0.0], "aspect_ratio": 1.0,
+             "d_max_nm": 0.0, "d_hull_nm": 0.0}
+    visible = np.array([s in native or s not in ORGANIC_ELEMENTS for s in syms])
+    if len(core) < 2 or visible.sum() < 2:
+        return {**out, **empty}
+
+    # SAXS: atomic-number-weighted electron density of the visible atoms.
+    r = pts[visible]
+    z = np.array([_Z.get(s, 20) for s, v in zip(syms, visible) if v], float)
+    r = r - (z[:, None] * r).sum(axis=0) / z.sum()
+    gyr = (z[:, None, None] * r[:, :, None] * r[:, None, :]).sum(axis=0) / z.sum()
+    lam = np.clip(np.sort(np.linalg.eigvalsh(gyr))[::-1], 0.0, None)
+    axes = 2.0 * np.sqrt(5.0 * lam)                      # uniform ellipsoid: <x^2> = a^2 / 5
+    r0 = max(np.sqrt(5.0 / 3.0 * lam.sum()), 1.0)        # Guinier radius, start of the fit
+    q = np.linspace(0.01, 1.3 * 4.493 / r0, 240)         # first lobe and ~30% beyond its minimum
+    intensity = np.abs(debye_intensity(r, z, q)) + 1e-30
+    from scipy.optimize import least_squares
+    fit = least_squares(
+        lambda p: np.log(p[0] * _sphere_form_factor(q, p[1]) + 1e-30) - np.log(intensity),
+        [intensity[0], r0], bounds=([0.0, 0.5], [np.inf, 10.0 * r0 + 10.0]),
+    )
+    out["d_nm"] = round(2.0 * float(fit.x[1]) / 10.0, 3)
+
+    out["d_volume_nm"] = None
+    core_syms = [s for s, c in zip(syms, is_core) if c]
+    if bulk_volume and all(s in bulk_volume for s in core_syms):
+        vol = sum(float(bulk_volume[s]) for s in core_syms)
+        out["d_volume_nm"] = round(2.0 * (3.0 * vol / (4.0 * np.pi)) ** (1.0 / 3.0) / 10.0, 3)
+
+    out["axes_nm"] = [round(float(a) / 10.0, 3) for a in axes]
+    out["aspect_ratio"] = round(float(axes[0] / axes[2]), 3) if axes[2] > 0 else None
+
     cen = core.mean(axis=0)
-    r = np.linalg.norm(core - cen, axis=1)
-    rg = float(np.sqrt(np.mean(r ** 2)))
-    out["d_nm"] = round(2.0 * np.sqrt(5.0 / 3.0) * rg / 10.0, 3)
-    out["d_max_nm"] = round(2.0 * float(r.max()) / 10.0, 3)
+    out["d_max_nm"] = round(2.0 * float(np.linalg.norm(core - cen, axis=1).max()) / 10.0, 3)
     try:
         from scipy.spatial import ConvexHull
         vol = ConvexHull(core).volume
@@ -172,6 +254,7 @@ def describe_structure(
     native_order: Sequence[str],
     charges: Dict[str, float],
     centre_index: Optional[int] = None,
+    bulk_volume: Optional[Mapping[str, float]] = None,
 ) -> dict:
     """
     Everything computable from coordinates alone (the core of a record).
@@ -179,6 +262,7 @@ def describe_structure(
     `centre_index` names the atom the cut was centred on, when known (builder
     output).  Polar sites such as wurtzite's leave the core centroid up to ~1 Å
     off that atom along c, beyond what `centre_species` can attribute.
+    `bulk_volume` (Å^3 per atom by element) enables the volume diameter.
     """
     comp = composition(symbols)
     native = set(native_order)
@@ -196,7 +280,7 @@ def describe_structure(
         "total_charge": total_charge(comp, charges),
         "centre": centre,
         "centre_offset_A": round(centre_d, 3),
-        "size": size_descriptors(symbols, pts, native),
+        "size": size_descriptors(symbols, pts, native, bulk_volume),
         "fingerprint": fingerprint(symbols, pts),
     }
 

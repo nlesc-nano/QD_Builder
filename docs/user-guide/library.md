@@ -112,6 +112,22 @@ generator, configuration, QD_Builder commit and whether the source tree was
 modified, the CIF, the recipe and, for reconstructions, the reconstruction
 ledger.
 
+The size descriptors (`size`, in nm) are defined to match experiments:
+
+| Key | Definition |
+|---|---|
+| `d_nm` | SAXS diameter: the homogeneous sphere fitted to the first lobe of the Debye intensity of the SAXS-visible atoms, weighted by atomic number. Core and inorganic shell (halides, Z-type metals) are visible; organic ligands match the solvent and are not. The library sorts and filters on it. |
+| `d_volume_nm` | volume diameter: the sphere holding the core atoms at the bulk volume per atom of the CIF. The gap to `d_nm` is the inorganic shell. |
+| `axes_nm`, `aspect_ratio` | diameters of the homogeneous ellipsoid with the same electron-density gyration tensor, longest first, and longest / shortest. Spheres and cubes give 1; above about 1.3 `d_nm` is only an equivalent-sphere size. |
+| `d_max_nm`, `d_hull_nm` | twice the largest core-atom distance from the core centroid; the sphere with the core convex-hull volume. |
+
+After a change to these definitions, refresh existing records without
+rebuilding them:
+
+```bash
+python -m builder.scripts.refresh_library_sizes <out>/CdSe [<out>/InP ...]
+```
+
 The repository ships configurations for all QDSpace templates in
 `examples/library/`:
 - zinc-blende II–VI (Cd, Zn, Hg chalcogenides; the Hg compounds add a
