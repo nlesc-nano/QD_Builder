@@ -405,6 +405,10 @@ def _priority1_swap_undercoord_anions_once(
             continue
         if s == ligand:
             continue
+        # Same charge as the ligand: already an X-type terminator (see the
+        # stabilization swaps below), so a swap would only change the element.
+        if charges.get(s, 0) == charges.get(ligand, 0):
+            continue
         if int(cn_bi[i]) > 2:
             continue
         if not mem[i]:
@@ -536,7 +540,11 @@ def _priority2_remove_low_cn_cation_once(
             )
             if ok:
                 cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-                native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
+                # A native anion with the ligand's charge (Cl in CsPbCl3 with a Br
+                # placeholder) is already an X-type terminator: swapping it only
+                # changes the element, so only higher-charge anions convert.
+                native_anions = {el for el, v in charges.items()
+                                 if v < 0 and el != ligand and v != charges.get(ligand, 0)}
                 for j, sj in enumerate(list(symbols)):
                     if charges.get(sj, 0) >= 0 or sj == ligand or sj not in native_anions:
                         continue
@@ -570,7 +578,11 @@ def _priority2_remove_low_cn_cation_once(
 
     # stabilization: convert native anions (not ligand) that dropped to CN<3 → ligand
     cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-    native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
+    # A native anion with the ligand's charge (Cl in CsPbCl3 with a Br
+    # placeholder) is already an X-type terminator: swapping it only
+    # changes the element, so only higher-charge anions convert.
+    native_anions = {el for el, v in charges.items()
+                     if v < 0 and el != ligand and v != charges.get(ligand, 0)}
     for j, sj in enumerate(list(symbols)):
         if charges.get(sj, 0) >= 0:
             continue
@@ -761,7 +773,11 @@ def _priority3_balance_positive_q_remove(
 
         # Post-stabilization: native anions (not ligand) that dropped to CN<3 → ligand
         cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        native_anions = {el for el, v in charges.items() if v < 0 and el != ligand}
+        # A native anion with the ligand's charge (Cl in CsPbCl3 with a Br
+        # placeholder) is already an X-type terminator: swapping it only
+        # changes the element, so only higher-charge anions convert.
+        native_anions = {el for el, v in charges.items()
+                         if v < 0 and el != ligand and v != charges.get(ligand, 0)}
         for j, sj in enumerate(list(symbols)):
             if charges.get(sj, 0) >= 0:
                 continue
