@@ -19,6 +19,11 @@ along every lattice axis (for non-cubic cells such as wurtzite).
 Optional `preset_overrides: [{min_unit_cells: X, <preset key>: ...}]` replaces
 preset keys (e.g. facets) for sizes >= X.
 
+Optional `outer_cation: Cs` keeps only structures whose outermost cation
+layer along every facet normal is that species (CsX- rather than
+PbX2-terminated perovskite cubes).  Facet families are expanded by signed
+permutations, which is exact for cubic cells only.
+
 Usage:
     python -m builder.scripts.generate_library examples/library/cdse_zb.yaml [--out DIR]
 """
@@ -77,6 +82,43 @@ def _sizes(spec) -> List[float]:
     return [float(x) for x in spec]
 
 
+def _facet_normals(facets: List[dict], lattice) -> np.ndarray:
+    """Cartesian unit normals of the preset facet families (signed permutations)."""
+    from itertools import permutations, product
+
+    from ..config import _parse_hkl
+
+    normals = []
+    for f in facets:
+        hkl = np.asarray(_parse_hkl(str(f["hkl"])), float)
+        family = {tuple(sg * v for sg, v in zip(signs, perm))
+                  for perm in permutations(hkl) for signs in product((1, -1), repeat=3)}
+        if f.get("scope", "family") != "family":
+            family = {tuple(hkl)}
+        for h in family:
+            n = np.asarray(h, float) @ lattice.reciprocal_lattice_crystallographic.matrix
+            normals.append(n / np.linalg.norm(n))
+    return np.unique(np.round(normals, 6), axis=0)
+
+
+def _outer_cation_violations(symbols, pts, normals: np.ndarray, charges: Dict[str, int],
+                             native: List[str], want: str, tol: float = 1.0) -> List[str]:
+    """
+    Facet normals along which a native cation other than `want` lies within
+    `tol` Å of the outermost cation layer.
+    """
+    pts = np.asarray(pts, float)
+    cations = [i for i, s in enumerate(symbols) if s in native and int(charges.get(s, 0)) > 0]
+    bad = []
+    for n in normals:
+        proj = pts[cations] @ n
+        top = proj.max()
+        outer = {symbols[cations[k]] for k in np.where(proj >= top - tol)[0]}
+        if outer - {want}:
+            bad.append(f"({' '.join(f'{v:g}' for v in np.round(n, 3) + 0.0)}): {'/'.join(sorted(outer))}")
+    return bad
+
+
 def _build(cif: str, recipe: dict, positive_q_mode: str, workdir: Path) -> Optional[dict]:
     """
     Run the builder in-process; return symbols, coordinates (centred at the
@@ -129,10 +171,12 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     min_anion_kept = float(cfg.get("min_anion_fraction_kept", 0.5))
     anions = [e for e in native_order if int(charges.get(e, 0)) < 0]
     reconstruction = cfg.get("reconstruction", "auto")
+    outer_cation = cfg.get("outer_cation")
     # Non-cubic cells (wurtzite): `isotropic_cells: true` scales the replica
     # counts so a size of N spans N * min(a, b, c) along every axis; otherwise
     # N cells along each axis stretch the dot by c/a.
-    lengths = np.array(Structure.from_file(cif).lattice.abc, dtype=float)
+    lattice = Structure.from_file(cif).lattice
+    lengths = np.array(lattice.abc, dtype=float)
     cell_scale = lengths.min() / lengths if cfg.get("isotropic_cells", False) else np.ones(3)
     bulk_volume = bulk_volume_per_atom(cif)
     out_root = Path(out_dir or (cfg_path.parent / cfg.get("out_dir", "out"))).resolve() / material
@@ -172,6 +216,11 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             after = sum(desc["core"].get(e, 0) for e in anions)
             if before and after < min_anion_kept * before:
                 reasons.append(f"keeps {after}/{before} anions of its clean parent")
+        if outer_cation:
+            bad = _outer_cation_violations(res["symbols"], res["pts"], _facet_normals(recipe["facets"], lattice),
+                                           charges, native_order, outer_cation)
+            if bad:
+                reasons.append(f"not {outer_cation}-terminated ({len(bad)} facets, e.g. {bad[0]})")
         if res["centre_index"] is None:
             reasons.append("no atom at the construction origin")
         elif desc["centre"] != centre:
