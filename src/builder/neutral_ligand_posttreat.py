@@ -164,6 +164,26 @@ def _anchor_vec_to_body(mol, coords: np.ndarray, anchor_idx: int) -> np.ndarray:
     return np.array([0.0, 0.0, 1.0])
 
 
+def _donor_antilone_pair_vec(mol, coords: np.ndarray, anchor_idx: int) -> np.ndarray:
+    """
+    Return the direction opposite to the lone pair of an L-type donor atom.
+
+    The sum of the unit bond vectors to all neighbours (hydrogens included)
+    points away from the lone pair(s) of an sp3 N/P or sp3 S, so aligning it
+    with the missing-bond direction makes the lone pair face the surface atom
+    (M-N-C ~ 110 deg for an amine instead of 180 deg with N-H folded back).
+    """
+    anchor_idx = int(anchor_idx)
+    anchor = coords[anchor_idx]
+    neigh = [nb.GetIdx() for nb in mol.GetAtomWithIdx(anchor_idx).GetNeighbors()]
+    if not neigh:
+        return _anchor_vec_to_body(mol, coords, anchor_idx)
+    v = _unit_rows(coords[neigh] - anchor).sum(axis=0)
+    if np.linalg.norm(v) < 1e-6:  # planar donor: no lone-pair direction to use
+        return _anchor_vec_to_body(mol, coords, anchor_idx)
+    return _unit(v)
+
+
 def _detect_neutral_anchor(mol) -> Tuple[int, np.ndarray, np.ndarray, str]:
     """
     Detect a neutral functional group and return its anchor frame.
@@ -222,7 +242,7 @@ def _detect_neutral_anchor(mol) -> Tuple[int, np.ndarray, np.ndarray, str]:
                 return h_idx, coords[h_idx], _unit(coords[o_idx] - coords[h_idx]), name
 
         anchor_idx = int(match[0])
-        return anchor_idx, coords[anchor_idx], _anchor_vec_to_body(mol, coords, anchor_idx), name
+        return anchor_idx, coords[anchor_idx], _donor_antilone_pair_vec(mol, coords, anchor_idx), name
 
     anchor_idx = _detect_anchor_atom(mol)
     return anchor_idx, coords[anchor_idx], _anchor_vec_to_body(mol, coords, anchor_idx), "electronegative_atom"
