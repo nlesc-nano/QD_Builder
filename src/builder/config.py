@@ -720,6 +720,10 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
     if cation_removal not in {"auto", "max", "mirror"}:
         raise ValueError("post_treatment.surface_reconstruction.cation_removal must be auto, max or mirror")
 
+    anion_pattern = str(raw.get("anion_pattern", "vacancy")).strip().lower()
+    if anion_pattern not in {"vacancy", "swap"}:
+        raise ValueError("post_treatment.surface_reconstruction.anion_pattern must be vacancy or swap")
+
     return SurfaceReconstructionSpec(
         enabled=True,
         ligand=str(raw.get("ligand", default_ligand)),
@@ -730,6 +734,7 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
         distribution=distribution,
         seed=int(raw.get("seed", 1337)),
         cation_removal=cation_removal,
+        anion_pattern=anion_pattern,
     )
 
 

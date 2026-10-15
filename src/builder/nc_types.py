@@ -136,6 +136,8 @@ class SurfaceReconstructionSpec:
     are active: sub-surface cation vacancies on the anion-terminated facets
     (two-coordinated anions become `ligand`), then ligand stripping and outer
     cation removal on the cation-terminated facets to restore neutrality.
+    With `anion_pattern: swap` the outer anions are converted instead and the
+    charge is compensated by ligands on the cation-terminated facets.
     `facets`, `target_reduction`, `min_separation` and `distribution` are
     parsed for backward compatibility but no longer used.
     """
@@ -152,6 +154,11 @@ class SurfaceReconstructionSpec:
     # vacancies made on the {-1-1-1} facets, rest as ligands), or "auto"
     # (mirror, for II-VI and III-V).
     cation_removal: str = "auto"
+    # How the anion-terminated facets are compensated: "vacancy" (sub-surface
+    # cation vacancies; the two-coordinated anions become the ligand) or
+    # "swap" (outer anions become the ligand, no vacancies; the charge goes to
+    # ligands added on the cation-terminated facets, no cations removed).
+    anion_pattern: str = "vacancy"
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,16 @@ Algorithm:
      cation-facet sites: for II-VI mu3 hollows first, then mu2 bridges (on-top
      only as a last resort); for III-V terminal on-top ligands.
 
+Swap pattern (spec.anion_pattern = "swap", II-VI and III-V): no vacancies.
+  1'. On the anion-terminated facets the minimum set of outer anions that
+      breaks every run becomes the ligand, then further outer anions, spread
+      evenly and mapped by symmetry, the same number per facet; each swap
+      adds q_lig - q_an (CdSe +1, InP +2).
+  2.  Ligands are stripped from the cation-terminated facets as above.
+  3'. No cation is removed: the whole charge goes to ligands on the cation
+      facets (same site rules).  The number of further swaps per facet is the
+      largest that these facets can compensate exactly (bisection).
+
 Vacancy acceptance: after removal, a native anion must keep CN >= 2 (CN == 2
 converts it to the ligand) and a ligand must keep CN >= 1.  Cations on facet
 edges (bonded to a ligand or to the outer layer of another {111} facet) are
@@ -640,6 +650,34 @@ def _fps_nonadjacent(
     return chosen
 
 
+def _fps_order(
+    cands: List[int],
+    pts: NDArray[np.float64],
+    existing: Optional[List[int]] = None,
+) -> List[int]:
+    """All candidates in maximin order: each next one farthest from those before it and from `existing`."""
+    existing = list(existing or [])
+    rest = list(cands)
+    chosen: List[int] = []
+    if not rest:
+        return chosen
+    centroid = pts[rest].mean(axis=0)
+    while rest:
+        ref = existing + chosen
+        if ref:
+            ref_pts = pts[ref]
+            best = max(rest, key=lambda c: (
+                round(float(np.min(np.linalg.norm(ref_pts - pts[c], axis=1))), 6),
+                round(float(np.linalg.norm(pts[c] - centroid)), 6),
+                -c,
+            ))
+        else:
+            best = max(rest, key=lambda c: (round(float(np.linalg.norm(pts[c] - centroid)), 6), -c))
+        chosen.append(best)
+        rest.remove(best)
+    return chosen
+
+
 def _symmetric_selection(
     facets: List[_Polar111],
     cands: Dict[int, List[int]],
@@ -969,10 +1007,15 @@ def reconstruct_polar_facets(
     removal_policy = str(getattr(spec, "cation_removal", "auto") or "auto").lower()
     if removal_policy == "auto":
         removal_policy = "mirror"
+    anion_pattern = str(getattr(spec, "anion_pattern", "vacancy") or "vacancy").lower()
+    if anion_pattern == "swap":
+        # Outer anions become the ligand; all compensation is by ligands on the
+        # cation-terminated facets, so no cation is removed.
+        removal_policy = "none"
     pts = np.asarray(pts, float)
     symbols = list(symbols)
     q0 = _total_q(symbols, charges)
-    print(f"[recon] cation removal on cation-{{111}}: {removal_policy}")
+    print(f"[recon] anion-facet pattern: {anion_pattern} | cation removal on cation-{{111}}: {removal_policy}")
     print(f"[recon] {cation}{anion}: q_cat={q_cat:+d} q_an={q_an:+d} ligand={recon_ligand}({ligand_charge:+d})"
           f"  Q_total before = {q0:+d}")
 
@@ -1069,13 +1112,21 @@ def reconstruct_polar_facets(
             res = {k: cover(k, nodes[k]) for k in nodes}
         return res
 
-    def _execute(n_vac: int) -> dict:
+    def _execute(n_vac: int, swap: Optional[Tuple[Dict[int, List[int]], Dict[int, List[int]]]] = None) -> dict:
+        """
+        One reconstruction attempt.  With `swap = (mandatory, extra)` no
+        vacancies are made: the listed outer anions become the ligand
+        (`mandatory` breaks the anion runs, `extra` are the further swaps).
+        """
         syms = list(base_symbols)
         alive = all_alive.copy()
-        an_sel = {
-            k: v if len(v) == n_vac else _fps_nonadjacent(v, pts, n_vac, d_nn)
-            for k, v in an_max.items()
-        }
+        if swap is not None:
+            an_sel = {k: [] for k in range(len(an_facets))}
+        else:
+            an_sel = {
+                k: v if len(v) == n_vac else _fps_nonadjacent(v, pts, n_vac, d_nn)
+                for k, v in an_max.items()
+            }
 
         # Global CN validation (edges shared between facets); drop offenders.
         removed_count: Dict[int, int] = {}
@@ -1105,9 +1156,18 @@ def reconstruct_polar_facets(
                     converted[facet_of_vac[c]] += 1
                     dq_anion += ligand_charge - q_an
 
+        n_breaks = {k: 0 for k in range(len(an_facets))}
+        if swap is not None:
+            mandatory, extra = swap
+            for counts, sel in ((n_breaks, mandatory), (converted, extra)):
+                for k, conv in sel.items():
+                    for a in conv:
+                        if alive[a] and syms[a] == anion:
+                            syms[a] = recon_ligand
+                            dq_anion += ligand_charge - q_an
+                            counts[k] += 1
         # Break runs of adjacent surviving outer anions (charge delocalisation),
         # on the facet and across its edges, with a minimal alternating set.
-        n_breaks = {k: 0 for k in range(len(an_facets))}
         for k, conv in _break_runs(syms, alive).items():
             for a in conv:
                 if syms[a] == anion:
@@ -1158,7 +1218,7 @@ def reconstruct_polar_facets(
             q -= ligand_charge
 
         # ---- 3. outer-cation vacancies on cation-terminated facets ---------
-        n_remove = q // q_cat if q > 0 else 0
+        n_remove = q // q_cat if q > 0 and removal_policy != "none" else 0
         if removal_policy == "mirror":
             # Remove as many cations as vacancies were made on the anion side;
             # the rest of the charge goes to ligands.
@@ -1286,13 +1346,69 @@ def reconstruct_polar_facets(
     # until the cation-terminated facets can compensate the charge exactly.
     # If no count balances, keep the attempt with the smallest residual charge
     # (most vacancies on ties).
+    swap_info: Optional[dict] = None
     res = None
-    for n_vac in range(n_vac_max, -1, -1):
-        trial = _execute(n_vac)
-        if res is None or abs(trial["q_final"]) < abs(res["q_final"]):
-            res = trial
-        if trial["q_final"] == 0:
-            break
+    if anion_pattern == "swap":
+        # Always: the fewest swaps that leave no run of under-coordinated
+        # anions (and a single-anion facet becomes the ligand).  Then as many
+        # further outer anions as the cation-terminated facets can compensate,
+        # spread evenly and mapped by symmetry, the same number on every facet.
+        mandatory = _break_runs(base_symbols, all_alive)
+        for k, f in enumerate(an_facets):
+            if len(f.outer) == 1 and f.outer[0] not in mandatory[k]:
+                mandatory[k] = list(mandatory[k]) + [f.outer[0]]
+        taken = {a for v in mandatory.values() for a in v}
+        rest = {
+            k: [a for a in f.outer if base_symbols[a] == anion and a not in taken]
+            for k, f in enumerate(an_facets)
+        }
+
+        def order_extra(k: int, eligible: List[int]) -> List[int]:
+            return _fps_order(eligible, pts, existing=mandatory[k])
+
+        order = _symmetric_selection(an_facets, rest, ops, order_extra) if len(an_facets) > 1 else None
+        an_symmetric = order is not None
+        if order is None:
+            order = {k: order_extra(k, rest[k]) for k in rest}
+        else:
+            for k in rest:   # sites the symmetric map could not reach, spread after it
+                left = [a for a in rest[k] if a not in set(order[k])]
+                order[k] = list(order[k]) + _fps_order(left, pts, existing=list(mandatory[k]) + list(order[k]))
+        level_max = max((len(v) for v in order.values()), default=0)
+        tried: Dict[int, dict] = {}
+
+        def attempt(level: int) -> dict:
+            if level not in tried:
+                tried[level] = _execute(0, swap=(mandatory, {k: v[:level] for k, v in order.items()}))
+            return tried[level]
+
+        # Extra swaps only add positive charge, so the levels that close are
+        # 0..L*: bisect for the largest one.
+        if attempt(level_max)["q_final"] != 0 and attempt(0)["q_final"] == 0:
+            lo, hi = 0, level_max
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if attempt(mid)["q_final"] == 0:
+                    lo = mid
+                else:
+                    hi = mid
+        level = min(tried, key=lambda lv: (abs(tried[lv]["q_final"]), -lv))
+        res = tried[level]
+        swap_info = {
+            "extra_per_facet": int(level),
+            "extra_max": int(level_max),
+            "outer_anions": int(sum(1 for f in an_facets for a in f.outer if base_symbols[a] == anion)),
+        }
+        print(f"[recon] swap: {level} of {level_max} further outer {anion} per facet become {recon_ligand}"
+              f" ({len(tried)} attempt(s)).")
+        n_vac_max = 0
+    else:
+        for n_vac in range(n_vac_max, -1, -1):
+            trial = _execute(n_vac)
+            if res is None or abs(trial["q_final"]) < abs(res["q_final"]):
+                res = trial
+            if trial["q_final"] == 0:
+                break
     n_vac_used = min(len(v) for v in res["an_sel"].values())
 
     print("\n=== {111} RECONSTRUCTION: anion-terminated facets ===")
@@ -1360,6 +1476,7 @@ def reconstruct_polar_facets(
     if ledger is not None:
         ledger.update({
             "status": "applied",
+            "anion_pattern": anion_pattern,
             "cation_removal": removal_policy,
             "cation": cation,
             "anion": anion,
@@ -1383,6 +1500,8 @@ def reconstruct_polar_facets(
             "total_charge_before": int(q0),
             "total_charge_after": int(q_final),
         })
+        if swap_info is not None:
+            ledger["swap"] = swap_info
         if rebalance is not None:
             ledger["charge_balance_fallback"] = rebalance
     return out_symbols, out_pts
