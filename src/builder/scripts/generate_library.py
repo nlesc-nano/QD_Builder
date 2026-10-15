@@ -171,6 +171,14 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     min_anion_kept = float(cfg.get("min_anion_fraction_kept", 0.5))
     anions = [e for e in native_order if int(charges.get(e, 0)) < 0]
     reconstruction = cfg.get("reconstruction", "auto")
+    # Anion-facet pattern of the reconstructed variant: "vacancy" (default) or
+    # "swap" (outer anions -> ligand, compensated on the cation facets).
+    recon_pattern = str(cfg.get("reconstruction_pattern", "vacancy")).strip().lower()
+    if recon_pattern not in {"vacancy", "swap"}:
+        raise ValueError("reconstruction_pattern must be vacancy or swap")
+    # A variant series can leave the clean structures to the default series:
+    # they are still built (parent link, anion check) but not written.
+    write_clean = bool(cfg.get("write_clean", True))
     outer_cation = cfg.get("outer_cation")
     # Non-cubic cells (wurtzite): `isotropic_cells: true` scales the replica
     # counts so a size of N spans N * min(a, b, c) along every axis; otherwise
@@ -187,7 +195,10 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
     by_id: Dict[str, dict] = {}  # id -> record
     review: List[dict] = []
 
-    def consider(centre: str, size: float, surface: str, recipe: dict, res: Optional[dict], parent: Optional[str]):
+    written: set = set()
+
+    def consider(centre: str, size: float, surface: str, recipe: dict, res: Optional[dict], parent: Optional[str],
+                 write: bool = True):
         row = {"centre": centre, "unit_cells": size, "surface": surface, "id": "", "formula": "",
                "d_nm": "", "n_atoms": "", "Q": "", "status": ""}
         if res is None or "skip" in res:
@@ -248,15 +259,23 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
         recon_ledger = res["manifest"].get("surface_reconstruction_ledger")
         if recon_ledger:
             origin["reconstruction_ledger"] = recon_ledger
+        extra = {"parent": parent} if parent else {}
+        if surface == "reconstructed":
+            extra["reconstruction_pattern"] = recon_pattern
         rec = make_record(
             material=material, family=family, phase=phase, surface=surface, source="builder",
             description=desc,
             stages=[{"stage": "start", "file": "start.xyz"}],
             origin=origin,
-            extra={"parent": parent} if parent else None,
+            extra=extra or None,
         )
         kept[fp] = rec
         by_id[rec["id"]] = rec
+        if not write:
+            row.update(id=rec["id"], status="parent only (not written)")
+            review.append(row)
+            return rec
+        written.add(rec["id"])
         target = out_root / rec["id"]
         target.mkdir(parents=True, exist_ok=True)
         _write_xyz(target / "start.xyz", res["symbols"], res["pts"], rec["id"])
@@ -279,13 +298,15 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
                 recipe["construction_origin"] = {"center_on_species": centre}
                 tag = f"{centre}_{size}"
                 clean = consider(centre, size, "clean", recipe,
-                                 _build(cif, recipe, posq, tmp / f"{tag}_clean"), None)
+                                 _build(cif, recipe, posq, tmp / f"{tag}_clean"), None, write=write_clean)
                 if reconstruction == "never":
                     continue
                 r_recipe = copy.deepcopy(recipe)
                 r_recipe.setdefault("post_treatment", {})["surface_reconstruction"] = {
                     "enabled": True, "ligand": preset["passivation"].get("ligand", "Cl"),
                 }
+                if recon_pattern != "vacancy":
+                    r_recipe["post_treatment"]["surface_reconstruction"]["anion_pattern"] = recon_pattern
                 res = _build(cif, r_recipe, posq, tmp / f"{tag}_recon")
                 ledger = (res or {}).get("manifest", {}).get("surface_reconstruction_ledger", {}) if res else {}
                 if res and "error" not in res and ledger.get("status") != "applied":
@@ -293,6 +314,8 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
                 consider(centre, size, "reconstructed", r_recipe, res, clean["id"] if clean else None)
 
     for rec in kept.values():
+        if rec["id"] not in written:
+            continue
         (out_root / rec["id"] / "record.json").write_text(json.dumps(rec, indent=2))
     _write_review(out_root, review, material)
     return out_root

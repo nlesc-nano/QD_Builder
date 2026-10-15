@@ -1,0 +1,32 @@
+# CdSe wurtzite size series, swap variant of the polar (001) reconstruction.
+material: CdSe
+family: II-VI
+phase: wurtzite
+cif: cifs/CdSe_wz.cif
+native_elements: [Cd, Se]          # formula order; everything else is a ligand
+centres: [Cd, Se]
+sizes: {start: 0.75, stop: 8.5, step: 0.25}   # units of a (4.35 Å)
+isotropic_cells: true
+positive_q_mode: add
+reconstruction: auto
+reconstruction_pattern: swap      # outer anions -> Cl, compensated on the cation (001)
+write_clean: false
+min_core_atoms: 20
+min_interatomic_distance: 1.8      # Å
+min_anion_fraction_kept: 0.5       # reconstructed variants keep >= this share of the clean anions
+out_dir: out_swap
+
+preset:
+  charges: {Cd: 2, Se: -2, Cl: -1}
+  passivation:
+    ligand: Cl
+    surf_tol: 2.0
+    prepass_mode: role-aware
+    prepass_min_cn_terrace: 3
+    prepass_min_cn_edge: 2
+    prepass_min_cn_vertex: 1
+  facets:
+    - {hkl: "100", scope: family, gamma: 1.0}
+    - {hkl: "001", scope: family, termination: cation_rich, gamma: 1.0}
+    - {hkl: "00-1", scope: family, termination: anion_rich, gamma: 1.0}
+  symmetry: {proper_rotations_only: true}

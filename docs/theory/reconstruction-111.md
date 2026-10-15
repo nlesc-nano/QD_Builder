@@ -276,6 +276,57 @@ and the edges. A charge that cannot be removed even then is reported as a
 warning and kept, rather than forced away by an arbitrary change to the
 structure.
 
+## An alternative pattern: anion swaps
+
+The vacancy pattern compensates an anion-terminated facet by removing metal
+beneath it and, by default, mirrors those vacancies with missing cations on
+the cation-terminated facets. A second pattern, selected with
+`anion_pattern: swap`, compensates the same facets without any vacancy or
+cation removal. The outer anions of the anion-terminated facets are
+converted into the reconstruction ligand on their own lattice sites, so
+each becomes a ligand bonded to three cations. All the charge this creates
+is returned by ligands placed on the cation-terminated facets.
+
+The swaps are made in two layers. The first is the set the vacancy pattern
+also uses: the minimum vertex cover that leaves no row of under-coordinated
+anions, together with the conversion of single-anion facets. On top of it,
+further outer anions are converted, in an order that spreads them evenly
+over each facet (farthest-point order from the anions already converted).
+The order is mapped between facets by the particle's rotations, and every
+anion facet receives the same number. Each swap costs
+$q_\text{lig} - q_\text{an}$, which is +1 in II–VI and +2 in III–V
+compounds. The cation-terminated facets are stripped as in the vacancy
+pattern and then receive
+
+$$
+N_\text{add} = N_\text{strip} + (q_\text{lig} - q_\text{an})\,N_\text{swap}
+$$
+
+ligands, placed with the selector of {ref}`theory-ligand-sites` (μ3 > μ2 >
+μ1 for II–VI, μ1 for III–V). No cation is removed.
+
+How far the swapping can go is limited by the cation-terminated facets.
+Every added ligand needs a host with a free bond, and no cation may exceed
+four-fold coordination. Converting every outer Se of a CdSe particle
+typically requires 0.5 to 1.1 chlorides per outer Cd of the cation facets.
+The cation facets then end up almost entirely covered by on-top chloride,
+and at some sizes a full swap does not fit. The builder therefore
+determines the largest number of further swaps per facet that the cation
+facets can compensate exactly. Further swaps only add positive charge, so
+the feasible numbers form a range starting at zero, and the largest is
+found by bisection. If even the minimal set cannot be compensated, the
+attempt with the smallest residual is kept and passed to the general
+charge balance, as in the vacancy pattern.
+
+The swap pattern is not a cure for particles whose cation-terminated facets
+are much smaller than the anion-terminated ones. On such particles the
+cation facets cannot host the compensation for either pattern (see the
+III–V discussion below). The ledger records the pattern (`anion_pattern`)
+and, for swaps, the number of further swaps per facet and its maximum
+(`swap.extra_per_facet`, `swap.extra_max`). In the per-facet entries,
+`chain_breaks` counts the minimal swaps and `anions_to_ligand` the further
+ones.
+
 ## III–V particles
 
 The reconstruction is the same for III–V compounds, but the trivalent
@@ -370,7 +421,8 @@ block of the recipe.
 |---|---|---|
 | `enabled` | `false` | run the reconstruction |
 | `ligand` | passivation ligand | reconstruction ligand (must be negatively charged) |
-| `cation_removal` | `auto` | `mirror` (= `auto`) or `max` |
+| `anion_pattern` | `vacancy` | `vacancy` or `swap` (outer anions become the ligand, compensated on the cation facets, no cation removal) |
+| `cation_removal` | `auto` | `mirror` (= `auto`) or `max`; not used by `swap` |
 | `seed` | `1337` | accepted, currently unused |
 
 The older keys `facets`, `target_reduction`, `min_separation` and

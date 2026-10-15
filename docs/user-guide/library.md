@@ -51,6 +51,8 @@ preset:                           # a complete builder recipe
 | `preset_overrides` | none | size-dependent changes, see below |
 | `positive_q_mode` | `add` | passed to the builder |
 | `reconstruction` | `auto` | `never` skips the {111}-reconstructed variant |
+| `reconstruction_pattern` | `vacancy` | anion-facet pattern of the reconstructed variant: `vacancy` or `swap` |
+| `write_clean` | `true` | `false` builds the clean parents (for the parent link and the anion check) without writing them, for variant series whose clean structures live in the default series |
 | `min_core_atoms` | 20 | reject smaller cores |
 | `min_interatomic_distance` | 1.8 Å | reject clashes |
 | `min_anion_fraction_kept` | 0.5 | reject reconstructions that lose most anions |
@@ -143,3 +145,9 @@ Variant recipes of a series (e.g. `inp_zb_100.yaml`, the III–V default plus
 a cation-rich {100} at γ = 1.2) write to their own output directory and are
 served from `builder_<tag>/` next to the default `builder/`; the webapp
 ingest keeps one copy of a structure that two recipes produce.
+
+The `*_swap.yaml` variants (all zinc-blende II–VI and III–V materials and
+wurtzite CdSe) reconstruct with `reconstruction_pattern: swap` and
+`write_clean: false`. They add only reconstructed structures, served from
+`builder_swap/`. Their records carry `reconstruction_pattern: swap` and
+point to the clean parents of the default series.
