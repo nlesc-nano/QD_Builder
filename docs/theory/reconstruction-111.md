@@ -276,6 +276,62 @@ and the edges. A charge that cannot be removed even then is reported as a
 warning and kept, rather than forced away by an arbitrary change to the
 structure.
 
+## III–V particles
+
+The reconstruction is the same for III–V compounds, but the trivalent
+charges change its bookkeeping in a way worth making explicit. With
+$q_\text{In} = +3$, $q_\text{P} = -3$ and $q_\text{Cl} = -1$, each elementary
+move has a fixed price:
+
+| Move | $\Delta Q$ (III–V) | $\Delta Q$ (II–VI) |
+|---|---|---|
+| remove one cation | −3 | −2 |
+| convert one anion into the ligand | +2 | +1 |
+| strip one ligand | +1 | +1 |
+| add one ligand | −1 | −1 |
+
+The III–V recipe builds tetrahedral particles. The In-terminated {111}
+facets ($\gamma = 0.8$) dominate, and the P-terminated {$\bar1\bar1\bar1$}
+facets ($\gamma = 1.6$) only truncate the corners. Before the
+reconstruction, the passivation has made the particle neutral with on-top
+chlorides.
+
+Below each P facet, every vacancy converts its three outer P atoms into Cl
+and contributes
+
+$$
+\Delta Q_\text{vac} = -q_\text{In} + 3\,(q_\text{Cl} - q_\text{P}) = -3 + 3\cdot2 = +3 ,
+$$
+
+and every chain-break swap adds +2. On the In facets the terrace chlorides
+are stripped, +1 each. After stripping, the charge is
+$Q = 3N_\text{vac} + 2N_\text{break} + N_\text{strip}$. Since
+$\lfloor Q/3\rfloor \ge N_\text{vac}$, mirror removal takes exactly
+$N_\text{rm} = N_\text{vac}$ indium atoms whenever the In facets offer that
+many removable atoms. Each vacancy below a P facet is then cancelled by a
+missing In above, and
+
+$$
+Q_3 = 2N_\text{break} + N_\text{strip}, \qquad
+N_\text{add} = N_\text{strip} + 2N_\text{break} .
+$$
+
+The reconstruction thus puts back every stripped chloride plus two for
+each chain break. III–V particles receive these chlorides on on-top μ1
+sites only. The site selector of {ref}`theory-ligand-sites` places them
+without taking any In above four bonds, keeps the bulk-derived spacings,
+and balances them across the In facets.
+
+Whether this closes depends on the shape of the particle. The cut planes
+of the two polar families alternate between In and P layers as the size
+grows, so at some sizes and centres the In-terminated facets shrink to a
+few atoms while the P-terminated facets become large. In the default InP
+series, all ten reconstructions that remain charged after the fallback
+(residuals of +21 to +417) are of this kind. Their In facets hold 4 to 60
+outer atoms, while their P facets hold 22 to 421. In every neutral
+reconstruction the In facets are the larger ones. A charged result is
+reported and kept as such, and the library generator rejects it.
+
 ## Determinism
 
 Every choice in the reconstruction is deterministic. Ties are broken
