@@ -56,3 +56,4 @@ examples/out/*
 cache/
 size_cell_scan/
 examples/library/out/
+docs/_build/
