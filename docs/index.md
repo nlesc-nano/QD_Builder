@@ -67,6 +67,7 @@ theory/structure-identity
 postprocessing/overview
 postprocessing/x-type
 postprocessing/l-type
+postprocessing/z-type-ligands
 postprocessing/neutral-exchange
 postprocessing/z-type
 postprocessing/alloying
