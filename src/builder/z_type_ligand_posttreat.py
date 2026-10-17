@@ -164,6 +164,206 @@ def _place_molecular_anion(
     return syms, best
 
 
+def _anion_site_candidates(
+    sites: List[dict],
+    syms: List[str],
+    pts: NDArray[np.float64],
+    cfg: Config,
+    bulk_struct,
+    planes: List[Plane],
+    f_shift: np.ndarray,
+) -> List[List[dict]]:
+    """
+    Free lattice anion sites around every metal site.
+
+    A site is free if no atom lies within 0.8 d_MX of it.  Sites generated
+    from neighbouring metal sites coincide and get the same ``id``, which is
+    how two complexes compete for an anion.  ``partners`` counts the core
+    cations the site would bridge to.
+    """
+    tree = cKDTree(pts)
+    per_site: List[List[dict]] = []
+    all_pos: List[np.ndarray] = []
+    for site in sites:
+        m_pos = np.asarray(site["pos"], float)
+        outward = _surface_outward_direction(site["hosts"][0], pts, planes, cfg.passivation.surf_tol)
+        cands = []
+        for vec in _bulk_site_neighbour_vectors(m_pos, bulk_struct, cfg.charges, f_shift):
+            x_pos = m_pos + vec
+            d_x = float(np.linalg.norm(vec))
+            if tree.query_ball_point(x_pos, r=_CLEARANCE_FRAC * d_x):
+                continue
+            partners = sum(
+                1 for j in tree.query_ball_point(x_pos, r=1.15 * d_x)
+                if int(cfg.charges.get(syms[j], 0)) > 0
+            )
+            cands.append({
+                "pos": x_pos,
+                "partners": partners,
+                "outward": float(np.dot(_unit(vec), outward)),
+                "id": len(all_pos),
+            })
+            all_pos.append(x_pos)
+        per_site.append(cands)
+
+    if all_pos:
+        root = list(range(len(all_pos)))
+
+        def find(a: int) -> int:
+            while root[a] != a:
+                root[a] = root[root[a]]
+                a = root[a]
+            return a
+
+        for a, b in cKDTree(np.asarray(all_pos)).query_pairs(0.3):
+            ra, rb = find(a), find(b)
+            root[max(ra, rb)] = min(ra, rb)
+        for cands in per_site:
+            for c in cands:
+                c["id"] = find(c["id"])
+    return per_site
+
+
+def _site_users(cands: List[List[dict]]) -> Dict[int, set]:
+    """Metal sites that can reach each candidate anion site."""
+    users: Dict[int, set] = {}
+    for i, cs in enumerate(cands):
+        for c in cs:
+            users.setdefault(c["id"], set()).add(i)
+    return users
+
+
+def _bonds(c: dict, j: int, users: Dict[int, set], placed: set) -> int:
+    """Cations other than metal j an anion on site c would bond to."""
+    return c["partners"] + sum(1 for m in users[c["id"]] if m != j and m in placed)
+
+
+def _free_sites(
+    j: int,
+    cands: List[List[dict]],
+    users: Dict[int, set],
+    used: set,
+    placed: set,
+) -> List[dict]:
+    """Free anion sites of metal j, bridging and outward ones first."""
+    free = [c for c in cands[j] if c["id"] not in used]
+    free.sort(key=lambda c: (-_bonds(c, j, users, placed), -c["outward"]))
+    return free
+
+
+def _plan_sequential(
+    cands: List[List[dict]],
+    n: int,
+    order: List[int],
+    k: int,
+) -> List[Tuple[int, List[dict]]]:
+    """Visit sites in ``order``; each takes its n best free anion sites."""
+    users = _site_users(cands)
+    used: set = set()
+    placed: set = set()
+    plan = []
+    for i in order:
+        if len(plan) >= k:
+            break
+        free = _free_sites(i, cands, users, used, placed)
+        if len(free) < n:
+            continue
+        plan.append((i, free[:n]))
+        placed.add(i)
+        used.update(c["id"] for c in free[:n])
+    return plan
+
+
+def _plan_alternating(
+    cands: List[List[dict]],
+    n: int,
+    positions: NDArray[np.float64],
+    k: int,
+) -> List[Tuple[int, List[dict]]]:
+    """
+    ``uniform`` plan: alternate sites first, then fill in.
+
+    Stage 1 takes, in farthest-point order, sites that share no candidate
+    anion site with a site already taken (on an anion-terminated {111}
+    facet one of the three sublattices of the sqrt3 x sqrt3 pattern), so
+    no complex competes for an anion.  Each takes the n sites fewest of the
+    remaining candidates need.  Stage 2 adds complexes on the remaining
+    sites, each time the one that leaves the most other candidates
+    placeable, then the one whose anions bridge most, then the farthest
+    from those placed.
+    """
+    users = _site_users(cands)
+    chosen: List[int] = []
+    blocked: set = set()
+    for i in _get_spatially_ordered_indices(positions, True):
+        if len(chosen) >= k:
+            break
+        if i in blocked or len(_free_sites(i, cands, users, set(), set())) < n:
+            continue
+        chosen.append(i)
+        for c in cands[i]:
+            blocked |= users[c["id"]]
+
+    pool = set(range(len(cands))) - set(chosen)
+
+    def demand(c: dict, exclude: int = -1) -> int:
+        return sum(1 for j in users[c["id"]] if j in pool and j != exclude)
+
+    used: set = set()
+    placed: set = set(chosen)
+    plan = []
+    for i in chosen:
+        free = _free_sites(i, cands, users, set(), set())
+        take = sorted(free, key=lambda c: (demand(c), -c["outward"]))[:n]
+        plan.append((i, take))
+        used.update(c["id"] for c in take)
+
+    min_dist = np.full(len(cands), np.inf)
+    for i in chosen:
+        min_dist = np.minimum(min_dist, np.linalg.norm(positions - positions[i], axis=1))
+    while len(plan) < k:
+        ready = {j for j in pool if len(_free_sites(j, cands, users, used, placed)) >= n}
+        if not ready:
+            break
+        best = None
+        for j in ready:
+            free = _free_sites(j, cands, users, used, placed)
+            take = sorted(
+                free, key=lambda c: (-_bonds(c, j, users, placed), demand(c, j), -c["outward"])
+            )[:n]
+            taken = {c["id"] for c in take}
+            after_used, after_placed = used | taken, placed | {j}
+            rivals = set().union(*(users[c["id"]] for c in cands[j])) & ready
+            lost = sum(
+                1 for m in rivals
+                if m != j and len(_free_sites(m, cands, users, after_used, after_placed)) < n
+            )
+            bridges = sum(_bonds(c, j, users, placed) > 0 for c in take) + sum(
+                1 for c in cands[j] if c["id"] in used
+            )
+            score = (lost, -bridges, -float(min_dist[j]))
+            if best is None or score < best[0]:
+                best = (score, j, take)
+        _, j, take = best
+        plan.append((j, take))
+        used.update(c["id"] for c in take)
+        placed.add(j)
+        pool.discard(j)
+        min_dist = np.minimum(min_dist, np.linalg.norm(positions - positions[j], axis=1))
+    print(f"  → Alternating: {len(chosen)} sites sharing no anion site, {len(plan) - len(chosen)} filled in")
+    return plan
+
+
+def _anion_coordination(cands: List[List[dict]], plan: List[Tuple[int, List[dict]]]) -> List[int]:
+    """Cations bonded to each planned anion: core cations plus planned metals."""
+    users = _site_users(cands)
+    placed = {i for i, _ in plan}
+    return [
+        c["partners"] + sum(1 for m in users[c["id"]] if m in placed)
+        for _, take in plan for c in take
+    ]
+
+
 def run_z_type_ligand_posttreatment(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -186,7 +386,6 @@ def run_z_type_ligand_posttreatment(
     work_syms = list(syms)
     work_pts = [np.asarray(p, float) for p in np.asarray(pts, float)]
     native_species = _native_core_species(cfg, bulk_struct)
-    surf_tol = cfg.passivation.surf_tol
     f_shift = nc_bulk_frac_shift(work_syms, np.asarray(work_pts), bulk_struct)
     if f_shift is None:
         print("  [warning] Cannot map the particle onto the CIF lattice. Skipping.")
@@ -228,71 +427,63 @@ def run_z_type_ligand_posttreatment(
         if k_req <= 0:
             continue
 
+        n = len(frags)
         positions = np.asarray([s["pos"] for s in sites], float)
+        cands = _anion_site_candidates(sites, work_syms, cur_pts, cfg, bulk_struct, planes, f_shift)
         if pass_spec.distribution == "random":
             order = list(range(total))
             random.Random(spec.seed + pass_idx).shuffle(order)
         else:
             order = _get_spatially_ordered_indices(positions, pass_spec.distribution == "uniform")
 
+        if pass_spec.distribution == "uniform":
+            plan = _plan_alternating(cands, n, positions, k_req)
+        else:
+            plan = _plan_sequential(cands, n, order, k_req)
+        anion_cn = iter(_anion_coordination(cands, plan))
+        unit_cn = [[next(anion_cn) for _ in take] for _, take in plan]
+        n_no_anion_site = k_req - len(plan)
+
         placed = 0
         n_clash = 0
-        n_no_anion_site = 0
         n_bridging = 0
+        n_terminal = 0
         n_added_atoms = 0
-        for idx in order:
-            if placed >= k_req:
-                break
-            site = sites[idx]
-            m_pos = np.asarray(site["pos"], float)
-            host = site["hosts"][0]
+        for (idx, take), cns in zip(plan, unit_cn):
+            m_pos = np.asarray(sites[idx]["pos"], float)
             cur_pts = np.asarray(work_pts, float)
             tree = cKDTree(cur_pts)
-            bond = float(np.linalg.norm(m_pos - cur_pts[host]))
-            if tree.query_ball_point(m_pos, r=_CLEARANCE_FRAC * bond):
+            bond = float(np.linalg.norm(m_pos - cur_pts[sites[idx]["hosts"][0]]))
+            # Molecular anions placed earlier can reach into a planned site.
+            if tree.query_ball_point(m_pos, r=_CLEARANCE_FRAC * bond) or any(
+                tree.query_ball_point(c["pos"], r=_CLEARANCE_FRAC * float(np.linalg.norm(c["pos"] - m_pos)))
+                for c in take
+            ):
                 n_clash += 1
                 continue
 
-            # Free anion sites around M: not occupied and clear of every atom.
-            outward = _surface_outward_direction(host, cur_pts, planes, surf_tol)
-            candidates = []
-            for vec in _bulk_site_neighbour_vectors(m_pos, bulk_struct, cfg.charges, f_shift):
-                x_pos = m_pos + vec
-                d_x = float(np.linalg.norm(vec))
-                if tree.query_ball_point(x_pos, r=_CLEARANCE_FRAC * d_x):
-                    continue
-                cation_partners = sum(
-                    1 for j in tree.query_ball_point(x_pos, r=1.15 * d_x)
-                    if int(cfg.charges.get(work_syms[j], 0)) > 0
-                )
-                candidates.append((cation_partners, float(np.dot(_unit(vec), outward)), x_pos))
-            if len(candidates) < len(frags):
-                n_no_anion_site += 1
-                continue
-            candidates.sort(key=lambda c: (-c[0], -c[1]))
-            chosen = candidates[:len(frags)]
-
             new_syms = [metal]
             new_pts = [m_pos]
-            for frag, prep, (partners, _, x_pos) in zip(frags, preps, chosen):
-                n_bridging += int(partners > 0)
+            for frag, prep, c in zip(frags, preps, take):
                 if prep is None:
                     new_syms.append(frag["symbol"])
-                    new_pts.append(x_pos)
+                    new_pts.append(c["pos"])
                 else:
                     env = cKDTree(np.vstack([cur_pts, np.asarray(new_pts)]))
-                    f_syms, f_pts = _place_molecular_anion(prep, m_pos, x_pos, env)
+                    f_syms, f_pts = _place_molecular_anion(prep, m_pos, c["pos"], env)
                     new_syms.extend(f_syms)
                     new_pts.extend(f_pts)
             work_syms.extend(new_syms)
             work_pts.extend(new_pts)
+            n_bridging += sum(cn >= 2 for cn in cns)
+            n_terminal += sum(cn < 2 for cn in cns)
             n_added_atoms += len(new_syms)
             placed += 1
 
         print(
-            f"  → Placed {placed} {formula} units ({n_bridging}/{placed * len(frags)} anions "
-            f"bridging to surface cations); skipped {n_clash} crowded sites, "
-            f"{n_no_anion_site} without {len(frags)} free anion sites"
+            f"  → Placed {placed} {formula} units ({n_bridging} anions bridging, {n_terminal} terminal; "
+            f"skipped {n_clash} crowded sites, "
+            f"{n_no_anion_site} requested units without {n} free anion sites)"
         )
         entry = {
             "complex": pass_spec.complex,
@@ -303,6 +494,7 @@ def run_z_type_ligand_posttreatment(
             "requested": k_req,
             "placed": placed,
             "bridging_anions": n_bridging,
+            "terminal_anions": n_terminal,
             "skipped_crowded": n_clash,
             "skipped_no_anion_site": n_no_anion_site,
             "atoms_added": n_added_atoms,

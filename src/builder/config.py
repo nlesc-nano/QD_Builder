@@ -786,7 +786,7 @@ def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
         target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
         if target_count < 0:
             raise ValueError(f"z_type_ligands.passes[{i}].target_count must be >= 0")
-        distribution = str(entry.get("distribution", "random")).strip().lower()
+        distribution = str(entry.get("distribution", "uniform")).strip().lower()
         if distribution not in valid_distributions:
             raise ValueError(
                 f"z_type_ligands.passes[{i}].distribution must be one of {valid_distributions!r}"

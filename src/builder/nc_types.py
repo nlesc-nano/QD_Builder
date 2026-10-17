@@ -188,13 +188,13 @@ class ZTypeLigandPass:
     complex      : MXn formula ("CdCl2") or ionic SMILES
                    ("[Cd+2].CC(=O)[O-].CC(=O)[O-]"); must be neutral.
     target_symbol: native anion to bind to; None means any native anion.
-    distribution : 'random' | 'segmented' | 'uniform'
+    distribution : 'uniform' (alternate sites, then fill in) | 'random' | 'segmented'
     ratio        : fraction of the free anion sites to use (0.0 - 1.0).
     target_count : exact number of complexes; if > 0 it overrides ratio.
     """
     complex: str
     target_symbol: Optional[str] = None
-    distribution: str = "random"
+    distribution: str = "uniform"
     ratio: float = 1.0
     target_count: int = 0
 

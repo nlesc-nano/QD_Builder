@@ -34,22 +34,71 @@ The anions of the complex also go on lattice positions. The metal site is
 mapped onto the CIF cell, and its first-shell anion sites are generated
 from the bulk structure. A site already occupied by an atom counts as a
 bond and is not filled again. Otherwise it is a candidate if no atom lies
-closer to it than $0.8\,d_{MX}$. The candidates are ranked by the number
-of cations within $1.15\,d_{MX}$, so that sites on the missing bonds of
-surface cations, where X bridges the new metal and the core, come first.
-Ties are broken by the most outward direction. The first $n$ candidates
-receive the anions. If fewer than $n$ sites are free, the unit is skipped.
+closer to it than $0.8\,d_{MX}$. Candidates generated from neighbouring
+metal sites coincide; two complexes that would use the same site compete
+for it, and a site is given to one complex only. Each complex needs $n$
+sites of its own. Among equally good choices, sites where X bridges to a
+core cation (within $1.15\,d_{MX}$) or to another complex come first, then
+the most outward ones.
 
-Complexes are placed one at a time in the order set by `distribution`, and
-each sees the ones placed before it. Full coverage is therefore often
-impossible. On an anion-terminated zinc-blende {-1-1-1} facet the metal
-sites above the surface anions form a complete cation layer. The anion
-sites around them lie in the next layer, and each of them is shared by
-three metal sites. A complete layer can hold one X per metal, while MX₂
-needs two. On the Se-centred CdSe particle of two unit cells, about 25 of
-the 42 free Se atoms receive a CdCl₂ unit. The anion sites of these facets
-lie above the new metal layer, so X bridges to core cations only at the
-edges with the cation-terminated {100} and {111} facets.
+## How many complexes fit
+
+Full coverage is usually impossible. On an anion-terminated zinc-blende
+{-1-1-1} facet the metal sites above the surface anions form a triangular
+layer. The anion sites around them lie in the next layer, about one per
+metal site, and each is shared by three metal sites. With $N$ free anions
+on the facet, MX₂ units that each need two sites of their own satisfy
+
+$$
+2\,n_\text{units} \le N_\text{anion sites} \approx N
+\quad\Rightarrow\quad n_\text{units} \le N/2 .
+$$
+
+Edge sites do better, because some of their anion sites hang over the
+edge. On the Se-centred CdSe particle of two unit cells, 28 of the 42 free
+Se atoms can receive a CdCl₂ unit. The bridging sites over core cations at
+the edges are already held by the X-type ligands there, so all the Cl of
+these complexes sit in the layer above the new metals.
+
+## Distribution
+
+Which sites receive a complex is set by `distribution`:
+
+- `uniform` (default) *alternates* the sites first. In farthest-point
+  order, a site is taken only if it shares no candidate anion site with a
+  site already taken. On a {-1-1-1} facet this selects one of the three
+  sublattices of the $\sqrt3\times\sqrt3$ pattern: every third surface
+  anion, with the complexes 7.5 Å apart on CdSe and every one of them
+  holding all its anion sites. Each takes the $n$ sites that the fewest
+  other candidates need. The remaining sites are then *filled in*: each
+  time the complex is added that leaves the most other candidates
+  placeable, then the one whose anions bridge most, then the one farthest
+  from the complexes already placed. The two stages together approach the
+  bound above: 28 of 42 on the CdSe particle of two unit cells, and 97 of
+  174 on the particle of four unit cells, where the exact maximum is 100.
+  A partial ratio stops in the first stage while it can, so a third of the
+  sites gives the alternating pattern exactly.
+- `random` and `segmented` visit the sites in random order or as a compact
+  patch, each taking its preferred free anion sites.
+
+## Terminal anions
+
+An anion bonded only to its own metal is terminal. On an anion-terminated
+{111} facet some terminal anions cannot be avoided: each metal has three
+anion sites in the layer above, so $U$ complexes form at most $3U$
+metal–anion bonds, while making all $2U$ anions bridging would need $4U$.
+When the choice costs no complex, sites where the anion bridges to a core
+cation or to another complex are taken first; on the CdSe particle of two
+unit cells about half the anions bridge. At an edge, a terminal anion sits
+on a lattice anion site of the neighbouring facet. There it obeys the
+same rules as that facet's ligands: a lattice position, clear of every
+atom, at the anion-sublattice spacing from other ligands. Forbidding
+terminal anions at edges altogether leaves only a few complexes on small
+particles (4 instead of 28 on CdSe), so it is not done.
+
+Molecular anions can still clash with each other when the plan is built
+(the plan only reserves the anion sites); such complexes are skipped and
+counted as crowded.
 
 ## The complex
 
@@ -95,12 +144,12 @@ CdCl₂·NH₂R on the surface.
 | `passes[].complex` | required | MXₙ formula or ionic SMILES (aliases `formula`, `smiles`) |
 | `passes[].target_symbol` | any | native anion to bind to |
 | `passes[].ratio` / `target_count` | 1.0 / 0 | fraction or number of free anions |
-| `passes[].distribution` | `random` | `random`, `uniform` or `segmented` |
+| `passes[].distribution` | `uniform` | `uniform`, `random` or `segmented` |
 
 The manifest contains a `z_type_ligand_ledger` with, for every pass, the
 formula of the unit, the number of free anion sites, the units requested
-and placed, how many anions bridge to surface cations, and how many sites
-were skipped.
+and placed, how many anions bridge and how many are terminal, and how
+many units could not be placed.
 
 ## Example
 
