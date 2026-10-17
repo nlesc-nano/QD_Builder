@@ -181,6 +181,34 @@ class NeutralExchangePostTreatSpec:
 
 
 @dataclass(frozen=True)
+class ZTypeLigandPass:
+    """
+    Add neutral Z-type complexes MXn on free surface anions.
+
+    complex      : MXn formula ("CdCl2") or ionic SMILES
+                   ("[Cd+2].CC(=O)[O-].CC(=O)[O-]"); must be neutral.
+    target_symbol: native anion to bind to; None means any native anion.
+    distribution : 'random' | 'segmented' | 'uniform'
+    ratio        : fraction of the free anion sites to use (0.0 - 1.0).
+    target_count : exact number of complexes; if > 0 it overrides ratio.
+    """
+    complex: str
+    target_symbol: Optional[str] = None
+    distribution: str = "random"
+    ratio: float = 1.0
+    target_count: int = 0
+
+
+@dataclass(frozen=True)
+class ZTypeLigandPostTreatSpec:
+    """Optional post-treatment adding Z-type complexes; runs before neutral_ligands."""
+    enabled: bool = False
+    passes: Tuple[ZTypeLigandPass, ...] = ()
+    ff: str = "uff"
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
 class PostTreatmentSpec:
     surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
     alloying: AlloyingPostTreatSpec = field(default_factory=AlloyingPostTreatSpec)
@@ -188,6 +216,7 @@ class PostTreatmentSpec:
     neutral_ligands: NeutralLigandPostTreatSpec = field(default_factory=NeutralLigandPostTreatSpec)
     ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
     neutral_exchange: NeutralExchangePostTreatSpec = field(default_factory=NeutralExchangePostTreatSpec)
+    z_type_ligands: ZTypeLigandPostTreatSpec = field(default_factory=ZTypeLigandPostTreatSpec)
 
 # Basic
 @dataclass(frozen=True)

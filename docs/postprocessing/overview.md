@@ -28,9 +28,10 @@ nanocrystal surface chemistry {cite:p}`owen2015,anderson2013`:
   the charge. *Neutral ligands* ({ref}`post-l-type`) attaches them to open
   coordination sites.
 - **Z-type ligands** are neutral two-electron acceptors: metal complexes
-  such as CdCl₂ or Cd(O₂CR)₂ bound to surface anions. *Z-type displacement*
-  ({ref}`post-z-type`) removes such units from the surface, mimicking their
-  displacement by L-type donors. *Neutral exchange*
+  such as CdCl₂ or Cd(O₂CR)₂ bound to surface anions. *Z-type ligands*
+  ({ref}`post-z-type-ligands`) add such complexes to free surface anions.
+  *Z-type displacement* ({ref}`post-z-type`) removes them from the surface,
+  mimicking their displacement by L-type donors. *Neutral exchange*
   ({ref}`post-neutral-exchange`) replaces them by another metal complex, a
   zwitterion or a neutral molecule.
 - *Alloying* ({ref}`post-alloying`) substitutes a fraction of the native
@@ -53,12 +54,14 @@ their order in the file:
 5. `z_type_displacement`;
 6. `neutral_exchange`, with charge compensation per pass;
 7. `ligand_exchange`, followed by a ligand-only charge compensation;
-8. `neutral_ligands`.
+8. `z_type_ligands`;
+9. `neutral_ligands`.
 
 The order follows the chemistry. The composition of the inorganic lattice
 is fixed first. Surface metal complexes are then removed or exchanged, the
-X-type shell is converted to molecules, and neutral donors are finally
-bound to the sites that remain open.
+X-type shell is converted to molecules, new metal complexes are bound to
+the free anions, and neutral donors are finally bound to the sites that
+remain open, including the metals of those complexes.
 
 ## Common conventions
 
@@ -101,4 +104,5 @@ previously placed ligands. The resulting coordinates contain every atom,
 hydrogens included. RDKit is therefore required for these treatments; the
 builder raises an informative error if it is missing. Treatments that only
 remove or relabel atoms (Z-type displacement, alloying, and MXn exchanges
-with atomic ions) do not need it.
+with atomic ions) do not need it, and neither do Z-type ligands with atomic
+anions such as CdCl₂.

@@ -25,7 +25,7 @@ passivation_iterative.charge_balance_iterative
 post-treatments
    surface_reconstruction → [stack relabel] → alloying (+ rebalance)
    → z_type_displacement → neutral_exchange → ligand_exchange (+ compensation)
-   → neutral_ligands
+   → z_type_ligands → neutral_ligands
    ▼
 XYZ + JSON manifest
 ```
