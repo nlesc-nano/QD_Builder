@@ -51,6 +51,8 @@ preset:                           # a complete builder recipe
 | `preset_overrides` | none | size-dependent changes, see below |
 | `positive_q_mode` | `add` | passed to the builder |
 | `reconstruction` | `auto` | `never` skips the {111}-reconstructed variant |
+| `reconstruction_pattern` | `vacancy` | anion-facet pattern of the reconstructed variant: `vacancy` or `swap` |
+| `write_clean` | `true` | `false` builds the clean parents (for the parent link and the anion check) without writing them, for variant series whose clean structures live in the default series |
 | `min_core_atoms` | 20 | reject smaller cores |
 | `min_interatomic_distance` | 1.8 Å | reject clashes |
 | `min_anion_fraction_kept` | 0.5 | reject reconstructions that lose most anions |
@@ -112,6 +114,22 @@ generator, configuration, QD_Builder commit and whether the source tree was
 modified, the CIF, the recipe and, for reconstructions, the reconstruction
 ledger.
 
+The size descriptors (`size`, in nm) are defined to match experiments:
+
+| Key | Definition |
+|---|---|
+| `d_nm` | SAXS diameter: the homogeneous sphere fitted to the first lobe of the Debye intensity of the SAXS-visible atoms, weighted by atomic number. Core and inorganic shell (halides, Z-type metals) are visible; organic ligands match the solvent and are not. The library sorts and filters on it. |
+| `d_volume_nm` | volume diameter: the sphere holding the core atoms at the bulk volume per atom of the CIF. The gap to `d_nm` is the inorganic shell. |
+| `axes_nm`, `aspect_ratio` | diameters of the homogeneous ellipsoid with the same electron-density gyration tensor, longest first, and longest / shortest. Spheres and cubes give 1; above about 1.3 `d_nm` is only an equivalent-sphere size. |
+| `d_max_nm`, `d_hull_nm` | twice the largest core-atom distance from the core centroid; the sphere with the core convex-hull volume. |
+
+After a change to these definitions, refresh existing records without
+rebuilding them:
+
+```bash
+python -m builder.scripts.refresh_library_sizes <out>/CdSe [<out>/InP ...]
+```
+
 The repository ships configurations for all QDSpace templates in
 `examples/library/`:
 - zinc-blende II–VI (Cd, Zn, Hg chalcogenides; the Hg compounds add a
@@ -127,3 +145,9 @@ Variant recipes of a series (e.g. `inp_zb_100.yaml`, the III–V default plus
 a cation-rich {100} at γ = 1.2) write to their own output directory and are
 served from `builder_<tag>/` next to the default `builder/`; the webapp
 ingest keeps one copy of a structure that two recipes produce.
+
+The `*_swap.yaml` variants (all zinc-blende II–VI and III–V materials and
+wurtzite CdSe) reconstruct with `reconstruction_pattern: swap` and
+`write_clean: false`. They add only reconstructed structures, served from
+`builder_swap/`. Their records carry `reconstruction_pattern: swap` and
+point to the clean parents of the default series.

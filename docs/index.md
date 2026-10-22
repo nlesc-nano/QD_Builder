@@ -42,6 +42,7 @@ user-guide/recipes
 user-guide/core-shell
 user-guide/heterostructures
 user-guide/library
+user-guide/properties
 ```
 
 ```{toctree}
@@ -66,6 +67,7 @@ theory/structure-identity
 postprocessing/overview
 postprocessing/x-type
 postprocessing/l-type
+postprocessing/z-type-ligands
 postprocessing/neutral-exchange
 postprocessing/z-type
 postprocessing/alloying

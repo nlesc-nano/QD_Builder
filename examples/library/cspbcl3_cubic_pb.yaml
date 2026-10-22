@@ -1,0 +1,28 @@
+# CsPbCl3 cubic perovskite size series centred on Pb, CsX-terminated cubes only.
+# Pb-centred {100} cubes are CsX-terminated at half-integer sizes; integer sizes give PbX2 faces and are rejected.
+material: CsPbCl3
+family: ABX3
+phase: cubic perovskite
+cif: cifs/CsPbCl3_cubic.cif
+native_elements: [Cs, Pb, Cl]
+centres: [Pb]
+sizes: {start: 1.0, stop: 6.0, step: 0.5}
+positive_q_mode: remove
+reconstruction: never
+outer_cation: Cs                   # keep only CsX-terminated cubes
+min_core_atoms: 20
+min_interatomic_distance: 1.8      # Å
+out_dir: out
+
+preset:
+  charges: {Cs: 1, Pb: 2, Cl: -1, Br: -1}
+  passivation:
+    ligand: Br                     # placeholder: Cl is native; {100} cubes need no added ligand
+    surf_tol: 2.0
+    prepass_mode: role-aware
+    prepass_min_cn_terrace: 3
+    prepass_min_cn_edge: 2
+    prepass_min_cn_vertex: 1
+  facets:
+    - {hkl: "100", scope: family, gamma: 1.0}
+  symmetry: {proper_rotations_only: true}

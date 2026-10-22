@@ -76,11 +76,12 @@ accepts `ratio` (0–1, default 1.0), `target_count` (alias `count`, default
 
 | Block | Pass keys | Chapter |
 |---|---|---|
-| `surface_reconstruction` | (no passes) `ligand`, `cation_removal` (`auto`, `mirror`, `max`) | {ref}`theory-reconstruction` |
+| `surface_reconstruction` | (no passes) `ligand`, `anion_pattern` (`vacancy`, `swap`), `cation_removal` (`auto`, `mirror`, `max`) | {ref}`theory-reconstruction` |
 | `alloying` (alias `alloy`) | `replace`, `with`, `with_charge`, `region` (`surface`, `core`, `both`) | {ref}`post-alloying` |
 | `z_type_displacement` | `cation`, `anion`, `anion_count` | {ref}`post-z-type` |
 | `neutral_exchange` | `cation`, `anion`, `anion_count`, `exchange_type` (`mxn`, `zwitterion`, `l_type`), `smiles` | {ref}`post-neutral-exchange` |
 | `ligand_exchange` | `replace`, `smiles`, `charge`, `replace_charge`; block keys `ff` | {ref}`post-x-type` |
+| `z_type_ligands` | `complex` (MXₙ formula or ionic SMILES), `target_symbol`; block key `ff` | {ref}`post-z-type-ligands` |
 | `neutral_ligands` | `target` (`cation`, `anion`, `both`), `target_symbol`, `smiles`; block key `ff` | {ref}`post-l-type` |
 
 ## Twins

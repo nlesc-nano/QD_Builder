@@ -948,6 +948,25 @@ def _run_passivation_and_write_outputs(
                     verbose=args.verbose,
                 )
 
+    # ── Z-type ligands (optional; MXn complexes on free surface anions, before L-type)
+    z_type_ligand_ledger = []
+    z_type_ligand_spec = getattr(
+        getattr(cfg, "post_treatment", None),
+        "z_type_ligands",
+        None,
+    )
+    if z_type_ligand_spec is not None and z_type_ligand_spec.enabled:
+        from .z_type_ligand_posttreat import run_z_type_ligand_posttreatment
+        syms, pts, z_type_ligand_ledger = run_z_type_ligand_posttreatment(
+            syms, pts, cfg, struct, planes
+        )
+        # Molecular anions of the complexes count by their molecular charge.
+        ligand_exchange_charge_ledger.extend(
+            {"z_type_ligand": entry["formula"], "charge": entry["charge"],
+             "ignored_element_charge": entry["ignored_element_charge"]}
+            for entry in z_type_ligand_ledger if "charge" in entry
+        )
+
     # ── Neutral-ligand post-treatment (optional; final post-treatment step) ───
     neutral_ligand_spec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -1050,6 +1069,8 @@ def _run_passivation_and_write_outputs(
         })
     if z_type_displacement_ledger:
         extra["z_type_displacement_ledger"] = z_type_displacement_ledger
+    if z_type_ligand_ledger:
+        extra["z_type_ligand_ledger"] = z_type_ligand_ledger
     if alloying_ledger:
         extra["alloying_ledger"] = alloying_ledger
     if surface_reconstruction_ledger:
