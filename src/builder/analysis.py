@@ -138,6 +138,21 @@ def derive_pair_cuts_from_cif(
 
             rc[key] = cutoff * safety
 
+    # Anion ligands not in the CIF (e.g. Cl on a PbSe dot) sit on native anion
+    # lattice sites: never let their cation cutoff fall below the calibrated
+    # cation-native-anion cutoff, or ligands on lattice sites count as unbonded
+    # (and get pruned as orphans).
+    for lig, q_lig in charges.items():
+        if int(q_lig) >= 0 or lig in elems:
+            continue
+        for a in elems:
+            if int(charges.get(a, 0)) <= 0:
+                continue
+            native = [rc[_pair_key(a, b)] for b in elems
+                      if int(charges.get(b, 0)) < 0 and _pair_key(a, b) in rc]
+            if native:
+                rc[_pair_key(a, lig)] = max(_pair_cut(a, lig), max(native))
+
     return PairCuts(rc=rc)
 
 
@@ -865,6 +880,46 @@ def _match_actual_to_ideal(
     return missing
 
 
+def nc_bulk_frac_shift(syms: List[str], pts: NDArray, bulk_struct) -> Optional[np.ndarray]:
+    """
+    Constant fractional shift that maps nanocrystal positions onto the CIF cell.
+
+    The nanocrystal is cut from the CIF lattice in the CIF Cartesian frame, up
+    to a translation (the construction origin).  The shift is found by trying
+    the bulk sites of the first native atom's species and keeping the first
+    one that brings the first 50 native atoms onto bulk sites of their own
+    species.  Returns None when no candidate fits.
+    """
+    if bulk_struct is None or not hasattr(bulk_struct, "sites"):
+        return None
+    pts = np.asarray(pts, float)
+    f_coords = bulk_struct.lattice.get_fractional_coords(pts)
+    bulk_species = {s.specie.symbol for s in bulk_struct.sites}
+    native_idx = [i for i, sym in enumerate(syms) if sym in bulk_species]
+    if not native_idx:
+        return None
+    ref_idx = native_idx[0]
+    test_indices = [j for j in range(min(50, len(syms))) if syms[j] in bulk_species]
+    sites_by_sym: Dict[str, list] = {}
+    for site in bulk_struct.sites:
+        sites_by_sym.setdefault(site.specie.symbol, []).append(site)
+    for site in sites_by_sym[syms[ref_idx]]:
+        candidate_shift = (site.frac_coords - f_coords[ref_idx]) % 1
+        all_match = True
+        for j in test_indices:
+            shifted_f = (f_coords[j] + candidate_shift + 0.5) % 1 - 0.5
+            min_diff = min(
+                float(np.linalg.norm((s.frac_coords - shifted_f + 0.5) % 1 - 0.5))
+                for s in sites_by_sym[syms[j]]
+            )
+            if min_diff > 0.05:
+                all_match = False
+                break
+        if all_match:
+            return candidate_shift
+    return None
+
+
 def compute_cif_virtual_sites(
     syms: List[str],
     pts: NDArray,
@@ -896,53 +951,9 @@ def compute_cif_virtual_sites(
 
     # 1. Calibrate constant fractional shift between NC and bulk reference structure
     f_coords = bulk_struct.lattice.get_fractional_coords(pts)
-    best_f_shift = np.zeros(3)
-    found_shift = False
-
-    bulk_species = {s.specie.symbol for s in bulk_struct.sites}
-    ref_idx = -1
-    for idx in range(len(syms)):
-        if syms[idx] in bulk_species:
-            ref_idx = idx
-            break
-
-    if ref_idx >= 0:
-        ref_sym = syms[ref_idx]
-        ref_sites = [s for s in bulk_struct.sites if s.specie.symbol == ref_sym]
-        ref_f = f_coords[ref_idx]
-        for site in ref_sites:
-            candidate_shift = (site.frac_coords - ref_f) % 1
-            
-            # test on first few bulk-native atoms of the NC
-            test_indices = []
-            for j in range(min(50, len(syms))):
-                if syms[j] in bulk_species:
-                    test_indices.append(j)
-                    
-            if not test_indices:
-                best_f_shift = candidate_shift
-                found_shift = True
-                break
-                
-            all_match = True
-            for j in test_indices:
-                shifted_f = (f_coords[j] + candidate_shift + 0.5) % 1 - 0.5
-                j_sites = [s for s in bulk_struct.sites if s.specie.symbol == syms[j]]
-                if not j_sites:
-                    all_match = False
-                    break
-                min_diff = min(
-                    float(np.linalg.norm((s.frac_coords - shifted_f + 0.5) % 1 - 0.5))
-                    for s in j_sites
-                )
-                if min_diff > 0.05:
-                    all_match = False
-                    break
-                    
-            if all_match:
-                best_f_shift = candidate_shift
-                found_shift = True
-                break
+    best_f_shift = nc_bulk_frac_shift(syms, pts, bulk_struct)
+    if best_f_shift is None:
+        best_f_shift = np.zeros(3)
 
     # Map each surface atom to its bulk CIF neighbor mapping
     for idx in np.where(surf_mask)[0]:

@@ -67,3 +67,5 @@ gfnff_adjacency
 # Scheduler artefacts
 slurm-*.out
 *.slurm.log
+examples/library/out/
+docs/_build/

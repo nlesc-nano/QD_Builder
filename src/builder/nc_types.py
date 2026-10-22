@@ -130,12 +130,16 @@ class ZTypeDisplacementPostTreatSpec:
 @dataclass(frozen=True)
 class SurfaceReconstructionSpec:
     """
-    Simplified polar-surface reconstruction post-treatment.
+    Polar {111} reconstruction of zinc-blende II-VI / III-V nanocrystals.
 
-    The step computes residual Lannoo-like facet charges after charge-balance
-    passivation, sparsely swaps native anions on negative polar facets to the
-    reconstruction ligand, and compensates each swap by adding one ligand to an
-    available cation-rich polar site.
+    Runs only when both a cation_rich {111} and an anion_rich {-1-1-1} family
+    are active: sub-surface cation vacancies on the anion-terminated facets
+    (two-coordinated anions become `ligand`), then ligand stripping and outer
+    cation removal on the cation-terminated facets to restore neutrality.
+    With `anion_pattern: swap` the outer anions are converted instead and the
+    charge is compensated by ligands on the cation-terminated facets.
+    `facets`, `target_reduction`, `min_separation` and `distribution` are
+    parsed for backward compatibility but no longer used.
     """
     enabled: bool = False
     ligand: Optional[str] = None
@@ -145,6 +149,16 @@ class SurfaceReconstructionSpec:
     min_separation: Optional[float] = None
     distribution: str = "fps"
     seed: int = 1337
+    # Cations removed on the cation-{111} facets: "max" (as many as the
+    # charge allows, rest as ligands), "mirror" (as many as the cation
+    # vacancies made on the {-1-1-1} facets, rest as ligands), or "auto"
+    # (mirror, for II-VI and III-V).
+    cation_removal: str = "auto"
+    # How the anion-terminated facets are compensated: "vacancy" (sub-surface
+    # cation vacancies; the two-coordinated anions become the ligand) or
+    # "swap" (outer anions become the ligand, no vacancies; the charge goes to
+    # ligands added on the cation-terminated facets, no cations removed).
+    anion_pattern: str = "vacancy"
 
 
 @dataclass(frozen=True)
@@ -167,6 +181,34 @@ class NeutralExchangePostTreatSpec:
 
 
 @dataclass(frozen=True)
+class ZTypeLigandPass:
+    """
+    Add neutral Z-type complexes MXn on free surface anions.
+
+    complex      : MXn formula ("CdCl2") or ionic SMILES
+                   ("[Cd+2].CC(=O)[O-].CC(=O)[O-]"); must be neutral.
+    target_symbol: native anion to bind to; None means any native anion.
+    distribution : 'uniform' (alternate sites, then fill in) | 'random' | 'segmented'
+    ratio        : fraction of the free anion sites to use (0.0 - 1.0).
+    target_count : exact number of complexes; if > 0 it overrides ratio.
+    """
+    complex: str
+    target_symbol: Optional[str] = None
+    distribution: str = "uniform"
+    ratio: float = 1.0
+    target_count: int = 0
+
+
+@dataclass(frozen=True)
+class ZTypeLigandPostTreatSpec:
+    """Optional post-treatment adding Z-type complexes; runs before neutral_ligands."""
+    enabled: bool = False
+    passes: Tuple[ZTypeLigandPass, ...] = ()
+    ff: str = "uff"
+    seed: int = 1337
+
+
+@dataclass(frozen=True)
 class PostTreatmentSpec:
     surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
     alloying: AlloyingPostTreatSpec = field(default_factory=AlloyingPostTreatSpec)
@@ -174,6 +216,7 @@ class PostTreatmentSpec:
     neutral_ligands: NeutralLigandPostTreatSpec = field(default_factory=NeutralLigandPostTreatSpec)
     ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
     neutral_exchange: NeutralExchangePostTreatSpec = field(default_factory=NeutralExchangePostTreatSpec)
+    z_type_ligands: ZTypeLigandPostTreatSpec = field(default_factory=ZTypeLigandPostTreatSpec)
 
 # Basic
 @dataclass(frozen=True)

@@ -18,6 +18,7 @@ from .nc_types import (
     LigandExchangePass, LigandExchangePostTreatSpec,
     AlloyingPass, AlloyingPostTreatSpec,
     ZTypeDisplacementPass, ZTypeDisplacementPostTreatSpec,
+    ZTypeLigandPass, ZTypeLigandPostTreatSpec,
     SurfaceReconstructionSpec, PostTreatmentSpec,
     NeutralExchangePass, NeutralExchangePostTreatSpec,
 )
@@ -737,6 +738,14 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
     if distribution != "fps":
         raise ValueError("post_treatment.surface_reconstruction.distribution currently supports only 'fps'")
 
+    cation_removal = str(raw.get("cation_removal", "auto")).strip().lower()
+    if cation_removal not in {"auto", "max", "mirror"}:
+        raise ValueError("post_treatment.surface_reconstruction.cation_removal must be auto, max or mirror")
+
+    anion_pattern = str(raw.get("anion_pattern", "vacancy")).strip().lower()
+    if anion_pattern not in {"vacancy", "swap"}:
+        raise ValueError("post_treatment.surface_reconstruction.anion_pattern must be vacancy or swap")
+
     return SurfaceReconstructionSpec(
         enabled=True,
         ligand=str(raw.get("ligand", default_ligand)),
@@ -746,6 +755,8 @@ def _parse_surface_reconstruction(raw, *, default_ligand: str) -> SurfaceReconst
         min_separation=min_separation,
         distribution=distribution,
         seed=int(raw.get("seed", 1337)),
+        cation_removal=cation_removal,
+        anion_pattern=anion_pattern,
     )
 
 
@@ -768,6 +779,61 @@ def _surface_reconstruction_from_legacy(raw, *, default_ligand: str) -> SurfaceR
         "seed": raw.get("seed", 1337),
     }
     return _parse_surface_reconstruction(sr_raw, default_ligand=default_ligand)
+
+
+def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
+    if raw is None:
+        return ZTypeLigandPostTreatSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.z_type_ligands must be a mapping")
+
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return ZTypeLigandPostTreatSpec(enabled=False)
+
+    passes_raw = raw.get("passes") or []
+    if not isinstance(passes_raw, list):
+        raise TypeError("post_treatment.z_type_ligands.passes must be a list")
+
+    valid_distributions = {"random", "segmented", "uniform"}
+    passes = []
+    for i, entry in enumerate(passes_raw):
+        if not isinstance(entry, dict):
+            raise TypeError(f"z_type_ligands.passes[{i}] must be a mapping")
+        complex_ = str(entry.get("complex", entry.get("formula", entry.get("smiles", "")))).strip()
+        if not complex_:
+            raise ValueError(f"z_type_ligands.passes[{i}].complex is required, e.g. CdCl2")
+        target_symbol = str(entry.get("target_symbol", "")).strip() or None
+        target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
+        if target_count < 0:
+            raise ValueError(f"z_type_ligands.passes[{i}].target_count must be >= 0")
+        distribution = str(entry.get("distribution", "uniform")).strip().lower()
+        if distribution not in valid_distributions:
+            raise ValueError(
+                f"z_type_ligands.passes[{i}].distribution must be one of {valid_distributions!r}"
+            )
+        ratio = float(entry.get("ratio", 1.0))
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"z_type_ligands.passes[{i}].ratio must be in [0, 1], got {ratio}")
+        if target_count <= 0 and ratio <= 0.0:
+            continue
+        passes.append(ZTypeLigandPass(
+            complex=complex_,
+            target_symbol=target_symbol,
+            distribution=distribution,
+            ratio=ratio,
+            target_count=target_count,
+        ))
+
+    ff = str(raw.get("ff", "uff")).strip().lower()
+    if ff not in {"uff", "mmff"}:
+        raise ValueError(f"z_type_ligands.ff must be 'uff' or 'mmff', got {ff!r}")
+    return ZTypeLigandPostTreatSpec(
+        enabled=True,
+        passes=tuple(passes),
+        ff=ff,
+        seed=int(raw.get("seed", 1337)),
+    )
 
 
 def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], default_ligand: str, legacy_recon_raw) -> PostTreatmentSpec:
@@ -796,6 +862,8 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
     neutral_exchange_raw = raw.get("neutral_exchange", raw.get("neutral-exchange"))
     neutral_exchange = _parse_neutral_exchange(neutral_exchange_raw, charges)
 
+    z_type_ligands = _parse_z_type_ligands(raw.get("z_type_ligands", raw.get("z-type-ligands")))
+
     surface_raw = raw.get("surface_reconstruction", raw.get("surface-reconstruction"))
     surface_reconstruction = _parse_surface_reconstruction(surface_raw, default_ligand=default_ligand)
     if not surface_reconstruction.enabled:
@@ -810,6 +878,7 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
         neutral_ligands=neutral_ligands,
         ligand_exchange=ligand_exchange,
         neutral_exchange=neutral_exchange,
+        z_type_ligands=z_type_ligands,
     )
 
 
@@ -950,10 +1019,16 @@ def parse_yaml_config(path: str) -> Config:
             scope_by[(h, k, l)] = scope
             term = f.get("termination")
             if term is not None:
-                term_s = str(term).strip().lower()
-                if term_s not in {"cation_rich", "anion_rich"}:
-                    raise ValueError("facet termination must be 'cation_rich' or 'anion_rich'")
-                term_by[(h, k, l)] = term_s
+                term_s = str(term).strip().lower().replace("-", "_")
+                if term_s in {"", "none", "null", "stoichiometric"}:
+                    term_by[(h, k, l)] = None   # non-polar facet: no termination to impose
+                elif term_s in {"cation_rich", "anion_rich"}:
+                    term_by[(h, k, l)] = term_s
+                else:
+                    raise ValueError(
+                        f"facet {hkl_raw}: termination {term!r} must be 'cation_rich', "
+                        "'anion_rich' or 'stoichiometric'"
+                    )
             else:
                 term_by[(h, k, l)] = None
 
