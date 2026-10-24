@@ -1615,20 +1615,12 @@ def _optimize_ligand_distribution_at_neutrality(
             if verbose:
                 print(f"[debug:migrate] Reference CIF load failed: {e}. Using outward normals.")
 
-    def calculate_fitness(cn_current: NDArray[np.int_]) -> int:
-        fit = 0
-        for i, s in enumerate(symbols):
-            if charges.get(s, 0) <= 0:
-                continue
-            T_i = int(bulk_map.get(s, 4))
-            c = int(cn_current[i])
-            if c >= T_i:
-                fit += 0
-            elif c == T_i - 1:
-                fit += -1
-            else:
-                fit += -10
-        return fit
+    def fitness_term(a: int, c: int) -> int:
+        """Contribution of cation a with coordination c to the surface fitness."""
+        T_a = int(bulk_map.get(symbols[a], 4))
+        if c >= T_a:
+            return 0
+        return -1 if c == T_a - 1 else -10
 
     migration_count = 0
 
@@ -1636,7 +1628,7 @@ def _optimize_ligand_distribution_at_neutrality(
         cn_current = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
         pt_tree = cKDTree(np.asarray(pts, float))
         min_spacing = _min_ligand_ligand_spacing(symbols, pts, ligand)
-        
+
         acceptors = []
         for i, s in enumerate(symbols):
             if charges.get(s, 0) <= 0:
@@ -1644,7 +1636,7 @@ def _optimize_ligand_distribution_at_neutrality(
             T_i = int(bulk_map.get(s, 4))
             if int(cn_current[i]) <= T_i - 2:
                 acceptors.append(i)
-        
+
         if not acceptors:
             break
 
@@ -1652,18 +1644,190 @@ def _optimize_ligand_distribution_at_neutrality(
         if not ligand_indices:
             break
 
+        # Everything below depends on the current structure only, not on
+        # which ligand is tried, so it is computed once per pass:
+        #   - each acceptor's single-host sites (recomputed for a ligand that
+        #     is one of the acceptor's bonded neighbours, which the bond-
+        #     direction test leaves out),
+        #   - per site: the other ligands closer than the spacing limit and
+        #     the cations that would gain a bond,
+        # and a candidate's fitness change is summed over the atoms whose
+        # coordination it changes (donor hosts and gaining cations).
+        cation_elems = {el for el in set(symbols) if charges.get(el, 0) > 0}
+        host_radius = max((_pair_cut_calibrated(el, ligand, pair_cuts) for el in cation_elems), default=0.0) + 1e-6
+        lig_tree = cKDTree(np.asarray(pts[ligand_indices], float))
+        n_unit = []
+        for (n_f, d_f) in planes:
+            ln_f = np.linalg.norm(n_f) + 1e-12
+            n_unit.append(np.asarray(n_f, float) / ln_f)
+        bulk_shell: Dict[int, object] = {}
+        vacant_dirs_of: Dict[int, List[np.ndarray]] = {}
+
+        def single_host_sites(i: int, exclude: int):
+            """(sites of acceptor i, its bonded neighbours), as the per-ligand loop built them."""
+            try:
+                rc = pc(symbols[i], ligand)
+                offset = (0.95 * rc) if rc > 0 else 2.5
+            except Exception:
+                offset = 2.5
+
+            inc = _incident_facets(i, pts, frames, surf_tol)
+            if not inc:
+                # Deeper than surf_tol under every facet: not a surface
+                # host, and no outward direction to place a ligand along.
+                return [], set()
+
+            vec = np.zeros(3, float)
+            for fid in inc:
+                vec += n_unit[fid]
+            ln = np.linalg.norm(vec)
+            n_out = n_unit[inc[0]] if ln < 1e-8 else (vec / ln)
+
+            placed_via_bulk = False
+            direction_pool = [n_out]
+            bonded = set()
+            if ref_struct is not None:
+                try:
+                    f_coord = ref_struct.lattice.get_fractional_coords(pts[i])
+                    site_idx = int(np.argmin([
+                        float(np.linalg.norm((site.frac_coords - f_coord + 0.5) % 1 - 0.5))
+                        for site in ref_struct.sites
+                    ]))
+                    bulk_site = ref_struct.sites[site_idx]
+                    if site_idx not in bulk_shell:
+                        bulk_shell[site_idx] = ref_struct.get_neighbors(bulk_site, r=4.5)
+                    all_neigh = bulk_shell[site_idx]
+                    if all_neigh:
+                        min_dist = min(neigh.nn_distance for neigh in all_neigh)
+                        bulk_neighbors = [neigh for neigh in all_neigh if neigh.nn_distance <= 1.15 * min_dist]
+                        ideal_vectors = []
+                        for neigh in bulk_neighbors:
+                            vec_ideal = neigh.coords - bulk_site.coords
+                            ln_ideal = float(np.linalg.norm(vec_ideal))
+                            if ln_ideal > 1e-8:
+                                ideal_vectors.append(vec_ideal / ln_ideal)
+
+                        actual_vectors = []
+                        neighbor_ids = pt_tree.query_ball_point(pts[i], r=4.5)
+                        for act_idx in neighbor_ids:
+                            if act_idx == i:
+                                continue
+                            rc_neigh = pc(symbols[i], symbols[act_idx])
+                            if rc_neigh <= 0:
+                                continue
+                            if float(np.linalg.norm(pts[act_idx] - pts[i])) <= rc_neigh + 1e-12:
+                                bonded.add(act_idx)
+                                if act_idx == exclude:
+                                    continue
+                                vec_act = pts[act_idx] - pts[i]
+                                ln_act = float(np.linalg.norm(vec_act))
+                                if ln_act > 1e-8:
+                                    actual_vectors.append(vec_act / ln_act)
+
+                        vacant_vectors = []
+                        for t_k in ideal_vectors:
+                            is_occupied = False
+                            for v_a in actual_vectors:
+                                if float(np.dot(v_a, t_k)) > 0.90:
+                                    is_occupied = True
+                                    break
+                            if not is_occupied:
+                                vacant_vectors.append(t_k)
+
+                        if vacant_vectors:
+                            direction_pool = vacant_vectors
+                            placed_via_bulk = True
+                except Exception:
+                    pass
+
+            sites = []
+            for vec in direction_pool:
+                ln_v = float(np.linalg.norm(vec))
+                if ln_v > 1e-8:
+                    sites.append({
+                        "pos": pts[i] + (vec / ln_v) * offset,
+                        "placed_via_bulk": placed_via_bulk,
+                        "hosts": [i]
+                    })
+            return sites, bonded
+
+        # acceptor pairs close enough to share a bridging site, in loop order
+        acc_pts = np.asarray(pts[acceptors], float)
+        near_pairs = sorted(cKDTree(acc_pts).query_pairs(4.5 + 1e-6)) if len(acceptors) > 1 else []
+        near_pairs = [(a, b) for a, b in near_pairs
+                      if not float(np.linalg.norm(pts[acceptors[a]] - pts[acceptors[b]])) > 4.5]
+
+        def candidate_list(single):
+            """Single-host sites in acceptor order, then the bridging sites."""
+            out = [c for i in acceptors for c in single[i]]
+            for a, b in near_pairs:
+                i1, i2 = acceptors[a], acceptors[b]
+                rc1 = pc(symbols[i1], ligand)
+                rc2 = pc(symbols[i2], ligand)
+                for c1 in single[i1]:
+                    for c2 in single[i2]:
+                        if float(np.linalg.norm(c1["pos"] - c2["pos"])) < 1.8:
+                            p_bridge = (c1["pos"] + c2["pos"]) / 2.0
+                            if float(np.linalg.norm(p_bridge - pts[i1])) <= rc1 + 0.15 and \
+                               float(np.linalg.norm(p_bridge - pts[i2])) <= rc2 + 0.15:
+                                out.append({
+                                    "pos": p_bridge,
+                                    "placed_via_bulk": c1["placed_via_bulk"] or c2["placed_via_bulk"],
+                                    "hosts": [i1, i2]
+                                })
+            return out
+
+        base_single = {}
+        bonded_of = {}
+        for i in acceptors:
+            base_single[i], bonded_of[i] = single_host_sites(i, exclude=-1)
+        base_candidates = candidate_list(base_single)
+
+        def site_effect(cand):
+            """(ligands too close to the site, cations that would gain a bond there)."""
+            eff = cand.get("_effect")
+            if eff is not None:
+                return eff
+            new_pos = cand["pos"]
+            close = set()
+            for k in lig_tree.query_ball_point(np.asarray(new_pos, float), r=min_spacing + 1e-6):
+                other_l = ligand_indices[k]
+                if float(np.linalg.norm(new_pos - pts[other_l])) < min_spacing - 1e-6:
+                    close.add(other_l)
+            gain = []
+            local_cut = 5.0
+            neighbor_ids = pt_tree.query_ball_point(np.asarray(new_pos, float), r=local_cut)
+            for j in neighbor_ids:
+                sj = symbols[j]
+                if charges.get(sj, 0) <= 0:
+                    continue
+                dist = float(np.linalg.norm(pts[j] - new_pos))
+                rc = _pair_cut_calibrated(sj, ligand, pair_cuts)
+                if dist <= rc:
+                    if ref_struct is not None:
+                        if j not in vacant_dirs_of:
+                            vacant_dirs_of[j] = _get_vacant_directions_for_site(j, symbols, pts, ref_struct, pt_tree)
+                        vacant_dirs = vacant_dirs_of[j]
+                        u_j = (new_pos - pts[j]) / (dist + 1e-12)
+                        if not any(float(np.dot(u_j, t_k)) > 0.80 for t_k in vacant_dirs):
+                            continue
+                    gain.append(j)
+            cand["_effect"] = eff = (close, gain)
+            return eff
+
         best_migration = None
         best_delta_fit = 0
 
         for l_idx in ligand_indices:
             hosts = []
-            for i, s in enumerate(symbols):
+            for i in sorted(pt_tree.query_ball_point(pts[l_idx], r=host_radius)):
+                s = symbols[i]
                 if charges.get(s, 0) <= 0:
                     continue
                 rc = _pair_cut_calibrated(s, ligand, pair_cuts)
                 if float(np.linalg.norm(pts[i] - pts[l_idx])) <= rc + 1e-12:
                     hosts.append(i)
-            
+
             if not hosts:
                 continue
 
@@ -1673,153 +1837,35 @@ def _optimize_ligand_distribution_at_neutrality(
                 if int(cn_current[h]) - 1 < T_h - 1:
                     safe_donor = False
                     break
-            
+
             if not safe_donor:
                 continue
 
-            cn_temp = cn_current.copy()
-            for h in hosts:
-                cn_temp[h] -= 1
-
-            candidate_positions = []
-            for i in acceptors:
-                try:
-                    rc = pc(symbols[i], ligand)
-                    offset = (0.95 * rc) if rc > 0 else 2.5
-                except Exception:
-                    offset = 2.5
-
-                inc = _incident_facets(i, pts, frames, surf_tol)
-                if not inc:
-                    # Deeper than surf_tol under every facet: not a surface
-                    # host, and no outward direction to place a ligand along.
-                    continue
-
-                n_unit = []
-                for (n_f, d_f) in planes:
-                    ln_f = np.linalg.norm(n_f) + 1e-12
-                    n_unit.append(np.asarray(n_f, float) / ln_f)
-                
-                vec = np.zeros(3, float)
-                for fid in inc:
-                    vec += n_unit[fid]
-                ln = np.linalg.norm(vec)
-                n_out = n_unit[inc[0]] if ln < 1e-8 else (vec / ln)
-
-                placed_via_bulk = False
-                direction_pool = [n_out]
-                if ref_struct is not None:
-                    try:
-                        f_coord = ref_struct.lattice.get_fractional_coords(pts[i])
-                        site_idx = int(np.argmin([
-                            float(np.linalg.norm((site.frac_coords - f_coord + 0.5) % 1 - 0.5))
-                            for site in ref_struct.sites
-                        ]))
-                        bulk_site = ref_struct.sites[site_idx]
-                        all_neigh = ref_struct.get_neighbors(bulk_site, r=4.5)
-                        if all_neigh:
-                            min_dist = min(neigh.nn_distance for neigh in all_neigh)
-                            bulk_neighbors = [neigh for neigh in all_neigh if neigh.nn_distance <= 1.15 * min_dist]
-                            ideal_vectors = []
-                            for neigh in bulk_neighbors:
-                                vec_ideal = neigh.coords - bulk_site.coords
-                                ln_ideal = float(np.linalg.norm(vec_ideal))
-                                if ln_ideal > 1e-8:
-                                    ideal_vectors.append(vec_ideal / ln_ideal)
-                            
-                            actual_vectors = []
-                            neighbor_ids = pt_tree.query_ball_point(pts[i], r=4.5)
-                            for act_idx in neighbor_ids:
-                                if act_idx == i or act_idx == l_idx:
-                                    continue
-                                rc_neigh = pc(symbols[i], symbols[act_idx])
-                                if rc_neigh <= 0:
-                                    continue
-                                if float(np.linalg.norm(pts[act_idx] - pts[i])) <= rc_neigh + 1e-12:
-                                    vec_act = pts[act_idx] - pts[i]
-                                    ln_act = float(np.linalg.norm(vec_act))
-                                    if ln_act > 1e-8:
-                                        actual_vectors.append(vec_act / ln_act)
-                            
-                            vacant_vectors = []
-                            for t_k in ideal_vectors:
-                                is_occupied = False
-                                for v_a in actual_vectors:
-                                    if float(np.dot(v_a, t_k)) > 0.90:
-                                        is_occupied = True
-                                        break
-                                if not is_occupied:
-                                    vacant_vectors.append(t_k)
-                            
-                            if vacant_vectors:
-                                direction_pool = vacant_vectors
-                                placed_via_bulk = True
-                    except Exception:
-                        pass
-                
-                for vec in direction_pool:
-                    ln_v = float(np.linalg.norm(vec))
-                    if ln_v > 1e-8:
-                        candidate_positions.append({
-                            "pos": pts[i] + (vec / ln_v) * offset,
-                            "placed_via_bulk": placed_via_bulk,
-                            "hosts": [i]
-                        })
-
-            for idx_a1, i1 in enumerate(acceptors):
-                for i2 in acceptors[idx_a1 + 1:]:
-                    if float(np.linalg.norm(pts[i1] - pts[i2])) > 4.5:
-                        continue
-                    
-                    rc1 = pc(symbols[i1], ligand)
-                    rc2 = pc(symbols[i2], ligand)
-                    
-                    cands1 = [c for c in candidate_positions if c["hosts"] == [i1]]
-                    cands2 = [c for c in candidate_positions if c["hosts"] == [i2]]
-                    for c1 in cands1:
-                        for c2 in cands2:
-                            if float(np.linalg.norm(c1["pos"] - c2["pos"])) < 1.8:
-                                p_bridge = (c1["pos"] + c2["pos"]) / 2.0
-                                if float(np.linalg.norm(p_bridge - pts[i1])) <= rc1 + 0.15 and \
-                                   float(np.linalg.norm(p_bridge - pts[i2])) <= rc2 + 0.15:
-                                    candidate_positions.append({
-                                        "pos": p_bridge,
-                                        "placed_via_bulk": c1["placed_via_bulk"] or c2["placed_via_bulk"],
-                                        "hosts": [i1, i2]
-                                    })
+            touched = [i for i in acceptors if l_idx in bonded_of[i]]
+            if touched:
+                single = dict(base_single)
+                for i in touched:
+                    single[i] = single_host_sites(i, exclude=l_idx)[0]
+                candidate_positions = candidate_list(single)
+            else:
+                candidate_positions = base_candidates
 
             for cand in candidate_positions:
                 new_pos = cand["pos"]
-                
-                too_close = False
-                for other_l in ligand_indices:
-                    if other_l == l_idx:
-                        continue
-                    if float(np.linalg.norm(new_pos - pts[other_l])) < min_spacing - 1e-6:
-                        too_close = True
-                        break
-                
-                if too_close:
+                close, gain = site_effect(cand)
+                if close - {l_idx}:
                     continue
 
-                cn_after = cn_temp.copy()
-                local_cut = 5.0
-                neighbor_ids = pt_tree.query_ball_point(np.asarray(new_pos, float), r=local_cut)
-                for j in neighbor_ids:
-                    sj = symbols[j]
-                    if charges.get(sj, 0) <= 0:
-                        continue
-                    dist = float(np.linalg.norm(pts[j] - new_pos))
-                    rc = _pair_cut_calibrated(sj, ligand, pair_cuts)
-                    if dist <= rc:
-                        if ref_struct is not None:
-                            vacant_dirs = _get_vacant_directions_for_site(j, symbols, pts, ref_struct, pt_tree)
-                            u_j = (new_pos - pts[j]) / (dist + 1e-12)
-                            if not any(float(np.dot(u_j, t_k)) > 0.80 for t_k in vacant_dirs):
-                                continue
-                        cn_after[j] += 1
-
-                delta_fit = calculate_fitness(cn_after) - calculate_fitness(cn_current)
+                change: Dict[int, int] = defaultdict(int)
+                for h in hosts:
+                    change[h] -= 1
+                for j in gain:
+                    change[j] += 1
+                delta_fit = 0
+                for a, dc in change.items():
+                    if dc:
+                        c0 = int(cn_current[a])
+                        delta_fit += fitness_term(a, c0 + dc) - fitness_term(a, c0)
                 if delta_fit > best_delta_fit:
                     best_delta_fit = delta_fit
                     best_migration = (delta_fit, l_idx, new_pos, cand["hosts"], hosts)
