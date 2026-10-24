@@ -955,8 +955,11 @@ def compute_cif_virtual_sites(
     if best_f_shift is None:
         best_f_shift = np.zeros(3)
 
-    # The bulk neighbour shell depends only on the CIF site, not on the atom.
+    # The bulk neighbour shell depends only on the CIF site, not on the atom,
+    # and the neighbour search radius only on the element.
     shell_by_site: Dict[int, list] = {}
+    elems = set(syms)
+    max_rcut_of: Dict[str, float] = {}
 
     # Map each surface atom to its bulk CIF neighbor mapping
     for idx in np.where(surf_mask)[0]:
@@ -999,11 +1002,13 @@ def compute_cif_virtual_sites(
             })
 
         # 3. Find actual neighbors in the nanocrystal
-        max_rcut = max(
-            _pair_cut_calibrated(sym_i, s2, cuts)
-            for s2 in set(syms)
-            if charges.get(s2, 0) * site_q < 0
-        ) if any(charges.get(s2, 0) * site_q < 0 for s2 in set(syms)) else 4.0
+        if sym_i not in max_rcut_of:
+            max_rcut_of[sym_i] = max(
+                _pair_cut_calibrated(sym_i, s2, cuts)
+                for s2 in elems
+                if charges.get(s2, 0) * site_q < 0
+            ) if any(charges.get(s2, 0) * site_q < 0 for s2 in elems) else 4.0
+        max_rcut = max_rcut_of[sym_i]
 
         neigh_idxs = tree.query_ball_point(pts[idx], r=max_rcut)
         actual_vecs = []

@@ -300,8 +300,20 @@ def core_roles(poly: Polyhedron, pts: np.ndarray, tol: float = 1.0) -> List[str]
     adjacent |= {(b, a) for a, b in adjacent}
     used = sorted({v for ids in poly.faces.values() for v in ids})
     vtree = cKDTree(poly.verts[used])
+    P = np.asarray(pts, float)
+    # Only atoms within tol of some face plane can be anything but interior;
+    # screen in bulk (widened by 1e-6) and classify the rest one by one.
+    faces = list(poly.faces)
+    if faces:
+        depth = poly.d[faces][None, :] - P @ poly.normals[faces].T
+        maybe = (depth < tol + 1e-6).any(axis=1)
+    else:
+        maybe = np.zeros(len(P), dtype=bool)
     out = []
-    for x in np.asarray(pts, float):
+    for x, check in zip(P, maybe.tolist()):
+        if not check:
+            out.append("interior")
+            continue
         near = []
         for p in poly.faces:
             s = float(poly.d[p] - x @ poly.normals[p])

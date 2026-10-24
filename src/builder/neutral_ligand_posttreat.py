@@ -595,8 +595,10 @@ def compute_missing_bond_vectors(
     com = pts.mean(axis=0)
     tree = cKDTree(pts)
 
-    # Cache ideal directions per species (same in whole crystal)
+    # Cache ideal directions and the neighbour search radius per species
     ideal_cache: Dict[str, List[np.ndarray]] = {}
+    elems = set(syms)
+    max_rcut_of: Dict[str, float] = {}
 
     result: Dict[int, List[np.ndarray]] = {}
 
@@ -617,11 +619,13 @@ def compute_missing_bond_vectors(
             continue
 
         # Find actual neighbors
-        max_rcut = max(
-            _pair_cut_calibrated(sym, s2, cuts)
-            for s2 in set(syms)
-            if charges.get(s2, 0) * q_i < 0
-        ) if any(charges.get(s2, 0) * q_i < 0 for s2 in set(syms)) else 4.0
+        if sym not in max_rcut_of:
+            max_rcut_of[sym] = max(
+                _pair_cut_calibrated(sym, s2, cuts)
+                for s2 in elems
+                if charges.get(s2, 0) * q_i < 0
+            ) if any(charges.get(s2, 0) * q_i < 0 for s2 in elems) else 4.0
+        max_rcut = max_rcut_of[sym]
 
         neigh_idxs = tree.query_ball_point(pts[i], r=max_rcut)
         actual_vecs = []

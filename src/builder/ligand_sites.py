@@ -201,9 +201,25 @@ def select_ligand_sites(
     def free_capacity(extra: Tuple[int, ...] = ()) -> int:
         return free_total - sum(1 for h in set(extra) if h in mu1_hosts and left(h) >= 1)
 
-    # distance from each candidate to the nearest pick so far
+    taken_arr = np.asarray(taken, float) if taken else None
+    avoid_arr = np.asarray(avoid_pts) if avoid_pts else None
+
+    def same_facet_stats(c):
+        """Distance to the nearest ligand added on c's facet, and their crowding."""
+        same = added_on[c["facet"]]
+        if same:
+            d = np.linalg.norm(np.asarray(same) - c["pos"], axis=1)
+            return float(d.min()), float(np.sum(1.0 / np.maximum(d, 1e-6) ** 3))
+        return np.inf, 0.0
+
+    # Spread-key ingredients per candidate, kept current as ligands are
+    # picked: d_new (nearest pick), d_taken (nearest existing ligand or
+    # `avoid` point), d_vac (nearest `avoid` point), d_same/crowd (facet).
     for c in cands:
         c["d_new"] = np.inf
+        c["d_taken"] = float(np.min(np.linalg.norm(taken_arr - c["pos"], axis=1))) if taken_arr is not None else np.inf
+        c["d_vac"] = float(np.min(np.linalg.norm(avoid_arr - c["pos"], axis=1))) if avoid_arr is not None else np.inf
+        c["d_same"], c["crowd"] = same_facet_stats(c)
 
     picks: List[dict] = []
     new_pts: List[NDArray[np.float64]] = []
@@ -234,18 +250,10 @@ def select_ligand_sites(
         least = min(counts[c["facet"]] for c in elig)
         elig = [c for c in elig if counts[c["facet"]] == least]
 
-        ref_all = np.asarray(taken + new_pts, float) if (taken or new_pts) else None
-
         def spread_key(c):
-            same = added_on[c["facet"]]
-            if same:
-                d = np.linalg.norm(np.asarray(same) - c["pos"], axis=1)
-                d_same, crowd = float(d.min()), float(np.sum(1.0 / np.maximum(d, 1e-6) ** 3))
-            else:
-                d_same, crowd = np.inf, 0.0
-            d_all = float(np.min(np.linalg.norm(ref_all - c["pos"], axis=1))) if ref_all is not None else np.inf
-            d_vac = float(np.min(np.linalg.norm(np.asarray(avoid_pts) - c["pos"], axis=1))) if avoid_pts else np.inf
-            return (round(d_same, 2), -round(crowd, 6), round(min(d_all, d_vac), 6), tuple(-h for h in c["hosts"]))
+            d_all = min(c["d_taken"], c["d_new"])      # nearest of existing ligands + picks
+            return (round(c["d_same"], 2), -round(c["crowd"], 6), round(min(d_all, c["d_vac"]), 6),
+                    tuple(-h for h in c["hosts"]))
 
         best = max(elig, key=spread_key)
         cands = [c for c in cands if c is not best]
@@ -263,4 +271,6 @@ def select_ligand_sites(
             for c, dc in zip(cands, d.tolist()):
                 if dc < c["d_new"]:
                     c["d_new"] = dc
+                if c["facet"] == best["facet"]:
+                    c["d_same"], c["crowd"] = same_facet_stats(c)
     return picks
