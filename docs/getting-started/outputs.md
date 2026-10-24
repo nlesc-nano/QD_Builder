@@ -48,11 +48,18 @@ intersection, so a plane that only touches a corner has no face:
 - `atom_fitted`: every plane moved to the outermost core atom along its
   normal, `d = max(n·r)` over the core atoms.
 
-Each facet has a family label: the Miller family (`100`, `110`), with `A`
-or `B` for a polar family whose `+n` and `-n` faces are not
-symmetry-equivalent. In zinc blende, `111A` is the cation-terminated and
-`111B` the anion-terminated {111}; the termination is read from the
-outermost layer of the cut.
+Each facet has a family label: the Miller family of its point-group orbit
+(`100`, `110`, `210`, ...), with `A` or `B` for a polar family whose `+n`
+and `-n` faces are not symmetry-equivalent. Orbits and polarity come from
+the point group of the CIF, so any lattice and Miller index is labelled.
+`A` exposes cations, `B` anions: in zinc blende `111A`/`111B`,
+`211A`/`211B` and `311A`/`311B`, in wurtzite `001A`/`001B` and
+`101A`/`101B`, while {100}, {110} and {210} carry no letter. The exposed
+species is the recipe's resolved termination when it is `cation_rich` or
+`anion_rich`, otherwise the bond rule used to resolve terminations (the
+species that loses the fewest bonds across the plane). The two orbits of
+a polar pair always get different letters. Hexagonal labels use the
+three-index (hkl) of the recipe.
 
 | Key in `facet_geometry.<polyhedron>` | Meaning |
 |---|---|

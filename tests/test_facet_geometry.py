@@ -93,6 +93,22 @@ def test_zincblende_labels_split_polar_111():
     assert Counter(labels) == {"100": 6, "111A": 4, "111B": 4, "110": 12}
 
 
+
+def test_labels_generic_high_index_and_hexagonal():
+    from pymatgen.core import Structure
+    from builder.facets import expand_facets
+    from builder.nc_types import Facet
+
+    charges = {"Cd": 2, "Se": -2}
+    zb = Structure.from_file(CDSE)
+    facets = expand_facets(zb, [Facet(2, 1, 0, 1.0), Facet(2, 1, 1, 1.0), Facet(-2, -1, -1, 1.0)], proper_only=True)
+    assert Counter(facet_labels(zb, facets, charges)) == {"210": 12, "211A": 12, "211B": 12}   # {210} is not polar
+    wz = Structure.from_file(ROOT / "examples/library/cifs/CdSe_wz.cif")
+    facets = expand_facets(wz, [Facet(1, 0, 0, 1.0), Facet(0, 0, 1, 1.0), Facet(0, 0, -1, 1.0),
+                                Facet(1, 0, 1, 1.0), Facet(1, 0, -1, 1.0)], proper_only=True)
+    assert Counter(facet_labels(wz, facets, charges)) == {"100": 6, "001A": 1, "001B": 1, "101A": 6, "101B": 6}
+
+
 # ---------------- builds ----------------
 PRESET = yaml.safe_load((ROOT / "examples/library/cdse_zb.yaml").read_text())["preset"]
 

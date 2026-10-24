@@ -34,7 +34,7 @@ from scipy.spatial import ConvexHull, HalfspaceIntersection, cKDTree
 from .facets import unit_normal
 from .nc_types import Facet, Plane
 
-LAYER_TOL = 0.3          # Å; outermost atom layer used to tell 111A from 111B
+LAYER_TOL = 0.3          # Å; outermost atom layer of the cut (last-resort A/B rule)
 
 
 # ---------------- facet family labels ----------------
@@ -78,40 +78,66 @@ def facet_labels(
     pts: Optional[np.ndarray] = None,
 ) -> List[str]:
     """
-    Family label per oriented facet. A polar family (n and -n in different
-    point-group orbits) gets A when its exposed layer is cation, B when anion:
-    measured on the outermost layer of the cut atoms `syms`/`pts` along every
-    member, else taken from the requested termination.
+    Family label per oriented facet: the Miller family of its point-group
+    orbit, plus A (cation exposed) or B (anion exposed) for a polar family,
+    i.e. when n and -n lie in different orbits (zinc-blende {111}, {211},
+    {311}; wurtzite (001), {101}).
+
+    The exposed species comes from the recipe's resolved termination when
+    every member of the orbit has the same cation_rich/anion_rich one, else
+    from the bulk bond rule the builder resolves terminations with (the
+    species losing the fewest bonds across the plane), else from the
+    outermost layer of the cut atoms `syms`/`pts`. The two orbits of a
+    polar pair always get different letters.
     """
+    from .main import _exposed_charge_for_wulff_hkl
+
     rotations = _point_group_rotations(struct)
     orbits: Dict[Tuple[int, int, int], set] = {}
-    labels = []
+    keys = []
     for f in facets:
         hkl = (int(f.h), int(f.k), int(f.l))
         key = next((k for k, orb in orbits.items() if hkl in orb), None)
         if key is None:
             orbits[hkl] = _hkl_orbit(struct, hkl, rotations)
             key = hkl
-        labels.append(key)
+        keys.append(key)
 
-    polar = {k: tuple(-x for x in k) not in orb for k, orb in orbits.items()}
-    suffix: Dict[Tuple[int, int, int], str] = {}
+    def neg(k):
+        return tuple(-x for x in k)
+
+    def partner(k):
+        return next((j for j, orb in orbits.items() if neg(k) in orb), None)
+
     have_atoms = syms is not None and pts is not None and len(pts) > 0
-    for key in orbits:
-        if not polar[key]:
-            suffix[key] = ""
+    P = np.asarray(pts, float) if have_atoms else None
+    score: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
+    for key, orb in orbits.items():
+        if neg(key) in orb:
             continue
-        q = 0.0
+        terms = {getattr(f, "termination", None) for f, k in zip(facets, keys) if k == key}
+        q_term = 1.0 if terms == {"cation_rich"} else -1.0 if terms == {"anion_rich"} else 0.0
+        q_bond = float(_exposed_charge_for_wulff_hkl(struct, key, charges))
+        q_cut = 0.0
         if have_atoms:
-            P = np.asarray(pts, float)
-            for f, k in zip(facets, labels):
-                if k == key:
-                    q += _top_layer_charge(syms, P, unit_normal(struct, (f.h, f.k, f.l)), charges)
-        if q == 0.0:
-            terms = {getattr(f, "termination", None) for f, k in zip(facets, labels) if k == key}
-            q = 1.0 if terms == {"cation_rich"} else -1.0 if terms == {"anion_rich"} else 0.0
+            q_cut = sum(_top_layer_charge(syms, P, unit_normal(struct, (f.h, f.k, f.l)), charges)
+                        for f, k in zip(facets, keys) if k == key)
+        score[key] = (q_term, q_bond, q_cut)
+
+    suffix = {k: "" for k in orbits}
+    for key, sc in score.items():
+        q = next((x for x in sc if x != 0.0), 0.0)
         suffix[key] = "A" if q > 0 else "B" if q < 0 else ""
-    return [_family_digits(orbits[k]) + suffix[k] for k in labels]
+    # A polar pair present together: compare the two, rule by rule.
+    for key in score:
+        other = partner(key)
+        if other is None or suffix[key] != suffix[other] and suffix[key]:
+            continue
+        for a, b in zip(score[key], score[other]):
+            if a != b:
+                suffix[key], suffix[other] = ("A", "B") if a > b else ("B", "A")
+                break
+    return [_family_digits(orbits[k]) + suffix[k] for k in keys]
 
 
 # ---------------- clipped polyhedron ----------------
