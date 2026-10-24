@@ -59,10 +59,13 @@ def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol
     offsets = np.array([f[1] for f in frames], float)
     depth = offsets[None, :] - np.asarray(pts, float) @ normals.T
     rows, cols = np.nonzero(depth < surf_tol + _SCREEN_EPS)
-    for i, fid in zip(rows.tolist(), cols.tolist()):
-        n, d = frames[fid][0], frames[fid][1]
-        if d - float(np.dot(pts[i], n)) < surf_tol:
-            out[i].append(fid)
+    keep = depth[rows, cols] < surf_tol
+    # Re-check hits close to the threshold with the per-atom expression.
+    for k in np.flatnonzero(np.abs(depth[rows, cols] - surf_tol) < _SCREEN_EPS):
+        n, d = frames[cols[k]][0], frames[cols[k]][1]
+        keep[k] = d - float(np.dot(pts[rows[k]], n)) < surf_tol
+    for i, fid in zip(rows[keep].tolist(), cols[keep].tolist()):
+        out[i].append(fid)
     return out
 
 def _record_uv_allfacets(idx: int,

@@ -20,6 +20,20 @@ or, in an existing Python environment:
 pip install -e .
 ```
 
+### Optional C++ kernels
+
+`native/` holds C++ versions of the hottest passivation loops (nanobind +
+scikit-build-core; needs a C++17 compiler and CMake >= 3.18). The builder uses
+them when they are installed and runs the same code in Python otherwise; the
+output is identical either way. Set `QDB_NATIVE=0` to switch them off.
+
+```bash
+pip install ./native
+```
+
+On Apple Silicon with an Intel (x86_64) CMake on the PATH, add
+`ARCHFLAGS="-arch arm64"` in front of the command.
+
 ## Main Builder
 
 Core-only, size defined in YAML:

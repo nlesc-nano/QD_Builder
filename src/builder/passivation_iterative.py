@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import os
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple, Optional
@@ -26,6 +27,7 @@ from .passivation import (
     _plane_uv,
     _incident_facets,
     _incident_facets_all,
+    _SCREEN_EPS,
     _record_uv_allfacets,
     _facet_memberships,
     _collect_cation_sites,
@@ -336,6 +338,22 @@ def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64], pt_tree: Op
     return out
 
 
+def _flatten_hits(hits_all) -> Tuple[NDArray[np.intp], NDArray[np.intp]]:
+    """(query index, hit index) pairs from a batched query_ball_point result."""
+    lengths = np.fromiter((len(h) for h in hits_all), dtype=np.intp, count=len(hits_all))
+    flat = np.fromiter(itertools.chain.from_iterable(hits_all), dtype=np.intp, count=int(lengths.sum()))
+    return np.repeat(np.arange(len(hits_all), dtype=np.intp), lengths), flat
+
+
+def _within(pts: NDArray[np.float64], i: NDArray[np.intp], j: NDArray[np.intp], limit: NDArray[np.float64]) -> NDArray[np.bool_]:
+    """np.linalg.norm(pts[j] - pts[i]) <= limit for each pair, as the scalar loop computed it."""
+    d = np.sqrt(np.sum((pts[j] - pts[i]) ** 2, axis=1))
+    ok = d <= limit
+    for k in np.flatnonzero(np.abs(d - limit) < _SCREEN_EPS):
+        ok[k] = np.linalg.norm(pts[j[k]] - pts[i[k]]) <= limit[k]
+    return ok
+
+
 def _ligand_protected_cation_mask(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -349,18 +367,16 @@ def _ligand_protected_cation_mask(
     if not lig_idx or not cat_idx:
         return protected
 
-    max_rc = max(_pair_cut_calibrated(symbols[i], ligand, pair_cuts) for i in cat_idx)
+    rc_of = {el: _pair_cut_calibrated(el, ligand, pair_cuts) for el in {symbols[i] for i in cat_idx}}
+    max_rc = max(rc_of.values())
     lig_tree = cKDTree(pts[lig_idx])
     hits_all = lig_tree.query_ball_point(pts[cat_idx], r=max_rc + 1e-6)
-    for i, hits in zip(cat_idx, hits_all):
-        if not hits:
-            continue
-        rc = _pair_cut_calibrated(symbols[i], ligand, pair_cuts)
-        xi = pts[i]
-        for h in hits:
-            if np.linalg.norm(pts[lig_idx[h]] - xi) <= rc + 1e-6:
-                protected[i] = True
-                break
+    cat_arr = np.asarray(cat_idx)
+    lig_arr = np.asarray(lig_idx)
+    rc_cat = np.array([rc_of[symbols[i]] for i in cat_idx], float)
+    a, b = _flatten_hits(hits_all)
+    within = _within(pts, cat_arr[a], lig_arr[b], rc_cat[a] + 1e-6)
+    protected[cat_arr[a[within]]] = True
     return protected
 
 
@@ -379,21 +395,17 @@ def _prune_orphan_ligands(
     if not lig_idx or not cat_idx:
         orphan_idx = lig_idx
     else:
-        max_rc = max(_pair_cut_calibrated(ligand, symbols[i], pair_cuts) for i in cat_idx)
+        rc_of = {el: _pair_cut_calibrated(ligand, el, pair_cuts) for el in {symbols[i] for i in cat_idx}}
+        max_rc = max(rc_of.values())
         cat_tree = cKDTree(pts[cat_idx])
-        orphan_idx = []
-        for i in lig_idx:
-            hits = cat_tree.query_ball_point(pts[i], r=max_rc + 1e-6)
-            has_host = False
-            xi = pts[i]
-            for h in hits:
-                j = cat_idx[h]
-                rc = _pair_cut_calibrated(ligand, symbols[j], pair_cuts)
-                if np.linalg.norm(pts[j] - xi) <= rc + 1e-6:
-                    has_host = True
-                    break
-            if not has_host:
-                orphan_idx.append(i)
+        cat_arr = np.asarray(cat_idx)
+        lig_arr = np.asarray(lig_idx)
+        rc_cat = np.array([rc_of[symbols[j]] for j in cat_idx], float)
+        a, b = _flatten_hits(cat_tree.query_ball_point(pts[lig_idx], r=max_rc + 1e-6))
+        within = _within(pts, lig_arr[a], cat_arr[b], rc_cat[b] + 1e-6)
+        has_host = np.zeros(len(lig_idx), dtype=bool)
+        has_host[a[within]] = True
+        orphan_idx = [int(i) for i in lig_arr[~has_host]]
     if not orphan_idx:
         return symbols, pts, 0
 

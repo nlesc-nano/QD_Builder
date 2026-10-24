@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
+from . import _native
 from .constants import COV_RAD
 from .nc_types import Plane, Facet
 
@@ -249,6 +250,36 @@ def pretty_print_pair_cuts(cuts: Optional[PairCuts], pairs_hint: Optional[List[T
 # Coordination-number functions
 # ===============================
 
+def _native_pair_counts(
+    pts: NDArray[np.float64],
+    sym_indices: NDArray[np.int_],
+    charge_arr: NDArray[np.float64],
+    cutoff_matrix: NDArray[np.float64],
+    max_rcut: float,
+    *,
+    bipartite: bool,
+) -> NDArray[np.int_]:
+    """
+    The C++ cell-list count. Pairs within _native.EPS of their cutoff come back
+    undecided and are settled with cKDTree, whose distances the scipy path
+    compares, so the counts match that path exactly.
+    """
+    cn, undecided = _native.KERNELS.pair_counts(
+        np.ascontiguousarray(pts, dtype=np.float64),
+        np.ascontiguousarray(sym_indices, dtype=np.int32),
+        np.ascontiguousarray(charge_arr, dtype=np.float64),
+        np.ascontiguousarray(cutoff_matrix, dtype=np.float64),
+        bipartite,
+        _native.EPS,
+    )
+    for i, j in undecided.tolist():
+        pair = cKDTree(pts[[i, j]])
+        d = pair.sparse_distance_matrix(pair, max_rcut, output_type="dict").get((0, 1))
+        if d is not None and d <= cutoff_matrix[sym_indices[i], sym_indices[j]]:
+            cn[i] += 1
+    return cn
+
+
 def coord_numbers_bipartite(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -264,7 +295,6 @@ def coord_numbers_bipartite(
         return np.zeros(0, dtype=int)
 
     pts = np.asarray(pts, float)
-    tree = cKDTree(pts)
 
     uniq_elems = sorted(list(set(symbols)))
     max_rcut = 0.0 if not uniq_elems else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq_elems for b in uniq_elems)
@@ -277,10 +307,14 @@ def coord_numbers_bipartite(
         for v, el_v in enumerate(uniq_elems):
             cutoff_matrix[u, v] = _pair_cut_calibrated(el_u, el_v, pair_cuts)
 
+    charge_arr = np.array([charges.get(s, 0) for s in symbols], dtype=float)
+    if _native.KERNELS is not None:
+        return _native_pair_counts(pts, sym_indices, charge_arr, cutoff_matrix, max_rcut, bipartite=True)
+
+    tree = cKDTree(pts)
     coo = tree.sparse_distance_matrix(tree, max_rcut, output_type='coo_matrix')
     row, col, dists = coo.row, coo.col, coo.data
 
-    charge_arr = np.array([charges.get(s, 0) for s in symbols], dtype=float)
     bipartite_mask = (charge_arr[row] * charge_arr[col] < 0) | (charge_arr[row] == 0)
     cutoff_mask = dists <= cutoff_matrix[sym_indices[row], sym_indices[col]]
     valid_mask = (row != col) & bipartite_mask & cutoff_mask
@@ -302,7 +336,6 @@ def coord_numbers(
         return np.zeros(0, dtype=int)
 
     pts = np.asarray(pts, float)
-    tree = cKDTree(pts)
 
     uniq_elems = sorted(list(set(symbols)))
     max_rcut = 0.0 if not uniq_elems else max(_pair_cut_calibrated(a, b, pair_cuts) for a in uniq_elems for b in uniq_elems)
@@ -315,6 +348,10 @@ def coord_numbers(
         for v, el_v in enumerate(uniq_elems):
             cutoff_matrix[u, v] = _pair_cut_calibrated(el_u, el_v, pair_cuts)
 
+    if _native.KERNELS is not None:
+        return _native_pair_counts(pts, sym_indices, np.zeros(N), cutoff_matrix, max_rcut, bipartite=False)
+
+    tree = cKDTree(pts)
     coo = tree.sparse_distance_matrix(tree, max_rcut, output_type='coo_matrix')
     row, col, dists = coo.row, coo.col, coo.data
 
