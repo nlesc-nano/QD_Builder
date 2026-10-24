@@ -213,6 +213,24 @@ class ZTypeLigandPostTreatSpec:
 
 
 @dataclass(frozen=True)
+class ZTypeTargetSpec:
+    """
+    Bring the charge-neutral dot to a total of ``target_total`` MX_q units.
+
+    After charge balance the core holds k_X units (its excess cations); for
+    target_total > k_X the missing units are added as Z-type complexes, for
+    target_total < k_X the extra ones are displaced (a cation with q of its
+    own ligands). Units go one at a time, split over ``per_family`` by its
+    weights (all sites when empty), so successive totals are nested.
+    """
+    enabled: bool = False
+    target_total: int = 0
+    per_family: Tuple[Tuple[str, float], ...] = ()
+    complex: Optional[str] = None          # default: the MX_q unit of the core, e.g. CdCl2
+    distribution: str = "uniform"
+
+
+@dataclass(frozen=True)
 class PostTreatmentSpec:
     surface_reconstruction: SurfaceReconstructionSpec = field(default_factory=SurfaceReconstructionSpec)
     alloying: AlloyingPostTreatSpec = field(default_factory=AlloyingPostTreatSpec)
@@ -221,6 +239,7 @@ class PostTreatmentSpec:
     ligand_exchange: LigandExchangePostTreatSpec = field(default_factory=LigandExchangePostTreatSpec)
     neutral_exchange: NeutralExchangePostTreatSpec = field(default_factory=NeutralExchangePostTreatSpec)
     z_type_ligands: ZTypeLigandPostTreatSpec = field(default_factory=ZTypeLigandPostTreatSpec)
+    z_type_target: ZTypeTargetSpec = field(default_factory=ZTypeTargetSpec)
 
 # Basic
 @dataclass(frozen=True)

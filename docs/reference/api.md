@@ -21,6 +21,9 @@ points are listed below.
 
 .. automodule:: builder.composition
    :members: core_composition
+
+.. automodule:: builder.z_type_target
+   :members: run_z_type_target
 ```
 
 ## Bonding and analysis

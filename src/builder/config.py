@@ -18,7 +18,7 @@ from .nc_types import (
     LigandExchangePass, LigandExchangePostTreatSpec,
     AlloyingPass, AlloyingPostTreatSpec,
     ZTypeDisplacementPass, ZTypeDisplacementPostTreatSpec,
-    ZTypeLigandPass, ZTypeLigandPostTreatSpec,
+    ZTypeLigandPass, ZTypeLigandPostTreatSpec, ZTypeTargetSpec,
     SurfaceReconstructionSpec, PostTreatmentSpec,
     NeutralExchangePass, NeutralExchangePostTreatSpec,
 )
@@ -829,6 +829,43 @@ def _surface_reconstruction_from_legacy(raw, *, default_ligand: str) -> SurfaceR
     return _parse_surface_reconstruction(sr_raw, default_ligand=default_ligand)
 
 
+def _parse_z_type_target(raw) -> ZTypeTargetSpec:
+    """z_type_target: {target_total: k, per_family: {"111B": 2, "edge": 1}, complex, distribution}"""
+    if raw is None:
+        return ZTypeTargetSpec()
+    if not isinstance(raw, dict):
+        raise TypeError("post_treatment.z_type_target must be a mapping")
+    unknown = set(raw) - {"enabled", "target_total", "per_family", "complex", "distribution"}
+    if unknown:
+        raise ValueError(f"post_treatment.z_type_target: unknown keys {sorted(unknown)}")
+    if not bool(raw.get("enabled", True)):
+        return ZTypeTargetSpec()
+    if raw.get("target_total") is None:
+        raise ValueError("post_treatment.z_type_target.target_total is required")
+    total = int(raw["target_total"])
+    if total < 0:
+        raise ValueError("post_treatment.z_type_target.target_total must be >= 0")
+    fam_raw = raw.get("per_family") or {}
+    if not isinstance(fam_raw, dict):
+        raise TypeError("post_treatment.z_type_target.per_family must be a mapping family -> weight")
+    per_family = []
+    for fam, wt in fam_raw.items():
+        if float(wt) < 0:
+            raise ValueError(f"z_type_target.per_family[{fam!r}] must be >= 0")
+        per_family.append((str(fam).strip(), float(wt)))
+    distribution = str(raw.get("distribution", "uniform")).strip().lower()
+    if distribution not in {"uniform", "random", "segmented"}:
+        raise ValueError("z_type_target.distribution must be uniform, random or segmented")
+    complex_ = raw.get("complex")
+    return ZTypeTargetSpec(
+        enabled=True,
+        target_total=total,
+        per_family=tuple(per_family),
+        complex=str(complex_).strip() if complex_ else None,
+        distribution=distribution,
+    )
+
+
 def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
     if raw is None:
         return ZTypeLigandPostTreatSpec()
@@ -920,6 +957,10 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
     neutral_exchange = _parse_neutral_exchange(neutral_exchange_raw, charges)
 
     z_type_ligands = _parse_z_type_ligands(raw.get("z_type_ligands", raw.get("z-type-ligands")))
+    z_type_target = _parse_z_type_target(raw.get("z_type_target", raw.get("z-type-target")))
+    if z_type_target.enabled and (z_type_ligands.enabled or z_type_displacement.enabled):
+        raise ValueError("post_treatment.z_type_target sets the Z-type units itself: "
+                         "drop z_type_ligands and z_type_displacement")
 
     surface_raw = raw.get("surface_reconstruction", raw.get("surface-reconstruction"))
     surface_reconstruction = _parse_surface_reconstruction(surface_raw, default_ligand=default_ligand)
@@ -936,6 +977,7 @@ def _parse_post_treatment(raw, *, pass_cfg: dict, charges: Dict[str, int], defau
         ligand_exchange=ligand_exchange,
         neutral_exchange=neutral_exchange,
         z_type_ligands=z_type_ligands,
+        z_type_target=z_type_target,
     )
 
 

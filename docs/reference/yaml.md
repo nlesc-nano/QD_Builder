@@ -16,6 +16,7 @@ stack (core/shell) recipe.
 | `size_unit_cells` | number, 3-list or string | none | e.g. `2`, `[2, 2, 1]`, `"2 2 1"` |
 | `facet_distances` | map family → Å | none | replaces `facets` and the size, see {ref}`facet-distances` |
 | `target` | map | none | with `facet_distances`: `{m, w, centres, roundings, max_builds}`, see {ref}`target-mode` |
+| `post_treatment.z_type_target` | map | none | `{target_total, per_family, complex, distribution}`, see {ref}`z-type-target` |
 | `shape` | map | Wulff, aspect (1,1,1) | see below |
 | `construction_origin` | map | behaves like `all` | see below |
 | `symmetry.proper_rotations_only` | bool | `true` | |

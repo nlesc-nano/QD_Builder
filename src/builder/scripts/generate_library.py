@@ -270,7 +270,7 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
             extra["reconstruction_pattern"] = recon_pattern
         # Facet areas, edges, vertices, per-atom site roles (aligned with start.xyz),
         # the [MA]_m(MX_q)_k composition and the per-family Z-type ledger.
-        for key in ("facet_geometry", "site_roles", "composition", "z_type_ligand_ledger"):
+        for key in ("facet_geometry", "site_roles", "composition", "z_type_ligand_ledger", "z_type_target_ledger"):
             if key in res["manifest"]:
                 extra[key] = res["manifest"][key]
         rec = make_record(

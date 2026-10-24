@@ -37,6 +37,8 @@ exactly what was done:
 | `alloying_ledger` | {ref}`post-alloying` |
 | `z_type_displacement_ledger` | {ref}`post-z-type` |
 | `ligand_exchange_charge_ledger` | {ref}`post-x-type` |
+| `z_type_ligand_ledger` | {ref}`post-z-type-ligands` |
+| `z_type_target_ledger` | {ref}`z-type-target` |
 
 (facet-geometry)=
 ## Facet geometry and site roles

@@ -149,6 +149,56 @@ the 1 Å role tolerance. {111}A facets with a complete Cd layer, and {100}
 facets, have none: their Se is four-coordinated, the {100} surface being Cd
 with bridging Cl after the prepass.
 
+(z-type-target)=
+## A target number of MX_q units
+
+```yaml
+post_treatment:
+  z_type_target:
+    target_total: 12                              # k
+    per_family: {"111B": 3, "edge": 1, "vertex": 1}   # weights; optional
+    # complex: CdCl2 (default: the MX_q unit of the core), distribution: uniform
+```
+
+The charge-neutral dot holds $k_X$ MX_q units after the charge balance
+(`composition.k_X`, $N_\text{Cd} - N_\text{Se}$ for CdSe). `z_type_target`
+brings it to $k$ = `target_total` with the existing post-treatment tools,
+choosing the direction from $k - k_X$:
+
+- **$k > k_X$: addition.** $k - k_X$ Z-type complexes go on free surface
+  anions, as with `targets` above. The family of a site is the role of its
+  host anion.
+- **$k < k_X$: displacement.** $k_X - k$ neutral units are removed, each a
+  core cation with $q$ ligands. Its own ligands go first; when it has fewer
+  than $q$, the nearest others are taken. The family is the role of the
+  cation. A removal is refused if it would leave a ligand without a
+  cation, or if it would split the structure (bonds by the calibrated
+  cation–anion cut-offs) into more pieces.
+
+Units move one at a time, and every step is neutral. The family of the next
+unit is chosen by the divisor (D'Hondt) rule: the family with the largest
+$w_f/(n_f + 1)$ among those that still have a site. Within a family, the
+next site comes from its addition plan, or for displacement from the
+least-bound cation (fewest core bonds, most own ligands, outermost). Raising
+the total never takes a unit away from a family, so the steps form one
+sequence, and the build for $k$ contains those closer to $k_X$. Without
+`per_family`, every site counts as one family. When the listed families run
+out of sites, the ledger reports the `shortfall`.
+
+The manifest gets `z_type_target_ledger`:
+
+| Key | Meaning |
+|---|---|
+| `k_X`, `target_total`, `delta` | units after the charge balance, requested, and $k - k_X$ |
+| `direction` | `add`, `displace` or `none` |
+| `complex` | the unit moved |
+| `units`, `achieved_total`, `shortfall` | units moved, the resulting $k$, and the units missing |
+| `per_family` | per family: `weight`, `requested` (its divisor share), `sites` (addition) or `candidates` (displacement), and `added` or `removed` |
+| `order` | the family of each unit, in order |
+
+`composition` reflects the result. `z_type_target` replaces
+`z_type_ligands` and `z_type_displacement` in the same recipe.
+
 ## The complex
 
 The complex is written as an MXₙ formula (`CdCl2`, `ZnBr2`, `InCl3`) or as

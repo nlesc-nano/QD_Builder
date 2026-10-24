@@ -985,6 +985,24 @@ def _run_passivation_and_write_outputs(
             for entry in z_type_ligand_ledger if "charge" in entry
         )
 
+    # ── Z-type target (optional; add or displace MX_q units to reach target_total) ──
+    z_type_target_ledger = None
+    z_type_target_units: list = []     # added units, counted by the composition
+    z_type_target_spec = getattr(getattr(cfg, "post_treatment", None), "z_type_target", None)
+    if z_type_target_spec is not None and z_type_target_spec.enabled:
+        from .z_type_target import run_z_type_target
+        roles_now = None
+        if facet_geometry_input is not None:
+            roles_now = _current_site_roles(
+                syms, pts, core_ref_pts, facet_geometry_input, charges=cfg.charges, ligand=anion_lig,
+            )
+        syms, pts, z_type_target_ledger, z_entry = run_z_type_target(
+            syms, pts, cfg, struct, planes, cif_path,
+            roles=roles_now, core=_core_mask(syms, pts, core_ref_pts, anion_lig), ligand=anion_lig,
+        )
+        if z_entry is not None:
+            z_type_target_units.append(z_entry)
+
     # ── Neutral-ligand post-treatment (optional; final post-treatment step) ───
     neutral_ligand_spec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -1090,6 +1108,8 @@ def _run_passivation_and_write_outputs(
         extra["z_type_displacement_ledger"] = z_type_displacement_ledger
     if z_type_ligand_ledger:
         extra["z_type_ligand_ledger"] = z_type_ligand_ledger
+    if z_type_target_ledger is not None:
+        extra["z_type_target_ledger"] = z_type_target_ledger
     if alloying_ledger:
         extra["alloying_ledger"] = alloying_ledger
     if surface_reconstruction_ledger:
@@ -1097,7 +1117,8 @@ def _run_passivation_and_write_outputs(
     if facet_geometry_input is not None:
         extra.update(_facet_geometry_entries(
             syms, pts, out_order, core_ref_pts, facet_geometry_input,
-            charges=cfg.charges, ligand=anion_lig, struct=struct, z_type_ledger=z_type_ligand_ledger,
+            charges=cfg.charges, ligand=anion_lig, struct=struct,
+            z_type_ledger=list(z_type_ligand_ledger) + z_type_target_units,
             origin=(-np.mean(np.asarray(pts, float), axis=0) if args.center and len(pts) else np.zeros(3)),
             verbose=args.verbose,
         ))

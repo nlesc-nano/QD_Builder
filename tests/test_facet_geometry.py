@@ -289,3 +289,43 @@ def test_z_type_per_family_is_nested(shape, tmp_path):
         assert prev is None or prev <= shell                          # k and k+1 nested
         prev = shell
     assert free > 0
+
+
+def _atoms_about_centre(res):
+    P = np.asarray(res["pts"]) - np.asarray(res["pts"])[res["centre_index"]]
+    return {(s, *np.round(p, 2)) for s, p in zip(res["symbols"], P)}
+
+
+@pytest.mark.parametrize("per_family", [{}, {"vertex": 2, "edge": 1, "111B": 1}])
+def test_z_type_target_both_directions_nested(per_family, tmp_path):
+    from scipy.spatial import cKDTree
+    octahedron = SHAPES["octahedron"][0]
+    prev, k_x = None, None
+    for total in range(4, 11):           # k_X = 7 for this octahedron: displace, none, add
+        recipe = _recipe(facets=octahedron, size_unit_cells=[2.0] * 3, construction_origin={"center_on_species": "Cd"},
+                         post_treatment={"z_type_target": {"target_total": total, "per_family": per_family}})
+        res = _run(recipe, tmp_path, f"t{total}")
+        man = res["manifest"]
+        led = man["z_type_target_ledger"]
+        k_x = led["k_X"] if k_x is None else k_x
+        assert led["k_X"] == k_x == 7
+        assert man["total_charge"] == 0 and led["shortfall"] == 0
+        assert man["composition"]["k"] == total == led["achieved_total"]
+        assert led["direction"] == ("displace" if total < k_x else "add" if total > k_x else "none")
+        moved = sum(v.get("added", v.get("removed", 0)) for v in led["per_family"].values())
+        assert moved == abs(total - k_x)
+        syms, P = np.array(res["symbols"]), np.asarray(res["pts"])
+        cd = cKDTree(P[syms == "Cd"])
+        assert all(cd.query_ball_point(x, 3.1) for x in P[syms == "Cl"])     # no ligand without a cation
+        cur = _atoms_about_centre(res)
+        assert prev is None or prev <= cur                                   # successive totals nested
+        prev = cur
+
+
+def test_z_type_target_rejects_mixed_blocks():
+    from builder.config import _parse_post_treatment
+    with pytest.raises(ValueError):
+        _parse_post_treatment({"z_type_target": {"target_total": 3},
+                               "z_type_ligands": {"enabled": True, "passes": [{"complex": "CdCl2"}]}},
+                              pass_cfg={}, charges={"Cd": 2, "Se": -2, "Cl": -1}, default_ligand="Cl",
+                              legacy_recon_raw=None)
