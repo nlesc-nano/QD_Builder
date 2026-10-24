@@ -21,6 +21,7 @@ stack (core/shell) recipe.
 | `twins` | map or list | none | see below |
 | `post_treatment` (alias `post-treatment`) | map | all disabled | see below |
 | `experimental.exhausted_positive_q_fallback` | bool | `false` | last-resort cation removal |
+| `facet_geometry` | map | `{enabled: true, role_tolerance: 1.0}` | manifest geometry and site roles, see {ref}`facet-geometry` |
 | `stack` | map | see below | stack recipes |
 | `materials` | list | – | selects stack mode |
 

@@ -125,8 +125,10 @@ def test_mixed_family_facet_scope_keeps_full_oriented_set() -> None:
     manifest = json.loads(out.with_suffix(".json").read_text())
 
     assert cut_atoms == 421
-    assert manifest["counts"] == {"In": 153, "Cl": 110, "As": 106}
-    assert manifest["total_charge"] == 31
+    # Not neutral: once the ordinary add moves are exhausted, the retry on
+    # planes refit to the native scaffold adds 6 Cl (110 before, Q=+31).
+    assert manifest["counts"] == {"In": 153, "Cl": 116, "As": 106}
+    assert manifest["total_charge"] == 25
 
 
 if __name__ == "__main__":

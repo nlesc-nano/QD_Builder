@@ -325,3 +325,4 @@ class Config:
     post_treatment: PostTreatmentSpec = field(default_factory=PostTreatmentSpec)
     experimental: Dict[str, Any] = field(default_factory=dict)
     stack: StackSpec = field(default_factory=StackSpec)
+    facet_geometry: Dict[str, Any] = field(default_factory=dict)  # {enabled, role_tolerance}

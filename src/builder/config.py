@@ -282,6 +282,21 @@ def _parse_optional_bool(raw, *, field: str) -> bool | None:
     raise TypeError(f"{field} must be a boolean")
 
 
+def _parse_facet_geometry(raw) -> dict:
+    """facet_geometry: {enabled: true, role_tolerance: 1.0} (Å) for the manifest's geometry and site roles."""
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise TypeError("facet_geometry must be a mapping")
+    unknown = set(raw) - {"enabled", "role_tolerance"}
+    if unknown:
+        raise ValueError(f"facet_geometry: unknown keys {sorted(unknown)}")
+    enabled = _parse_optional_bool(raw.get("enabled"), field="facet_geometry.enabled")
+    tol = float(raw.get("role_tolerance", 1.0))
+    if tol <= 0:
+        raise ValueError("facet_geometry.role_tolerance must be positive")
+    return {"enabled": True if enabled is None else enabled, "role_tolerance": tol}
+
+
 def _parse_facet_reconstruction(raw) -> FacetReconstructionSpec:
     if raw is None:
         return FacetReconstructionSpec()
@@ -933,6 +948,7 @@ def parse_yaml_config(path: str) -> Config:
     experimental = cfg.get("experimental") or {}
     if not isinstance(experimental, dict):
         raise TypeError("experimental must be a mapping")
+    facet_geometry = _parse_facet_geometry(cfg.get("facet_geometry"))
     stack_raw = cfg.get("stack") or {}
     if not isinstance(stack_raw, dict):
         raise TypeError("stack must be a mapping")
@@ -1118,6 +1134,7 @@ def parse_yaml_config(path: str) -> Config:
             post_treatment=post_treatment,
             experimental=experimental,
             stack=stack_spec,
+            facet_geometry=facet_geometry,
         )
 
     # ---- SINGLE MODE (legacy) ----
@@ -1147,4 +1164,5 @@ def parse_yaml_config(path: str) -> Config:
         post_treatment=post_treatment,
         experimental=experimental,
         stack=stack_spec,
+        facet_geometry=facet_geometry,
     )

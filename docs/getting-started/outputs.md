@@ -23,6 +23,8 @@ name.
 | `actual_radius_ang`, `actual_size_unit_cells` | size of the particle actually obtained |
 | `size_metrics` | box-span estimate of the diameter |
 | `stack_size_metrics` | core/shell particles: size per layer |
+| `facet_geometry` | facet areas, edges and vertices of the Wulff polyhedron (below) |
+| `site_roles` | facet, edge or vertex of every atom, aligned with the XYZ (below) |
 
 Treatments that change the surface add their own ledgers, which record
 exactly what was done:
@@ -33,6 +35,65 @@ exactly what was done:
 | `alloying_ledger` | {ref}`post-alloying` |
 | `z_type_displacement_ledger` | {ref}`post-z-type` |
 | `ligand_exchange_charge_ledger` | {ref}`post-x-type` |
+
+(facet-geometry)=
+## Facet geometry and site roles
+
+Single-material Wulff builds (not spheres or stacks) report two polyhedra
+with the facet normals of the construction, both clipped with a half-space
+intersection, so a plane that only touches a corner has no face:
+
+- `construction`: the final Wulff planes (terminations resolved, symmetry
+  expanded, shifted off atom layers);
+- `atom_fitted`: every plane moved to the outermost core atom along its
+  normal, `d = max(n·r)` over the core atoms.
+
+Each facet has a family label: the Miller family (`100`, `110`), with `A`
+or `B` for a polar family whose `+n` and `-n` faces are not
+symmetry-equivalent. In zinc blende, `111A` is the cation-terminated and
+`111B` the anion-terminated {111}; the termination is read from the
+outermost layer of the cut.
+
+| Key in `facet_geometry.<polyhedron>` | Meaning |
+|---|---|
+| `areas_A2` | area per family label, Å² |
+| `total_area_A2` | sum of the areas, Å² |
+| `edges` | per facet-pair type (`100\|111A`, labels sorted): `n` edges and total `length_A`, Å |
+| `n_faces`, `n_edges`, `n_vertices` | counts of the clipped polyhedron |
+| `vertex_types` | vertices per type, the labels of the faces meeting there joined by `+` (`100+100+111A`) |
+| `volume_A3` | volume, Å³ |
+| `planes` | per oriented facet: `hkl`, `label`, `normal`, `d_A` (Å from the construction origin) and `area_A2` (0 when clipped away) |
+
+`facet_geometry.origin_A` is the construction origin in the XYZ frame
+(zero unless `--center` moved it). A polyhedron that cannot be formed (a
+flat or empty core) has an `error` entry instead.
+
+`site_roles` holds lists aligned with the atoms of the XYZ file:
+
+| Key | Meaning |
+|---|---|
+| `roles` | `facet:<label>`, `edge:<label>\|<label>`, `vertex:<labels>` or `interior` |
+| `is_core` | `true` for the inorganic core |
+| `host` | for a ligand atom, the index of the core atom it binds to; `-1` for core atoms |
+| `counts` | atoms per role and element, `core` and `ligand` |
+| `tolerance_A` | distance tolerance used |
+
+A core atom within `tolerance_A` of exactly one clipped face of the
+atom-fitted polyhedron lies on that facet, of two adjacent faces on their
+edge, and of three or more (or of two that meet only at a corner) at the
+nearest vertex. Core atoms are the non-ligand atoms of the passivated cut;
+complexes added by later post-treatments (Z-type MXn) are not. Ligand
+atoms are grouped into molecules by covalent radii and take the role of
+their host: the nearest core cation to the molecule's binding atom, or the
+nearest core anion when that atom is a cation (Z-type metal).
+
+The tolerance is set in the recipe:
+
+```yaml
+facet_geometry:
+  enabled: true          # default
+  role_tolerance: 1.0    # Å; zinc-blende Se lies 0.88 Å under a {111}A Cd layer
+```
 
 ## Several centres, several files
 

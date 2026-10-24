@@ -102,7 +102,15 @@ def _metrics_for_indices(pts, indices):
     return get_cluster_size_metrics(np.asarray(pts, float)[indices])
 
 
-def _ordered_xyz_view(symbols, pts, charges, ligand_symbol: str, *, layer_planes=None, pts_for_layers=None):
+def _ordered_xyz_view(symbols, pts, charges, ligand_symbol: str, *, layer_planes=None, pts_for_layers=None,
+                      return_order: bool = False):
+    out = _ordered_xyz_view_and_order(
+        symbols, pts, charges, ligand_symbol, layer_planes=layer_planes, pts_for_layers=pts_for_layers)
+    return out if return_order else out[:2]
+
+
+def _ordered_xyz_view_and_order(symbols, pts, charges, ligand_symbol: str, *, layer_planes=None,
+                                pts_for_layers=None):
     pts = np.asarray(pts, float)
     pts_ref = np.asarray(pts_for_layers, float) if pts_for_layers is not None else pts
     if layer_planes is None:
@@ -115,7 +123,7 @@ def _ordered_xyz_view(symbols, pts, charges, ligand_symbol: str, *, layer_planes
                 i,
             ),
         )
-        return [symbols[i] for i in order], pts[order]
+        return [symbols[i] for i in order], pts[order], order
 
     region_masks = region_masks_from_layer_planes(pts_ref, layer_planes)
 
@@ -139,7 +147,7 @@ def _ordered_xyz_view(symbols, pts, charges, ligand_symbol: str, *, layer_planes
             i,
         ),
     )
-    return [symbols[i] for i in order], pts[order]
+    return [symbols[i] for i in order], pts[order], order
 
 
 def _stack_size_metrics(symbols, pts, charges, ligand_symbol: str, materials_cfg, layer_planes):
@@ -765,6 +773,7 @@ def _run_passivation_and_write_outputs(
     output_materials=None,
     region_masks=None,
     stack_passivation: bool = False,
+    facet_geometry_input: dict | None = None,
 ):
     prefix = os.path.splitext(args.out)[0]
 
@@ -845,6 +854,10 @@ def _run_passivation_and_write_outputs(
             pair_cuts_override=pair_cuts_override,
             verbose=args.verbose,
         )
+
+    # The inorganic core as passivated: later post-treatments add complexes
+    # (Z-type MXn, molecular ligands) whose metal must not count as core.
+    core_ref_pts = np.asarray(pts, float)[[s != anion_lig for s in syms]]
 
     ligand_exchange_charge_ledger = []
     z_type_displacement_ledger = []
@@ -982,13 +995,14 @@ def _run_passivation_and_write_outputs(
     if args.verbose:
         print(f"\n[11] Writing final XYZ to {args.out}")
     final_pts = center_coords(pts) if args.center else pts
-    out_syms, out_pts = _ordered_xyz_view(
+    out_syms, out_pts, out_order = _ordered_xyz_view(
         syms,
         final_pts,
         cfg.charges,
         anion_lig,
         layer_planes=output_layer_planes,
         pts_for_layers=pts,
+        return_order=True,
     )
     write_xyz(args.out, out_syms, out_pts)
     construction_radius = (
@@ -1075,9 +1089,74 @@ def _run_passivation_and_write_outputs(
         extra["alloying_ledger"] = alloying_ledger
     if surface_reconstruction_ledger:
         extra["surface_reconstruction_ledger"] = surface_reconstruction_ledger
+    if facet_geometry_input is not None:
+        extra.update(_facet_geometry_entries(
+            syms, pts, out_order, core_ref_pts, facet_geometry_input,
+            charges=cfg.charges, ligand=anion_lig,
+            origin=(-np.mean(np.asarray(pts, float), axis=0) if args.center and len(pts) else np.zeros(3)),
+            verbose=args.verbose,
+        ))
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     return syms, pts, ligand_exchange_charge_ledger
+
+
+def _facet_geometry_input(struct, cfg: Config, wulff_facets, planes_geo, cut_syms, cut_pts, *, verbose: bool):
+    """Construction planes with their family labels, or None when the geometry is off or cannot be labelled."""
+    if not (cfg.facet_geometry or {}).get("enabled", True):
+        return None
+    try:
+        from .polyhedron import facet_labels
+        labels = facet_labels(struct, wulff_facets, cfg.charges, cut_syms, cut_pts)
+    except Exception as exc:  # never fail a build over its report
+        if verbose:
+            print(f"    - Facet geometry skipped: {type(exc).__name__}: {exc}")
+        return None
+    return {
+        "planes": [(np.asarray(n, float), float(d)) for n, d in planes_geo],
+        "labels": labels,
+        "hkls": [(int(f.h), int(f.k), int(f.l)) for f in wulff_facets],
+        "role_tolerance": float((cfg.facet_geometry or {}).get("role_tolerance", 1.0)),
+    }
+
+
+def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, ligand, origin, verbose):
+    """
+    Manifest entries `facet_geometry` and `site_roles` (aligned with the
+    written XYZ, i.e. permuted by `order`). Core atoms are the non-ligand
+    atoms still at a position of the passivated inorganic core.
+    """
+    from scipy.spatial import cKDTree
+    from .polyhedron import facet_geometry
+    P = np.asarray(pts, float)
+    core = np.zeros(len(syms), dtype=bool)
+    if len(core_ref_pts) and len(P):
+        dist, _j = cKDTree(np.asarray(core_ref_pts, float)).query(P)
+        core = (dist < 1e-3) & np.array([s != ligand for s in syms], dtype=bool)
+    try:
+        geo, roles = facet_geometry(
+            geo_in["planes"], geo_in["labels"], geo_in["hkls"], syms, P, core, charges,
+            role_tol=geo_in["role_tolerance"],
+        )
+    except Exception as exc:  # never fail a build over its report
+        if verbose:
+            print(f"[geometry] facet geometry failed: {type(exc).__name__}: {exc}")
+        return {"facet_geometry": {"error": f"{type(exc).__name__}: {exc}"}}
+    geo["origin_A"] = [round(float(x), 6) for x in origin]
+    out = {"facet_geometry": geo}
+    if roles is not None:
+        order = list(order)
+        new_index = {old: new for new, old in enumerate(order)}
+        roles["roles"] = [roles["roles"][i] for i in order]
+        roles["is_core"] = [roles["is_core"][i] for i in order]
+        roles["host"] = [new_index[roles["host"][i]] if roles["host"][i] >= 0 else -1 for i in order]
+        out["site_roles"] = roles
+    if verbose:
+        fit = geo.get("atom_fitted", {})
+        if "areas_A2" in fit:
+            areas = ", ".join(f"{k}={v:.1f}" for k, v in fit["areas_A2"].items())
+            print(f"[geometry] atom-fitted facets (Å^2): {areas}; {fit['n_edges']} edges, {fit['n_vertices']} vertices")
+    return out
 
 
 def _fps_subsample(coords: np.ndarray, num_to_pick: int) -> np.ndarray:
@@ -2102,6 +2181,12 @@ def main(argv: List[str] | None = None) -> int:
                 verbose=args.verbose,
             )
 
+        geometry_input = None
+        if cfg.shape_mode != "sphere":
+            geometry_input = _facet_geometry_input(
+                struct, cfg, wulff_facets, _planes_geo, syms, pts, verbose=args.verbose,
+            )
+
         syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
             syms,
             pts,
@@ -2113,6 +2198,7 @@ def main(argv: List[str] | None = None) -> int:
             struct=struct,
             facet_seeds=wulff_facets,
             material_label=material_label,
+            facet_geometry_input=geometry_input,
         )
 
         if multiple_variants and variant_label == variants[0][0]:

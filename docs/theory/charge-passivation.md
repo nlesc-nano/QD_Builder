@@ -135,6 +135,20 @@ count and ligand count recurs more than five times. The usual cause of
 such a cycle is a ligand that is added and then pruned as an orphan, which
 points to an inconsistent set of bond cut-offs.
 
+When the ordinary add and remove moves are exhausted at $Q > 0$, the add
+step is retried once more on the facet planes refit to the outermost native
+atoms, ignoring the ligand. The prepass can turn an outer anion layer into
+ligand; the planes then pass through those ligand atoms, and the
+under-coordinated cations beneath them, a full layer down, are missed by
+the outer-shell gate. Pure {100} zinc-blende II–VI cubes are the typical
+case: every cube edge keeps a row of three-coordinated cations, each
+carrying $+\tfrac12$ by electron counting, and half of them take an on-top
+ligand. Builds that reach neutrality without this step are unchanged.
+
+A surface prepass that consumes the whole cut (a few atoms at sub-cell
+sizes) raises a `ValueError` that names the cut size, instead of failing
+later.
+
 An optional last resort is enabled with
 `experimental: {exhausted_positive_q_fallback: true}`. When a small positive
 charge remains, it tries removing a three- or four-coordinated surface

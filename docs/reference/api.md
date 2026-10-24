@@ -12,6 +12,9 @@ points are listed below.
 
 .. automodule:: builder.geometry
    :members: build_nanocrystal, build_spherical_nanocrystal, apply_core_lattice_fit
+
+.. automodule:: builder.polyhedron
+   :members: facet_labels, clip, fitted_planes, summary, core_roles, site_roles, facet_geometry
 ```
 
 ## Bonding and analysis

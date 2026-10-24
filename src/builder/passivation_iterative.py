@@ -800,6 +800,78 @@ def _priority3_balance_positive_q_remove(
 
 
 # ---------- PRIORITY 3C: Q>0 — add anion ligands (outer-only; UNIQUE>EDGE>VERTEX) ----------
+def _scaffold_planes(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    ligand: str,
+) -> Optional[List[Plane]]:
+    """
+    The facet planes refit through the outermost native atoms, ignoring the
+    passivating ligand. None when no ligand sits outside the native scaffold
+    (the planes would not move).
+
+    After the prepass has swapped an outer anion layer to ligand, the planes
+    pass through those ligand atoms and the cations under them lie a full
+    layer below the surface, out of reach of the outer-shell gates.
+    """
+    mask = np.array([s != ligand for s in symbols], dtype=bool)
+    if not mask.any() or mask.all():
+        return None
+    scaffold = np.asarray(pts, float)[mask]
+    refit = [(n, float(np.max(scaffold @ n) + 1e-5)) for n, _d in planes]
+    if all(abs(d_new - float(d_old)) < 1e-3 for (_n, d_new), (_m, d_old) in zip(refit, planes)):
+        return None
+    return refit
+
+
+def _scaffold_positive_q_add_once(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    charges: Dict[str, int],
+    ligand: str,
+    surf_tol: float,
+    uv_taken: Dict[int, List[Tuple[float, float]]],
+    edit_count_facet: Dict[int, int],
+    add_count_facet: Dict[int, int],
+    host_taken: Dict[int, int],
+    pair_cuts: Optional[PairCuts],
+    *,
+    verbose: bool,
+    include_sublayer: bool,
+    stack_passivation: bool,
+    atom_regions: Optional[List[int]],
+    region_masks: Optional[List[NDArray[np.bool_]]],
+    cif_path: Optional[str],
+    positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
+) -> Tuple[bool, List[str], NDArray[np.float64]]:
+    """
+    Q>0 with every remove/add candidate exhausted: retry the ligand addition
+    with the planes refit to the native scaffold, so the under-coordinated
+    cations under a ligand layer (zinc-blende {100} cube edges after the
+    prepass turned the outer anions into ligand) count as outer sites.
+    Only reached where the build would otherwise halt charged.
+    """
+    refit = _scaffold_planes(symbols, pts, planes, ligand)
+    if refit is None:
+        return False, symbols, pts
+    if verbose:
+        print("[strategy] Q>0 exhausted → retry ligand addition on planes refit to the native scaffold")
+    return _priority3_balance_positive_q_add(
+        symbols, pts, _build_facet_frames(refit), refit, _facet_memberships(pts, refit, surf_tol),
+        coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts), charges, ligand, surf_tol,
+        uv_taken, edit_count_facet, add_count_facet, host_taken, {}, pair_cuts,
+        positive_q_strategy_selector=positive_q_strategy_selector,
+        verbose=verbose,
+        include_sublayer=include_sublayer,
+        stack_passivation=stack_passivation,
+        atom_regions=atom_regions,
+        region_masks=region_masks,
+        cif_path=cif_path,
+    )
+
+
 def _priority3_balance_positive_q_add(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -1508,7 +1580,11 @@ def _optimize_ligand_distribution_at_neutrality(
                     offset = 2.5
 
                 inc = _incident_facets(i, pts, frames, surf_tol)
-                
+                if not inc:
+                    # Deeper than surf_tol under every facet: not a surface
+                    # host, and no outward direction to place a ligand along.
+                    continue
+
                 n_unit = []
                 for (n_f, d_f) in planes:
                     ln_f = np.linalg.norm(n_f) + 1e-12
@@ -1709,6 +1785,7 @@ def charge_balance_iterative(
         atom_regions = atom_regions_from_masks(len(symbols), region_masks)
 
     # Prepass cleanup (prints its own actions)
+    n_cut = len(symbols)
     symbols, pts, uv_taken, edit_count_facet = prepass_surface_cleanup(
         symbols, pts, planes, charges, ligand, surf_tol, pair_cuts=pair_cuts, verbose=verbose,
         stack_passivation=stack_passivation,
@@ -1723,6 +1800,11 @@ def charge_balance_iterative(
     symbols, pts, _ = _prune_orphan_ligands(
         symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
     )
+    if not any(s != ligand for s in symbols):
+        raise ValueError(
+            f"surface prepass removed every native atom of the {n_cut}-atom cut "
+            "(too small for these facets; no core left to passivate)"
+        )
     # Update planes to reflect the new shrunk boundary of the nanocrystal after prepass
     # In rebalancing mode (prepass_mode == "none"), exclude passivating ligand atoms
     # from determining the boundary because they lie outside the scaffold.
@@ -1921,6 +2003,19 @@ def charge_balance_iterative(
                 )
                 if progressed:
                     continue
+            progressed, symbols, pts = _scaffold_positive_q_add_once(
+                symbols, pts, planes, charges, ligand, surf_tol,
+                uv_taken, edit_count_facet, add_count_facet, host_taken, pair_cuts,
+                verbose=verbose,
+                include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
+                positive_q_strategy_selector=positive_q_strategy_selector,
+            )
+            if progressed:
+                continue
             if verbose:
                 print("[halt] Q>0 and no region-allowed remove/add candidates remain.")
             return _finish(symbols, pts)
@@ -1995,6 +2090,18 @@ def charge_balance_iterative(
                 )
                 if progressed:
                     continue
+            progressed, symbols, pts = _scaffold_positive_q_add_once(
+                symbols, pts, planes, charges, ligand, surf_tol,
+                uv_taken, edit_count_facet, add_count_facet, host_taken, pair_cuts,
+                verbose=verbose,
+                include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
+            )
+            if progressed:
+                continue
             if verbose:
                 print("[halt] Q>0 but no removable cations/additions available. Consider revising facet energies.")
             return _finish(symbols, pts)
@@ -2026,6 +2133,18 @@ def charge_balance_iterative(
                 )
                 if progressed:
                     continue
+            progressed, symbols, pts = _scaffold_positive_q_add_once(
+                symbols, pts, planes, charges, ligand, surf_tol,
+                uv_taken, edit_count_facet, add_count_facet, host_taken, pair_cuts,
+                verbose=verbose,
+                include_sublayer=include_sublayer,
+                stack_passivation=stack_passivation,
+                atom_regions=atom_regions,
+                region_masks=region_masks if stack_passivation else None,
+                cif_path=cif_path,
+            )
+            if progressed:
+                continue
             if verbose:
                 print("[halt] Q>0 and cannot add more ligands — likely surface fully saturated.")
             return _finish(symbols, pts)

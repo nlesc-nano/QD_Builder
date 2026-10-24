@@ -10,7 +10,7 @@ checked (neutral, no atom clashes, minimum core size) and written as
 
     <out>/<material>/<id>/start.xyz
     <out>/<material>/<id>/recipe.yaml
-    <out>/<material>/<id>/record.json
+    <out>/<material>/<id>/record.json      (incl. facet_geometry and site_roles)
     <out>/<material>/review.csv  and  review.md   (every build, incl. rejects)
 
 Optional `isotropic_cells: true` makes a size of N span N * min(a, b, c)
@@ -143,12 +143,18 @@ def _build(cif: str, recipe: dict, positive_q_mode: str, workdir: Path) -> Optio
     symbols, pts = read_xyz_first_frame(str(out))
     pts = np.asarray(pts, float).reshape(-1, 3)
     centre_index = None
+    shift = np.zeros(3)
     if len(pts):
         d_origin = np.linalg.norm(pts, axis=1)
         centre_index = int(np.argmin(d_origin)) if d_origin.min() <= 0.1 else None
+        shift = pts.mean(axis=0)
         pts = center_coords(pts)
     manifest_path = workdir / "out.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    geo = manifest.get("facet_geometry")
+    if isinstance(geo, dict) and "origin_A" in geo:
+        # The construction origin, moved with the coordinates to the centre of mass.
+        geo["origin_A"] = [round(float(x), 6) for x in np.asarray(geo["origin_A"], float) - shift]
     return {"symbols": symbols, "pts": pts, "centre_index": centre_index, "manifest": manifest,
             "log": log.getvalue()}
 
@@ -262,6 +268,10 @@ def generate(config_path: str, out_dir: Optional[str] = None) -> Path:
         extra = {"parent": parent} if parent else {}
         if surface == "reconstructed":
             extra["reconstruction_pattern"] = recon_pattern
+        # Facet areas, edges, vertices and per-atom site roles (aligned with start.xyz).
+        for key in ("facet_geometry", "site_roles"):
+            if key in res["manifest"]:
+                extra[key] = res["manifest"][key]
         rec = make_record(
             material=material, family=family, phase=phase, surface=surface, source="builder",
             description=desc,
