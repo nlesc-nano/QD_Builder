@@ -195,8 +195,15 @@ def select_ligand_sites(
     def left(h: int) -> int:
         return hosts_all[h] - use[h]
 
+    # sum(max(0, left(h))) over mu1 hosts, kept up to date as hosts are used
+    free_total = sum(max(0, left(h)) for h in mu1_hosts)
+
     def free_capacity(extra: Tuple[int, ...] = ()) -> int:
-        return sum(max(0, left(h) - (1 if h in extra else 0)) for h in mu1_hosts)
+        return free_total - sum(1 for h in set(extra) if h in mu1_hosts and left(h) >= 1)
+
+    # distance from each candidate to the nearest pick so far
+    for c in cands:
+        c["d_new"] = np.inf
 
     picks: List[dict] = []
     new_pts: List[NDArray[np.float64]] = []
@@ -208,8 +215,12 @@ def select_ligand_sites(
                 continue
             if c["mu"] >= 2 and free_capacity(c["hosts"]) < remaining_after:
                 continue
-            if new_pts and float(np.min(np.linalg.norm(np.asarray(new_pts) - c["pos"], axis=1))) < spacing:
-                continue
+            if new_pts:
+                d_new = c["d_new"]
+                if abs(d_new - spacing) < 1e-6:
+                    d_new = float(np.min(np.linalg.norm(np.asarray(new_pts) - c["pos"], axis=1)))
+                if d_new < spacing:
+                    continue
             elig.append(c)
         if not elig:
             break
@@ -243,5 +254,13 @@ def select_ligand_sites(
         added_on[best["facet"]].append(best["pos"])
         counts[best["facet"]] += 1
         for h in best["hosts"]:
+            before = max(0, left(h)) if h in mu1_hosts else 0
             use[h] += 1
+            if h in mu1_hosts:
+                free_total += max(0, left(h)) - before
+        if cands:
+            d = np.linalg.norm(np.asarray([c["pos"] for c in cands]) - best["pos"], axis=1)
+            for c, dc in zip(cands, d.tolist()):
+                if dc < c["d_new"]:
+                    c["d_new"] = dc
     return picks

@@ -918,6 +918,9 @@ def compute_cif_virtual_sites(
     if best_f_shift is None:
         best_f_shift = np.zeros(3)
 
+    # The bulk neighbour shell depends only on the CIF site, not on the atom.
+    shell_by_site: Dict[int, list] = {}
+
     # Map each surface atom to its bulk CIF neighbor mapping
     for idx in np.where(surf_mask)[0]:
         sym_i = syms[int(idx)]
@@ -934,7 +937,9 @@ def compute_cif_virtual_sites(
         bulk_site = bulk_struct.sites[site_idx]
 
         # 2. Get first-shell opposite-charge bulk neighbors
-        all_neigh = bulk_struct.get_neighbors(bulk_site, r=4.5)
+        if site_idx not in shell_by_site:
+            shell_by_site[site_idx] = bulk_struct.get_neighbors(bulk_site, r=4.5)
+        all_neigh = shell_by_site[site_idx]
         if not all_neigh:
             continue
         min_dist = min(neigh.nn_distance for neigh in all_neigh)
@@ -1010,13 +1015,15 @@ def compute_cif_virtual_sites(
         return []
 
     # 6. Graph-based proximity clustering (threshold 0.2 Å for exact unit cell alignment)
+    # The KD-tree only proposes pairs; the scalar test below decides, and
+    # sorted pairs keep each adjacency list in ascending order as before.
     adj = {i: [] for i in range(n_raw)}
-    for i1 in range(n_raw):
-        for i2 in range(i1 + 1, n_raw):
-            d = float(np.linalg.norm(raw_virtual_sites[i1]["pos"] - raw_virtual_sites[i2]["pos"]))
-            if d < 0.2:
-                adj[i1].append(i2)
-                adj[i2].append(i1)
+    raw_pos = np.asarray([s["pos"] for s in raw_virtual_sites], float)
+    for i1, i2 in sorted(cKDTree(raw_pos).query_pairs(0.2 + 1e-6)):
+        d = float(np.linalg.norm(raw_virtual_sites[i1]["pos"] - raw_virtual_sites[i2]["pos"]))
+        if d < 0.2:
+            adj[i1].append(i2)
+            adj[i2].append(i1)
 
     visited = [False] * n_raw
     components = []
