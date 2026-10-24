@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import os
+from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple, Optional
 import numpy as np
 from numpy.typing import NDArray
@@ -24,6 +25,7 @@ from .passivation import (
     _build_facet_frames,
     _plane_uv,
     _incident_facets,
+    _incident_facets_all,
     _record_uv_allfacets,
     _facet_memberships,
     _collect_cation_sites,
@@ -40,7 +42,31 @@ ROLE_ORDER_VEU = ["unique", "edge", "vertex"]
 UVCache = Dict[Tuple[int, int], Tuple[float, float]]  # (facet_id, atom_idx) -> (u,v)
 
 
+_BULK_CN_CACHE: Dict[tuple, Dict[str, int]] = {}
+
+
 def derive_true_bulk_cn_from_cif(
+    cif_path: str,
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts] = None,
+) -> Dict[str, int]:
+    # Called on every charge-balance pass; the CIF parse dominates, so memoise
+    # per (file version, charges, cuts).
+    try:
+        st = os.stat(cif_path)
+        key = (
+            os.path.abspath(cif_path), st.st_mtime_ns, st.st_size,
+            tuple(sorted(charges.items())),
+            tuple(sorted(pair_cuts.rc.items())) if pair_cuts is not None else None,
+        )
+    except (OSError, TypeError):
+        return _derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts)
+    if key not in _BULK_CN_CACHE:
+        _BULK_CN_CACHE[key] = _derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts)
+    return dict(_BULK_CN_CACHE[key])
+
+
+def _derive_true_bulk_cn_from_cif(
     cif_path: str,
     charges: Dict[str, int],
     pair_cuts: Optional[PairCuts] = None,
@@ -68,7 +94,7 @@ def derive_true_bulk_cn_from_cif(
 
 
 def _total_Q(symbols: List[str], charges: Dict[str, int]) -> int:
-    return int(sum(int(charges.get(s, 0)) for s in symbols))
+    return int(sum(int(charges.get(s, 0)) * n for s, n in Counter(symbols).items()))
 
 
 def _surface_low_cn_cations_remain(
@@ -93,10 +119,11 @@ def _surface_low_cn_cations_remain(
             edges_by_facet, verts_by_facet = _intersections_geometry(frames)
         except Exception:
             edges_by_facet = verts_by_facet = None
+    inc_all = _incident_facets_all(pts, frames, surf_tol)
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
-        inc = _incident_facets(i, pts, frames, surf_tol)
+        inc = inc_all[i]
         if not inc:
             continue
 
@@ -175,7 +202,13 @@ def _get_vacant_directions_for_site(
             for site in ref_struct.sites
         ]))
         bulk_site = ref_struct.sites[site_idx]
-        all_neigh = ref_struct.get_neighbors(bulk_site, r=4.5)
+        # The bulk shell depends only on the CIF site; memoise it on the
+        # structure, keyed by its geometry so an edited structure misses.
+        shells = ref_struct.__dict__.setdefault("_qdb_bulk_shells", {})
+        shell_key = (site_idx, ref_struct.lattice.matrix.tobytes(), ref_struct.frac_coords.tobytes())
+        if shell_key not in shells:
+            shells[shell_key] = ref_struct.get_neighbors(bulk_site, r=4.5)
+        all_neigh = shells[shell_key]
         if not all_neigh:
             return []
         min_dist = min(neigh.nn_distance for neigh in all_neigh)
@@ -318,8 +351,8 @@ def _ligand_protected_cation_mask(
 
     max_rc = max(_pair_cut_calibrated(symbols[i], ligand, pair_cuts) for i in cat_idx)
     lig_tree = cKDTree(pts[lig_idx])
-    for i in cat_idx:
-        hits = lig_tree.query_ball_point(pts[i], r=max_rc + 1e-6)
+    hits_all = lig_tree.query_ball_point(pts[cat_idx], r=max_rc + 1e-6)
+    for i, hits in zip(cat_idx, hits_all):
         if not hits:
             continue
         rc = _pair_cut_calibrated(symbols[i], ligand, pair_cuts)
@@ -468,11 +501,12 @@ def _priority2_remove_low_cn_cation_once(
             edges_by_facet, verts_by_facet = _intersections_geometry(frames)
         except Exception:
             edges_by_facet = verts_by_facet = None
+    inc_all = _incident_facets_all(pts, frames, surf_tol)
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
 
-        inc = _incident_facets(i, pts, frames, surf_tol)
+        inc = inc_all[i]
         if not inc:
             continue
 
@@ -545,10 +579,11 @@ def _priority2_remove_low_cn_cation_once(
                 # changes the element, so only higher-charge anions convert.
                 native_anions = {el for el, v in charges.items()
                                  if v < 0 and el != ligand and v != charges.get(ligand, 0)}
+                inc_now = _incident_facets_all(pts, frames, surf_tol)
                 for j, sj in enumerate(list(symbols)):
                     if charges.get(sj, 0) >= 0 or sj == ligand or sj not in native_anions:
                         continue
-                    if len(_incident_facets(j, pts, frames, surf_tol)) == 0:
+                    if not inc_now[j]:
                         continue
                     if int(cn2[j]) < 3:
                         old = symbols[j]
@@ -583,6 +618,7 @@ def _priority2_remove_low_cn_cation_once(
     # changes the element, so only higher-charge anions convert.
     native_anions = {el for el, v in charges.items()
                      if v < 0 and el != ligand and v != charges.get(ligand, 0)}
+    inc_now = _incident_facets_all(pts, frames, surf_tol)
     for j, sj in enumerate(list(symbols)):
         if charges.get(sj, 0) >= 0:
             continue
@@ -590,7 +626,7 @@ def _priority2_remove_low_cn_cation_once(
             continue
         if sj not in native_anions:
             continue
-        if len(_incident_facets(j, pts, frames, surf_tol)) == 0:
+        if not inc_now[j]:
             continue
         if int(cn2[j]) < 3:
             old = symbols[j]
@@ -717,6 +753,7 @@ def _priority3_balance_positive_q_remove(
 
     cands_by_cn: Dict[int, List[Tuple[int, float, float, int, int, int]]] = {}
     protected = _ligand_protected_cation_mask(symbols, pts, charges, ligand, pair_cuts)
+    inc_all = _incident_facets_all(pts, frames, surf_tol)
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
@@ -725,7 +762,7 @@ def _priority3_balance_positive_q_remove(
                 continue
         if protected[i]:
             continue
-        inc = _incident_facets(i, pts, frames, surf_tol)
+        inc = inc_all[i]
         if not inc:
             continue
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
@@ -778,6 +815,7 @@ def _priority3_balance_positive_q_remove(
         # changes the element, so only higher-charge anions convert.
         native_anions = {el for el, v in charges.items()
                          if v < 0 and el != ligand and v != charges.get(ligand, 0)}
+        inc_now = _incident_facets_all(pts, frames, surf_tol)
         for j, sj in enumerate(list(symbols)):
             if charges.get(sj, 0) >= 0:
                 continue
@@ -785,7 +823,7 @@ def _priority3_balance_positive_q_remove(
                 continue
             if sj not in native_anions:
                 continue
-            if len(_incident_facets(j, pts, frames, surf_tol)) == 0:
+            if not inc_now[j]:
                 continue
             if int(cn2[j]) < 3:
                 old = symbols[j]
@@ -1317,10 +1355,11 @@ def _experimental_exhausted_positive_q_fallback_once(
         edges_by_facet, verts_by_facet = _intersections_geometry(frames)
     except Exception:
         edges_by_facet = verts_by_facet = None
+    inc_all = _incident_facets_all(pts, frames, surf_tol)
     for i, s in enumerate(symbols):
         if charges.get(s, 0) <= 0:
             continue
-        inc = _incident_facets(i, pts, frames, surf_tol)
+        inc = inc_all[i]
         if not inc:
             continue
         ci = int(cn_bi[i])

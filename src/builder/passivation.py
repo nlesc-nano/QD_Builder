@@ -1,5 +1,7 @@
 # nanocrystal_builder/passivation.py
 from __future__ import annotations
+import itertools
+from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import numpy.linalg as LA
@@ -43,6 +45,26 @@ def _incident_facets(idx: int, pts: NDArray[np.float64], frames: List[tuple], su
             out.append(fid)
     return out
 
+# Vectorised screens are widened by this much and every hit is re-checked with
+# the scalar expression, so results match the per-atom code bit for bit.
+_SCREEN_EPS = 1e-6
+
+def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol: float) -> List[List[int]]:
+    """_incident_facets(i, ...) for every atom i, in one pass."""
+    n_atoms = len(pts)
+    out: List[List[int]] = [[] for _ in range(n_atoms)]
+    if n_atoms == 0 or not frames:
+        return out
+    normals = np.array([f[0] for f in frames], float)
+    offsets = np.array([f[1] for f in frames], float)
+    depth = offsets[None, :] - np.asarray(pts, float) @ normals.T
+    rows, cols = np.nonzero(depth < surf_tol + _SCREEN_EPS)
+    for i, fid in zip(rows.tolist(), cols.tolist()):
+        n, d = frames[fid][0], frames[fid][1]
+        if d - float(np.dot(pts[i], n)) < surf_tol:
+            out[i].append(fid)
+    return out
+
 def _record_uv_allfacets(idx: int,
                          pts: NDArray[np.float64],
                          frames: List[tuple],
@@ -65,54 +87,125 @@ def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: 
 
 # ---------- Geometry-driven role classification ----------
 
+class _FacetGeometry:
+    """
+    Edge lines and vertex points of every facet for one set of unit planes,
+    with a memo of atom roles.  Built once per plane set by
+    _intersections_geometry (the planes do not change during a charge-balance
+    run, only the atoms do).
+
+      edges[fid]  -> (P0 (E,3), U (E,3)): lines p0 + t*u, u unit
+      verts[fid]  -> row indices into vert_xyz (K,3) of the vertex points
+    Lines and points are the pairwise and triple plane intersections, in the
+    same order the original per-pair loops produced them.
+    """
+
+    def __init__(self, frames: List[tuple]):
+        planes = _unit_planes_from_frames(frames)
+        N = len(planes)
+        edge_lists: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {k: [] for k in range(N)}
+
+        def _line_ij(i: int, j: int):
+            ni, di = planes[i]; nj, dj = planes[j]
+            u = np.cross(ni, nj)
+            lu = LA.norm(u)
+            if lu < 1e-9:
+                return None
+            u /= lu
+            A = np.vstack([ni, nj])       # 2x3
+            b = np.array([di, dj], float) # 2
+            p0 = A.T @ LA.pinv(A @ A.T) @ b
+            return p0, u
+
+        for i in range(N):
+            for j in range(i+1, N):
+                out = _line_ij(i, j)
+                if out is None:
+                    continue
+                edge_lists[i].append(out)
+                edge_lists[j].append(out)
+        self.edges = {
+            k: (np.array([p0 for p0, _u in lst], float).reshape(-1, 3),
+                np.array([u for _p0, u in lst], float).reshape(-1, 3))
+            for k, lst in edge_lists.items()
+        }
+
+        # vertices (triple intersections), batched; det/solve run the same
+        # LAPACK kernels per 3x3 system as the scalar calls did
+        self.vert_xyz = np.zeros((0, 3))
+        self.verts = {k: np.zeros(0, dtype=np.int32) for k in range(N)}
+        if N >= 3:
+            normals = np.array([n for n, _d in planes], float)
+            offsets = np.array([d for _n, d in planes], float)
+            triples = np.array(list(itertools.combinations(range(N), 3)), dtype=np.intp)
+            M = normals[triples]
+            ok = np.abs(LA.det(M)) >= 1e-9
+            triples = triples[ok]
+            self.vert_xyz = LA.solve(M[ok], offsets[triples][..., None])[..., 0]
+            for k in range(N):
+                self.verts[k] = np.flatnonzero((triples == k).any(axis=1)).astype(np.int32)
+
+        self._roles: Dict[tuple, Tuple[str, int]] = {}
+
+    def role(self, x: NDArray[np.float64], fid: int, edge_tol: float, vertex_tol: float) -> Tuple[str, int]:
+        key = (x.tobytes(), fid, edge_tol, vertex_tol)
+        hit = self._roles.get(key)
+        if hit is None:
+            hit = self._roles[key] = self._classify(x, fid, edge_tol, vertex_tol)
+        return hit
+
+    def _classify(self, x: NDArray[np.float64], fid: int, edge_tol: float, vertex_tol: float) -> Tuple[str, int]:
+        idx = self.verts.get(fid)
+        if idx is not None and len(idx):
+            V = self.vert_xyz[idx]
+            dv = float(np.sqrt(np.min(np.sum((x - V) ** 2, axis=1))))
+            if abs(dv - vertex_tol) < _SCREEN_EPS:
+                dv = min(float(LA.norm(x - v)) for v in V)
+            if dv < vertex_tol:
+                return "vertex", 2
+        E = self.edges.get(fid)
+        if E is not None and len(E[0]):
+            P0, U = E
+            W = x - P0
+            W = W - np.einsum("ij,ij->i", W, U)[:, None] * U
+            de = float(np.sqrt(np.min(np.sum(W ** 2, axis=1))))
+            if abs(de - edge_tol) < _SCREEN_EPS:
+                de = min(_point_line_distance(x, p0, u) for p0, u in zip(P0, U))
+            if de < edge_tol:
+                return "edge", 1
+        return "unique", 0
+
+
+class _GeometryView(dict):
+    """Per-facet mapping returned by _intersections_geometry; `.geom` is the owner."""
+    geom: _FacetGeometry
+
+
+_GEOMETRY_CACHE: "OrderedDict[bytes, _FacetGeometry]" = OrderedDict()
+_GEOMETRY_CACHE_SIZE = 2
+
+
 def _intersections_geometry(frames: List[tuple]):
     """
     From unit planes (frames), build:
-      - edges_by_facet[fid] -> list of lines (p0, u) on facet fid (u unit)
-      - verts_by_facet[fid] -> list of vertex points on facet fid
+      - edges_by_facet[fid] -> (P0, U) arrays of lines p0 + t*u on facet fid (u unit)
+      - verts_by_facet[fid] -> indices of facet fid's vertex points in
+        verts_by_facet.geom.vert_xyz
+    Cached per plane set.
     """
-    planes = _unit_planes_from_frames(frames)
-    N = len(planes)
-    edges_by_facet: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {k: [] for k in range(N)}
-    verts_by_facet: Dict[int, List[np.ndarray]] = {k: [] for k in range(N)}
-
-    def _line_ij(i: int, j: int):
-        ni, di = planes[i]; nj, dj = planes[j]
-        u = np.cross(ni, nj)
-        lu = LA.norm(u)
-        if lu < 1e-9:
-            return None
-        u /= lu
-        A = np.vstack([ni, nj])       # 2x3
-        b = np.array([di, dj], float) # 2
-        p0 = A.T @ LA.pinv(A @ A.T) @ b
-        return p0, u
-
-    for i in range(N):
-        for j in range(i+1, N):
-            out = _line_ij(i, j)
-            if out is None: 
-                continue
-            p0, u = out
-            edges_by_facet[i].append((p0, u))
-            edges_by_facet[j].append((p0, u))
-
-    # vertices (triple intersections)
-    for i in range(N):
-        ni, di = planes[i]
-        for j in range(i+1, N):
-            nj, dj = planes[j]
-            for k in range(j+1, N):
-                nk, dk = planes[k]
-                M = np.vstack([ni, nj, nk])  # 3x3
-                if abs(LA.det(M)) < 1e-9:
-                    continue
-                x = LA.solve(M, np.array([di, dj, dk], float))
-                verts_by_facet[i].append(x)
-                verts_by_facet[j].append(x)
-                verts_by_facet[k].append(x)
-
+    key = b"".join(np.asarray(n, float).tobytes() + np.float64(d).tobytes() for (n, d, *_rest) in frames)
+    geom = _GEOMETRY_CACHE.get(key)
+    if geom is None:
+        geom = _FacetGeometry(frames)
+        _GEOMETRY_CACHE[key] = geom
+        while len(_GEOMETRY_CACHE) > _GEOMETRY_CACHE_SIZE:
+            _GEOMETRY_CACHE.popitem(last=False)
+    else:
+        _GEOMETRY_CACHE.move_to_end(key)
+    edges_by_facet, verts_by_facet = _GeometryView(geom.edges), _GeometryView(geom.verts)
+    edges_by_facet.geom = verts_by_facet.geom = geom
     return edges_by_facet, verts_by_facet
+
 
 def _point_line_distance(p: np.ndarray, p0: np.ndarray, u: np.ndarray) -> float:
     v = p - p0
@@ -121,8 +214,8 @@ def _point_line_distance(p: np.ndarray, p0: np.ndarray, u: np.ndarray) -> float:
 def _role_by_geometry(i: int, fid: int,
                       pts: NDArray[np.float64],
                       frames: List[tuple],
-                      edges_by_facet: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
-                      verts_by_facet: Dict[int, List[np.ndarray]],
+                      edges_by_facet: Dict[int, Tuple[np.ndarray, np.ndarray]],
+                      verts_by_facet: Dict[int, np.ndarray],
                       edge_tol: float,
                       vertex_tol: float) -> Tuple[str, int]:
     """
@@ -131,19 +224,9 @@ def _role_by_geometry(i: int, fid: int,
       - else edge if within edge_tol of any (fid, *) edge line
       - else unique
     Returns (role_name, role_rank) with ranks: unique=0, edge=1, vertex=2.
+    edges_by_facet / verts_by_facet come from _intersections_geometry.
     """
-    x = pts[i]
-    vlist = verts_by_facet.get(fid, [])
-    if vlist:
-        dv = min(float(LA.norm(x - v)) for v in vlist)
-        if dv < vertex_tol:
-            return "vertex", 2
-    elist = edges_by_facet.get(fid, [])
-    if elist:
-        de = min(_point_line_distance(x, p0, u) for (p0, u) in elist)
-        if de < edge_tol:
-            return "edge", 1
-    return "unique", 0
+    return verts_by_facet.geom.role(np.asarray(pts[i], float), fid, edge_tol, vertex_tol)
 
 # --------------------------------------
 # Candidate collection (no mutation)
