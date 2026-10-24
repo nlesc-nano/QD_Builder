@@ -272,11 +272,119 @@ def _native_pair_counts(
         bipartite,
         _native.EPS,
     )
+    _settle_undecided(cn, undecided, pts, sym_indices, cutoff_matrix, max_rcut)
+    return cn
+
+
+def _settle_undecided(cn, undecided, pts, sym_indices, cutoff_matrix, max_rcut) -> None:
+    """Count the undecided (i, j) pairs the way the scipy path decides them."""
     for i, j in undecided.tolist():
         pair = cKDTree(pts[[i, j]])
         d = pair.sparse_distance_matrix(pair, max_rcut, output_type="dict").get((0, 1))
         if d is not None and d <= cutoff_matrix[sym_indices[i], sym_indices[j]]:
             cn[i] += 1
+
+
+class _ElementCodes(dict):
+    """A stable small-integer code per element symbol, assigned on first sight."""
+
+    def __missing__(self, key):
+        code = self[key] = len(self)
+        return code
+
+
+_ELEMENT_CODES = _ElementCodes()
+# (key, pts, codes, cn) of the last native bipartite count, for incremental updates
+_LAST_BIPARTITE_CN: List[tuple] = [None]
+
+
+def _align_rows(old: NDArray[np.float64], new: NDArray[np.float64], max_deleted: int = 64):
+    """
+    Describe `new` as `old` with some rows deleted (order kept) and rows
+    appended at the end. Returns (kept_old, deleted_old, M): new[:M] are the
+    old rows kept_old, new[M:] are appended. None when the change is not of
+    that form or more than max_deleted rows were deleted.
+    """
+    n_old, n_new = len(old), len(new)
+    i = j = 0
+    deleted: List[int] = []
+    while True:
+        L = min(n_old - i, n_new - j)
+        if L <= 0:
+            break
+        same = (old[i:i + L] == new[j:j + L]).all(axis=1)
+        if same.all():
+            i += L
+            j += L
+            break
+        k = int(np.argmin(same))
+        i += k
+        j += k
+        deleted.append(i)
+        i += 1
+        if len(deleted) > max_deleted:
+            return None
+    deleted.extend(range(i, n_old))
+    if len(deleted) > max_deleted:
+        return None
+    kept_old = np.delete(np.arange(n_old), deleted)
+    if len(kept_old) != j:
+        return None
+    return kept_old, np.asarray(deleted, dtype=np.intp), j
+
+
+def _native_bipartite_cn(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    charges: Dict[str, int],
+    pair_cuts: Optional[PairCuts],
+) -> NDArray[np.int_]:
+    """
+    coord_numbers_bipartite on the C++ kernel. When the previous call saw the
+    same species, charges and cutoffs and this structure differs from it by
+    deleted rows, appended rows and changed elements, only the atoms within
+    the largest cutoff of a change are recounted; every other count depends
+    on unchanged neighbours only and is carried over.
+    """
+    N = len(symbols)
+    pts = np.ascontiguousarray(pts, dtype=np.float64)
+    codes = np.fromiter(map(_ELEMENT_CODES.__getitem__, symbols), dtype=np.int32, count=N)
+    name_of = {c: e for e, c in _ELEMENT_CODES.items()}
+    uniq_elems = sorted(name_of[int(c)] for c in np.unique(codes))
+    cutoff_matrix = np.array([[_pair_cut_calibrated(a, b, pair_cuts) for b in uniq_elems] for a in uniq_elems], float)
+    max_rcut = float(cutoff_matrix.max())
+    lut_idx = np.zeros(len(_ELEMENT_CODES), dtype=np.int32)
+    lut_q = np.zeros(len(_ELEMENT_CODES), dtype=float)
+    for k, el in enumerate(uniq_elems):
+        lut_idx[_ELEMENT_CODES[el]] = k
+        lut_q[_ELEMENT_CODES[el]] = float(charges.get(el, 0))
+    sym_indices = lut_idx[codes]
+    charge_arr = lut_q[codes]
+    key = (tuple(uniq_elems), tuple(lut_q[_ELEMENT_CODES[el]] for el in uniq_elems), cutoff_matrix.tobytes())
+
+    cn = None
+    last = _LAST_BIPARTITE_CN[0]
+    if last is not None and last[0] == key:
+        _key, old_pts, old_codes, old_cn = last
+        aligned = _align_rows(old_pts, pts)
+        if aligned is not None:
+            kept_old, deleted_old, M = aligned
+            changed = np.flatnonzero(old_codes[kept_old] != codes[:M])
+            seeds = np.concatenate([old_pts[deleted_old], pts[M:], pts[changed]])
+            cn = np.full(N, -1, dtype=np.int64)
+            cn[:M] = old_cn[kept_old]
+            if len(seeds):
+                atoms, counts, undecided = _native.KERNELS.pair_counts_local(
+                    pts, sym_indices, charge_arr, cutoff_matrix, True, _native.EPS,
+                    np.ascontiguousarray(seeds), max_rcut + 1e-6,
+                )
+                cn[atoms] = counts
+                _settle_undecided(cn, undecided, pts, sym_indices, cutoff_matrix, max_rcut)
+            if (cn < 0).any():
+                cn = None
+    if cn is None:
+        cn = _native_pair_counts(pts, sym_indices, charge_arr, cutoff_matrix, max_rcut, bipartite=True)
+    _LAST_BIPARTITE_CN[0] = (key, pts.copy(), codes, cn.copy())
     return cn
 
 
@@ -293,6 +401,8 @@ def coord_numbers_bipartite(
     N = len(symbols)
     if N == 0:
         return np.zeros(0, dtype=int)
+    if _native.KERNELS is not None:
+        return _native_bipartite_cn(symbols, pts, charges, pair_cuts)
 
     pts = np.asarray(pts, float)
 
@@ -308,8 +418,6 @@ def coord_numbers_bipartite(
             cutoff_matrix[u, v] = _pair_cut_calibrated(el_u, el_v, pair_cuts)
 
     charge_arr = np.array([charges.get(s, 0) for s in symbols], dtype=float)
-    if _native.KERNELS is not None:
-        return _native_pair_counts(pts, sym_indices, charge_arr, cutoff_matrix, max_rcut, bipartite=True)
 
     tree = cKDTree(pts)
     coo = tree.sparse_distance_matrix(tree, max_rcut, output_type='coo_matrix')

@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 
+from . import _native
 from .nc_types import Plane
 from .analysis import (
     PairCuts,
@@ -18,6 +19,7 @@ from .analysis import (
     compute_strict_missing_bond_vectors,
     compute_cif_virtual_sites,
 )
+from .analysis import _ELEMENT_CODES
 from .analysis import _pair_cut as pc
 from .analysis import _pair_cut_calibrated
 from .passivation import (
@@ -122,12 +124,11 @@ def _surface_low_cn_cations_remain(
         except Exception:
             edges_by_facet = verts_by_facet = None
     inc_all = _incident_facets_all(pts, frames, surf_tol)
-    for i, s in enumerate(symbols):
+    for i in inc_all.rows:
+        s = symbols[i]
         if charges.get(s, 0) <= 0:
             continue
         inc = inc_all[i]
-        if not inc:
-            continue
 
         cation_cn = int(cn_bi[i])
         role = 0
@@ -338,6 +339,30 @@ def _neighbors(i: int, symbols: List[str], pts: NDArray[np.float64], pt_tree: Op
     return out
 
 
+def _rows_with_element(symbols: List[str], elements) -> List[int]:
+    """Indices i with symbols[i] in `elements`, ascending."""
+    if not elements:
+        return []
+    lut_codes = [_ELEMENT_CODES[el] for el in elements]
+    codes = np.fromiter(map(_ELEMENT_CODES.__getitem__, symbols), dtype=np.int32, count=len(symbols))
+    lut = np.zeros(len(_ELEMENT_CODES), dtype=bool)
+    lut[lut_codes] = True
+    return np.flatnonzero(lut[codes]).tolist()
+
+
+class _LazyTree:
+    """cKDTree over pts, built on the first query (most passes never query it)."""
+
+    def __init__(self, pts: NDArray[np.float64]):
+        self._pts = np.array(pts, dtype=float)
+        self._tree: Optional[cKDTree] = None
+
+    def query_ball_point(self, *args, **kwargs):
+        if self._tree is None:
+            self._tree = cKDTree(self._pts)
+        return self._tree.query_ball_point(*args, **kwargs)
+
+
 def _flatten_hits(hits_all) -> Tuple[NDArray[np.intp], NDArray[np.intp]]:
     """(query index, hit index) pairs from a batched query_ball_point result."""
     lengths = np.fromiter((len(h) for h in hits_all), dtype=np.intp, count=len(hits_all))
@@ -354,29 +379,78 @@ def _within(pts: NDArray[np.float64], i: NDArray[np.intp], j: NDArray[np.intp], 
     return ok
 
 
+def _any_within(
+    pts: NDArray[np.float64],
+    q_idx: NDArray[np.intp],
+    q_type: NDArray[np.intp],
+    r_idx: NDArray[np.intp],
+    r_type: NDArray[np.intp],
+    limits: NDArray[np.float64],
+    max_r: float,
+) -> NDArray[np.bool_]:
+    """
+    For each query atom q_idx[a]: does a ball query of radius max_r around it
+    find a reference atom r_idx[b] with np.linalg.norm(pts[r] - pts[q]) <=
+    limits[q_type[a], r_type[b]]? On the C++ kernel, pairs within EPS of their
+    limit are settled with the same ball query and norm.
+    """
+    hit = np.zeros(len(q_idx), dtype=bool)
+    if len(q_idx) == 0 or len(r_idx) == 0:
+        return hit
+    if _native.KERNELS is not None:
+        counts, undecided = _native.KERNELS.cross_counts(
+            np.ascontiguousarray(pts[q_idx]), np.ascontiguousarray(q_type, dtype=np.int32),
+            np.ascontiguousarray(pts[r_idx]), np.ascontiguousarray(r_type, dtype=np.int32),
+            np.ascontiguousarray(limits, dtype=np.float64), _native.EPS,
+        )
+        hit = counts > 0
+        for a, b in undecided.tolist():
+            if hit[a]:
+                continue
+            q, r = q_idx[a], r_idx[b]
+            if (cKDTree(pts[[r]]).query_ball_point(pts[q], r=max_r)
+                    and np.linalg.norm(pts[r] - pts[q]) <= limits[q_type[a], r_type[b]]):
+                hit[a] = True
+        return hit
+    a, b = _flatten_hits(cKDTree(pts[r_idx]).query_ball_point(pts[q_idx], r=max_r))
+    within = _within(pts, q_idx[a], r_idx[b], limits[q_type[a], r_type[b]])
+    hit[a[within]] = True
+    return hit
+
+
 def _ligand_protected_cation_mask(
     symbols: List[str],
     pts: NDArray[np.float64],
     charges: Dict[str, int],
     ligand: str,
     pair_cuts: Optional[PairCuts],
+    candidates: Optional[List[int]] = None,
 ) -> NDArray[np.bool_]:
+    """
+    Cations bound to a ligand. With `candidates`, only those atoms are
+    evaluated (the rest stay False).
+    """
     protected = np.zeros(len(symbols), dtype=bool)
-    lig_idx = [i for i, s in enumerate(symbols) if s == ligand]
-    cat_idx = [i for i, s in enumerate(symbols) if charges.get(s, 0) > 0]
+    lig_idx = _rows_with_element(symbols, {ligand})
+    if candidates is None:
+        cat_idx = _rows_with_element(symbols, {el for el in set(symbols) if charges.get(el, 0) > 0})
+    else:
+        cat_idx = [i for i in candidates if charges.get(symbols[i], 0) > 0]
     if not lig_idx or not cat_idx:
         return protected
 
-    rc_of = {el: _pair_cut_calibrated(el, ligand, pair_cuts) for el in {symbols[i] for i in cat_idx}}
-    max_rc = max(rc_of.values())
-    lig_tree = cKDTree(pts[lig_idx])
-    hits_all = lig_tree.query_ball_point(pts[cat_idx], r=max_rc + 1e-6)
-    cat_arr = np.asarray(cat_idx)
-    lig_arr = np.asarray(lig_idx)
-    rc_cat = np.array([rc_of[symbols[i]] for i in cat_idx], float)
-    a, b = _flatten_hits(hits_all)
-    within = _within(pts, cat_arr[a], lig_arr[b], rc_cat[a] + 1e-6)
-    protected[cat_arr[a[within]]] = True
+    # The query radius follows every cation species present, as before.
+    cat_elems = sorted(el for el in set(symbols) if charges.get(el, 0) > 0)
+    type_of = {el: k for k, el in enumerate(cat_elems)}
+    limits = np.array([[_pair_cut_calibrated(el, ligand, pair_cuts) + 1e-6] for el in cat_elems], float)
+    max_rc = max(_pair_cut_calibrated(el, ligand, pair_cuts) for el in cat_elems)
+    cat_arr = np.asarray(cat_idx, dtype=np.intp)
+    hit = _any_within(
+        pts, cat_arr, np.array([type_of[symbols[i]] for i in cat_idx], dtype=np.intp),
+        np.asarray(lig_idx, dtype=np.intp), np.zeros(len(lig_idx), dtype=np.intp),
+        limits, max_rc + 1e-6,
+    )
+    protected[cat_arr[hit]] = True
     return protected
 
 
@@ -390,21 +464,21 @@ def _prune_orphan_ligands(
     verbose: bool = True,
     atom_regions: Optional[List[int]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], int]:
-    lig_idx = [i for i, s in enumerate(symbols) if s == ligand]
-    cat_idx = [i for i, s in enumerate(symbols) if charges.get(s, 0) > 0]
+    lig_idx = _rows_with_element(symbols, {ligand})
+    cat_idx = _rows_with_element(symbols, {el for el in set(symbols) if charges.get(el, 0) > 0})
     if not lig_idx or not cat_idx:
         orphan_idx = lig_idx
     else:
-        rc_of = {el: _pair_cut_calibrated(ligand, el, pair_cuts) for el in {symbols[i] for i in cat_idx}}
-        max_rc = max(rc_of.values())
-        cat_tree = cKDTree(pts[cat_idx])
-        cat_arr = np.asarray(cat_idx)
-        lig_arr = np.asarray(lig_idx)
-        rc_cat = np.array([rc_of[symbols[j]] for j in cat_idx], float)
-        a, b = _flatten_hits(cat_tree.query_ball_point(pts[lig_idx], r=max_rc + 1e-6))
-        within = _within(pts, lig_arr[a], cat_arr[b], rc_cat[b] + 1e-6)
-        has_host = np.zeros(len(lig_idx), dtype=bool)
-        has_host[a[within]] = True
+        cat_elems = sorted({symbols[i] for i in cat_idx})
+        type_of = {el: k for k, el in enumerate(cat_elems)}
+        limits = np.array([[_pair_cut_calibrated(ligand, el, pair_cuts) + 1e-6 for el in cat_elems]], float)
+        max_rc = max(_pair_cut_calibrated(ligand, el, pair_cuts) for el in cat_elems)
+        lig_arr = np.asarray(lig_idx, dtype=np.intp)
+        has_host = _any_within(
+            pts, lig_arr, np.zeros(len(lig_idx), dtype=np.intp),
+            np.asarray(cat_idx, dtype=np.intp), np.array([type_of[symbols[j]] for j in cat_idx], dtype=np.intp),
+            limits, max_rc + 1e-6,
+        )
         orphan_idx = [int(i) for i in lig_arr[~has_host]]
     if not orphan_idx:
         return symbols, pts, 0
@@ -445,15 +519,11 @@ def _priority1_swap_undercoord_anions_once(
     *, verbose: bool = True,
     pt_tree: Optional[cKDTree] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
-    for i, s in enumerate(list(symbols)):
-        if charges.get(s, 0) >= 0:
-            continue
-        if s == ligand:
-            continue
-        # Same charge as the ligand: already an X-type terminator (see the
-        # stabilization swaps below), so a swap would only change the element.
-        if charges.get(s, 0) == charges.get(ligand, 0):
-            continue
+    # Native anions only: not the ligand, and not of the ligand's charge (those
+    # are already X-type terminators, so a swap would only change the element).
+    swappable = {el for el, v in charges.items() if v < 0 and el != ligand and v != charges.get(ligand, 0)}
+    for i in _rows_with_element(symbols, swappable):
+        s = symbols[i]
         if int(cn_bi[i]) > 2:
             continue
         if not mem[i]:
@@ -514,13 +584,12 @@ def _priority2_remove_low_cn_cation_once(
         except Exception:
             edges_by_facet = verts_by_facet = None
     inc_all = _incident_facets_all(pts, frames, surf_tol)
-    for i, s in enumerate(symbols):
+    for i in inc_all.rows:
+        s = symbols[i]
         if charges.get(s, 0) <= 0:
             continue
 
         inc = inc_all[i]
-        if not inc:
-            continue
 
         cation_cn = int(cn_bi[i])
         role = 0
@@ -592,9 +661,7 @@ def _priority2_remove_low_cn_cation_once(
                 native_anions = {el for el, v in charges.items()
                                  if v < 0 and el != ligand and v != charges.get(ligand, 0)}
                 inc_now = _incident_facets_all(pts, frames, surf_tol)
-                for j, sj in enumerate(list(symbols)):
-                    if charges.get(sj, 0) >= 0 or sj == ligand or sj not in native_anions:
-                        continue
+                for j in _rows_with_element(symbols, native_anions):
                     if not inc_now[j]:
                         continue
                     if int(cn2[j]) < 3:
@@ -631,13 +698,7 @@ def _priority2_remove_low_cn_cation_once(
     native_anions = {el for el, v in charges.items()
                      if v < 0 and el != ligand and v != charges.get(ligand, 0)}
     inc_now = _incident_facets_all(pts, frames, surf_tol)
-    for j, sj in enumerate(list(symbols)):
-        if charges.get(sj, 0) >= 0:
-            continue
-        if sj == ligand:
-            continue
-        if sj not in native_anions:
-            continue
+    for j in _rows_with_element(symbols, native_anions):
         if not inc_now[j]:
             continue
         if int(cn2[j]) < 3:
@@ -764,19 +825,17 @@ def _priority3_balance_positive_q_remove(
     bulk_map = bulk_cn_opposite_by_interior(symbols, pts, planes_raw, surf_tol, charges, pair_cuts=pair_cuts, true_bulk_cn=true_bulk_cn)
 
     cands_by_cn: Dict[int, List[Tuple[int, float, float, int, int, int]]] = {}
-    protected = _ligand_protected_cation_mask(symbols, pts, charges, ligand, pair_cuts)
     inc_all = _incident_facets_all(pts, frames, surf_tol)
-    for i, s in enumerate(symbols):
-        if charges.get(s, 0) <= 0:
-            continue
+    surface_cations = [i for i in inc_all.rows if charges.get(symbols[i], 0) > 0]
+    protected = _ligand_protected_cation_mask(symbols, pts, charges, ligand, pair_cuts, candidates=surface_cations)
+    for i in surface_cations:
+        s = symbols[i]
         if positive_q_strategy_selector is not None:
             if positive_q_strategy_selector(i, s, pts[i]) != "remove":
                 continue
         if protected[i]:
             continue
         inc = inc_all[i]
-        if not inc:
-            continue
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
         fid, depth = min(depths, key=lambda t: t[1])
         shell = "outer" if depth < outer_thr else "sublayer"
@@ -787,20 +846,27 @@ def _priority3_balance_positive_q_remove(
         deficit = tgt - ci
         inc_count = len(inc)
         role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)  # V>E>U for removal
-        uv = _get_uv(frames, fid, i, pts, uv_cache)
-        taken = uv_taken.get(fid, [])
-        if taken:
-            from math import hypot
-            dmin = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken)
-        else:
-            dmin = float("inf")
-        cands_by_cn.setdefault(ci, []).append((role_rank, -dmin, depth, fid, i, deficit))
+        cands_by_cn.setdefault(ci, []).append((role_rank, 0.0, depth, fid, i, deficit))
 
     if not cands_by_cn:
         return False, symbols, pts
 
+    def neg_dmin_of(t):
+        """-(distance in facet uv to the nearest earlier edit), the spacing term."""
+        _rr, _nd, _dp, fid, i, _df = t
+        uv = _get_uv(frames, fid, i, pts, uv_cache)
+        taken = uv_taken.get(fid, [])
+        if taken:
+            from math import hypot
+            return -min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken)
+        return -float("inf")
+
     for cn_tier in sorted(cands_by_cn.keys()):  # 1 -> 2 -> 3 -> ...
         lst = cands_by_cn[cn_tier]
+        # Order: deficit desc, role desc, spacing desc, depth, index. The
+        # spacing term is only needed for the leading deficit/role group.
+        lead = max((t[5], t[0]) for t in lst)
+        lst = [(t[0], neg_dmin_of(t)) + t[2:] for t in lst if (t[5], t[0]) == lead]
         lst.sort(key=lambda t: (-t[5], -t[0], t[1], t[2], t[4]))
         role_rank, neg_dmin, depth, fid, i, deficit = lst[0]
 
@@ -828,13 +894,7 @@ def _priority3_balance_positive_q_remove(
         native_anions = {el for el, v in charges.items()
                          if v < 0 and el != ligand and v != charges.get(ligand, 0)}
         inc_now = _incident_facets_all(pts, frames, surf_tol)
-        for j, sj in enumerate(list(symbols)):
-            if charges.get(sj, 0) >= 0:
-                continue
-            if sj == ligand:
-                continue
-            if sj not in native_anions:
-                continue
+        for j in _rows_with_element(symbols, native_anions):
             if not inc_now[j]:
                 continue
             if int(cn2[j]) < 3:
@@ -1440,12 +1500,11 @@ def _experimental_exhausted_positive_q_fallback_once(
     except Exception:
         edges_by_facet = verts_by_facet = None
     inc_all = _incident_facets_all(pts, frames, surf_tol)
-    for i, s in enumerate(symbols):
+    for i in inc_all.rows:
+        s = symbols[i]
         if charges.get(s, 0) <= 0:
             continue
         inc = inc_all[i]
-        if not inc:
-            continue
         ci = int(cn_bi[i])
         if ci not in (3, 4):
             continue
@@ -1911,7 +1970,7 @@ def charge_balance_iterative(
         frames = _build_facet_frames(planes)
         mem = _facet_memberships(pts, planes, surf_tol)
         cn_bi = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
-        pt_tree = cKDTree(np.asarray(pts, float))
+        pt_tree = _LazyTree(pts)
         uv_cache: UVCache = {}
 
         Q = _total_Q(symbols, charges)

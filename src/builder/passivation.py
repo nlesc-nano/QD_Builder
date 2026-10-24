@@ -2,7 +2,7 @@
 from __future__ import annotations
 import itertools
 from collections import OrderedDict
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Sequence, Set
 import numpy as np
 import numpy.linalg as LA
 from numpy.typing import NDArray
@@ -49,10 +49,19 @@ def _incident_facets(idx: int, pts: NDArray[np.float64], frames: List[tuple], su
 # the scalar expression, so results match the per-atom code bit for bit.
 _SCREEN_EPS = 1e-6
 
-def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol: float) -> List[List[int]]:
-    """_incident_facets(i, ...) for every atom i, in one pass."""
+class _IncidentLists(list):
+    """Per-atom facet lists; `rows` holds, ascending, the atoms on some facet."""
+    rows: List[int]
+
+
+def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol: float) -> List[Sequence[int]]:
+    """
+    _incident_facets(i, ...) for every atom i, in one pass. Atoms on no facet
+    share one empty tuple; read the result, do not mutate it.
+    """
     n_atoms = len(pts)
-    out: List[List[int]] = [[] for _ in range(n_atoms)]
+    out = _IncidentLists([()] * n_atoms)
+    out.rows = []
     if n_atoms == 0 or not frames:
         return out
     normals = np.array([f[0] for f in frames], float)
@@ -64,8 +73,14 @@ def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol
     for k in np.flatnonzero(np.abs(depth[rows, cols] - surf_tol) < _SCREEN_EPS):
         n, d = frames[cols[k]][0], frames[cols[k]][1]
         keep[k] = d - float(np.dot(pts[rows[k]], n)) < surf_tol
-    for i, fid in zip(rows[keep].tolist(), cols[keep].tolist()):
-        out[i].append(fid)
+    rows, cols = rows[keep], cols[keep]
+    if len(rows):
+        starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+        ends = np.r_[starts[1:], len(rows)]
+        fids = cols.tolist()
+        out.rows = rows[starts].tolist()
+        for i, a, b in zip(out.rows, starts.tolist(), ends.tolist()):
+            out[i] = fids[a:b]
     return out
 
 def _record_uv_allfacets(idx: int,
@@ -80,12 +95,31 @@ def _record_uv_allfacets(idx: int,
         edit_count_facet[fid] = edit_count_facet.get(fid, 0) + 1
 
 def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
-    """List facet-IDs each atom belongs to (within surf_tol)."""
-    mem = [[] for _ in range(len(pts))]
-    for fid, (n, d) in enumerate(planes):
-        shell = np.where((d - pts @ n) < surf_tol)[0]
-        for i in shell:
-            mem[i].append(fid)
+    """List facet-IDs each atom belongs to (within surf_tol). Atoms on no facet share one empty tuple."""
+    n_atoms = len(pts)
+    mem: List = [()] * n_atoms
+    if n_atoms == 0 or not planes:
+        return mem
+    P = np.asarray(pts, float)
+    normals = np.array([np.asarray(n, float) for n, _d in planes])
+    offsets = np.array([float(d) for _n, d in planes])
+    depth = offsets[None, :] - P @ normals.T
+    rows, cols = np.nonzero(depth < surf_tol + _SCREEN_EPS)
+    keep = depth[rows, cols] < surf_tol
+    # Hits close to the threshold: the per-plane expression decides.
+    band = np.flatnonzero(np.abs(depth[rows, cols] - surf_tol) < _SCREEN_EPS)
+    for fid in np.unique(cols[band]).tolist():
+        n, d = planes[fid]
+        exact = (d - P @ n) < surf_tol
+        sel = band[cols[band] == fid]
+        keep[sel] = exact[rows[sel]]
+    rows, cols = rows[keep], cols[keep]
+    if len(rows):
+        starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+        ends = np.r_[starts[1:], len(rows)]
+        fids = cols.tolist()
+        for i, a, b in zip(rows[starts].tolist(), starts.tolist(), ends.tolist()):
+            mem[i] = fids[a:b]
     return mem
 
 # ---------- Geometry-driven role classification ----------

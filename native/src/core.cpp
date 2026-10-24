@@ -73,6 +73,25 @@ struct CellList {
         for (int64_t i = 0; i < N; ++i) order[fill[cell_of[i]]++] = i;
     }
 
+    // Cells that can hold a point within h of x, for any x (inside the box
+    // or not). Atoms on the top face are stored in the last cell, so the
+    // range always reaches it; extra cells only cost distance checks.
+    template <typename F>
+    void for_cells_near(const double *x, F &&f) const {
+        int64_t lo_c[3], hi_c[3];
+        for (int k = 0; k < 3; ++k) {
+            const double fc = std::floor((x[k] - lo[k]) / h);
+            const int64_t c = fc < -2.0 ? -2 : (fc > double(n[k]) + 2.0 ? n[k] + 2 : int64_t(fc));
+            lo_c[k] = std::max<int64_t>(0, std::min(c - 1, n[k] - 1));
+            hi_c[k] = std::min(n[k] - 1, c + 1);
+            if (lo_c[k] > hi_c[k]) return;
+        }
+        for (int64_t a = lo_c[0]; a <= hi_c[0]; ++a)
+            for (int64_t b = lo_c[1]; b <= hi_c[1]; ++b)
+                for (int64_t c = lo_c[2]; c <= hi_c[2]; ++c)
+                    f((a * n[1] + b) * n[2] + c);
+    }
+
     template <typename F>
     void for_neighbor_cells(int64_t cell, F &&f) const {
         const int64_t cz = cell % n[2], cy = (cell / n[2]) % n[1], cx = cell / (n[1] * n[2]);
@@ -143,9 +162,124 @@ static nb::tuple pair_counts(Points pts, IntVec type_id, RealVec charge, RealMat
                           to_numpy(std::move(undecided), {M, 2}));
 }
 
+static inline double dist(const double *a, const double *b) {
+    const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+static void check_types(const int32_t *t, int64_t N, int64_t T) {
+    for (int64_t i = 0; i < N; ++i)
+        if (t[i] < 0 || t[i] >= T) throw nb::value_error("type_id out of range");
+}
+
+// pair_counts restricted to the atoms within `seed_radius` of any seed point
+// (a superset of the atoms whose count an edit at the seeds can change).
+// Returns (atoms, counts, undecided) with the same rules as pair_counts.
+static nb::tuple pair_counts_local(Points pts, IntVec type_id, RealVec charge, RealMat cutoff,
+                                   bool bipartite, double eps, Points seeds, double seed_radius) {
+    const int64_t N = int64_t(pts.shape(0)), K = int64_t(seeds.shape(0));
+    if (int64_t(type_id.shape(0)) != N || int64_t(charge.shape(0)) != N)
+        throw nb::value_error("pts, type_id and charge must have the same length");
+    if (cutoff.shape(0) != cutoff.shape(1)) throw nb::value_error("cutoff must be square");
+    const int64_t T = int64_t(cutoff.shape(0));
+    const double *p = pts.data(), *q = charge.data(), *cut = cutoff.data(), *sp = seeds.data();
+    const int32_t *t = type_id.data();
+    check_types(t, N, T);
+
+    std::vector<int64_t> atoms, counts, undecided;
+    {
+        nb::gil_scoped_release release;
+        if (N > 0 && K > 0) {
+            double rmax = 0.0;
+            for (int64_t k = 0; k < T * T; ++k) rmax = std::max(rmax, cut[k]);
+            const CellList cl(p, N, std::max(rmax + eps, seed_radius));
+            std::vector<char> hit(N, 0);
+            for (int64_t s = 0; s < K; ++s)
+                cl.for_cells_near(sp + 3 * s, [&](int64_t cell) {
+                    for (int64_t k = cl.start[cell]; k < cl.start[cell + 1]; ++k) {
+                        const int64_t j = cl.order[k];
+                        if (!hit[j] && dist(sp + 3 * s, p + 3 * j) <= seed_radius) hit[j] = 1;
+                    }
+                });
+            for (int64_t i = 0; i < N; ++i) {
+                if (!hit[i]) continue;
+                int64_t c_i = 0;
+                cl.for_cells_near(p + 3 * i, [&](int64_t cell) {
+                    for (int64_t k = cl.start[cell]; k < cl.start[cell + 1]; ++k) {
+                        const int64_t j = cl.order[k];
+                        if (j == i) continue;
+                        if (bipartite && !(q[i] * q[j] < 0.0 || q[i] == 0.0)) continue;
+                        const double d = dist(p + 3 * i, p + 3 * j);
+                        const double c = cut[int64_t(t[i]) * T + t[j]];
+                        if (std::fabs(d - c) <= eps) {
+                            undecided.push_back(i);
+                            undecided.push_back(j);
+                        } else if (d < c) {
+                            ++c_i;
+                        }
+                    }
+                });
+                atoms.push_back(i);
+                counts.push_back(c_i);
+            }
+        }
+    }
+    const size_t A = atoms.size(), M = undecided.size() / 2;
+    return nb::make_tuple(to_numpy(std::move(atoms), {A}), to_numpy(std::move(counts), {A}),
+                          to_numpy(std::move(undecided), {M, 2}));
+}
+
+// For every query point a, the number of reference points b with
+// d(a, b) <= cutoff[qtype a, rtype b]; pairs with |d - cutoff| <= eps are
+// returned undecided (as (a, b)) instead of counted.
+static nb::tuple cross_counts(Points qpts, IntVec qtype, Points rpts, IntVec rtype, RealMat cutoff,
+                              double eps) {
+    const int64_t NQ = int64_t(qpts.shape(0)), NR = int64_t(rpts.shape(0));
+    if (int64_t(qtype.shape(0)) != NQ || int64_t(rtype.shape(0)) != NR)
+        throw nb::value_error("points and types must have the same length");
+    const int64_t TQ = int64_t(cutoff.shape(0)), TR = int64_t(cutoff.shape(1));
+    const double *qp = qpts.data(), *rp = rpts.data(), *cut = cutoff.data();
+    const int32_t *qt = qtype.data(), *rt = rtype.data();
+    check_types(qt, NQ, TQ);
+    check_types(rt, NR, TR);
+
+    std::vector<int64_t> counts(NQ, 0), undecided;
+    {
+        nb::gil_scoped_release release;
+        if (NQ > 0 && NR > 0) {
+            double rmax = 0.0;
+            for (int64_t k = 0; k < TQ * TR; ++k) rmax = std::max(rmax, cut[k]);
+            const CellList cl(rp, NR, rmax + eps);
+            for (int64_t a = 0; a < NQ; ++a)
+                cl.for_cells_near(qp + 3 * a, [&](int64_t cell) {
+                    for (int64_t k = cl.start[cell]; k < cl.start[cell + 1]; ++k) {
+                        const int64_t b = cl.order[k];
+                        const double d = dist(qp + 3 * a, rp + 3 * b);
+                        const double c = cut[int64_t(qt[a]) * TR + rt[b]];
+                        if (std::fabs(d - c) <= eps) {
+                            undecided.push_back(a);
+                            undecided.push_back(b);
+                        } else if (d < c) {
+                            ++counts[a];
+                        }
+                    }
+                });
+        }
+    }
+    const size_t M = undecided.size() / 2;
+    return nb::make_tuple(to_numpy(std::move(counts), {size_t(NQ)}),
+                          to_numpy(std::move(undecided), {M, 2}));
+}
+
 NB_MODULE(_core, m) {
     m.doc() = "C++ kernels for nanocrystal-builder";
     m.def("pair_counts", &pair_counts, nb::arg("pts"), nb::arg("type_id"), nb::arg("charge"),
           nb::arg("cutoff"), nb::arg("bipartite"), nb::arg("eps"),
           "Coordination counts with per-type-pair cutoffs; returns (counts, undecided (M,2)).");
+    m.def("pair_counts_local", &pair_counts_local, nb::arg("pts"), nb::arg("type_id"), nb::arg("charge"),
+          nb::arg("cutoff"), nb::arg("bipartite"), nb::arg("eps"), nb::arg("seeds"), nb::arg("seed_radius"),
+          "pair_counts for the atoms within seed_radius of any seed; returns (atoms, counts, undecided).");
+    m.def("cross_counts", &cross_counts, nb::arg("qpts"), nb::arg("qtype"), nb::arg("rpts"), nb::arg("rtype"),
+          nb::arg("cutoff"), nb::arg("eps"),
+          "Reference points within cutoff[qtype, rtype] of each query; returns (counts, undecided (M,2)).");
 }
