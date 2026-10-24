@@ -38,6 +38,79 @@ command line overrides the recipe. Fractional values are allowed and are
 useful for fine size series, since the particle is cut from a discrete
 lattice and many sizes map onto the same structure.
 
+(facet-distances)=
+## Facet distances instead of a size
+
+```yaml
+facet_distances: {"100": 12.4, "111A": 9.8, "111B": 14.1, "110": 13.0}   # Å
+construction_origin: {center_on_species: Se}
+```
+
+`facet_distances` replaces `facets` and `size_unit_cells`: one plane
+distance $h_f$ per facet family, in ångström from the construction origin.
+A key is an hkl as in `facets`; a trailing `A` or `B` names the cation- or
+anion-terminated orbit of a polar family (termination `cation_rich` or
+`anion_rich`), so the polar zinc-blende {111} counts as two families. A
+key without a letter for a polar family (`"111"`) puts both orbits at the
+same distance. Internally every seed gets $\gamma_f = h_f$ and the radius
+is $R = \min_g h_g$ with aspect (1, 1, 1), which places every plane at
+
+$$
+d_i = R\,\frac{\gamma_{f(i)}}{\gamma_\text{min}} = h_{f(i)} .
+$$
+
+The cut is therefore the same as the equivalent $\gamma$/size recipe. As in
+every Wulff build, a plane within 0.05 Å of an atom layer is moved out by
+0.25 Å, so a realised construction distance is $h_f$ or $h_f + 0.25$ Å
+(the `planes` of `facet_geometry.construction` give the value used).
+Pruning, the prepass and charge balance then act on the outermost layers:
+the atom-fitted distances in `facet_geometry.atom_fitted` lie about one
+layer inside $h_f$.
+
+(target-mode)=
+## Target mode: the build closest to a size and shape
+
+```yaml
+facet_distances: {"100": 10.0, "111A": 9.5, "111B": 11.5, "110": 12.0}
+target: {m: 60, w: 1.0}        # optional: centres, roundings, max_builds
+```
+
+The cut is discrete, so a set of distances is a target rather than a
+recipe. With `target`, the builder tries every construction centre and
+every layer rounding of the distances, $h_f + r\,\delta_f$ with
+$r \in$ `roundings` (default $-1, 0, 1$), and keeps the neutral build that
+minimises
+
+$$
+J = \left(\frac{m_b - m}{m}\right)^2
+  + w \sum_f \left(\frac{A_{f,b}}{A_b} - \frac{A_f(\vec h)}{A(\vec h)}\right)^2 .
+$$
+
+- $m_b$ counts formula units of the core of the build (`composition.m`), and
+  $m$ is `target.m`. Without it, $m = V(\vec h)/v_\text{fu}$, the volume of the
+  target polyhedron per formula unit of the CIF.
+- $A_{f,b}$ are the atom-fitted areas of the build and $A_f(\vec h)$ those of
+  the polyhedron with its planes at $h_f$.
+- $\delta_f$ is the spacing of the cation layers along the family's normal,
+  taken from the CIF: the plane spacing of the primitive lattice divided by
+  the number of distinct layers of one sublattice per period. For zinc blende
+  this gives $a/\sqrt3$ for {111}, $a/2$ for {100} and $a/(2\sqrt2)$ for
+  {110}; for wurtzite (001) it gives $c/2$.
+- `centres: auto` (the default) tries every species and the empty points of
+  a 1/4 grid of the cell whose site symmetry is as high as that of the
+  occupied sites, one per orbit. For zinc blende these are the tetrahedral
+  and octahedral holes. A list of species or `construction_origin` mappings
+  replaces them.
+
+Distinct cuts are built once. Identical cuts from different roundings are
+marked `same cut as candidate N`. Candidates skip the ligand-only
+post-treatments (`z_type_ligands`, `neutral_ligands`), and the best one is
+rebuilt with the full recipe. The recipe of that build is written next to
+the output as `<name>_target.yaml`. The manifest's `target_search` holds
+the target, $\delta_f$, the best candidate (centre, roundings, distances
+used, $m_b$, $J$ and its two terms, areas, atom-fitted distances per family)
+and every candidate tried. `max_builds` (400) caps the number of builds.
+
 ## Centre
 
 ```yaml

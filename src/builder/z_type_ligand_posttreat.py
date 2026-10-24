@@ -99,6 +99,7 @@ def z_type_ligand_host_sites(
     *,
     target_symbol: Optional[str] = None,
     cuts=None,
+    dropped: Optional[Dict[str, List[dict]]] = None,
 ) -> List[dict]:
     """
     Empty cation sites above free core anions, one per anion.
@@ -107,6 +108,9 @@ def z_type_ligand_host_sites(
     (the L-type anion sites), with no ligand atom within 3.5 Å (the check the
     native-anion X-type exchange uses), and the cation site must be clear of
     every atom.  The builder UI reports ``len()`` as the available count.
+    ``dropped``, when given, collects the sites lost to each rule under
+    "crowded" (ligand within 3.5 Å of the anion) and "blocked" (cation site
+    not clear).
     """
     pts = np.asarray(pts, float)
     if native_species is None:
@@ -122,9 +126,13 @@ def z_type_ligand_host_sites(
     for site in sites:
         hosts = list(site["hosts"])
         if not _free_anion_hosts(syms, pts, native_species, hosts):
+            if dropped is not None:
+                dropped.setdefault("crowded", []).append(site)
             continue
         bond = float(np.linalg.norm(site["pos"] - pts[hosts[0]]))
         if tree.query_ball_point(site["pos"], r=_CLEARANCE_FRAC * bond):
+            if dropped is not None:
+                dropped.setdefault("blocked", []).append(site)
             continue
         out.append(site)
     return out
@@ -364,15 +372,179 @@ def _anion_coordination(cands: List[List[dict]], plan: List[Tuple[int, List[dict
     ]
 
 
+def _place_unit(
+    site: dict,
+    take: List[dict],
+    metal: str,
+    frags: List[dict],
+    preps: List[Optional[dict]],
+    work_syms: List[str],
+    work_pts: List[np.ndarray],
+) -> Optional[List[str]]:
+    """Add one MXn unit at ``site`` with its anions on ``take``; None if it clashes."""
+    m_pos = np.asarray(site["pos"], float)
+    cur_pts = np.asarray(work_pts, float)
+    tree = cKDTree(cur_pts)
+    bond = float(np.linalg.norm(m_pos - cur_pts[site["hosts"][0]]))
+    # Molecular anions placed earlier can reach into a planned site.
+    if tree.query_ball_point(m_pos, r=_CLEARANCE_FRAC * bond) or any(
+        tree.query_ball_point(c["pos"], r=_CLEARANCE_FRAC * float(np.linalg.norm(c["pos"] - m_pos)))
+        for c in take
+    ):
+        return None
+
+    new_syms = [metal]
+    new_pts = [m_pos]
+    for frag, prep, c in zip(frags, preps, take):
+        if prep is None:
+            new_syms.append(frag["symbol"])
+            new_pts.append(c["pos"])
+        else:
+            env = cKDTree(np.vstack([cur_pts, np.asarray(new_pts)]))
+            f_syms, f_pts = _place_molecular_anion(prep, m_pos, c["pos"], env)
+            new_syms.extend(f_syms)
+            new_pts.extend(f_pts)
+    work_syms.extend(new_syms)
+    work_pts.extend(new_pts)
+    return new_syms
+
+
+def site_family_matches(family: str, role: str) -> bool:
+    """
+    Whether a site role ("facet:111B", "edge:100|111B", "vertex:100+100+111B")
+    belongs to a target family: a facet label ("111B" or "facet:111B"), an
+    exact edge or vertex role, or "edge" / "vertex" for any of them.
+    """
+    fam = family.strip()
+    if fam in {"edge", "vertex"}:
+        return role.startswith(fam + ":")
+    if ":" not in fam:
+        fam = "facet:" + fam
+    return role == fam
+
+
+def _family_plans(
+    sites: List[dict],
+    cands: List[List[dict]],
+    n: int,
+    family_sites: Dict[str, List[int]],
+    distribution: str,
+    seed: int,
+) -> Dict[str, List[Tuple[int, List[dict]]]]:
+    """
+    Full placement order per family, planned on that family's sites alone
+    (every site it could fill), so that the first k units of the plan are
+    the k-unit build: k and k+1 are nested.
+    """
+    plans = {}
+    for fam, idxs in family_sites.items():
+        if not idxs:
+            plans[fam] = []
+            continue
+        sub_cands = [cands[i] for i in idxs]
+        positions = np.asarray([sites[i]["pos"] for i in idxs], float)
+        if distribution == "uniform":
+            sub = _plan_alternating(sub_cands, n, positions, len(idxs))
+        else:
+            if distribution == "random":
+                order = list(range(len(idxs)))
+                random.Random(seed).shuffle(order)
+            else:
+                order = _get_spatially_ordered_indices(positions, False)
+            sub = _plan_sequential(sub_cands, n, order, len(idxs))
+        plans[fam] = [(idxs[j], take) for j, take in sub]
+    return plans
+
+
+def _run_family_targets(
+    pass_spec,
+    sites: List[dict],
+    dropped: Dict[str, List[dict]],
+    roles: List[str],
+    cands: List[List[dict]],
+    n: int,
+    metal: str,
+    frags: List[dict],
+    preps: List[Optional[dict]],
+    work_syms: List[str],
+    work_pts: List[np.ndarray],
+    seed: int,
+) -> Tuple[int, dict]:
+    """
+    Place the requested units of every family, one at a time in the family's
+    planned order, each capped at the family's free sites. Returns the units
+    placed and the per-family ledger.
+    """
+    def family_of(site_list):
+        out: Dict[str, List[int]] = {}
+        for fam, _k in pass_spec.targets:
+            out[fam] = [i for i, s in enumerate(site_list) if site_family_matches(fam, roles[s["hosts"][0]])]
+        return out
+
+    family_sites = family_of(sites)
+    crowded = family_of(dropped.get("crowded", []))
+    blocked = family_of(dropped.get("blocked", []))
+    plans = _family_plans(sites, cands, n, family_sites, pass_spec.distribution, seed)
+    users = _site_users(cands)
+    used_ids: set = set()
+    taken_sites: set = set()
+    ledger = {}
+    total = 0
+    for fam, k_req in pass_spec.targets:
+        free = len(family_sites[fam])
+        k = min(int(k_req), free)
+        placed = n_clash = n_taken = 0
+        for idx, take in plans[fam]:
+            if placed >= k:
+                break
+            if idx in taken_sites:
+                n_taken += 1
+                continue
+            if any(c["id"] in used_ids for c in take):
+                # Another family took an anion site of this unit: take the next free ones.
+                take = _free_sites(idx, cands, users, used_ids, taken_sites)[:n]
+                if len(take) < n:
+                    n_taken += 1
+                    continue
+            if _place_unit(sites[idx], take, metal, frags, preps, work_syms, work_pts) is None:
+                n_clash += 1
+                continue
+            used_ids.update(c["id"] for c in take)
+            taken_sites.add(idx)
+            placed += 1
+        ledger[fam] = {
+            "free_sites": free,
+            "crowded_sites": len(crowded[fam]),
+            "blocked_sites": len(blocked[fam]),
+            "requested": int(k_req),
+            "capped": k,
+            "placed": placed,
+            "skipped": int(k_req) - placed,
+            "skipped_crowded": n_clash,
+            "skipped_no_anion_site": k - placed - n_clash,
+            "skipped_taken": n_taken,
+        }
+        total += placed
+        print(
+            f"  → {fam}: {free} free sites ({len(crowded[fam])} more crowded by ligands within "
+            f"{_FREE_ANION_CUTOFF} Å); requested {k_req}, placed {placed}"
+        )
+    return total, ledger
+
+
 def run_z_type_ligand_posttreatment(
     syms: List[str],
     pts: NDArray[np.float64],
     cfg: Config,
     bulk_struct,
     planes: List[Plane],
+    site_roles: Optional[List[str]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], List[dict]]:
     """
     Add neutral MXn complexes on free surface anions.
+
+    A pass with ``targets`` places a count per site family; it needs
+    ``site_roles`` (one role per atom of ``syms``, from the facet geometry).
 
     Returns the updated structure and one ledger entry per pass.  Passes with
     molecular anions also carry ``charge`` / ``ignored_element_charge`` so the
@@ -416,11 +588,46 @@ def run_z_type_ligand_posttreatment(
             preps.append(_prepare_anion_fragment(frag["mol"], spec.seed + 101 * (pass_idx + 1) + k, spec.ff))
 
         cur_pts = np.asarray(work_pts, float)
+        dropped: Dict[str, List[dict]] = {}
         sites = z_type_ligand_host_sites(
             work_syms, cur_pts, cfg, bulk_struct, planes, native_species,
-            target_symbol=pass_spec.target_symbol,
+            target_symbol=pass_spec.target_symbol, dropped=dropped,
         )
         total = len(sites)
+        if pass_spec.targets:
+            if site_roles is None:
+                print("  [warning] per-family targets need the facet geometry (site roles). Skipping pass.")
+                continue
+            # Roles of atoms added by earlier passes: not core, never hosts.
+            roles = list(site_roles) + ["ligand"] * (len(work_syms) - len(site_roles))
+            cands = _anion_site_candidates(sites, work_syms, cur_pts, cfg, bulk_struct, planes, f_shift)
+            n_before = len(work_syms)
+            placed, families = _run_family_targets(
+                pass_spec, sites, dropped, roles, cands, len(frags), metal, frags, preps,
+                work_syms, work_pts, spec.seed + pass_idx,
+            )
+            entry = {
+                "complex": pass_spec.complex,
+                "formula": formula,
+                "metal": metal,
+                "anions": [f["smiles"] for f in frags],
+            "anion_symbols": [f["symbol"] if f["is_atomic"] else None for f in frags],
+                "available_sites": total,
+                "requested": sum(k for _f, k in pass_spec.targets),
+                "placed": placed,
+                "families": families,
+                "atoms_added": len(work_syms) - n_before,
+            }
+            molecular = [f for f in frags if not f["is_atomic"]]
+            if molecular and placed:
+                ignored = sum(
+                    int(cfg.charges.get(_z_to_symbol(int(z)), 0))
+                    for prep in preps if prep is not None for z in prep["numbers"]
+                )
+                entry["charge"] = placed * sum(int(f["charge"]) for f in molecular)
+                entry["ignored_element_charge"] = placed * ignored
+            ledger.append(entry)
+            continue
         k_req = int(pass_spec.target_count) if pass_spec.target_count > 0 else int(round(pass_spec.ratio * total))
         k_req = min(k_req, total)
         print(f"  → {total} free core anion sites; placing {k_req} {formula} units")
@@ -450,31 +657,10 @@ def run_z_type_ligand_posttreatment(
         n_terminal = 0
         n_added_atoms = 0
         for (idx, take), cns in zip(plan, unit_cn):
-            m_pos = np.asarray(sites[idx]["pos"], float)
-            cur_pts = np.asarray(work_pts, float)
-            tree = cKDTree(cur_pts)
-            bond = float(np.linalg.norm(m_pos - cur_pts[sites[idx]["hosts"][0]]))
-            # Molecular anions placed earlier can reach into a planned site.
-            if tree.query_ball_point(m_pos, r=_CLEARANCE_FRAC * bond) or any(
-                tree.query_ball_point(c["pos"], r=_CLEARANCE_FRAC * float(np.linalg.norm(c["pos"] - m_pos)))
-                for c in take
-            ):
+            new_syms = _place_unit(sites[idx], take, metal, frags, preps, work_syms, work_pts)
+            if new_syms is None:
                 n_clash += 1
                 continue
-
-            new_syms = [metal]
-            new_pts = [m_pos]
-            for frag, prep, c in zip(frags, preps, take):
-                if prep is None:
-                    new_syms.append(frag["symbol"])
-                    new_pts.append(c["pos"])
-                else:
-                    env = cKDTree(np.vstack([cur_pts, np.asarray(new_pts)]))
-                    f_syms, f_pts = _place_molecular_anion(prep, m_pos, c["pos"], env)
-                    new_syms.extend(f_syms)
-                    new_pts.extend(f_pts)
-            work_syms.extend(new_syms)
-            work_pts.extend(new_pts)
             n_bridging += sum(cn >= 2 for cn in cns)
             n_terminal += sum(cn < 2 for cn in cns)
             n_added_atoms += len(new_syms)
@@ -490,6 +676,7 @@ def run_z_type_ligand_posttreatment(
             "formula": formula,
             "metal": metal,
             "anions": [f["smiles"] for f in frags],
+            "anion_symbols": [f["symbol"] if f["is_atomic"] else None for f in frags],
             "available_sites": total,
             "requested": k_req,
             "placed": placed,

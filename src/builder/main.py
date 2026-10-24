@@ -970,8 +970,13 @@ def _run_passivation_and_write_outputs(
     )
     if z_type_ligand_spec is not None and z_type_ligand_spec.enabled:
         from .z_type_ligand_posttreat import run_z_type_ligand_posttreatment
+        roles_now = None
+        if facet_geometry_input is not None and any(p.targets for p in z_type_ligand_spec.passes):
+            roles_now = _current_site_roles(
+                syms, pts, core_ref_pts, facet_geometry_input, charges=cfg.charges, ligand=anion_lig,
+            )
         syms, pts, z_type_ligand_ledger = run_z_type_ligand_posttreatment(
-            syms, pts, cfg, struct, planes
+            syms, pts, cfg, struct, planes, site_roles=roles_now,
         )
         # Molecular anions of the complexes count by their molecular charge.
         ligand_exchange_charge_ledger.extend(
@@ -1092,7 +1097,7 @@ def _run_passivation_and_write_outputs(
     if facet_geometry_input is not None:
         extra.update(_facet_geometry_entries(
             syms, pts, out_order, core_ref_pts, facet_geometry_input,
-            charges=cfg.charges, ligand=anion_lig,
+            charges=cfg.charges, ligand=anion_lig, struct=struct, z_type_ledger=z_type_ligand_ledger,
             origin=(-np.mean(np.asarray(pts, float), axis=0) if args.center and len(pts) else np.zeros(3)),
             verbose=args.verbose,
         ))
@@ -1120,19 +1125,48 @@ def _facet_geometry_input(struct, cfg: Config, wulff_facets, planes_geo, cut_sym
     }
 
 
-def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, ligand, origin, verbose):
-    """
-    Manifest entries `facet_geometry` and `site_roles` (aligned with the
-    written XYZ, i.e. permuted by `order`). Core atoms are the non-ligand
-    atoms still at a position of the passivated inorganic core.
-    """
+def _core_mask(syms, pts, core_ref_pts, ligand) -> np.ndarray:
+    """Non-ligand atoms still at a position of the passivated inorganic core."""
     from scipy.spatial import cKDTree
-    from .polyhedron import facet_geometry
     P = np.asarray(pts, float)
     core = np.zeros(len(syms), dtype=bool)
     if len(core_ref_pts) and len(P):
         dist, _j = cKDTree(np.asarray(core_ref_pts, float)).query(P)
         core = (dist < 1e-3) & np.array([s != ligand for s in syms], dtype=bool)
+    return core
+
+
+def _current_site_roles(syms, pts, core_ref_pts, geo_in, *, charges, ligand):
+    """Site role of every atom of the structure as it is now (None if the geometry fails)."""
+    from .polyhedron import facet_geometry
+    try:
+        _geo, roles = facet_geometry(
+            geo_in["planes"], geo_in["labels"], geo_in["hkls"], syms, np.asarray(pts, float),
+            _core_mask(syms, pts, core_ref_pts, ligand), charges, role_tol=geo_in["role_tolerance"],
+        )
+    except Exception as exc:
+        print(f"[geometry] site roles failed: {type(exc).__name__}: {exc}")
+        return None
+    return None if roles is None else roles["roles"]
+
+
+def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, ligand, origin, verbose,
+                            struct=None, z_type_ledger=None):
+    """
+    Manifest entries `facet_geometry`, `site_roles` (aligned with the
+    written XYZ, i.e. permuted by `order`) and `composition`. Core atoms are
+    the non-ligand atoms still at a position of the passivated inorganic core.
+    """
+    from .polyhedron import facet_geometry
+    P = np.asarray(pts, float)
+    core = _core_mask(syms, P, core_ref_pts, ligand)
+    comp = None
+    if struct is not None:
+        try:
+            from .composition import core_composition
+            comp = core_composition(struct, syms, core, charges, ligand, z_type_ledger)
+        except Exception as exc:  # never fail a build over its report
+            comp = {"error": f"{type(exc).__name__}: {exc}"}
     try:
         geo, roles = facet_geometry(
             geo_in["planes"], geo_in["labels"], geo_in["hkls"], syms, P, core, charges,
@@ -1141,9 +1175,14 @@ def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, 
     except Exception as exc:  # never fail a build over its report
         if verbose:
             print(f"[geometry] facet geometry failed: {type(exc).__name__}: {exc}")
-        return {"facet_geometry": {"error": f"{type(exc).__name__}: {exc}"}}
+        out = {"facet_geometry": {"error": f"{type(exc).__name__}: {exc}"}}
+        if comp is not None:
+            out["composition"] = comp
+        return out
     geo["origin_A"] = [round(float(x), 6) for x in origin]
     out = {"facet_geometry": geo}
+    if comp is not None:
+        out["composition"] = comp
     if roles is not None:
         order = list(order)
         new_index = {old: new for new, old in enumerate(order)}
@@ -1994,6 +2033,16 @@ def main(argv: List[str] | None = None) -> int:
         po_cli = getattr(args, "proper_rotations_only", None)
         eff_proper = cfg.proper_only if po_cli is None else bool(po_cli)
         print(f"    - Proper rotations only (effective): {bool(eff_proper)}")
+
+    if cfg.radius_ang is not None:
+        # Distance mode: gamma_f = h_f and R = min h, so every plane sits at h_f.
+        if args.size_unit_cells is not None or args.aspect is not None:
+            p.error("facet_distances sets size and shape: drop --size-unit-cells / --aspect")
+        if args.radius is None:
+            args.radius = float(cfg.radius_ang)
+        if cfg.target is not None:
+            from .target_build import run_target_mode
+            return run_target_mode(args, cfg, struct)
 
     # Resolve size/aspect and proper-only (CLI can override YAML size).
     size_unit_cells_eff = _effective_single_size_unit_cells(cfg, args)

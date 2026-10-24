@@ -25,6 +25,8 @@ name.
 | `stack_size_metrics` | core/shell particles: size per layer |
 | `facet_geometry` | facet areas, edges and vertices of the Wulff polyhedron (below) |
 | `site_roles` | facet, edge or vertex of every atom, aligned with the XYZ (below) |
+| `composition` | the dot as $[MA]_m(MX_q)_k$ (below) |
+| `target_search` | target mode only: every candidate and the best one ({ref}`target-mode`) |
 
 Treatments that change the surface add their own ledgers, which record
 exactly what was done:
@@ -101,6 +103,25 @@ facet_geometry:
   enabled: true          # default
   role_tolerance: 1.0    # Å; zinc-blende Se lies 0.88 Å under a {111}A Cd layer
 ```
+
+## Composition
+
+`composition` writes the dot as $[MA]_m(MX_q)_k$:
+
+| Key | Meaning |
+|---|---|
+| `formula_unit` | the bulk formula unit of the CIF (`CdSe`) |
+| `m` | formula units in the core (the limiting species) |
+| `core_excess` | core atoms beyond `m` formula units (`{"Cd": 13}`) |
+| `x_type` | ligand symbol and number of X-type ligand atoms from the charge balance |
+| `z_type` | Z-type units placed, per complex formula |
+| `mx_unit` | the MX_q unit of the one excess cation (`CdCl2`) |
+| `k_X` | excess cations in MX_q units ($N_\text{Cd} - N_\text{Se}$ for CdSe) |
+| `k_Z`, `k` | Z-type MX_q units, and $k = k_X + k_Z$ |
+| `formula` | e.g. `[CdSe]_55(CdCl2)_13` |
+| `x_type_balanced` | the X-type ligands are exactly $q\,k_X$ |
+
+The last six keys are present when the excess is a single cation species.
 
 ## Several centres, several files
 

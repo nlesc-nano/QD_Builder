@@ -15,6 +15,12 @@ points are listed below.
 
 .. automodule:: builder.polyhedron
    :members: facet_labels, clip, fitted_planes, summary, core_roles, site_roles, facet_geometry
+
+.. automodule:: builder.target_build
+   :members: layer_spacing, auto_centres, run_target_mode
+
+.. automodule:: builder.composition
+   :members: core_composition
 ```
 
 ## Bonding and analysis

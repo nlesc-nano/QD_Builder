@@ -100,6 +100,55 @@ Molecular anions can still clash with each other when the plan is built
 (the plan only reserves the anion sites); such complexes are skipped and
 counted as crowded.
 
+## Per facet family
+
+```yaml
+post_treatment:
+  z_type_ligands:
+    enabled: true
+    passes:
+      - complex: CdCl2
+        targets: {"111B": 6, "111A": 2, "edge:100|111B": 1}
+```
+
+`targets` asks for a number of units per site family and replaces `ratio`
+and `target_count`. A free anion belongs to a family through its site role
+in the facet geometry ({ref}`facet-geometry`):
+
+- a facet label (`"111B"`, or `"facet:111B"`);
+- an exact edge or vertex role (`"edge:100|111B"`, `"vertex:100+100+111B"`);
+- `"edge"` or `"vertex"` for all of them.
+
+The free sites $s_f$ of a family are its free anions. Each family is planned
+once over all of its free sites with the pass's `distribution`, and the
+first $k_f$ units of that plan are placed, one at a time. A build with
+$k_f + 1$ units therefore contains the one with $k_f$. A request above
+$s_f$ is capped:
+
+$$
+k_f^{Z} = \min\left(s_f,\ k_f^\text{requested}\right) .
+$$
+
+Families are filled in the order given. A unit whose anion sites another
+family has already taken uses the next free ones, or is skipped.
+
+The ledger entry of the pass has `families`, with, per family:
+
+| Key | Meaning |
+|---|---|
+| `free_sites` | $s_f$ |
+| `crowded_sites` | anions of the family dropped by the 3.5 Å ligand rule |
+| `blocked_sites` | anions whose cation site is not clear |
+| `requested`, `capped`, `placed`, `skipped` | units asked for, after the cap, placed, and `requested - placed` |
+| `skipped_crowded`, `skipped_no_anion_site`, `skipped_taken` | why units of the plan were not placed |
+
+On the zinc-blende CdSe dots of the library preset, the 3.5 Å rule removes
+no site. The free Se sit on the anion-terminated {111}B facets and under
+Cd vacancies of {111}A, whose Se layer is 0.88 Å below the Cd and so within
+the 1 Å role tolerance. {111}A facets with a complete Cd layer, and {100}
+facets, have none: their Se is four-coordinated, the {100} surface being Cd
+with bridging Cl after the prepass.
+
 ## The complex
 
 The complex is written as an MXₙ formula (`CdCl2`, `ZnBr2`, `InCl3`) or as
@@ -145,6 +194,7 @@ CdCl₂·NH₂R on the surface.
 | `passes[].target_symbol` | any | native anion to bind to |
 | `passes[].ratio` / `target_count` | 1.0 / 0 | fraction or number of free anions |
 | `passes[].distribution` | `uniform` | `uniform`, `random` or `segmented` |
+| `passes[].targets` | none | units per site family, see above |
 
 The manifest contains a `z_type_ligand_ledger` with, for every pass, the
 formula of the unit, the number of free anion sites, the units requested

@@ -191,12 +191,16 @@ class ZTypeLigandPass:
     distribution : 'uniform' (alternate sites, then fill in) | 'random' | 'segmented'
     ratio        : fraction of the free anion sites to use (0.0 - 1.0).
     target_count : exact number of complexes; if > 0 it overrides ratio.
+    targets      : complexes per site family, e.g. (("111B", 6), ("edge:100|111B", 2));
+                   a family is a facet label, "edge:<a>|<b>", "vertex:<...>", or
+                   "edge" / "vertex" for all of them. Overrides ratio and target_count.
     """
     complex: str
     target_symbol: Optional[str] = None
     distribution: str = "uniform"
     ratio: float = 1.0
     target_count: int = 0
+    targets: Tuple[Tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -326,3 +330,9 @@ class Config:
     experimental: Dict[str, Any] = field(default_factory=dict)
     stack: StackSpec = field(default_factory=StackSpec)
     facet_geometry: Dict[str, Any] = field(default_factory=dict)  # {enabled, role_tolerance}
+    # Distance mode: one plane distance per facet family (Å from the construction origin);
+    # the seeds then carry gamma = h and the cut uses R = min h, aspect (1, 1, 1).
+    facet_distances: Optional[Dict[str, float]] = None
+    radius_ang: Optional[float] = None
+    # Target mode (with facet_distances): {m, w, centres, roundings, max_builds}
+    target: Optional[Dict[str, Any]] = None

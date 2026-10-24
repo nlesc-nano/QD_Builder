@@ -114,8 +114,8 @@ generator, configuration, QD_Builder commit and whether the source tree was
 modified, the CIF, the recipe and, for reconstructions, the reconstruction
 ledger.
 
-Records also copy the manifest's `facet_geometry` and `site_roles` (see
-{ref}`facet-geometry`); the site roles are aligned with `start.xyz`, and
+Records also copy the manifest's `facet_geometry`, `site_roles`,
+`composition` and `z_type_ligand_ledger` (see {ref}`facet-geometry`); the site roles are aligned with `start.xyz`, and
 `facet_geometry.origin_A` gives the construction origin in its
 centre-of-mass frame.
 

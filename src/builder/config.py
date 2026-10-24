@@ -297,6 +297,60 @@ def _parse_facet_geometry(raw) -> dict:
     return {"enabled": True if enabled is None else enabled, "role_tolerance": tol}
 
 
+def _parse_facet_distances(raw) -> list[dict]:
+    """
+    facet_distances: {"100": 12.4, "111A": 9.8, "111B": 14.1, "110": 13.0} (Å).
+    A trailing A/B marks the cation/anion-terminated orbit of a polar family
+    (termination cation_rich/anion_rich); any other key is an hkl as in
+    `facets`. Returns facet items with gamma = h.
+    """
+    if not isinstance(raw, dict) or not raw:
+        raise TypeError("facet_distances must be a non-empty mapping family -> distance in Å")
+    items = []
+    for key, val in raw.items():
+        label = str(key).strip()
+        h = float(val)
+        if not h > 0:
+            raise ValueError(f"facet_distances[{label!r}] must be positive, got {val!r}")
+        term = None
+        hkl = label
+        if label[-1:].upper() in {"A", "B"}:
+            term = "cation_rich" if label[-1].upper() == "A" else "anion_rich"
+            hkl = _parse_hkl(label[:-1])
+            if term == "anion_rich":     # the opposite orbit, written as the gamma recipes do ("-1-1-1")
+                hkl = tuple(-x for x in hkl)
+        items.append({"hkl": hkl, "gamma": h, **({"termination": term} if term else {})})
+    keys = [tuple(_parse_hkl(it["hkl"])) for it in items]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"facet_distances: two keys name the same facet family: {list(raw)}")
+    return items
+
+
+def _parse_target(raw) -> dict:
+    """target: {m, w, centres, roundings, max_builds} for the target-mode search."""
+    if not isinstance(raw, dict):
+        raise TypeError("target must be a mapping")
+    unknown = set(raw) - {"m", "w", "centres", "centers", "roundings", "max_builds"}
+    if unknown:
+        raise ValueError(f"target: unknown keys {sorted(unknown)}")
+    m = raw.get("m")
+    if m is not None and not float(m) > 0:
+        raise ValueError("target.m must be positive")
+    roundings = [int(r) for r in raw.get("roundings", [-1, 0, 1])]
+    if not roundings:
+        raise ValueError("target.roundings must not be empty")
+    centres = raw.get("centres", raw.get("centers", "auto"))
+    if centres != "auto" and not isinstance(centres, list):
+        raise TypeError("target.centres must be 'auto' or a list of species / {fractional_shift: [...]}")
+    return {
+        "m": None if m is None else float(m),
+        "w": float(raw.get("w", 1.0)),
+        "centres": centres,
+        "roundings": sorted(set(roundings)),
+        "max_builds": int(raw.get("max_builds", 400)),
+    }
+
+
 def _parse_facet_reconstruction(raw) -> FacetReconstructionSpec:
     if raw is None:
         return FacetReconstructionSpec()
@@ -809,7 +863,15 @@ def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
         ratio = float(entry.get("ratio", 1.0))
         if not (0.0 <= ratio <= 1.0):
             raise ValueError(f"z_type_ligands.passes[{i}].ratio must be in [0, 1], got {ratio}")
-        if target_count <= 0 and ratio <= 0.0:
+        targets_raw = entry.get("targets") or {}
+        if not isinstance(targets_raw, dict):
+            raise TypeError(f"z_type_ligands.passes[{i}].targets must be a mapping family -> count")
+        targets = []
+        for fam, cnt in targets_raw.items():
+            if int(cnt) < 0:
+                raise ValueError(f"z_type_ligands.passes[{i}].targets[{fam!r}] must be >= 0")
+            targets.append((str(fam).strip(), int(cnt)))
+        if target_count <= 0 and ratio <= 0.0 and not targets:
             continue
         passes.append(ZTypeLigandPass(
             complex=complex_,
@@ -817,6 +879,7 @@ def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
             distribution=distribution,
             ratio=ratio,
             target_count=target_count,
+            targets=tuple(targets),
         ))
 
     ff = str(raw.get("ff", "uff")).strip().lower()
@@ -1147,6 +1210,23 @@ def parse_yaml_config(path: str) -> Config:
     )
 
     top_facets = cfg.get("facets", cfg.get("seeds"))
+    facet_distances = None
+    radius_ang = None
+    target = None
+    if cfg.get("facet_distances") is not None:
+        if top_facets is not None:
+            raise ValueError("facet_distances replaces facets: give one or the other")
+        if size_unit_cells is not None:
+            raise ValueError("facet_distances sets the size: drop size_unit_cells")
+        if shape_mode == "sphere" or aspect != (1.0, 1.0, 1.0):
+            raise ValueError("facet_distances needs a Wulff shape with aspect (1, 1, 1)")
+        facet_distances = {str(k): float(v) for k, v in cfg["facet_distances"].items()}
+        top_facets = _parse_facet_distances(cfg["facet_distances"])
+        radius_ang = min(f["gamma"] for f in top_facets)
+    if cfg.get("target") is not None:
+        if facet_distances is None:
+            raise ValueError("target needs facet_distances")
+        target = _parse_target(cfg["target"])
     if top_facets is None and shape_mode != "sphere":
         raise KeyError("YAML: need 'facets' (or 'seeds') for single mode")
 
@@ -1165,4 +1245,7 @@ def parse_yaml_config(path: str) -> Config:
         experimental=experimental,
         stack=stack_spec,
         facet_geometry=facet_geometry,
+        facet_distances=facet_distances,
+        radius_ang=radius_ang,
+        target=target,
     )
