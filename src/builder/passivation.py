@@ -1,6 +1,5 @@
 # nanocrystal_builder/passivation.py
 from __future__ import annotations
-import itertools
 from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional, Sequence, Set
 import numpy as np
@@ -126,62 +125,40 @@ def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: 
 
 class _FacetGeometry:
     """
-    Edge lines and vertex points of every facet for one set of unit planes,
-    with a memo of atom roles.  Built once per plane set by
-    _intersections_geometry (the planes do not change during a charge-balance
-    run, only the atoms do).
+    Corners and edges of every face of the clipped polyhedron n.x <= d
+    (polyhedron.clip, the geometry the manifest's facet roles use), with a
+    memo of atom roles. Built once per plane set by _intersections_geometry
+    (the planes do not change during a charge-balance run, only the atoms).
 
-      edges[fid]  -> (P0 (E,3), U (E,3)): lines p0 + t*u, u unit
-      verts[fid]  -> row indices into vert_xyz (K,3) of the vertex points
-    Lines and points are the pairwise and triple plane intersections, in the
-    same order the original per-pair loops produced them.
+      verts[fid]  -> (V,3) corners of face fid
+      edges[fid]  -> (A (E,3), B (E,3)) end points of the edges face fid
+                     shares with a neighbouring face
+    A plane that clips to no face (it only touches a corner or misses the
+    solid) has neither, so atoms near it count as "unique" on it.
     """
 
     def __init__(self, frames: List[tuple]):
+        from .polyhedron import clip
+
         planes = _unit_planes_from_frames(frames)
         N = len(planes)
-        edge_lists: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {k: [] for k in range(N)}
-
-        def _line_ij(i: int, j: int):
-            ni, di = planes[i]; nj, dj = planes[j]
-            u = np.cross(ni, nj)
-            lu = LA.norm(u)
-            if lu < 1e-9:
-                return None
-            u /= lu
-            A = np.vstack([ni, nj])       # 2x3
-            b = np.array([di, dj], float) # 2
-            p0 = A.T @ LA.pinv(A @ A.T) @ b
-            return p0, u
-
-        for i in range(N):
-            for j in range(i+1, N):
-                out = _line_ij(i, j)
-                if out is None:
-                    continue
-                edge_lists[i].append(out)
-                edge_lists[j].append(out)
-        self.edges = {
-            k: (np.array([p0 for p0, _u in lst], float).reshape(-1, 3),
-                np.array([u for _p0, u in lst], float).reshape(-1, 3))
-            for k, lst in edge_lists.items()
-        }
-
-        # vertices (triple intersections), batched; det/solve run the same
-        # LAPACK kernels per 3x3 system as the scalar calls did
-        self.vert_xyz = np.zeros((0, 3))
-        self.verts = {k: np.zeros(0, dtype=np.int32) for k in range(N)}
-        if N >= 3:
-            normals = np.array([n for n, _d in planes], float)
-            offsets = np.array([d for _n, d in planes], float)
-            triples = np.array(list(itertools.combinations(range(N), 3)), dtype=np.intp)
-            M = normals[triples]
-            ok = np.abs(LA.det(M)) >= 1e-9
-            triples = triples[ok]
-            self.vert_xyz = LA.solve(M[ok], offsets[triples][..., None])[..., 0]
-            for k in range(N):
-                self.verts[k] = np.flatnonzero((triples == k).any(axis=1)).astype(np.int32)
-
+        self.verts: Dict[int, np.ndarray] = {k: np.zeros((0, 3)) for k in range(N)}
+        self.edges: Dict[int, Tuple[np.ndarray, np.ndarray]] = {k: (np.zeros((0, 3)), np.zeros((0, 3))) for k in range(N)}
+        try:
+            poly = clip(planes, [""] * N)
+        except ValueError:
+            poly = None           # planes enclose no volume: no corners or edges
+        if poly is not None:
+            for k, ids in poly.faces.items():
+                self.verts[k] = poly.verts[ids]
+            ends: Dict[int, Tuple[list, list]] = {}
+            for a, b, v0, v1 in poly.edges:
+                for k in (a, b):
+                    ends.setdefault(k, ([], []))
+                    ends[k][0].append(poly.verts[v0])
+                    ends[k][1].append(poly.verts[v1])
+            for k, (A, B) in ends.items():
+                self.edges[k] = (np.array(A, float), np.array(B, float))
         self._roles: Dict[tuple, Tuple[str, int]] = {}
 
     def role(self, x: NDArray[np.float64], fid: int, edge_tol: float, vertex_tol: float) -> Tuple[str, int]:
@@ -192,23 +169,14 @@ class _FacetGeometry:
         return hit
 
     def _classify(self, x: NDArray[np.float64], fid: int, edge_tol: float, vertex_tol: float) -> Tuple[str, int]:
-        idx = self.verts.get(fid)
-        if idx is not None and len(idx):
-            V = self.vert_xyz[idx]
-            dv = float(np.sqrt(np.min(np.sum((x - V) ** 2, axis=1))))
-            if abs(dv - vertex_tol) < _SCREEN_EPS:
-                dv = min(float(LA.norm(x - v)) for v in V)
-            if dv < vertex_tol:
-                return "vertex", 2
-        E = self.edges.get(fid)
-        if E is not None and len(E[0]):
-            P0, U = E
-            W = x - P0
-            W = W - np.einsum("ij,ij->i", W, U)[:, None] * U
-            de = float(np.sqrt(np.min(np.sum(W ** 2, axis=1))))
-            if abs(de - edge_tol) < _SCREEN_EPS:
-                de = min(_point_line_distance(x, p0, u) for p0, u in zip(P0, U))
-            if de < edge_tol:
+        V = self.verts.get(fid)
+        if V is not None and len(V) and float(np.min(np.linalg.norm(x - V, axis=1))) < vertex_tol:
+            return "vertex", 2
+        A, B = self.edges.get(fid, (np.zeros((0, 3)), np.zeros((0, 3))))
+        if len(A):
+            AB = B - A
+            t = np.clip(np.einsum("ij,ij->i", x - A, AB) / np.maximum(np.einsum("ij,ij->i", AB, AB), 1e-12), 0.0, 1.0)
+            if float(np.min(np.linalg.norm(x - (A + t[:, None] * AB), axis=1))) < edge_tol:
                 return "edge", 1
         return "unique", 0
 
@@ -224,10 +192,9 @@ _GEOMETRY_CACHE_SIZE = 2
 
 def _intersections_geometry(frames: List[tuple]):
     """
-    From unit planes (frames), build:
-      - edges_by_facet[fid] -> (P0, U) arrays of lines p0 + t*u on facet fid (u unit)
-      - verts_by_facet[fid] -> indices of facet fid's vertex points in
-        verts_by_facet.geom.vert_xyz
+    From unit planes (frames), build the clipped polyhedron's
+      - edges_by_facet[fid] -> (A, B) end points of facet fid's edges
+      - verts_by_facet[fid] -> (V,3) corners of facet fid
     Cached per plane set.
     """
     key = b"".join(np.asarray(n, float).tobytes() + np.float64(d).tobytes() for (n, d, *_rest) in frames)
@@ -244,10 +211,6 @@ def _intersections_geometry(frames: List[tuple]):
     return edges_by_facet, verts_by_facet
 
 
-def _point_line_distance(p: np.ndarray, p0: np.ndarray, u: np.ndarray) -> float:
-    v = p - p0
-    return LA.norm(v - (v @ u) * u)
-
 def _role_by_geometry(i: int, fid: int,
                       pts: NDArray[np.float64],
                       frames: List[tuple],
@@ -257,9 +220,10 @@ def _role_by_geometry(i: int, fid: int,
                       vertex_tol: float) -> Tuple[str, int]:
     """
     Decide 'vertex'/'edge'/'unique' for atom i on facet fid by geometric proximity.
-      - vertex if within vertex_tol of any vertex point of fid
-      - else edge if within edge_tol of any (fid, *) edge line
+      - vertex if within vertex_tol of a corner of face fid
+      - else edge if within edge_tol of one of its edges (segments)
       - else unique
+    Corners and edges are those of the clipped polyhedron.
     Returns (role_name, role_rank) with ranks: unique=0, edge=1, vertex=2.
     edges_by_facet / verts_by_facet come from _intersections_geometry.
     """
