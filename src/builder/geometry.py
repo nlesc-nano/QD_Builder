@@ -77,6 +77,101 @@ def recut_with_planes(syms: List[str], pts: np.ndarray, planes: List[Plane], tol
     pts2 = pts[mask]
     return syms2, pts2
 
+def _dual_termination_families(facets: List[Facet]) -> set:
+    """Facet families for which both cation_rich and anion_rich facets are requested."""
+    terms: dict = {}
+    for f in facets:
+        t = getattr(f, "termination", None)
+        if getattr(f, "scope", "family") == "family" and t in {"cation_rich", "anion_rich"}:
+            terms.setdefault(tuple(abs(int(x)) for x in (f.h, f.k, f.l)), set()).add(t)
+    return {fam for fam, ts in terms.items() if len(ts) == 2}
+
+
+def _bond_vectors(struct) -> List[np.ndarray]:
+    """First-shell bond vectors of every unit-cell site (1.15 x the shortest bond)."""
+    dmin = min(float(nb.nn_distance) for site in struct.sites for nb in struct.get_neighbors(site, 6.0))
+    return [
+        np.array([nb.coords - site.coords for nb in struct.get_neighbors(site, 1.15 * dmin)], float).reshape(-1, 3)
+        for site in struct.sites
+    ]
+
+
+def place_polar_planes(
+    struct,
+    facets: List[Facet],
+    planes: List[Plane],
+    coords: np.ndarray,
+    site_index: np.ndarray,
+    charges: dict,
+    margin: float = 0.25,
+    window: float = 6.0,
+) -> List[Plane]:
+    """
+    Move the planes of polar families (both terminations requested) so the
+    cut leaves the requested species outermost with the fewest dangling
+    bonds, e.g. zinc-blende {111}: In with one bond out on a cation-rich
+    face, P with one bond out on an anion-rich one. A Wulff plane that falls
+    between the two close layers of an In-P pair leaves the other species,
+    with three bonds out, on top; the passivation prepass strips those and
+    the face ends up with the opposite termination.
+
+    A plane already above a valid top layer is left untouched; otherwise it
+    moves to the nearest position at least `margin` from the layers on both
+    sides with a valid top layer (ties outward).
+    """
+    dual = _dual_termination_families(facets)
+    if not dual or len(coords) == 0:
+        return planes
+    bonds = _bond_vectors(struct)
+    sign = [int(np.sign(charges.get(site.specie.symbol, 0))) for site in struct.sites]
+    out: List[Plane] = []
+    for f, (n, d) in zip(facets, planes):
+        term = getattr(f, "termination", None)
+        if tuple(abs(int(x)) for x in (f.h, f.k, f.l)) not in dual or term not in {"cation_rich", "anion_rich"}:
+            out.append((n, d))
+            continue
+        want = 1 if term == "cation_rich" else -1
+        n_unit = np.asarray(n, float) / np.linalg.norm(n)
+        up = [int(np.sum(b @ n_unit > 1e-3 * np.linalg.norm(b, axis=1))) for b in bonds]
+        candidates = [s for s in range(len(up)) if sign[s] == want and up[s] > 0]
+        if not candidates:
+            out.append((n, d))
+            continue
+        fewest = min(up[s] for s in candidates)
+        good = {s for s in candidates if up[s] == fewest}
+
+        z = coords @ n
+        near = np.flatnonzero(np.abs(z - d) < window)
+        layers: dict = {}
+        for zk, s in zip(np.round(z[near], 3).tolist(), site_index[near].tolist()):
+            layers.setdefault(zk, set()).add(s)
+        zs = sorted(layers)
+        valid = [layers[zk] <= good for zk in zs]
+
+        kept = [k for k, zk in enumerate(zs) if zk <= d + PLANE_EPS]
+        if kept and valid[kept[-1]]:
+            out.append((n, d))
+            continue
+        best = None
+        for k in range(len(zs) - 1):
+            if not valid[k]:
+                continue
+            lo, hi = zs[k], zs[k + 1]
+            target = (lo + hi) / 2 if hi - lo <= 2 * margin else min(max(d, lo + margin), hi - margin)
+            key = (abs(target - d), -target)
+            if best is None or key < best[0]:
+                best = (key, target)
+        if best is None:
+            out.append((n, d))
+            continue
+        d_new = float(best[1])
+        top = "/".join(sorted({struct.sites[s].specie.symbol for s in layers[max(z for z in zs if z <= d_new)]}))
+        print(f"[wulff:termination] Moved {term} facet ({f.h} {f.k} {f.l}) plane by {d_new - d:+.2f} Å "
+              f"(d={d:.4f} -> {d_new:.4f}) so {top} with {fewest} bond(s) out is the top layer.")
+        out.append((n, d_new))
+    return out
+
+
 # ---------- Build a single-material nanocrystal (existing behavior) ----------
 
 def build_nanocrystal(
@@ -85,9 +180,12 @@ def build_nanocrystal(
     R: float,
     aspect=(1.0, 1.0, 1.0),
     origin_shift: np.ndarray | None = None,
+    charges: dict | None = None,
 ):
     """
     Build a Wulff-cut particle from a bulk Structure with anisotropic aspect.
+    With `charges`, planes of polar families requested with both
+    terminations are placed between atomic layers (place_polar_planes).
     Returns (symbols, coords[N,3], planes).
     """
     planes = halfspaces(struct, facets, R, aspect=aspect)
@@ -111,6 +209,9 @@ def build_nanocrystal(
 
     # Automatically shift planes to avoid cutting through atomic layers
     planes = auto_shift_planes(all_coords, planes, threshold=0.05, shift_amount=0.25)
+    if charges is not None:
+        site_index = np.tile(np.arange(len(base)), len(all_coords_list))
+        planes = place_polar_planes(struct, facets, planes, all_coords, site_index, charges)
 
     # In case maxd increased, update ranges
     maxd = max(d for _, d in planes)

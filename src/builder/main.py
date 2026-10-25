@@ -713,15 +713,6 @@ def _termination_mismatches_for_detected_facets(
     return mismatches
 
 
-def _flip_terminated_facets(facets: List[Facet]) -> List[Facet]:
-    return [
-        Facet(-f.h, -f.k, -f.l, f.gamma, termination=f.termination, scope=f.scope)
-        if getattr(f, "termination", None) in {"cation_rich", "anion_rich"}
-        else f
-        for f in facets
-    ]
-
-
 def _format_termination_mismatches(mismatches: List[dict]) -> str:
     parts = []
     for m in mismatches[:8]:
@@ -743,6 +734,7 @@ def _build_wulff_cut(
     *,
     aspect,
     origin_shift,
+    charges=None,
 ):
     syms, pts, planes_geo = build_nanocrystal(
         struct,
@@ -750,6 +742,7 @@ def _build_wulff_cut(
         radius_eff,
         aspect=aspect,
         origin_shift=origin_shift,
+        charges=charges,
     )
     syms, pts = dedupe_points(syms, pts, tol=1e-3)
     return syms, pts, planes_geo
@@ -2142,9 +2135,8 @@ def main(argv: List[str] | None = None) -> int:
             print(f"    - Output: {run_args.out}")
 
         facets_for_variant = wulff_facets
-        last_mismatches: List[dict] = []
         variant_failed = False
-        for termination_attempt in range(2):
+        while True:
             if cfg.shape_mode == "sphere":
                 syms, pts, _planes_geo = build_spherical_nanocrystal(
                     struct,
@@ -2160,6 +2152,7 @@ def main(argv: List[str] | None = None) -> int:
                     radius_eff,
                     aspect=aspect,
                     origin_shift=origin_shift,
+                    charges=cfg.charges,
                 )
             if args.verbose:
                 print(f"    - Cut particle: {len(syms)} atoms")
@@ -2201,23 +2194,15 @@ def main(argv: List[str] | None = None) -> int:
                 cfg.passivation.surf_tol,
             )
             if not mismatches:
-                if termination_attempt and args.verbose:
-                    print("    - Effective facet termination check passed after flipping terminated Wulff seeds")
                 wulff_facets = facets_for_variant
                 break
-            last_mismatches = mismatches
-            if termination_attempt == 0:
-                if args.verbose:
-                    print(
-                        "    - Effective facet termination mismatch after pruning; "
-                        "retrying with opposite terminated Wulff seeds: "
-                        f"{_format_termination_mismatches(mismatches)}"
-                    )
-                facets_for_variant = _flip_terminated_facets(facets_for_variant)
-                continue
+            # The polar planes already sit between atomic layers with the
+            # requested species on top (geometry.place_polar_planes); what is
+            # left are small corner facets. Flipping the seeds would hand the
+            # low surface energy to the opposite polarity, so report and keep.
             msg = (
                 "Requested facet termination could not be realized by the finite Wulff cut after pruning. "
-                f"{_format_termination_mismatches(last_mismatches)}"
+                f"{_format_termination_mismatches(mismatches)}"
             )
             if multiple_variants:
                 if args.verbose:
@@ -2227,6 +2212,7 @@ def main(argv: List[str] | None = None) -> int:
             if args.verbose:
                 print(f"    - WARNING: {msg}")
             wulff_facets = facets_for_variant
+            break
 
         if variant_failed:
             continue
