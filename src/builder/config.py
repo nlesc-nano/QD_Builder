@@ -50,6 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Post-treatment only: run the recipe's post_treatment block on this already "
              "passivated dot (no Wulff cut, no first charge balance). Single-material mode."
     )
+    p.add_argument(
+        "--options", metavar="DOT.xyz", default=None,
+        help="Write the post-treatment options (Z-type, alloying, X/L-type, Z-type ligands) "
+             "and size metrics of this dot to <OUT stem>.json; nothing is built."
+    )
+    p.add_argument("--size-xyz", metavar="XYZ", default=None,
+                   help="With --options: dot for the size metrics (default: the --options dot)")
+    p.add_argument("--size-cif", metavar="CIF", action="append", default=None,
+                   help="With --options: CIF for bulk volumes, repeatable, core first (default: the CIF)")
 
     p.add_argument(
         "--positive-q-mode",

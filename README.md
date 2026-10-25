@@ -92,6 +92,17 @@ python -m builder examples/cifs/CdSe_zb.cif exchange.yaml --from-xyz examples/ou
   -o examples/out/cdse_acetate.xyz
 ```
 
+Post-treatment options of a dot, without building anything: the Z-type displacement,
+alloying, X-type, L-type and Z-type-ligand sites the recipe's post-treatments could use,
+and the size metrics (SAXS and volume diameters), as one JSON file (`<OUT stem>.json`).
+`--size-xyz` sizes another dot (e.g. the post-treated one) and `--size-cif`, repeatable
+with the core first, sets the bulk volumes of a core-shell dot:
+
+```bash
+python -m builder examples/cifs/CdSe_zb.cif recipe.yaml --options examples/out/cdse.xyz \
+  -o examples/out/cdse_options.json
+```
+
 ## Janus Heterostructures
 
 The Janus workflow is experimental and lives in a separate script:

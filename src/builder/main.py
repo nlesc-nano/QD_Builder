@@ -1644,11 +1644,18 @@ def main(argv: List[str] | None = None) -> int:
         pass_spec = dataclasses.replace(pass_spec, **updated_pass_fields)
         cfg = dataclasses.replace(cfg, passivation=pass_spec)
 
+    if args.from_xyz is not None and args.options is not None:
+        p.error("--from-xyz and --options are separate runs")
     if args.from_xyz is not None:
         if cfg.mode == "stack" or args.cif is None:
             p.error("--from-xyz needs single-material mode: nc-builder STRUCT.cif RECIPE.yaml --from-xyz DOT.xyz")
         from .from_xyz import run_from_xyz
         return run_from_xyz(args, cfg)
+    if args.options is not None:
+        if cfg.mode == "stack" or args.cif is None:
+            p.error("--options needs single-material mode: nc-builder STRUCT.cif RECIPE.yaml --options DOT.xyz")
+        from .post_options import run_options
+        return run_options(args, cfg)
 
     if cfg.mode != "stack" and args.cif is None:
         p.error("single-material mode requires: nc-builder STRUCT.cif RECIPE.yaml")
