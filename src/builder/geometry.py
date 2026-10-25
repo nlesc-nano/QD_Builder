@@ -116,8 +116,9 @@ def place_polar_planes(
     the face ends up with the opposite termination.
 
     A plane already above a valid top layer is left untouched; otherwise it
-    moves to the nearest position at least `margin` from the layers on both
-    sides with a valid top layer (ties outward).
+    moves inward, to just below the unstable top layer (`margin` from it),
+    which is the cut the low-coordination pruning produces where it runs.
+    Only when no valid layer lies within `window` below does it move out.
     """
     dual = _dual_termination_families(facets)
     if not dual or len(coords) == 0:
@@ -152,19 +153,19 @@ def place_polar_planes(
         if kept and valid[kept[-1]]:
             out.append((n, d))
             continue
-        best = None
-        for k in range(len(zs) - 1):
-            if not valid[k]:
-                continue
+        def target_in(k: int) -> float:
             lo, hi = zs[k], zs[k + 1]
-            target = (lo + hi) / 2 if hi - lo <= 2 * margin else min(max(d, lo + margin), hi - margin)
-            key = (abs(target - d), -target)
-            if best is None or key < best[0]:
-                best = (key, target)
-        if best is None:
+            return (lo + hi) / 2 if hi - lo <= 2 * margin else min(max(d, lo + margin), hi - margin)
+
+        gaps = [k for k in range(len(zs) - 1) if valid[k]]
+        inward = [k for k in gaps if target_in(k) <= d]
+        if inward:
+            d_new = float(target_in(max(inward)))
+        elif gaps:
+            d_new = float(target_in(min(gaps, key=lambda k: abs(target_in(k) - d))))
+        else:
             out.append((n, d))
             continue
-        d_new = float(best[1])
         top = "/".join(sorted({struct.sites[s].specie.symbol for s in layers[max(z for z in zs if z <= d_new)]}))
         print(f"[wulff:termination] Moved {term} facet ({f.h} {f.k} {f.l}) plane by {d_new - d:+.2f} Å "
               f"(d={d:.4f} -> {d_new:.4f}) so {top} with {fewest} bond(s) out is the top layer.")
