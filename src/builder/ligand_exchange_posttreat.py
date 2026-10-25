@@ -335,8 +335,23 @@ def _bound_hosts(
     q_lig = int(charges.get(lig, 0))
     if q_lig == 0:
         return []
+    # One array distance test against the largest cutoff of any opposite-
+    # charge species present (plus a margin) leaves the few atoms that can
+    # bind; the scalar test below then decides them as it always has.
+    cut_max = max(
+        (_pair_cut_calibrated(sym, lig, cuts) for sym in set(symbols)
+         if int(charges.get(sym, 0)) * q_lig < 0),
+        default=None,
+    )
+    if cut_max is None:
+        return []
+    pts_arr = np.asarray(pts, float)[:len(symbols)]
+    reach = float(cut_max) + 1e-3
+    delta = pts_arr - pts_arr[ligand_idx]
+    d2 = np.einsum("ij,ij->i", delta, delta)
     hosts: List[Tuple[float, int]] = []
-    for i, sym in enumerate(symbols):
+    for i in np.flatnonzero(d2 <= reach * reach).tolist():
+        sym = symbols[i]
         if i == ligand_idx:
             continue
         if int(charges.get(sym, 0)) * q_lig >= 0:

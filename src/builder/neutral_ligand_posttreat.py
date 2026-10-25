@@ -722,23 +722,32 @@ def _native_core_species(cfg: Config, bulk_struct) -> set[str]:
     return species
 
 
-def _virtual_site_occupied_by_ligand(
-    site_pos: np.ndarray,
+def _virtual_sites_occupied_by_ligand(
+    site_positions: List[np.ndarray],
     syms: List[str],
     pts: NDArray,
     native_species: set[str],
     tol: float = 0.85,
-) -> bool:
-    """Return True if a non-native atom already occupies this virtual site."""
-    site_pos = np.asarray(site_pos, float)
+) -> List[bool]:
+    """Per virtual site, True if a non-native atom already occupies it."""
     pts = np.asarray(pts, float)
     tol2 = float(tol) ** 2
-    for sym, xyz in zip(syms, pts):
-        if sym in native_species:
-            continue
-        if float(np.sum((np.asarray(xyz, float) - site_pos) ** 2)) <= tol2:
-            return True
-    return False
+    ligand_pts = np.asarray(
+        [xyz for sym, xyz in zip(syms, pts) if sym not in native_species], float
+    ).reshape(-1, 3)
+    if not len(site_positions) or not len(ligand_pts):
+        return [False] * len(site_positions)
+    # The tree (with a margin) finds the atoms near each site; the squared
+    # distance test then decides them exactly as the per-atom scan did.
+    site_arr = np.asarray([np.asarray(p, float) for p in site_positions], float)
+    near = cKDTree(ligand_pts).query_ball_point(site_arr, r=float(tol) + 1e-6)
+    return [
+        any(
+            float(np.sum((ligand_pts[k] - site_arr[s]) ** 2)) <= tol2
+            for k in near[s]
+        )
+        for s in range(len(site_arr))
+    ]
 
 
 def _neutral_ligand_surface_mask(
@@ -898,12 +907,10 @@ def neutral_ligand_host_sites(
         return []
 
     before_occupied_filter = len(merged_cif_sites)
-    merged_cif_sites = [
-        site for site in merged_cif_sites
-        if not _virtual_site_occupied_by_ligand(
-            site["pos"], cur_syms, cur_pts, native_species
-        )
-    ]
+    occupied = _virtual_sites_occupied_by_ligand(
+        [site["pos"] for site in merged_cif_sites], cur_syms, cur_pts, native_species
+    )
+    merged_cif_sites = [site for site, occ in zip(merged_cif_sites, occupied) if not occ]
     n_filtered = before_occupied_filter - len(merged_cif_sites)
     if n_filtered:
         print(

@@ -94,34 +94,59 @@ def _count_bound_groups(
 ) -> int:
     needed = max(1, int(anion_count))
     count = 0
-    used_anions = set()
-    for ci in cation_indices:
-        cation = syms[int(ci)]
-        c_pos = pts[int(ci)]
-        bound = []
-        for ai in anion_indices:
-            if ai in used_anions:
-                continue
-            anion = syms[int(ai)]
+    # Each cation tests every anion with one array distance; the scalar
+    # distance is computed only for anions within a margin of the cutoff, or
+    # of the last completion slot, so decisions and order are unchanged.
+    anions = [int(ai) for ai in anion_indices]
+    if not anions:
+        return 0
+    anion_pts = np.asarray([pts[ai] for ai in anions], float)
+    free = np.ones(len(anions), bool)
+    positions: Dict[int, List[int]] = {}
+    for k, ai in enumerate(anions):
+        positions.setdefault(ai, []).append(k)
+    limit_of: Dict[Tuple[str, str], float] = {}
+    limits_of: Dict[str, np.ndarray] = {}
+
+    def _limit(cation: str, anion: str) -> float:
+        key = (cation, anion)
+        if key not in limit_of:
             try:
                 cutoff = _pair_cut_calibrated(cation, anion, cuts)
             except Exception:
                 cutoff = 3.2
-            dist = float(np.linalg.norm(pts[int(ai)] - c_pos))
-            if dist <= max(3.2, 1.15 * cutoff):
-                bound.append((dist, int(ai)))
+            limit_of[key] = max(3.2, 1.15 * cutoff)
+        return limit_of[key]
+
+    margin = 1e-6
+    for ci in cation_indices:
+        cation = syms[int(ci)]
+        c_pos = pts[int(ci)]
+        if cation not in limits_of:
+            limits_of[cation] = np.array([_limit(cation, syms[ai]) for ai in anions], float)
+        limits = limits_of[cation]
+        approx = np.sqrt(np.sum((anion_pts - np.asarray(c_pos, float)) ** 2, axis=1))
+        bound = []
+        for k in np.flatnonzero(free & (approx <= limits + margin)).tolist():
+            ai = anions[k]
+            dist = float(np.linalg.norm(pts[ai] - c_pos))
+            if dist <= limit_of[(cation, syms[ai])]:
+                bound.append((dist, ai))
         if not bound:
             continue
         bound.sort()
         chosen = [ai for _dist, ai in bound[:needed]]
         if allow_unbound_completion and len(chosen) < needed:
-            chosen_set = set(chosen)
+            missing = needed - len(chosen)
+            eligible = free.copy()
+            for ai in chosen:
+                eligible[positions[ai]] = False
+            pool = np.flatnonzero(eligible)
+            if len(pool) > missing:
+                kth = float(np.partition(approx[pool], missing - 1)[missing - 1])
+                pool = pool[approx[pool] <= kth + margin]
             extras = sorted(
-                (
-                    (float(np.linalg.norm(pts[int(ai)] - c_pos)), int(ai))
-                    for ai in anion_indices
-                    if int(ai) not in used_anions and int(ai) not in chosen_set
-                ),
+                ((float(np.linalg.norm(pts[anions[k]] - c_pos)), anions[k]) for k in pool.tolist()),
                 key=lambda item: item[0],
             )
             for _dist, ai in extras:
@@ -130,7 +155,8 @@ def _count_bound_groups(
                     break
         if len(chosen) < needed:
             continue
-        used_anions.update(chosen)
+        for ai in chosen:
+            free[positions[ai]] = False
         count += 1
     return count
 

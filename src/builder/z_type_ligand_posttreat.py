@@ -73,14 +73,20 @@ def _bulk_site_neighbour_vectors(
     ]
 
 
-def _free_anion_hosts(
+def _non_native_points(
     syms: List[str],
     pts: NDArray[np.float64],
     native_species: set[str],
+) -> NDArray[np.float64]:
+    return np.asarray([p for s, p in zip(syms, pts) if s not in native_species], float)
+
+
+def _free_anion_hosts(
+    non_native: NDArray[np.float64],
+    pts: NDArray[np.float64],
     hosts: List[int],
 ) -> bool:
-    """True if no non-native atom lies within the exchange cutoff of any host."""
-    non_native = np.asarray([p for s, p in zip(syms, pts) if s not in native_species], float)
+    """True if no non-native atom (``_non_native_points``) lies within the exchange cutoff of any host."""
     if non_native.size == 0:
         return True
     for h in hosts:
@@ -122,10 +128,11 @@ def z_type_ligand_host_sites(
     if not sites:
         return []
     tree = cKDTree(pts)
+    non_native = _non_native_points(syms, pts, native_species)
     out = []
     for site in sites:
         hosts = list(site["hosts"])
-        if not _free_anion_hosts(syms, pts, native_species, hosts):
+        if not _free_anion_hosts(non_native, pts, hosts):
             if dropped is not None:
                 dropped.setdefault("crowded", []).append(site)
             continue

@@ -107,18 +107,58 @@ def _sphere_form_factor(q: NDArray[np.float64], radius: float) -> NDArray[np.flo
     return (3.0 * (np.sin(x) - x * np.cos(x)) / x ** 3) ** 2
 
 
+def _pair_histogram_integer_weights(pts: NDArray[np.float64], weights: NDArray[np.float64],
+                                    bin_width: float, n_bins: int) -> Optional[NDArray[np.float64]]:
+    """
+    sum_ij w_i w_j per distance bin int(d_ij / bin_width) (d from cdist),
+    or None unless every weight is an integer and every partial sum is exact
+    in float64 (|sum w|^2 < 2^53).  The sum is then independent of the order,
+    so each unordered pair is binned once, per pair of weight values, and the
+    result equals the all-pairs weighted histogram to the last bit.
+    """
+    from scipy.spatial.distance import cdist
+    w = np.asarray(weights, float)
+    values, type_id = np.unique(w, return_inverse=True)
+    if not np.all(values == np.round(values)) or float(np.abs(w).sum()) ** 2 >= 2.0 ** 53:
+        return None
+    n_types = len(values)
+    order = np.argsort(type_id, kind="stable")
+    p = np.ascontiguousarray(pts[order], float)
+    bounds = np.searchsorted(type_id[order], np.arange(n_types + 1))
+    counts = np.zeros((n_types, n_types, n_bins), np.int64)  # ordered pairs (i, j)
+
+    def _add(ta: int, tb: int, rows: NDArray[np.float64], cols: NDArray[np.float64], mult: int) -> None:
+        if len(rows) and len(cols):
+            idx = (cdist(rows, cols) / bin_width).astype(np.int64).ravel()
+            counts[ta, tb] += mult * np.bincount(idx, minlength=n_bins)[:n_bins]
+
+    block = max(1, int(2e7 // len(p)))
+    for ta in range(n_types):
+        for i0 in range(int(bounds[ta]), int(bounds[ta + 1]), block):
+            i1 = min(i0 + block, int(bounds[ta + 1]))
+            rows = p[i0:i1]
+            _add(ta, ta, rows, p[i0:i1], 1)                  # both orders and i == j
+            _add(ta, ta, rows, p[i1:bounds[ta + 1]], 2)      # j > i, counted for (j, i) too
+            for tb in range(ta + 1, n_types):
+                _add(ta, tb, rows, p[bounds[tb]:bounds[tb + 1]], 2)
+    prod = np.rint(np.outer(values, values)).astype(np.int64)
+    return np.tensordot(prod, counts, axes=([0, 1], [0, 1])).astype(float)
+
+
 def debye_intensity(pts: NDArray[np.float64], weights: NDArray[np.float64], q: NDArray[np.float64],
                     bin_width: float = 0.02) -> NDArray[np.float64]:
     """Debye intensity sum_ij w_i w_j sin(q r_ij)/(q r_ij) from a histogram of pair distances."""
     from scipy.spatial.distance import cdist
     r_max = 2.0 * float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).max()) + 2.0 * bin_width
     n_bins = int(r_max / bin_width) + 2
-    hist = np.zeros(n_bins)
-    block = max(1, int(2e7 // len(pts)))
-    for i0 in range(0, len(pts), block):
-        idx = (cdist(pts[i0:i0 + block], pts) / bin_width).astype(np.int64).ravel()
-        w = (weights[i0:i0 + block, None] * weights[None, :]).ravel()
-        hist += np.bincount(idx, weights=w, minlength=n_bins)[:n_bins]
+    hist = _pair_histogram_integer_weights(pts, weights, bin_width, n_bins)
+    if hist is None:
+        hist = np.zeros(n_bins)
+        block = max(1, int(2e7 // len(pts)))
+        for i0 in range(0, len(pts), block):
+            idx = (cdist(pts[i0:i0 + block], pts) / bin_width).astype(np.int64).ravel()
+            w = (weights[i0:i0 + block, None] * weights[None, :]).ravel()
+            hist += np.bincount(idx, weights=w, minlength=n_bins)[:n_bins]
     centres = (np.arange(n_bins) + 0.5) * bin_width
     return (hist[None, :] * np.sinc(np.outer(q, centres) / np.pi)).sum(axis=1)
 
