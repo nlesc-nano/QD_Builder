@@ -384,20 +384,31 @@ def _place_exchange_ligand(
     e_z = np.cross(e_x, e_y)
     E = np.column_stack([e_x, e_y, e_z])
 
-    # Search for neighboring cations for bidentate coordination reward
-    env_symbols = [_z_to_symbol(z) for z in env_z]
+    # Search for neighboring cations for bidentate coordination reward.
+    # Element properties are looked up once per distinct atomic number.
+    env_z_arr = np.asarray(env_z, dtype=int)
+    present_z = np.unique(env_z_arr)
     cation_metals = {"Pb", "Cd", "Zn", "In", "Ga", "Cs", "Na", "K", "Ba", "Sr", "Ca", "Mg"}
-    cation_indices = [
-        idx for idx, sym in enumerate(env_symbols)
-        if int(cfg_charges.get(sym, 0)) > 0 or sym in cation_metals
-    ]
-    neighbor_cation_pts = []
-    for idx in cation_indices:
-        if idx == primary_host_idx_in_env:
-            continue
-        dist = float(np.linalg.norm(env_pos[idx] - dpos))
-        if 1.5 <= dist <= r_search:
-            neighbor_cation_pts.append(env_pos[idx])
+    cation_z = []
+    for z in present_z.tolist():
+        sym = _z_to_symbol(z)
+        if int(cfg_charges.get(sym, 0)) > 0 or sym in cation_metals:
+            cation_z.append(z)
+    cation_indices = np.flatnonzero(np.isin(env_z_arr, cation_z))
+    if primary_host_idx_in_env is not None:
+        cation_indices = cation_indices[cation_indices != primary_host_idx_in_env]
+    env_pos_arr = np.asarray(env_pos, float)
+    cat_dist = np.sqrt(np.sum((env_pos_arr[cation_indices] - dpos) ** 2, axis=1))
+
+    def _within(lo: float, hi: float) -> np.ndarray:
+        """lo <= |env_pos[idx] - dpos| <= hi per cation, as the scalar test decides it."""
+        ok = (cat_dist >= lo) & (cat_dist <= hi)
+        for k in np.flatnonzero((np.abs(cat_dist - lo) < 1e-9) | (np.abs(cat_dist - hi) < 1e-9)):
+            dist = float(np.linalg.norm(env_pos[cation_indices[k]] - dpos))
+            ok[k] = lo <= dist <= hi
+        return ok
+
+    neighbor_cation_pts = [env_pos[idx] for idx in cation_indices[_within(1.5, r_search)].tolist()]
 
     # Candidate poses: spin about the surface normal, plus the same spin about
     # normals tilted toward six azimuths, so a ligand on a crowded site can lean
@@ -434,13 +445,7 @@ def _place_exchange_ligand(
 
     # Track valid coordination partners of this site
     hosts_to_exclude = set(site_config.get("hosts", []))
-    neighbor_cation_indices = set()
-    for idx in cation_indices:
-        if idx == primary_host_idx_in_env:
-            continue
-        dist = float(np.linalg.norm(env_pos[idx] - dpos))
-        if dist <= r_search:
-            neighbor_cation_indices.add(idx)
+    neighbor_cation_indices = set(cation_indices[_within(-np.inf, r_search)].tolist())
     coord_partners = hosts_to_exclude.union(neighbor_cation_indices)
 
     dents = {d1}
@@ -454,7 +459,8 @@ def _place_exchange_ligand(
     if len(env_pos) > 0:
         # Every environment atom within reach of a vdW contact counts: a fixed
         # k-nearest query lets the surface atoms hide the neighbouring ligands.
-        env_vdw = np.array([_get_vdw(int(z)) for z in env_z] + [0.0], float)
+        vdw_present = np.array([_get_vdw(int(z)) for z in present_z], float)
+        env_vdw = np.append(vdw_present[np.searchsorted(present_z, env_z_arr)], 0.0)
         lig_vdw = np.array([_get_vdw(int(z)) for z in numbers], float)
         reach = float(lig_vdw.max() + env_vdw[:-1].max())
         k_val = min(24, len(env_pos))

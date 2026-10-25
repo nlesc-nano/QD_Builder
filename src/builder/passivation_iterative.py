@@ -759,8 +759,13 @@ def _priority3_balance_negative_q(
         subset = [c for c in cand if int(c.get("cn", 0)) == cn_target]
         if not subset:
             continue
-        # refresh spacing against global uv_taken
-        for r in subset:
+        # role V->E->U (higher is better: vertex>edge>unique), then spacing,
+        # then shallower; the first of equals wins. Only the leading role
+        # group can win, so the spacing is refreshed against the global
+        # uv_taken for that group alone.
+        top_role = max(int(r.get("role_rank", 0)) for r in subset)
+        lead = [r for r in subset if int(r.get("role_rank", 0)) == top_role]
+        for r in lead:
             fid = int(r.get("fid", -1))
             idx = int(r.get("idx", -1))
             if fid < 0 or idx < 0:
@@ -772,13 +777,7 @@ def _priority3_balance_negative_q(
                 r["dmin_uv"] = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken)
             else:
                 r["dmin_uv"] = float("inf")
-        # role V->E->U, then spacing, then shallower
-        subset.sort(key=lambda r: (
-            int(r.get("role_rank", 0)),           # higher is better: vertex>edge>unique
-            float(r.get("dmin_uv", 0.0)),
-            -float(r.get("depth", 0.0)),
-        ), reverse=True)
-        picked = subset[0]
+        picked = max(lead, key=lambda r: (float(r.get("dmin_uv", 0.0)), -float(r.get("depth", 0.0))))
         i = int(picked.get("idx", -1))
         fid = int(picked.get("fid", -1))
         if i < 0 or fid < 0:
