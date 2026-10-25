@@ -1791,6 +1791,7 @@ def main(argv: List[str] | None = None) -> int:
                     radius_eff,
                     aspect=aspect_outer,
                     origin_shift=origin_shift,
+                    charges=cfg.charges,
                 )
             syms, pts = dedupe_points(syms, pts)
             if args.verbose:

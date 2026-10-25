@@ -182,13 +182,14 @@ def _subargv(args, cif: str, yaml_path: str, out: str, *, final: bool) -> List[s
     return argv
 
 
-def _cut_key(struct, wulff, h, origin_spec) -> Tuple:
+def _cut_key(struct, wulff, h, origin_spec, charges=None) -> Tuple:
     from .geometry import build_nanocrystal, dedupe_points
     from .main import construction_origin_shift
     with contextlib.redirect_stdout(io.StringIO()):
         syms, pts, _planes = build_nanocrystal(
             struct, wulff, min(h.values()), aspect=(1.0, 1.0, 1.0),
             origin_shift=construction_origin_shift(struct, origin_spec),
+            charges=charges,
         )
     syms, pts = dedupe_points(syms, pts, tol=1e-3)
     return tuple(sorted(zip(syms, map(tuple, np.round(pts, 2).tolist()))))
@@ -257,7 +258,7 @@ def run_target_mode(args, cfg, struct) -> int:
                 if min(h.values()) <= 0:
                     candidates.append({**rec, "status": "skipped: non-positive distance"})
                     continue
-                key = (_cut_key(struct, _wulff_for(wbf, h), h, origin),)
+                key = (_cut_key(struct, _wulff_for(wbf, h), h, origin, cfg.charges),)
                 if key in seen:
                     candidates.append({**rec, "status": f"same cut as candidate {seen[key]}", "same_as": seen[key]})
                     continue
