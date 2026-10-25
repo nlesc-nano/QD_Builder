@@ -34,6 +34,15 @@ pip install ./native
 On Apple Silicon with an Intel (x86_64) CMake on the PATH, add
 `ARCHFLAGS="-arch arm64"` in front of the command.
 
+Prebuilt wheels (CPython 3.10-3.14; Linux x86_64/aarch64, macOS arm64/x86_64,
+Windows x64) are attached to the GitHub releases tagged `native-v*`, e.g.
+
+```bash
+pip install nanocrystal-builder-native --find-links https://github.com/nlesc-nano/QD_Builder/releases/expanded_assets/native-v0.1.0
+```
+
+Check an install with `python -c "import qdb_native; qdb_native.self_check()"`.
+
 ## Main Builder
 
 Core-only, size defined in YAML:
