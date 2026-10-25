@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--write-all", action="store_true", help="Also write *_cut.xyz")
     p.add_argument("--center", action="store_true", help="Center the particle at the COM before writing")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument(
+        "--from-xyz", metavar="DOT.xyz", default=None,
+        help="Post-treatment only: run the recipe's post_treatment block on this already "
+             "passivated dot (no Wulff cut, no first charge balance). Single-material mode."
+    )
 
     p.add_argument(
         "--positive-q-mode",

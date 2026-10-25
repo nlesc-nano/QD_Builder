@@ -82,6 +82,16 @@ python -m builder examples/cifs/CdSe_zb.cif examples/core-only/inas_wulff_size_c
 For core-shell mode, the positional CIF is ignored; material CIFs come from
 `materials[].cif` in the YAML.
 
+Post-treatment only, on a dot a build already passivated (no Wulff cut, no first
+charge balance). The recipe's `post_treatment` block runs in the build's order, the
+Wulff planes are detected on the dot, and `out.json` lists every step's ledger
+(`post_treatment_ledger`). The XYZ keeps the input atom order:
+
+```bash
+python -m builder examples/cifs/CdSe_zb.cif exchange.yaml --from-xyz examples/out/cdse.xyz \
+  -o examples/out/cdse_acetate.xyz
+```
+
 ## Janus Heterostructures
 
 The Janus workflow is experimental and lives in a separate script:
