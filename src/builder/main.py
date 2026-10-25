@@ -1621,6 +1621,9 @@ def main(argv: List[str] | None = None) -> int:
         p.error("expected one argument (YAML for stack mode) or two arguments (CIF YAML for single-material mode)")
 
     cfg: Config = parse_yaml_config(args.yaml)
+    if args.verbose:
+        from ._native import describe as describe_native
+        print(f"[native] {describe_native()}")
     # Merge CLI options into PassivationSpec
     pass_spec = cfg.passivation
     updated_pass_fields = {}
@@ -2110,6 +2113,7 @@ def main(argv: List[str] | None = None) -> int:
     if args.verbose and multiple_variants:
         print(f"    - Construction center variants: {[label for label, _ in variants]}")
 
+    skipped_variants: List[str] = []
     for variant_label, origin_shift in variants:
         run_args = copy.copy(args)
         run_args.size_unit_cells = size_unit_cells_eff
@@ -2215,6 +2219,7 @@ def main(argv: List[str] | None = None) -> int:
             break
 
         if variant_failed:
+            skipped_variants.append(variant_label)
             continue
 
         report_label = f" ({variant_label})" if multiple_variants else ""
@@ -2281,6 +2286,15 @@ def main(argv: List[str] | None = None) -> int:
                 ligand_exchange_charge_ledger=ligand_exchange_charge_ledger,
             )
 
+    if skipped_variants:
+        # Always on stderr: a run that writes nothing must not look like a success.
+        print(
+            f"[nc-builder] skipped centre variant(s) {skipped_variants}: the requested facet terminations "
+            "could not be realised for this size (rerun with --verbose for details)",
+            file=sys.stderr,
+        )
+        if len(skipped_variants) == len(variants):
+            return 1
     return 0
 
 if __name__ == "__main__":

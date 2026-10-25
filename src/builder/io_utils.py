@@ -17,9 +17,12 @@ def center_coords(pts: NDArray[np.float64]) -> NDArray[np.float64]:
     return pts - com
 
 def write_manifest(prefix: str, symbols: List[str], charges: dict, extra: dict | None = None):
+    from ._native import VERSION as native_version
+
     out = {
         "counts": Counter(symbols),
         "total_charge": int(sum(charges[s] for s in symbols if s in charges)),
+        "native_kernels": native_version,
     }
     if extra:
         out.update(extra)
