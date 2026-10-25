@@ -15,3 +15,15 @@ dependencies = ["numpy"]
 minimum-version = "build-system.requires"
 wheel.packages = ["src/qdb_native"]
 cmake.build-type = "Release"
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = ["cp3??t-*", "*-win32", "*-*linux_i686", "*-musllinux*"]
+test-requires = ["numpy"]
+test-command = "python -c \"import qdb_native; qdb_native.self_check(); print('qdb_native self-check passed')\""
+
+[tool.cibuildwheel.macos]
+# arm64 and Intel wheels from the arm64 runner; Intel wheels are not run there.
+archs = ["arm64", "x86_64"]
+test-skip = "*-macosx_x86_64"
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }

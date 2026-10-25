@@ -1,0 +1,67 @@
+# Wheels for the optional C++ kernels in native/ (qdb_native).
+#
+# - Any push or pull request that touches native/ builds and tests the wheels
+#   (each wheel runs qdb_native.self_check()); they are kept as run artifacts.
+# - Publishing a GitHub release tagged native-v* also attaches the wheels
+#   and the sdist to that release.
+name: native wheels
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-wheels.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-wheels.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pypa/cibuildwheel@v4.3.0
+        with:
+          package-dir: native
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: pipx run build --sdist native --outdir dist
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'native-v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: dist/*
