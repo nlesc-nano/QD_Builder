@@ -714,7 +714,10 @@ def _parse_mxn_replacement(spec: str, charges: Dict[str, int]) -> dict:
     if not text:
         raise ValueError("MXn exchange requires a replacement formula or ionic SMILES")
 
-    if "." not in text and not any(ch in text for ch in "[]+-"):
+    # A plain formula (ZnCl2, CdBr2): element symbols and counts only. Anything
+    # else - including neutral SMILES such as CC(=O)O - goes to RDKit, which
+    # requires charged fragments, instead of being read letter by letter.
+    if re.fullmatch(r"(?:[A-Z][a-z]?\d*)+", text):
         parts = re.findall(r"([A-Z][a-z]?)(\d*)", text)
         if len(parts) < 2:
             raise ValueError(f"Cannot parse MXn formula: {text!r}")
@@ -722,6 +725,12 @@ def _parse_mxn_replacement(spec: str, charges: Dict[str, int]) -> dict:
         cat_count = int(cat_count_raw or "1")
         if cat_count != 1:
             raise ValueError(f"MXn formula currently expects one cation, got {text!r}")
+        if _charge_for_symbol(cat_sym, charges) <= 0 or any(_charge_for_symbol(sym, charges) >= 0 for sym, _n in parts[1:]):
+            raise ValueError(
+                f"MXn formula {text!r} must be a cation followed by anions with charges set "
+                f"(e.g. ZnCl2); for a molecular salt give an ionic SMILES such as "
+                f"[Zn+2].CC(=O)[O-].CC(=O)[O-]"
+            )
         anion_frags: List[dict] = []
         for sym, count_raw in parts[1:]:
             count = int(count_raw or "1")
