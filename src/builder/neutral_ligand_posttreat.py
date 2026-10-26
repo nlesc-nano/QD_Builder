@@ -131,9 +131,9 @@ def _smiles_to_3d_mol(smiles: str, seed: int = 1337, ff: str = "uff"):
     return mol
 
 
-def _rdconf_to_numpy(mol) -> np.ndarray:
+def _rdconf_to_numpy(mol, conf_id: int = -1) -> np.ndarray:
     """Extract conformer coordinates as (N, 3) float array."""
-    conf = mol.GetConformer()
+    conf = mol.GetConformer(int(conf_id))
     n = mol.GetNumAtoms()
     xyz = np.zeros((n, 3), float)
     for i in range(n):
@@ -184,19 +184,22 @@ def _donor_antilone_pair_vec(mol, coords: np.ndarray, anchor_idx: int) -> np.nda
     return _unit(v)
 
 
-def _detect_neutral_anchor(mol) -> Tuple[int, np.ndarray, np.ndarray, str]:
+def _detect_neutral_anchor(mol, coords: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray, np.ndarray, str]:
     """
     Detect a neutral functional group and return its anchor frame.
 
     The molecule is not ionized or deprotonated.  Acidic groups anchor through
     their neutral X-H proton; neutral donors anchor through the donor atom.
+    ``coords`` (default: the molecule's conformer) gives the geometry.
     """
     try:
         from rdkit import Chem
     except ImportError:
         raise ImportError("Neutral ligand post-treatment requires RDKit.")
 
-    coords = _rdconf_to_numpy(mol)
+    if coords is None:
+        coords = _rdconf_to_numpy(mol)
+    coords = np.asarray(coords, float)
 
     patterns = [
         ("carboxylic_acid_h", Chem.MolFromSmarts("[CX3](=O)[OX2H1]")),
@@ -285,6 +288,164 @@ def _detect_anchor_atom(mol, direction_hint: Optional[np.ndarray] = None) -> int
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Ligand conformer: extended, with the donor axis along the tail
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _branch_heavy_count(mol, start: int, parent: int) -> int:
+    seen = {int(parent), int(start)}
+    stack = [int(start)]
+    count = 0
+    while stack:
+        cur = stack.pop()
+        if mol.GetAtomWithIdx(cur).GetAtomicNum() > 1:
+            count += 1
+        for nb in mol.GetAtomWithIdx(cur).GetNeighbors():
+            if nb.GetIdx() not in seen:
+                seen.add(nb.GetIdx())
+                stack.append(nb.GetIdx())
+    return count
+
+
+def _set_backbone_trans(mol, conf_id: int) -> None:
+    """Set every acyclic single-bond heavy-atom torsion to 180 deg (all-trans chains)."""
+    from rdkit import Chem
+    from rdkit.Chem import rdMolTransforms
+
+    conf = mol.GetConformer(int(conf_id))
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.SINGLE or bond.IsInRing():
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        ni = [a.GetIdx() for a in bond.GetBeginAtom().GetNeighbors() if a.GetIdx() != j and a.GetAtomicNum() > 1]
+        nj = [a.GetIdx() for a in bond.GetEndAtom().GetNeighbors() if a.GetIdx() != i and a.GetAtomicNum() > 1]
+        if not ni or not nj:
+            continue
+        a = max(ni, key=lambda k: _branch_heavy_count(mol, k, i))
+        d = max(nj, key=lambda k: _branch_heavy_count(mol, k, j))
+        rdMolTransforms.SetDihedralDeg(conf, a, i, j, d, 180.0)
+
+
+def _anchor_rotor(mol, anchor_idx: int) -> Optional[Tuple[int, int, List[int]]]:
+    """(axis start, pivot, moving H atoms) of the anchor group's X-H rotor, if any."""
+    atom = mol.GetAtomWithIdx(int(anchor_idx))
+    pivot = atom if atom.GetAtomicNum() > 1 else next(iter(atom.GetNeighbors()), None)
+    if pivot is None:
+        return None
+    heavy = [nb.GetIdx() for nb in pivot.GetNeighbors() if nb.GetAtomicNum() > 1]
+    hyd = [nb.GetIdx() for nb in pivot.GetNeighbors() if nb.GetAtomicNum() == 1]
+    if len(heavy) != 1 or not hyd:
+        return None
+    return int(heavy[0]), int(pivot.GetIdx()), [int(h) for h in hyd]
+
+
+def _donor_tail_vec(numbers: np.ndarray, coords: np.ndarray, anchor_idx: int, anchor_center: np.ndarray) -> np.ndarray:
+    body = [i for i, z in enumerate(numbers) if z > 1 and i != int(anchor_idx)]
+    if not body:
+        return np.array([0.0, 0.0, 1.0])
+    return _unit(coords[body].mean(axis=0) - anchor_center)
+
+
+def _body_reach(numbers: np.ndarray, coords: np.ndarray, anchor_idx: int,
+                anchor_center: np.ndarray, anchor_vec: np.ndarray) -> float:
+    """Mean height of the heavy body above the anchor along the donor axis."""
+    body = [i for i, z in enumerate(numbers) if z > 1 and i != int(anchor_idx)]
+    if not body:
+        return 0.0
+    return float(np.mean((coords[body] - anchor_center) @ _unit(anchor_vec)))
+
+
+def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_confs: int = 10) -> dict:
+    """
+    Embed a neutral ligand in the conformer that stands up from its donor.
+
+    The donor axis (anti-lone-pair vector, or the anchor's X-H bond) is what
+    placement aligns with the metal-ligand bond, so the conformer must carry
+    its body along that axis: a single ETKDG conformer of an alkylamine has
+    the NH2 lone pair gauche to the chain, about 90 deg from the tail, and
+    the tail then lies flat on the surface.  Candidates are the ETKDG
+    conformers plus their all-trans version, each with the anchor X-H rotor
+    scanned; the one whose heavy body reaches highest along the donor axis
+    wins.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+    except ImportError:
+        raise ImportError(
+            "Neutral ligand post-treatment requires RDKit. "
+            "Install it with: conda install -c conda-forge rdkit"
+        )
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Cannot parse SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = int(seed)
+    cids = list(AllChem.EmbedMultipleConfs(mol, int(n_confs), params))
+    if not cids:
+        raise RuntimeError(f"3-D embedding failed for SMILES: {smiles!r}")
+
+    def optimize(m, cid=-1):
+        if ff == "mmff" and AllChem.MMFFHasAllMoleculeParams(m):
+            AllChem.MMFFOptimizeMolecule(m, maxIters=500, confId=cid)
+        else:
+            AllChem.UFFOptimizeMolecule(m, maxIters=500, confId=cid)
+
+    for cid in cids:
+        optimize(mol, cid)
+    numbers = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], int)
+    candidates = [_rdconf_to_numpy(mol, cid) for cid in cids]
+    trans = Chem.Mol(mol, confId=cids[0])
+    _set_backbone_trans(trans, -1)
+    optimize(trans)
+    candidates.append(_rdconf_to_numpy(trans))
+
+    anchor_idx, _, _, anchor_name = _detect_neutral_anchor(mol, candidates[0])
+    rotor = _anchor_rotor(mol, anchor_idx)
+    best = None
+    for xyz in candidates:
+        variants = [xyz]
+        if rotor is not None:
+            start, pivot, moving = rotor
+            axis = _unit(xyz[pivot] - xyz[start])
+            for phi in np.deg2rad(np.arange(10.0, 360.0, 10.0)):
+                rot = _rotation_about(axis, phi)
+                v = xyz.copy()
+                v[moving] = (xyz[moving] - xyz[pivot]) @ rot.T + xyz[pivot]
+                variants.append(v)
+        for v in variants:
+            a_idx, a_center, a_vec, _ = _detect_neutral_anchor(mol, v)
+            reach = _body_reach(numbers, v, a_idx, a_center, a_vec)
+            if best is None or reach > best[0] + 1e-9:
+                best = (reach, v, a_idx, a_center, a_vec)
+    _, coords, anchor_idx, anchor_center, anchor_vec = best
+    return {
+        "numbers": numbers,
+        "coords": coords,
+        "anchor_idx": int(anchor_idx),
+        "anchor_center": np.asarray(anchor_center, float),
+        "anchor_vec": _unit(anchor_vec),
+        "tail_vec": _donor_tail_vec(numbers, coords, anchor_idx, anchor_center),
+        "anchor_name": anchor_name,
+    }
+
+
+def _rotation_about(axis: np.ndarray, theta: float) -> np.ndarray:
+    return _rotations_about(axis, np.array([float(theta)]))[0]
+
+
+def _rotations_about(axis: np.ndarray, thetas: np.ndarray) -> np.ndarray:
+    """(n, 3, 3) rotations by each angle of ``thetas`` about ``axis``."""
+    ux, uy, uz = _unit(axis)
+    c, s = np.cos(thetas), np.sin(thetas)
+    return np.array([
+        [c + ux * ux * (1 - c), ux * uy * (1 - c) - uz * s, ux * uz * (1 - c) + uy * s],
+        [uy * ux * (1 - c) + uz * s, c + uy * uy * (1 - c), uy * uz * (1 - c) - ux * s],
+        [uz * ux * (1 - c) - uy * s, uz * uy * (1 - c) + ux * s, c + uz * uz * (1 - c)],
+    ]).transpose(2, 0, 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Spatial distribution assignment (adapted from miniCAT)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -335,116 +496,176 @@ def _refine_one_ligand(
     env_pos: np.ndarray,
     env_z: np.ndarray,
     args_ns,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Place and orientate one neutral ligand at a virtual anchor site.
+
+    Candidate poses align the ligand's tail with the local surface normal or
+    with normals tilted toward twelve azimuths and spin it about that axis,
+    with the anchor on the virtual site; the anchor moves out along the M-L
+    bond (``adaptive_offset_step``) only when no pose on the site is clean.
+    Poses whose donor axis (anti-lone-pair or X-H vector) strays from the
+    M-L bond by more than ``max_donor_dev_deg`` are dropped.  The score
+    follows the X-type exchange: smallest vdW clearance to every environment
+    atom within reach, minus 1000 x the summed squared overlaps beyond
+    ``sterics_margin``; soft penalties prefer an upright tail, a donor on the
+    bond, and tails not leaning toward the other selected sites.
 
     Parameters
     ----------
     site_config : dict with keys:
-        dpos      – virtual anchor position (Å), i.e. pts[i] + offset * n0
-        n0        – outward normal (missing bond direction)
-        numbers   – atomic numbers of ligand atoms
-        coords    – ligand coords in its own frame (from RDKit conformer)
-        anchor_idx– index of anchor atom in the ligand
-        metal_pos – position of the surface atom (for bond-length reference)
-        bond_len  – target M–L bond length (Å)
-    env_pos : (M, 3) float — positions of already-placed atoms in environment
+        dpos          – virtual anchor position (Å)
+        n0            – unit vector host → virtual site (the M–L bond)
+        n_surf        – local outward surface normal (default n0)
+        numbers       – atomic numbers of ligand atoms
+        coords        – ligand coords in its own frame
+        anchor_idx    – index of the anchor (dentate) atom
+        anchor_center – point of the ligand put on the site
+        anchor_vec    – donor axis, aligned with n0
+        tail_vec      – anchor → heavy-body direction, aligned with n_surf
+        hosts         – env indices the anchor bonds to (not clashes)
+        other_site_positions – sites of the other ligands of the pass
+    env_pos : (M, 3) float — positions of the atoms already present
     env_z   : (M,)   int  — atomic numbers of environment atoms
-    args_ns : namespace with fields: sterics_mode, coarse_step_deg,
-              adaptive_offset_steps, adaptive_offset_step, neighbor_repulsion
+    args_ns : namespace with the pose grid, margins and weights
+
     Returns
     -------
-    numbers, coords : arrays for the placed ligand
+    numbers, coords, contacts : the placed ligand and its number of hard
+    contacts (heavy pairs inside vdW - sterics_margin, pairs with H inside
+    vdW - h_margin); 0 means the pose is clean.
     """
-    numbers    = np.asarray(site_config["numbers"], int)
+    numbers = np.asarray(site_config["numbers"], int)
     lig_coords = np.asarray(site_config["coords"], float)
     anchor_idx = int(site_config["anchor_idx"])
-    anchor_center = np.asarray(
-        site_config.get("anchor_center", lig_coords[anchor_idx]), float
-    )
+    anchor_center = np.asarray(site_config.get("anchor_center", lig_coords[anchor_idx]), float)
     anchor_vec = _unit(np.asarray(site_config.get("anchor_vec", [0.0, 0.0, 1.0]), float))
-    n0         = _unit(site_config["n0"])
-    dpos       = np.asarray(site_config["dpos"], float)
-    metal_pos  = np.asarray(site_config["metal_pos"], float)
-    bond_len   = float(site_config["bond_len"])
-    host_env_idx = site_config.get("host_env_idx")
-    other_site_positions = np.asarray(site_config.get("other_site_positions", []), float)
+    tail_vec = _unit(np.asarray(site_config.get("tail_vec", anchor_vec), float))
+    n0 = _unit(np.asarray(site_config["n0"], float))
+    n_surf = _unit(np.asarray(site_config.get("n_surf", n0), float))
+    if float(np.dot(n_surf, n0)) < 0.0:
+        n_surf = n0
+    dpos = np.asarray(site_config["dpos"], float)
+    env_pos = np.asarray(env_pos, float).reshape(-1, 3)
+    env_z = np.asarray(env_z, int)
+    hosts = [int(h) for h in site_config.get("hosts", [site_config.get("host_env_idx")]) if h is not None]
 
-    # ---------- Align ligand: anchor atom → surface atom (inward) ----------
-    # Step 1: translate so the neutral anchor point is at origin.
+    margin = float(getattr(args_ns, "sterics_margin", 0.4))
+    h_margin = float(getattr(args_ns, "h_margin", 0.8))
+    heavy_only = str(getattr(args_ns, "sterics_mode", "vdw")) == "heavy"
+    free_dev = float(getattr(args_ns, "donor_dev_free_deg", 25.0))
+    max_dev = float(getattr(args_ns, "max_donor_dev_deg", 60.0))
+
+    # ---------- Pose grid ----------
+    def frame_perp(v):
+        arb = np.array([1.0, 0.0, 0.0]) if abs(v[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        a = _unit(arb - np.dot(arb, v) * v)
+        return a, np.cross(v, a)
+
+    t_x, t_z = frame_perp(n_surf)
+    axes, tilts = [n_surf], [0.0]
+    az_step = float(getattr(args_ns, "azimuth_step_deg", 30.0))
+    for tilt in getattr(args_ns, "tilt_deg", (15.0, 30.0, 45.0, 60.0)):
+        if float(tilt) <= 0.0:
+            continue
+        th = np.deg2rad(float(tilt))
+        for psi in np.deg2rad(np.arange(0.0, 360.0, az_step)):
+            axes.append(_unit(np.cos(th) * n_surf + np.sin(th) * (np.cos(psi) * t_x + np.sin(psi) * t_z)))
+            tilts.append(float(tilt))
+    axes = np.asarray(axes)
+    spins = np.deg2rad(np.arange(0.0, 360.0, float(getattr(args_ns, "coarse_step_deg", 15.0))))
+
+    # R = spin(axis, phi) @ align(tail_vec -> axis), for every (axis, phi)
+    rots = np.concatenate([
+        _rotations_about(ax, spins) @ _rotation_matrix_from_vectors(tail_vec, ax) for ax in axes
+    ])
+    pose_tilt = np.repeat(np.asarray(tilts, float), len(spins))
+    donor = rots @ anchor_vec
+    dev = np.degrees(np.arccos(np.clip(donor @ n0, -1.0, 1.0)))
+    keep = dev <= max_dev
+    if not keep.any():
+        keep = dev <= dev.min() + 1e-9
+    rots, pose_tilt, dev = rots[keep], pose_tilt[keep], dev[keep]
+
     lig0 = lig_coords - anchor_center
+    rotated = np.einsum("pij,aj->pai", rots, lig0)                  # (n_pose, n_atom, 3)
+    n_pose, n_atom = rotated.shape[:2]
 
-    # Step 2: align anchor→body to point AWAY from surface (along n0)
-    #   → so anchor atom ends up closest to the surface
-    aligned = (_rotation_matrix_from_vectors(anchor_vec, n0) @ lig0.T).T
+    # ---------- Soft preferences (the same at every offset) ----------
+    soft = -float(getattr(args_ns, "donor_weight", 0.02)) * np.maximum(dev - free_dev, 0.0)
+    soft -= float(getattr(args_ns, "tilt_weight", 0.01)) * pose_tilt
+    other = np.asarray(site_config.get("other_site_positions", []), float).reshape(-1, 3)
+    repulsion = float(getattr(args_ns, "neighbor_repulsion", 0.0))
+    if len(other) and repulsion > 0.0:
+        vec = other - dpos
+        dist = np.linalg.norm(vec, axis=1)
+        sel = (dist > 1e-6) & (dist < float(getattr(args_ns, "neighbor_radius", 10.0)))
+        if sel.any():
+            dirs = vec[sel] / dist[sel, None]
+            align = np.clip((rots @ tail_vec) @ dirs.T, 0.0, None)
+            soft -= repulsion * np.sum(align ** 2, axis=1)
 
-    # ---------- Steric scan: rotate around n0 ----------
-    # Do not count the intended host-anchor contact as a steric clash.
-    exclude_mask = np.zeros(len(env_z), bool)
-    hosts_to_exclude = site_config.get("hosts", [host_env_idx])
-    for h in hosts_to_exclude:
-        if h is not None and 0 <= int(h) < len(exclude_mask):
-            exclude_mask[int(h)] = True
+    # ---------- Sterics against every environment atom within vdW reach ----------
+    n_off = int(getattr(args_ns, "adaptive_offset_steps", 1))
+    off_step = float(getattr(args_ns, "adaptive_offset_step", 0.3))
+    extras = np.arange(n_off + 1) * off_step
+    lig_vdw = np.array([_get_vdw(int(z)) for z in numbers], float)
+    lig_on = (numbers > 1) if heavy_only else np.ones(n_atom, bool)
+    radius = float(np.max(np.linalg.norm(lig0, axis=1))) + float(extras[-1]) + 2.0 * 2.5
+    near = np.flatnonzero(np.sum((env_pos - dpos) ** 2, axis=1) <= radius ** 2)
+    if heavy_only:
+        near = near[env_z[near] > 1]
+    if not len(near):
+        best = int(np.argmax(soft))
+        return numbers, rotated[best] + dpos, 0
+    sub_pos = env_pos[near]
+    sub_vdw = np.array([_get_vdw(int(z)) for z in env_z[near]], float)
+    sub_h = env_z[near] == 1
+    is_host = np.isin(near, hosts)
+    reach = float(lig_vdw.max() + sub_vdw.max())
+    tree = cKDTree(sub_pos)
+    k_val = min(24, len(near))
 
-    extra_base = bond_len - float(np.linalg.norm(metal_pos - dpos))
+    def sterics(poses, atoms):
+        """Score and gaps (vdW sum to distance, inf if out of reach) of ``atoms``."""
+        n_p, n_a = poses.shape[0], len(atoms)
+        dists, idx = tree.query(poses[:, atoms].reshape(-1, 3), k=k_val, distance_upper_bound=reach)
+        dists = dists.reshape(n_p, n_a, k_val)
+        idx = idx.reshape(n_p, n_a, k_val)
+        found = idx < len(near)
+        safe = np.where(found, idx, 0)
+        counted = found & lig_on[atoms][None, :, None]
+        dent = np.flatnonzero(atoms == anchor_idx)
+        if len(dent):
+            counted[:, dent[0], :] &= ~is_host[safe[:, dent[0], :]]
+        gap = np.where(counted, dists - (lig_vdw[atoms][None, :, None] + sub_vdw[safe]), np.inf)
+        overlap = np.clip(-margin - gap, 0.0, None)
+        clearance = np.minimum(gap.min(axis=2), 1.0)
+        return clearance.min(axis=1) - 1000.0 * np.sum(overlap ** 2, axis=(1, 2)), gap, safe
 
-    phis = np.deg2rad(np.arange(0, 360, float(getattr(args_ns, "coarse_step_deg", 20.0))))
-    n_adaptive = int(getattr(args_ns, "adaptive_offset_steps", 4))
-    adaptive_step = float(getattr(args_ns, "adaptive_offset_step", 0.15))
-    extras = np.arange(n_adaptive + 1) * adaptive_step
-
-    phi_grid, extra_grid = np.meshgrid(phis, extras)
-    phi_flat = phi_grid.flatten()
-    extra_flat = extra_grid.flatten()
-    num_poses = len(phi_flat)
-
-    ux, uy, uz = n0
-    c, s = np.cos(phi_flat), np.sin(phi_flat)
-    R = np.array([
-        [c + ux*ux*(1-c),   ux*uy*(1-c) - uz*s,  ux*uz*(1-c) + uy*s],
-        [uy*ux*(1-c) + uz*s, c + uy*uy*(1-c),    uy*uz*(1-c) - ux*s],
-        [uz*ux*(1-c) - uy*s, uz*uy*(1-c) + ux*s,  c + uz*uz*(1-c)  ],
-    ]).transpose(2, 0, 1)  # (num_poses, 3, 3)
-
-    all_rotated = np.einsum("pij,aj->pai", R, aligned)   # (num_poses, N_lig, 3)
-    anchor_pts  = dpos + n0 * (extra_base + extra_flat[:, None])
-    all_coords  = all_rotated + anchor_pts[:, None, :]   # (num_poses, N_lig, 3)
-
-    sterics_mode = str(getattr(args_ns, "sterics_mode", "vdw"))
-    if len(env_pos) > 0:
-        cand_idx = (
-            np.where(numbers > 1)[0] if sterics_mode == "heavy"
-            else np.arange(len(numbers))
-        )
-        tree, env_radii = _build_sterics_tree(env_pos, env_z, exclude_mask, sterics_mode)
-        query_pts = all_coords[:, cand_idx, :].reshape(-1, 3)
-        dist_vals, neigh_idx = tree.query(query_pts, k=1)
-        dist_vals = dist_vals.reshape(num_poses, -1)
-        if sterics_mode == "vdw":
-            cand_radii  = np.array([_get_vdw(int(numbers[i])) for i in cand_idx])
-            env_r_match = env_radii[neigh_idx].reshape(num_poses, -1)
-            clearances  = dist_vals - (cand_radii[None, :] + env_r_match)
-        else:
-            clearances = dist_vals
-        steric_scores = np.min(clearances, axis=1)
-    else:
-        steric_scores = np.zeros(num_poses)
-
-    if other_site_positions.size and float(getattr(args_ns, "neighbor_repulsion", 0.0)) > 0.0:
-        if other_site_positions.ndim == 1:
-            other_site_positions = other_site_positions.reshape(1, 3)
-        neighbor_dirs = _unit_rows(other_site_positions - dpos)
-        lig_coms = np.mean(all_coords, axis=1)
-        tail_vecs = _unit_rows(lig_coms - anchor_pts)
-        alignments = np.einsum("pi,ki->pk", tail_vecs, neighbor_dirs)
-        alignments[alignments < 0] = 0.0
-        penalties = float(getattr(args_ns, "neighbor_repulsion", 0.0)) * np.sum(alignments ** 2, axis=1)
-    else:
-        penalties = np.zeros(num_poses)
-
-    best = int(np.argmax(steric_scores - penalties))
-    return numbers, all_coords[best]
+    # Heavy atoms rank every pose; the best ``n_refine`` are scored on all
+    # atoms.  The anchor sits on the virtual site and moves out along the
+    # M-L bond only when no pose on the site is clean.
+    heavy_atoms = np.flatnonzero(numbers > 1)
+    all_atoms = np.arange(n_atom)
+    n_refine = int(getattr(args_ns, "n_refine", 256))
+    fallback = None
+    for extra in extras:
+        poses = rotated + (dpos + extra * n0)
+        cand = np.arange(n_pose)
+        if len(heavy_atoms) < n_atom and n_pose > n_refine:
+            coarse = sterics(poses, heavy_atoms)[0] + soft
+            cand = np.argsort(-coarse, kind="stable")[:n_refine]
+        scores, gap, safe = sterics(poses[cand], all_atoms)
+        scores += soft[cand]
+        b = int(np.argmax(scores))
+        with_h = (numbers[:, None] == 1) | sub_h[safe[b]]
+        contacts = int(np.sum(gap[b] < -np.where(with_h, h_margin, margin)))
+        if contacts == 0:
+            return numbers, poses[cand[b]], 0
+        if fallback is None or contacts < fallback[2]:
+            fallback = (numbers, poses[cand[b]], contacts)
+    return fallback
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -984,10 +1205,19 @@ def run_neutral_ligand_posttreatment(
     # Setup args namespace for _refine_one_ligand
     class _Args:
         sterics_mode        = spec.sterics_mode
-        coarse_step_deg     = 20.0
-        adaptive_offset_steps = 4
-        adaptive_offset_step  = 0.15
+        coarse_step_deg     = 15.0                    # spin about the tail axis
+        tilt_deg            = (15.0, 30.0, 45.0, 60.0)  # tail tilts from the surface normal
+        azimuth_step_deg    = 30.0
+        adaptive_offset_steps = 1
+        adaptive_offset_step  = 0.3
+        sterics_margin      = 0.4                     # heavy pairs: clash inside vdW sum - 0.4 Å
+        h_margin            = 0.6                     # pairs with H: clash inside vdW sum - 0.6 Å
+        donor_dev_free_deg  = 25.0
+        max_donor_dev_deg   = 60.0
+        donor_weight        = 0.02
+        tilt_weight         = 0.01
         neighbor_repulsion  = 0.5
+        neighbor_radius     = 10.0
 
     args_ns = _Args()
 
@@ -1010,15 +1240,15 @@ def run_neutral_ligand_posttreatment(
 
         # Prepare ligand molecule once.  It remains neutral: no ionic transform.
         try:
-            mol = _smiles_to_3d_mol(pass_spec.smiles, seed=spec.seed, ff=spec.ff)
+            lig = _prepare_neutral_ligand(pass_spec.smiles, seed=spec.seed, ff=spec.ff)
         except Exception as exc:
             print(f"  [warning] Could not prepare SMILES {pass_spec.smiles!r}: {exc}. Skipping pass.")
             continue
 
-        lig_coords = _rdconf_to_numpy(mol)
-        lig_numbers = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], int)
-        anchor_atom_idx, anchor_center, anchor_vec, anchor_name = _detect_neutral_anchor(mol)
-        print(f"  → Neutral anchor: {anchor_name} atom_index={anchor_atom_idx}")
+        lig_coords = lig["coords"]
+        lig_numbers = lig["numbers"]
+        anchor_atom_idx = lig["anchor_idx"]
+        print(f"  → Neutral anchor: {lig['anchor_name']} atom_index={anchor_atom_idx}")
 
         unique_host_sites = neutral_ligand_host_sites(
             cur_syms, cur_pts, cfg, bulk_struct, planes, native_species,
@@ -1051,11 +1281,7 @@ def run_neutral_ligand_posttreatment(
             # Fallback: keep the original multiplicity-based order (descending)
             ordered_indices = list(range(total_unique))
 
-        selected_cif_sites = []
-        for idx in ordered_indices:
-            if len(selected_cif_sites) >= k:
-                break
-            selected_cif_sites.append(unique_host_sites[idx])
+        selected_cif_sites = [unique_host_sites[idx] for idx in ordered_indices[:k]]
 
         # satisfied_slots is the sum of multiplicities (deficits satisfied)
         satisfied_slots = sum(site["multiplicity"] for site in selected_cif_sites)
@@ -1063,95 +1289,55 @@ def run_neutral_ligand_posttreatment(
 
         print(f"  → {len(selected_cif_sites)} sites selected for passivation (satisfying {satisfied_slots}/{total_slots} deficit slots; distribution={pass_spec.distribution})")
 
-        if not selected_cif_sites:
-            continue
-
-        # Pre-compute site configs and refine ligands against each other, miniCAT-style.
-        base_syms = list(work_syms)
-        base_pts = np.asarray(work_pts, float)
-        site_configs = []
-        site_dpos = []
-        for site in selected_cif_sites:
-            new_pos = site["pos"]
+        # Place one ligand at a time against the dot and every ligand already
+        # on it (native, X-type, Z-type, and this pass's earlier ones).  A site
+        # with no clash-free pose is skipped and the next site in the
+        # distribution order takes its place.
+        env_pos = np.asarray(work_pts, float)
+        env_z = np.array([_atomic_number(s) for s in work_syms], int)
+        intended = np.asarray([s["pos"] for s in selected_cif_sites], float)
+        placed_count = 0
+        skipped = 0
+        for idx in ordered_indices:
+            if placed_count >= k:
+                break
+            site = unique_host_sites[idx]
             hosts = site["hosts"]
             primary_host = hosts[0]
-            sym_i = cur_syms[primary_host]
-            metal_pos = cur_pts[primary_host]
-            n0 = site["u_vecs"][primary_host]
-            bond_len = float(np.linalg.norm(new_pos - metal_pos))
-            site_dpos.append(new_pos)
-
-            site_configs.append({
-                "dpos":       new_pos,
-                "n0":         n0,
+            site_config = {
+                "dpos":       np.asarray(site["pos"], float),
+                "n0":         site["u_vecs"][primary_host],
+                "n_surf":     _surface_outward_direction(primary_host, cur_pts, planes, surf_tol),
                 "numbers":    lig_numbers,
                 "coords":     lig_coords,
                 "anchor_idx": anchor_atom_idx,
-                "anchor_center": anchor_center,
-                "anchor_vec":  anchor_vec,
-                "metal_pos":  metal_pos,
-                "bond_len":   bond_len,
+                "anchor_center": lig["anchor_center"],
+                "anchor_vec":  lig["anchor_vec"],
+                "tail_vec":    lig["tail_vec"],
                 "host_env_idx": primary_host,
                 "hosts":      hosts,
-            })
-
-        for i, sc in enumerate(site_configs):
-            sc["other_site_positions"] = [
-                p for j, p in enumerate(site_dpos) if j != i
-            ]
-
-        # Partition sites into independent, spatially isolated batches
-        batches = []
-        site_positions = np.asarray(site_dpos, float)
-        for idx in range(len(site_positions)):
-            pos = site_positions[idx]
-            placed_in_batch = False
-            for batch in batches:
-                clash = False
-                for other_idx in batch:
-                    dist = float(np.linalg.norm(pos - site_positions[other_idx]))
-                    if dist < 10.0:
-                        clash = True
-                        break
-                if not clash:
-                    batch.append(idx)
-                    placed_in_batch = True
-                    break
-            if not placed_in_batch:
-                batches.append([idx])
-
-        placed_ligands: List[Tuple[np.ndarray, np.ndarray]] = [
-            (np.array([], dtype=int), np.zeros((0, 3), float))
-            for _ in site_configs
-        ]
-        for batch in batches:
-            # Build env_pos containing base nanocrystal plus all ligands placed in previous batches
-            env_pos_parts = [base_pts]
-            env_z_parts = [np.array([_atomic_number(s) for s in base_syms], int)]
-            for j, (nums_j, coords_j) in enumerate(placed_ligands):
-                if len(nums_j) > 0:
-                    env_pos_parts.append(np.asarray(coords_j, float))
-                    env_z_parts.append(np.asarray(nums_j, int))
-            env_pos = np.vstack(env_pos_parts)
-            env_z = np.concatenate(env_z_parts)
-            
-            # Place and optimize all ligands in the current batch simultaneously
-            for i in batch:
-                site_config = site_configs[i]
-                placed_ligands[i] = _refine_one_ligand(
-                    site_config, env_pos, env_z, args_ns
-                )
-
-        placed_count = 0
-        for placed_numbers, placed_coords in placed_ligands:
+                "other_site_positions": intended,
+            }
+            placed_numbers, placed_coords, contacts = _refine_one_ligand(
+                site_config, env_pos, env_z, args_ns
+            )
+            if contacts:
+                skipped += 1
+                continue
             for at_z, at_pos in zip(placed_numbers, placed_coords):
-                sym_lig = _z_to_symbol(int(at_z))
-                work_syms.append(sym_lig)
+                work_syms.append(_z_to_symbol(int(at_z)))
                 work_pts.append(at_pos)
+            env_pos = np.vstack([env_pos, placed_coords])
+            env_z = np.concatenate([env_z, placed_numbers])
             placed_count += 1
             total_placed += 1
 
         print(f"  → Placed ligand on {placed_count} sites")
+        if skipped:
+            print(f"  → Skipped {skipped} sites with no clash-free pose")
+        if placed_count < k:
+            print(f"  [warning] Placed {placed_count} of {k} requested ligands: "
+                  "the remaining sites are too crowded for this ligand")
 
     print(f"[neutral-ligand:done] Total neutral ligand atoms added: "
           f"{len(work_syms) - len(syms)}")

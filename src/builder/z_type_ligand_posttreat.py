@@ -34,7 +34,9 @@ from .neutral_exchange_posttreat import (
     _rotation_about_axis,
 )
 from .neutral_ligand_posttreat import (
+    _atomic_number,
     _get_spatially_ordered_indices,
+    _get_vdw,
     _native_core_species,
     _z_to_symbol,
     neutral_ligand_host_sites,
@@ -45,6 +47,9 @@ from .neutral_ligand_posttreat import (
 _CLEARANCE_FRAC = 0.8
 # Same no-ligand-within radius the native-anion X-type exchange uses.
 _FREE_ANION_CUTOFF = 3.5
+# A new atom clashes with a ligand atom (non-native: Cl, X-type, L-type) closer
+# than their vdW radii sum minus this margin, the X-type exchange's margin.
+_VDW_MARGIN = 0.4
 
 
 def _bulk_site_neighbour_vectors(
@@ -387,8 +392,16 @@ def _place_unit(
     preps: List[Optional[dict]],
     work_syms: List[str],
     work_pts: List[np.ndarray],
+    native_species: Optional[set] = None,
+    native_anions: Optional[set] = None,
 ) -> Optional[List[str]]:
-    """Add one MXn unit at ``site`` with its anions on ``take``; None if it clashes."""
+    """
+    Add one MXn unit at ``site`` with its anions on ``take``; None if it clashes.
+
+    Every new atom keeps 0.8 d_MX from every atom.  With ``native_species``,
+    the unit also keeps vdW clearance from the atoms it cannot bond to
+    (``_clashes_ligands``).
+    """
     m_pos = np.asarray(site["pos"], float)
     cur_pts = np.asarray(work_pts, float)
     tree = cKDTree(cur_pts)
@@ -411,9 +424,59 @@ def _place_unit(
             f_syms, f_pts = _place_molecular_anion(prep, m_pos, c["pos"], env)
             new_syms.extend(f_syms)
             new_pts.extend(f_pts)
+    if native_species is not None and _clashes_ligands(
+        new_syms, new_pts, work_syms, cur_pts, native_species, native_anions or set()
+    ):
+        return None
     work_syms.extend(new_syms)
     work_pts.extend(new_pts)
     return new_syms
+
+
+def _clashes_ligands(
+    new_syms: List[str],
+    new_pts: List[np.ndarray],
+    syms: List[str],
+    pts: NDArray[np.float64],
+    native_species: set,
+    native_anions: set,
+) -> bool:
+    """
+    True if a new unit (metal first) overlaps a vdW shell it may not touch.
+
+    The metal must clear ligand C and H; the anions must clear every ligand
+    atom and the core anions; the C and H of molecular anions must clear
+    every atom.
+    """
+    pts = np.asarray(pts, float)
+    env_vdw = np.array([_get_vdw(_atomic_number(s)) for s in syms], float)
+    ligand = np.array([s not in native_species for s in syms], bool)
+    anion_side = ligand | np.array([s in native_anions for s in syms], bool)
+    ligand_ch = ligand & np.array([s in ("C", "H") for s in syms], bool)
+    for k, (sym, pos) in enumerate(zip(new_syms, new_pts)):
+        if k == 0:
+            mask = ligand_ch
+        elif sym in ("C", "H"):
+            mask = np.ones(len(syms), bool)
+        else:
+            mask = anion_side
+        if not mask.any():
+            continue
+        d = np.linalg.norm(pts[mask] - np.asarray(pos, float), axis=1)
+        if np.any(d < _get_vdw(_atomic_number(sym)) + env_vdw[mask] - _VDW_MARGIN):
+            return True
+    return False
+    lig_pts = pts[lig]
+    lig_vdw = np.array([_get_vdw(_atomic_number(syms[i])) for i in lig], float)
+    lig_ch = np.array([syms[i] in ("C", "H") for i in lig], bool)
+    for k, (sym, pos) in enumerate(zip(new_syms, new_pts)):
+        d = np.linalg.norm(lig_pts - np.asarray(pos, float), axis=1)
+        hit = d < _get_vdw(_atomic_number(sym)) + lig_vdw - _VDW_MARGIN
+        if k == 0:
+            hit &= lig_ch
+        if hit.any():
+            return True
+    return False
 
 
 def site_family_matches(family: str, role: str) -> bool:
@@ -476,6 +539,8 @@ def _run_family_targets(
     work_syms: List[str],
     work_pts: List[np.ndarray],
     seed: int,
+    native_species: Optional[set] = None,
+    native_anions: Optional[set] = None,
 ) -> Tuple[int, dict]:
     """
     Place the requested units of every family, one at a time in the family's
@@ -513,7 +578,7 @@ def _run_family_targets(
                 if len(take) < n:
                     n_taken += 1
                     continue
-            if _place_unit(sites[idx], take, metal, frags, preps, work_syms, work_pts) is None:
+            if _place_unit(sites[idx], take, metal, frags, preps, work_syms, work_pts, native_species, native_anions) is None:
                 n_clash += 1
                 continue
             used_ids.update(c["id"] for c in take)
@@ -565,6 +630,7 @@ def run_z_type_ligand_posttreatment(
     work_syms = list(syms)
     work_pts = [np.asarray(p, float) for p in np.asarray(pts, float)]
     native_species = _native_core_species(cfg, bulk_struct)
+    native_anions = {s for s in native_species if int(cfg.charges.get(s, 0)) < 0}
     f_shift = nc_bulk_frac_shift(work_syms, np.asarray(work_pts), bulk_struct)
     if f_shift is None:
         print("  [warning] Cannot map the particle onto the CIF lattice. Skipping.")
@@ -611,7 +677,7 @@ def run_z_type_ligand_posttreatment(
             n_before = len(work_syms)
             placed, families = _run_family_targets(
                 pass_spec, sites, dropped, roles, cands, len(frags), metal, frags, preps,
-                work_syms, work_pts, spec.seed + pass_idx,
+                work_syms, work_pts, spec.seed + pass_idx, native_species, native_anions,
             )
             entry = {
                 "complex": pass_spec.complex,
@@ -664,7 +730,9 @@ def run_z_type_ligand_posttreatment(
         n_terminal = 0
         n_added_atoms = 0
         for (idx, take), cns in zip(plan, unit_cn):
-            new_syms = _place_unit(sites[idx], take, metal, frags, preps, work_syms, work_pts)
+            new_syms = _place_unit(
+                sites[idx], take, metal, frags, preps, work_syms, work_pts, native_species, native_anions,
+            )
             if new_syms is None:
                 n_clash += 1
                 continue
