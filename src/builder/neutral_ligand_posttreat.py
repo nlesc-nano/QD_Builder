@@ -306,16 +306,22 @@ def _branch_heavy_count(mol, start: int, parent: int) -> int:
     return count
 
 
-def _set_backbone_trans(mol, conf_id: int) -> None:
-    """Set every acyclic single-bond heavy-atom torsion to 180 deg (all-trans chains)."""
+def _set_backbone_trans(mol, conf_id: int, fixed=()) -> None:
+    """Set every acyclic single-bond heavy-atom torsion to 180 deg (all-trans chains).
+
+    Bonds between two atoms of ``fixed`` keep their torsion.
+    """
     from rdkit import Chem
     from rdkit.Chem import rdMolTransforms
 
+    fixed = set(int(i) for i in fixed)
     conf = mol.GetConformer(int(conf_id))
     for bond in mol.GetBonds():
         if bond.GetBondType() != Chem.BondType.SINGLE or bond.IsInRing():
             continue
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if i in fixed and j in fixed:
+            continue
         ni = [a.GetIdx() for a in bond.GetBeginAtom().GetNeighbors() if a.GetIdx() != j and a.GetAtomicNum() > 1]
         nj = [a.GetIdx() for a in bond.GetEndAtom().GetNeighbors() if a.GetIdx() != i and a.GetAtomicNum() > 1]
         if not ni or not nj:
@@ -354,7 +360,8 @@ def _body_reach(numbers: np.ndarray, coords: np.ndarray, anchor_idx: int,
     return float(np.mean((coords[body] - anchor_center) @ _unit(anchor_vec)))
 
 
-def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_confs: int = 10) -> dict:
+def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_confs: int = 10,
+                            anchor_frame=None) -> dict:
     """
     Embed a neutral ligand in the conformer that stands up from its donor.
 
@@ -365,7 +372,8 @@ def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_co
     the tail then lies flat on the surface.  Candidates are the ETKDG
     conformers plus their all-trans version, each with the anchor X-H rotor
     scanned; the one whose heavy body reaches highest along the donor axis
-    wins.
+    wins.  ``anchor_frame(mol, coords)`` returns the anchor frame like
+    ``_detect_neutral_anchor`` (the default).
     """
     try:
         from rdkit import Chem
@@ -400,7 +408,8 @@ def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_co
     optimize(trans)
     candidates.append(_rdconf_to_numpy(trans))
 
-    anchor_idx, _, _, anchor_name = _detect_neutral_anchor(mol, candidates[0])
+    detect = anchor_frame or _detect_neutral_anchor
+    anchor_idx, _, _, anchor_name = detect(mol, candidates[0])
     rotor = _anchor_rotor(mol, anchor_idx)
     best = None
     for xyz in candidates:
@@ -414,7 +423,7 @@ def _prepare_neutral_ligand(smiles: str, seed: int = 1337, ff: str = "uff", n_co
                 v[moving] = (xyz[moving] - xyz[pivot]) @ rot.T + xyz[pivot]
                 variants.append(v)
         for v in variants:
-            a_idx, a_center, a_vec, _ = _detect_neutral_anchor(mol, v)
+            a_idx, a_center, a_vec, _ = detect(mol, v)
             reach = _body_reach(numbers, v, a_idx, a_center, a_vec)
             if best is None or reach > best[0] + 1e-9:
                 best = (reach, v, a_idx, a_center, a_vec)
@@ -524,6 +533,7 @@ def _refine_one_ligand(
         anchor_vec    – donor axis, aligned with n0
         tail_vec      – anchor → heavy-body direction, aligned with n_surf
         hosts         – env indices the anchor bonds to (not clashes)
+        anchor_group  – ligand atoms whose host contacts are bonds (default: the anchor)
         other_site_positions – sites of the other ligands of the pass
     env_pos : (M, 3) float — positions of the atoms already present
     env_z   : (M,)   int  — atomic numbers of environment atoms
@@ -549,6 +559,7 @@ def _refine_one_ligand(
     env_pos = np.asarray(env_pos, float).reshape(-1, 3)
     env_z = np.asarray(env_z, int)
     hosts = [int(h) for h in site_config.get("hosts", [site_config.get("host_env_idx")]) if h is not None]
+    anchor_group = np.asarray(site_config.get("anchor_group", [anchor_idx]), int)
 
     margin = float(getattr(args_ns, "sterics_margin", 0.4))
     h_margin = float(getattr(args_ns, "h_margin", 0.8))
@@ -635,9 +646,8 @@ def _refine_one_ligand(
         found = idx < len(near)
         safe = np.where(found, idx, 0)
         counted = found & lig_on[atoms][None, :, None]
-        dent = np.flatnonzero(atoms == anchor_idx)
-        if len(dent):
-            counted[:, dent[0], :] &= ~is_host[safe[:, dent[0], :]]
+        for dent in np.flatnonzero(np.isin(atoms, anchor_group)):
+            counted[:, dent, :] &= ~is_host[safe[:, dent, :]]
         gap = np.where(counted, dists - (lig_vdw[atoms][None, :, None] + sub_vdw[safe]), np.inf)
         overlap = np.clip(-margin - gap, 0.0, None)
         clearance = np.minimum(gap.min(axis=2), 1.0)
