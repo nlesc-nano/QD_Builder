@@ -730,6 +730,53 @@ def _collect_anion_candidates_flat(
     return list(outer) if len(outer) > 0 else list(outer) + list(subl)
 
 
+def _refresh_uv_spacing(
+    lead: List[dict],
+    frames: List[Plane],
+    pts: NDArray[np.float64],
+    uv_taken: Dict[int, List[Tuple[float, float]]],
+    uv_cache: UVCache,
+) -> None:
+    """
+    r["dmin_uv"]: in-plane distance from candidate r to the nearest site
+    already taken on its facet (inf if none).  One array per facet gives the
+    distances; candidates within 1e-9 Å of the largest spacing (the only ones
+    that can win) get the exact math.hypot minimum, the rest keep the array
+    value, which stays below the winner's.
+    """
+    from math import hypot
+    by_fid: Dict[int, List[Tuple[dict, Tuple[float, float]]]] = defaultdict(list)
+    for r in lead:
+        fid = int(r.get("fid", -1))
+        idx = int(r.get("idx", -1))
+        if fid < 0 or idx < 0:
+            continue
+        uv = _get_uv(frames, fid, idx, pts, uv_cache)
+        if uv_taken.get(fid):
+            by_fid[fid].append((r, uv))
+        else:
+            r["dmin_uv"] = float("inf")
+    rows = []
+    for fid, items in by_fid.items():
+        T = np.asarray(uv_taken[fid], float)
+        U = np.asarray([uv for _r, uv in items], float)
+        D = np.hypot(U[:, :1] - T[None, :, 0], U[:, 1:] - T[None, :, 1])
+        rows.extend((r, uv, fid, dm, drow) for (r, uv), dm, drow in zip(items, D.min(axis=1).tolist(), D))
+    if not rows:
+        return
+    # A candidate on a facet with nothing taken yet (inf) beats every finite one.
+    top = max(dm for _r, _uv, _fid, dm, _d in rows)
+    if any(r.get("dmin_uv") == float("inf") for r in lead):
+        top = float("inf")
+    for r, uv, fid, dm, drow in rows:
+        if dm >= top - 1e-9:
+            taken = uv_taken[fid]
+            r["dmin_uv"] = min(hypot(uv[0] - taken[k][0], uv[1] - taken[k][1])
+                               for k in np.flatnonzero(drow <= dm + 1e-9).tolist())
+        else:
+            r["dmin_uv"] = dm
+
+
 def _priority3_balance_negative_q(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -765,18 +812,7 @@ def _priority3_balance_negative_q(
         # uv_taken for that group alone.
         top_role = max(int(r.get("role_rank", 0)) for r in subset)
         lead = [r for r in subset if int(r.get("role_rank", 0)) == top_role]
-        for r in lead:
-            fid = int(r.get("fid", -1))
-            idx = int(r.get("idx", -1))
-            if fid < 0 or idx < 0:
-                continue
-            uv = _get_uv(frames, fid, idx, pts, uv_cache)
-            taken = uv_taken.get(fid, [])
-            if taken:
-                from math import hypot
-                r["dmin_uv"] = min(hypot(uv[0]-u, uv[1]-v) for (u, v) in taken)
-            else:
-                r["dmin_uv"] = float("inf")
+        _refresh_uv_spacing(lead, frames, pts, uv_taken, uv_cache)
         picked = max(lead, key=lambda r: (float(r.get("dmin_uv", 0.0)), -float(r.get("depth", 0.0))))
         i = int(picked.get("idx", -1))
         fid = int(picked.get("fid", -1))

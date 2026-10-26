@@ -30,6 +30,7 @@ Rules, applied the same way everywhere:
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -212,24 +213,50 @@ def select_ligand_sites(
             return float(d.min()), float(np.sum(1.0 / np.maximum(d, 1e-6) ** 3))
         return np.inf, 0.0
 
+    def crowd_rounded(c) -> float:
+        """round(crowding, 6) of same_facet_stats.  The running sum decides it
+        unless it lies within 1e-9 of a rounding boundary; then the full sum
+        over the facet's ligands is taken, as same_facet_stats computes it."""
+        scaled = c["crowd_sum"] * 1e6
+        if abs(scaled - math.floor(scaled) - 0.5) < 1e-3:
+            return round(same_facet_stats(c)[1], 6)
+        return round(c["crowd_sum"], 6)
+
     # Spread-key ingredients per candidate, kept current as ligands are
     # picked: d_new (nearest pick), d_taken (nearest existing ligand or
-    # `avoid` point), d_vac (nearest `avoid` point), d_same/crowd (facet).
+    # `avoid` point), d_vac (nearest `avoid` point), d_same/crowd_sum
+    # (ligands added on the candidate's facet).
     for c in cands:
         c["d_new"] = np.inf
         c["d_taken"] = float(np.min(np.linalg.norm(taken_arr - c["pos"], axis=1))) if taken_arr is not None else np.inf
         c["d_vac"] = float(np.min(np.linalg.norm(avoid_arr - c["pos"], axis=1))) if avoid_arr is not None else np.inf
-        c["d_same"], c["crowd"] = same_facet_stats(c)
+        c["d_same"], c["crowd_sum"] = same_facet_stats(c)
+
+    # Host capacity per candidate (smallest and largest left() over its
+    # hosts) and its priority level; a pick changes them only for the
+    # candidates that share one of its hosts.
+    def refresh_level(c) -> None:
+        lefts = [left(h) for h in c["hosts"]]
+        c["min_left"] = min(lefts)
+        need = max(lefts)
+        c["level"] = (need, c["over"] == 0, c["type_rank"]) if zb_pair is not None else (need, c["net"], c["type_rank"])
+
+    by_host: Dict[int, List[dict]] = defaultdict(list)
+    for c in cands:
+        refresh_level(c)
+        for h in set(c["hosts"]):
+            by_host[h].append(c)
 
     picks: List[dict] = []
     new_pts: List[NDArray[np.float64]] = []
     while len(picks) < n_needed:
         remaining_after = n_needed - len(picks) - 1
         elig = []
+        alive = []
         for c in cands:
-            if any(left(h) < 1 for h in c["hosts"]):
-                continue
-            if c["mu"] >= 2 and free_capacity(c["hosts"]) < remaining_after:
+            # A full host or a pick closer than `spacing` excludes c for good
+            # (hosts only fill, picks only add), so c is dropped from cands.
+            if c["min_left"] < 1:
                 continue
             if new_pts:
                 d_new = c["d_new"]
@@ -237,25 +264,28 @@ def select_ligand_sites(
                     d_new = float(np.min(np.linalg.norm(np.asarray(new_pts) - c["pos"], axis=1)))
                 if d_new < spacing:
                     continue
+            alive.append(c)
+            if c["mu"] >= 2 and free_capacity(c["hosts"]) < remaining_after:
+                continue
             elig.append(c)
+        cands = alive
         if not elig:
             break
 
-        def level(c):
-            need = max(left(h) for h in c["hosts"])
-            return (need, c["over"] == 0, c["type_rank"]) if zb_pair is not None else (need, c["net"], c["type_rank"])
-
-        best_level = max(level(c) for c in elig)
-        elig = [c for c in elig if level(c) == best_level]
+        best_level = max(c["level"] for c in elig)
+        elig = [c for c in elig if c["level"] == best_level]
         least = min(counts[c["facet"]] for c in elig)
         elig = [c for c in elig if counts[c["facet"]] == least]
 
         def spread_key(c):
             d_all = min(c["d_taken"], c["d_new"])      # nearest of existing ligands + picks
-            return (round(c["d_same"], 2), -round(c["crowd"], 6), round(min(d_all, c["d_vac"]), 6),
+            return (round(c["d_same"], 2), -crowd_rounded(c), round(min(d_all, c["d_vac"]), 6),
                     tuple(-h for h in c["hosts"]))
 
-        best = max(elig, key=spread_key)
+        # Only candidates with the largest leading key can win, so the rest
+        # of the key is evaluated for those alone (same order, same winner).
+        top = max(round(c["d_same"], 2) for c in elig)
+        best = max((c for c in elig if round(c["d_same"], 2) == top), key=spread_key)
         cands = [c for c in cands if c is not best]
         picks.append({"pos": best["pos"], "hosts": best["hosts"], "mu": best["mu"], "facet": best["facet"]})
         new_pts.append(best["pos"])
@@ -266,11 +296,16 @@ def select_ligand_sites(
             use[h] += 1
             if h in mu1_hosts:
                 free_total += max(0, left(h)) - before
+        for h in set(best["hosts"]):
+            for c in by_host[h]:
+                refresh_level(c)
         if cands:
             d = np.linalg.norm(np.asarray([c["pos"] for c in cands]) - best["pos"], axis=1)
             for c, dc in zip(cands, d.tolist()):
                 if dc < c["d_new"]:
                     c["d_new"] = dc
                 if c["facet"] == best["facet"]:
-                    c["d_same"], c["crowd"] = same_facet_stats(c)
+                    if dc < c["d_same"]:
+                        c["d_same"] = dc                # |c - best| is the new facet distance
+                    c["crowd_sum"] += 1.0 / max(dc, 1e-6) ** 3
     return picks

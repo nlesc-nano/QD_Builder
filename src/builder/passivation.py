@@ -11,8 +11,36 @@ from .analysis import coord_numbers_bipartite, bulk_cn_opposite_by_interior, Pai
 
 __all__ = ["collect_anion_candidates"]
 
+# One-entry memos for the geometry the charge-balance loop asks for on every
+# iteration while only the symbols change.  Keys are the exact input bytes;
+# the results are read-only for every caller.
+_MEMO: Dict[str, tuple] = {}
+
+
+def _memo(name: str, key: tuple, compute):
+    hit = _MEMO.get(name)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    value = compute()
+    _MEMO[name] = (key, value)
+    return value
+
+
+def _planes_key(planes) -> bytes:
+    return b"".join(np.asarray(p[0], float).tobytes() + np.float64(p[1]).tobytes() for p in planes)
+
+
+def _pts_key(pts) -> tuple:
+    P = np.ascontiguousarray(pts, float)
+    return P.shape, P.tobytes()
+
+
 def _build_facet_frames(planes: List[Plane]):
     """Return list of tuples (n̂, d̂, u, v, x0) with normalized plane normals."""
+    return _memo("frames", (len(planes), _planes_key(planes)), lambda: _build_facet_frames_uncached(planes))
+
+
+def _build_facet_frames_uncached(planes: List[Plane]):
     frames = []
     for (n, d) in planes:
         n = np.asarray(n, float); ln = LA.norm(n) + 1e-12
@@ -58,6 +86,11 @@ def _incident_facets_all(pts: NDArray[np.float64], frames: List[tuple], surf_tol
     _incident_facets(i, ...) for every atom i, in one pass. Atoms on no facet
     share one empty tuple; read the result, do not mutate it.
     """
+    key = (_pts_key(pts), len(frames), _planes_key(frames), float(surf_tol))
+    return _memo("incident", key, lambda: _incident_facets_all_uncached(pts, frames, surf_tol))
+
+
+def _incident_facets_all_uncached(pts: NDArray[np.float64], frames: List[tuple], surf_tol: float) -> List[Sequence[int]]:
     n_atoms = len(pts)
     out = _IncidentLists([()] * n_atoms)
     out.rows = []
@@ -94,7 +127,13 @@ def _record_uv_allfacets(idx: int,
         edit_count_facet[fid] = edit_count_facet.get(fid, 0) + 1
 
 def _facet_memberships(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
-    """List facet-IDs each atom belongs to (within surf_tol). Atoms on no facet share one empty tuple."""
+    """List facet-IDs each atom belongs to (within surf_tol). Atoms on no facet share one empty tuple.
+    Read the result, do not mutate it."""
+    key = (_pts_key(pts), len(planes), _planes_key(planes), float(surf_tol))
+    return _memo("memberships", key, lambda: _facet_memberships_uncached(pts, planes, surf_tol))
+
+
+def _facet_memberships_uncached(pts: NDArray[np.float64], planes: List[Plane], surf_tol: float) -> List[List[int]]:
     n_atoms = len(pts)
     mem: List = [()] * n_atoms
     if n_atoms == 0 or not planes:
