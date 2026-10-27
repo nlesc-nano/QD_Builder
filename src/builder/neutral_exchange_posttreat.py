@@ -546,12 +546,14 @@ def _tail_vector_from_cation(mol, coords: np.ndarray, cat_idx: int, an_idx: int)
 # Pose search for the molecules placed into displaced MX groups.  A pose is
 # clean when no heavy pair is inside the vdW sum - _CLASH_MARGIN and no pair
 # with H inside the vdW sum - _CLASH_H_MARGIN, the anchor group's contacts
-# with the cations it binds excepted; tails stay within _MAX_TAIL_DEG of the
-# local outward normal.
+# with the cations it binds excepted; tails stay within _MAX_TAIL_DEG
+# (zwitterion R groups _ZW_MAX_TAIL_DEG) of the local outward normal.
 _CLASH_MARGIN = 0.4
 _CLASH_H_MARGIN = 0.6
 _MAX_TAIL_DEG = 60.0
 _MAX_CATION_SHIFT = 1.5    # zwitterion N+/P+ within this of the displaced cation site
+_ZW_MAX_TAIL_DEG = 50.0    # zwitterion R group: tighter, its head is pinned to two sites
+_ZW_TAIL_WEIGHT = 3.0      # weight of an upright R group against vdW clearance (capped at 1 A)
 _ZW_ELEVATION_DEG = (0.0, 10.0, 20.0, 30.0)   # spacer axis lifted off the anion-to-cation line
 _ZW_LATERAL_DEG = (-15.0, 0.0, 15.0)          # and swung sideways
 _N_REFINE = 256
@@ -747,7 +749,7 @@ def _search_zwitterion_pose(
     sideways.  Spinning about that axis keeps both anchors in place.  Poses
     are kept only when the cationic anchor is within _MAX_CATION_SHIFT of
     its site, the cation's tail (its mean and its far end) stays
-    within _MAX_TAIL_DEG of the outward normal with no atom below the
+    within _ZW_MAX_TAIL_DEG of the outward normal with no atom below the
     cationic head, a side branch faces outward, and no atom clashes with
     the environment (the anionic group's contacts with ``hosts``
     excepted).  Among those, the
@@ -812,9 +814,9 @@ def _search_zwitterion_pose(
         tail_cos = (tail @ n_surf) / (np.linalg.norm(tail, axis=1) + 1e-12)
         end = poses[:, int(prep["tail_end"])] - poses[:, cat_idx]
         end_cos = (end @ n_surf) / (np.linalg.norm(end, axis=1) + 1e-12)
-        keep &= np.minimum(tail_cos, end_cos) >= np.cos(np.deg2rad(_MAX_TAIL_DEG))
+        keep &= np.minimum(tail_cos, end_cos) >= np.cos(np.deg2rad(_ZW_MAX_TAIL_DEG))
         keep &= (rel @ n_surf).min(axis=1) >= -0.3
-        soft += tail_cos
+        soft += _ZW_TAIL_WEIGHT * tail_cos
     if branch_center is not None and len(branch_atoms):
         bvec = poses[:, branch_atoms].mean(axis=1) - poses[:, int(branch_center)]
         branch_proj = (bvec @ n_surf) / (np.linalg.norm(bvec, axis=1) + 1e-12)

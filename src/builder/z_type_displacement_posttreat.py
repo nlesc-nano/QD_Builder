@@ -324,12 +324,11 @@ def detect_z_type_displacement_options(
     if cfg.passivation.cation_ligand:
         passivation_ligands.add(cfg.passivation.cation_ligand)
 
+    # Only species on the dot: a passivation ligand that was never placed
+    # (no Cl on a neutral CsPbBr3 dot) has no unit to displace.
     species_present = sorted(set(syms))
     cations = [s for s in species_present if int(charges.get(s, 0)) > 0]
     anions = [s for s in species_present if int(charges.get(s, 0)) < 0]
-    for lig in passivation_ligands:
-        if lig and lig not in anions and int(charges.get(lig, 0)) < 0:
-            anions.append(lig)
 
     options = []
     for cation in cations:
@@ -369,8 +368,6 @@ def detect_z_type_displacement_options(
                     cuts,
                     allow_unbound_completion=True,
                 )
-            elif anion not in species_present and anion in passivation_ligands:
-                count = len(cation_indices)
             else:
                 count = _count_possible_groups(cation_indices, anion_indices, anion_count)
             if count <= 0:
