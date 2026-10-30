@@ -769,6 +769,9 @@ def _run_passivation_and_write_outputs(
     facet_geometry_input: dict | None = None,
 ):
     prefix = os.path.splitext(args.out)[0]
+    # The lattice sites: every atom of the Wulff cut, before passivation. Only
+    # the `lattice_fitted` area report uses them; roles and builds do not.
+    lattice_pts = np.asarray(pts, float).copy()
 
     if args.write_all:
         if args.verbose:
@@ -1109,7 +1112,7 @@ def _run_passivation_and_write_outputs(
         extra["surface_reconstruction_ledger"] = surface_reconstruction_ledger
     if facet_geometry_input is not None:
         extra.update(_facet_geometry_entries(
-            syms, pts, out_order, core_ref_pts, facet_geometry_input,
+            syms, pts, out_order, core_ref_pts, facet_geometry_input, lattice_pts=lattice_pts,
             charges=cfg.charges, ligand=anion_lig, struct=struct,
             z_type_ledger=list(z_type_ligand_ledger) + z_type_target_units,
             origin=(-np.mean(np.asarray(pts, float), axis=0) if args.center and len(pts) else np.zeros(3)),
@@ -1164,12 +1167,30 @@ def _current_site_roles(syms, pts, core_ref_pts, geo_in, *, charges, ligand):
     return None if roles is None else roles["roles"]
 
 
+def _lattice_fitted(geo_in, syms, pts, lattice_pts) -> dict:
+    """
+    Report only: the polyhedron with each plane through the outermost atom on
+    a lattice site of the Wulff cut, whatever its species (a ligand anion
+    swapped onto an anion site counts; adsorbed ligands do not).
+    """
+    from scipy.spatial import cKDTree
+    from .polyhedron import clip, fitted_planes, summary
+    P = np.asarray(pts, float)
+    dist, _j = cKDTree(np.asarray(lattice_pts, float)).query(P)
+    on_site = dist < 1e-3
+    out = summary(clip(fitted_planes(geo_in["planes"], P[on_site]), geo_in["labels"]), geo_in["hkls"])
+    out["n_lattice_atoms"] = dict(sorted(Counter(s for s, k in zip(syms, on_site) if k).items()))
+    return out
+
+
 def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, ligand, origin, verbose,
-                            struct=None, z_type_ledger=None):
+                            struct=None, z_type_ledger=None, lattice_pts=None):
     """
     Manifest entries `facet_geometry`, `site_roles` (aligned with the
     written XYZ, i.e. permuted by `order`) and `composition`. Core atoms are
     the non-ligand atoms still at a position of the passivated inorganic core.
+    With `lattice_pts` (the Wulff cut), `facet_geometry` also reports
+    `lattice_fitted` (areas only; the roles keep the core atoms).
     """
     from .polyhedron import facet_geometry
     P = np.asarray(pts, float)
@@ -1193,6 +1214,11 @@ def _facet_geometry_entries(syms, pts, order, core_ref_pts, geo_in, *, charges, 
         if comp is not None:
             out["composition"] = comp
         return out
+    if lattice_pts is not None and len(lattice_pts):
+        try:
+            geo["lattice_fitted"] = _lattice_fitted(geo_in, syms, P, lattice_pts)
+        except Exception as exc:  # never fail a build over its report
+            geo["lattice_fitted"] = {"error": f"{type(exc).__name__}: {exc}"}
     geo["origin_A"] = [round(float(x), 6) for x in origin]
     out = {"facet_geometry": geo}
     if comp is not None:
