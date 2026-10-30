@@ -1,7 +1,7 @@
 # nanocrystal_builder/passivation.py
 from __future__ import annotations
 from collections import OrderedDict
-from typing import Dict, List, Tuple, Optional, Sequence, Set
+from typing import Collection, Dict, List, Tuple, Optional, Sequence, Set
 import numpy as np
 import numpy.linalg as LA
 from numpy.typing import NDArray
@@ -434,6 +434,25 @@ def _try_q_neutral_cation_removal_bundle(
     return True, pts
 
 
+def role_planes(fids: Sequence[int], ignore: Optional[Collection[int]], planes: Sequence[tuple]) -> Sequence[int]:
+    """
+    The planes that decide an atom's site role: `fids` without the `ignore`
+    planes (families with no Wulff face, laid by atom fitting onto edges and
+    corners), but only when every plane left is a {111} one (either orbit).
+    Otherwise `fids` unchanged, so e.g. cube corners keep the terrace rule.
+    """
+    if not ignore:
+        return fids
+    real = [fid for fid in fids if fid not in ignore]
+    if not real or len(real) == len(fids):
+        return fids
+    for fid in real:
+        a = np.sort(np.abs(np.asarray(planes[fid][0], float)))
+        if a[0] < 1e-6 or a[2] - a[0] > 1e-4 * a[2]:
+            return fids
+    return real
+
+
 def prepass_surface_cleanup(
     symbols: List[str],
     pts: NDArray[np.float64],
@@ -452,11 +471,17 @@ def prepass_surface_cleanup(
     prepass_min_cn_terrace: int = 2,
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
+    role_ignore_planes: Optional[Collection[int]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[int, List[Tuple[float, float]]], Dict[int, int]]:
     """
     Always run before charge balancing:
       • swap all surface anions with CN<=min_cn to the anion ligand (e.g., Se2- -> Cl-)
       • remove all surface cations with CN<min_cn (spacing-aware)
+    `role_ignore_planes` (role-aware mode): planes of the facet families the
+    Wulff shape does not expose, left out of the role of atoms on {111} facets
+    only (see role_planes). Without it a tetrahedron's edge Cd, also on a
+    zero-area {100} plane, would count as a heterogeneous {111}|{100}
+    intersection and be held to the terrace CN.
     Returns (symbols, pts, uv_taken, edit_count_facet) to seed spacing state.
     """
     from .analysis import coord_numbers_bipartite
@@ -504,8 +529,9 @@ def prepass_surface_cleanup(
                 cation_cn = int(round(cn[i]))
                 role = 0
                 if prepass_mode == "role-aware":
+                    role_fids = role_planes(mem[i], role_ignore_planes, planes)
                     fid_for_role = min(
-                        mem[i],
+                        role_fids,
                         key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])),
                     )
                     if edges_by_facet is not None and verts_by_facet is not None:
@@ -514,12 +540,12 @@ def prepass_surface_cleanup(
                             edges_by_facet, verts_by_facet, edge_tol, vertex_tol,
                         )
                     else:
-                        m_count = len(mem[i])
+                        m_count = len(role_fids)
                         role = 0 if m_count == 1 else (1 if m_count == 2 else 2)
                     
                     # Demote heterogeneous intersections to terrace
                     if role in {1, 2}:
-                        if not _is_homogeneous_intersection(mem[i], planes):
+                        if not _is_homogeneous_intersection(role_fids, planes):
                             role = 0
                             
                     if role == 0:

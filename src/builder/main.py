@@ -767,8 +767,18 @@ def _run_passivation_and_write_outputs(
     region_masks=None,
     stack_passivation: bool = False,
     facet_geometry_input: dict | None = None,
+    construction_planes=None,
 ):
     prefix = os.path.splitext(args.out)[0]
+
+    # Facet families the Wulff shape does not expose still get atom-fitted
+    # planes on its edges/corners; leave them out of the prepass site roles.
+    role_ignore_planes = None
+    if construction_planes is not None and cfg.passivation.prepass_mode == "role-aware":
+        from .polyhedron import zero_area_planes
+        role_ignore_planes = zero_area_planes(planes, construction_planes) or None
+        if role_ignore_planes and args.verbose:
+            print(f"    - Site roles ignore {len(role_ignore_planes)} plane(s) with no Wulff face")
 
     if args.write_all:
         if args.verbose:
@@ -798,6 +808,7 @@ def _run_passivation_and_write_outputs(
         prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
         prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
         include_sublayer=cfg.passivation.include_sublayer,
+        prepass_role_ignore_planes=role_ignore_planes,
     )
 
     surface_reconstruction_spec = getattr(
@@ -893,6 +904,7 @@ def _run_passivation_and_write_outputs(
                 prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
                 prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
                 include_sublayer=cfg.passivation.include_sublayer,
+                prepass_role_ignore_planes=role_ignore_planes,
             )
 
     # ── Z-type displacement (optional; after reconstruction, before X-type exchange)
@@ -2274,6 +2286,7 @@ def main(argv: List[str] | None = None) -> int:
             facet_seeds=wulff_facets,
             material_label=material_label,
             facet_geometry_input=geometry_input,
+            construction_planes=None if cfg.shape_mode == "sphere" else _planes_geo,
         )
 
         if multiple_variants and variant_label == variants[0][0]:

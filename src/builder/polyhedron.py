@@ -226,6 +226,27 @@ def clip(planes: Sequence[Plane], labels: Sequence[str], tol: float = 1e-6) -> P
     return poly
 
 
+def zero_area_planes(planes: Sequence[Plane], construction: Sequence[Plane]) -> set:
+    """
+    Indices of `planes` (e.g. atom-fitted) whose normal is a construction plane
+    with no face on the clipped construction polyhedron: a facet family the
+    Wulff shape does not expose (the {100} of a tetrahedron), which atom
+    fitting still lays onto its edges or corners. Planes without a
+    construction counterpart are never included.
+    """
+    try:
+        poly = clip(construction, [""] * len(construction))
+    except ValueError:
+        return set()
+    out = set()
+    for i, (n, _d) in enumerate(planes):
+        n = np.asarray(n, float) / np.linalg.norm(n)
+        hits = np.flatnonzero(poly.normals @ n > 1.0 - 1e-6)
+        if len(hits) and not any(int(p) in poly.areas for p in hits):
+            out.add(i)
+    return out
+
+
 def fitted_planes(planes: Sequence[Plane], core_pts: np.ndarray) -> List[Plane]:
     """The planes moved to the outermost core atom along each normal."""
     P = np.asarray(core_pts, float)

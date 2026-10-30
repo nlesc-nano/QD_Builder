@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 from collections import Counter, defaultdict
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Callable, Collection, Dict, List, Tuple, Optional
 import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial import cKDTree
@@ -35,6 +35,7 @@ from .passivation import (
     _collect_cation_sites,
     _intersections_geometry,
     _role_by_geometry,
+    role_planes,
     _atom_region_index,
     _try_q_neutral_cation_removal_bundle,
     atom_regions_from_masks,
@@ -572,6 +573,7 @@ def _priority2_remove_low_cn_cation_once(
     prepass_min_cn_terrace: int = 2,
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
+    role_ignore_planes: Optional[Collection[int]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     use_stack = stack_passivation
     cands: List[Tuple] = []
@@ -594,13 +596,16 @@ def _priority2_remove_low_cn_cation_once(
         cation_cn = int(cn_bi[i])
         role = 0
         if prepass_mode == "role-aware":
-            fid_for_role = min(inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
+            # Planes of families with no Wulff face touch the dot only at edges and
+            # corners; their degenerate faces give no role ({111} facets only).
+            role_inc = role_planes(inc, role_ignore_planes, frames)
+            fid_for_role = min(role_inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
             if edges_by_facet is not None and verts_by_facet is not None:
                 _role_name, role = _role_by_geometry(
                     i, fid_for_role, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
                 )
             else:
-                m_count = len(inc)
+                m_count = len(role_inc)
                 role = 0 if m_count == 1 else (1 if m_count == 2 else 2)
             if role == 0:
                 min_cn = prepass_min_cn_terrace
@@ -1946,6 +1951,7 @@ def charge_balance_iterative(
     prepass_min_cn_terrace: int = 2,
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
+    prepass_role_ignore_planes: Optional[Collection[int]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     # Calibrate pair cuts from CIF once (robust bipartite ruler everywhere)
     pair_cuts = (
@@ -1987,6 +1993,7 @@ def charge_balance_iterative(
         prepass_min_cn_terrace=prepass_min_cn_terrace,
         prepass_min_cn_edge=prepass_min_cn_edge,
         prepass_min_cn_vertex=prepass_min_cn_vertex,
+        role_ignore_planes=prepass_role_ignore_planes,
     )
     symbols, pts, _ = _prune_orphan_ligands(
         symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
@@ -2085,6 +2092,7 @@ def charge_balance_iterative(
             prepass_min_cn_terrace=prepass_min_cn_terrace,
             prepass_min_cn_edge=prepass_min_cn_edge,
             prepass_min_cn_vertex=prepass_min_cn_vertex,
+            role_ignore_planes=prepass_role_ignore_planes,
         )
         if progressed:
             continue
