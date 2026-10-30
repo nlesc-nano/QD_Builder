@@ -226,16 +226,17 @@ def clip(planes: Sequence[Plane], labels: Sequence[str], tol: float = 1e-6) -> P
     return poly
 
 
-def zero_area_planes(planes: Sequence[Plane], construction: Sequence[Plane]) -> set:
+def zero_area_planes(planes: Sequence[Plane], reference: Sequence[Plane]) -> set:
     """
-    Indices of `planes` (e.g. atom-fitted) whose normal is a construction plane
-    with no face on the clipped construction polyhedron: a facet family the
-    Wulff shape does not expose (the {100} of a tetrahedron), which atom
-    fitting still lays onto its edges or corners. Planes without a
-    construction counterpart are never included.
+    Indices of `planes` whose normal is a `reference` plane with no face on
+    the polyhedron clipped from `reference`: a facet family the shape does not
+    expose (the {100} of a tetrahedron), whose plane still lies on its edges or
+    corners. With reference = fitted_planes(planes, atoms) this is judged on
+    the atoms themselves. Planes without a reference counterpart are never
+    included.
     """
     try:
-        poly = clip(construction, [""] * len(construction))
+        poly = clip(reference, [""] * len(reference))
     except ValueError:
         return set()
     out = set()

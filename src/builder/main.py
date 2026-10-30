@@ -767,18 +767,21 @@ def _run_passivation_and_write_outputs(
     region_masks=None,
     stack_passivation: bool = False,
     facet_geometry_input: dict | None = None,
-    construction_planes=None,
+    faceless_roles: bool = False,
 ):
     prefix = os.path.splitext(args.out)[0]
 
-    # Facet families the Wulff shape does not expose still get atom-fitted
-    # planes on its edges/corners; leave them out of the prepass site roles.
+    # A facet family with no face on the cut itself (planes moved onto its
+    # outermost atoms) still gets a detected plane on the cut's edges/corners;
+    # leave such planes out of the prepass site roles. Judged on the atoms, so
+    # a construction facet that carves none of them changes nothing.
     role_ignore_planes = None
-    if construction_planes is not None and cfg.passivation.prepass_mode == "role-aware":
-        from .polyhedron import zero_area_planes
-        role_ignore_planes = zero_area_planes(planes, construction_planes) or None
+    if faceless_roles and cfg.passivation.prepass_mode == "role-aware":
+        from .polyhedron import fitted_planes, zero_area_planes
+        native = np.asarray(pts, float)[[s != anion_lig for s in syms]]
+        role_ignore_planes = zero_area_planes(planes, fitted_planes(planes, native)) or None
         if role_ignore_planes and args.verbose:
-            print(f"    - Site roles ignore {len(role_ignore_planes)} plane(s) with no Wulff face")
+            print(f"    - Site roles ignore {len(role_ignore_planes)} plane(s) with no face on the cut")
 
     if args.write_all:
         if args.verbose:
@@ -2286,7 +2289,7 @@ def main(argv: List[str] | None = None) -> int:
             facet_seeds=wulff_facets,
             material_label=material_label,
             facet_geometry_input=geometry_input,
-            construction_planes=None if cfg.shape_mode == "sphere" else _planes_geo,
+            faceless_roles=cfg.shape_mode != "sphere",
         )
 
         if multiple_variants and variant_label == variants[0][0]:
