@@ -996,6 +996,7 @@ def _scaffold_positive_q_add_once(
     region_masks: Optional[List[NDArray[np.bool_]]],
     cif_path: Optional[str],
     positive_q_strategy_selector: Optional[Callable[[int, str, NDArray[np.float64]], Optional[str]]] = None,
+    ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     """
     Q>0 with every remove/add candidate exhausted: retry the ligand addition
@@ -1020,6 +1021,7 @@ def _scaffold_positive_q_add_once(
         atom_regions=atom_regions,
         region_masks=region_masks,
         cif_path=cif_path,
+        ledger=ledger,
     )
 
 
@@ -1046,6 +1048,7 @@ def _priority3_balance_positive_q_add(
     atom_regions: Optional[List[int]] = None,
     region_masks: Optional[List[NDArray[np.bool_]]] = None,
     cif_path: Optional[str] = None,
+    ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     # gather candidates; include_sublayer=True expands search to sublayer atoms
     true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts=pair_cuts) if cif_path else None
@@ -1136,8 +1139,31 @@ def _priority3_balance_positive_q_add(
             for rank_num, c in enumerate(picks, start=1):
                 primary_host = c["hosts"][0]
                 cn_before = int(cn_bi[primary_host])
+                new_idx = len(symbols)
                 symbols.append(ligand)
                 pts = np.vstack([pts, c["pos"]])
+                if ledger is not None:
+                    # Pre-reorder index space (same convention
+                    # run_ligand_exchange_posttreatment/run_neutral_ligand_posttreatment
+                    # use) -- remapped to final-XYZ indices by main.py's
+                    # _remap_placement_ledger, same as those two ledgers.
+                    # Also captured by position (`position`/`host_positions`/
+                    # `host_symbols`/`mechanism`): unlike x_type/l_type, this
+                    # mechanism can run *before* a later atom-count-changing
+                    # step (z-type), which silently invalidates the raw
+                    # indices above with no remap of its own -- the position
+                    # fields let the caller resolve this entry the same
+                    # robust way as lattice_substitution_provenance instead.
+                    ledger.append({
+                        "atom_indices": [new_idx],
+                        "anchor_local_idx": 0,
+                        "host_env_indices": list(c["hosts"]),
+                        "position": pts[new_idx].tolist(),
+                        "symbol": ligand,
+                        "host_positions": [pts[h].tolist() for h in c["hosts"]],
+                        "host_symbols": [symbols[h] for h in c["hosts"]],
+                        "mechanism": "charge_balance",
+                    })
                 if atom_regions is not None:
                     atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
                 _record_uv_allfacets(primary_host, pts, frames, surf_tol, uv_taken, edit_count_facet)
@@ -1452,8 +1478,24 @@ def _priority3_balance_positive_q_add(
             host_elem = symbols[primary_host]
             cn_before = int(cn_bi[primary_host])
 
+            new_idx = len(symbols)
             symbols.append(ligand)
             pts = np.vstack([pts, new_pos])
+            if ledger is not None:
+                # See the sibling ledger.append above (the select_ligand_sites
+                # batch path) for why the position fields are needed alongside the raw
+                # indices: this mechanism can run before z-type, which
+                # invalidates raw indices with no remap of its own.
+                ledger.append({
+                    "atom_indices": [new_idx],
+                    "anchor_local_idx": 0,
+                    "host_env_indices": [primary_host],
+                    "position": pts[new_idx].tolist(),
+                    "symbol": ligand,
+                    "host_positions": [pts[primary_host].tolist()],
+                    "host_symbols": [symbols[primary_host]],
+                    "mechanism": "charge_balance",
+                })
             if atom_regions is not None:
                 atom_regions.append(_atom_region_index(primary_host, region_masks, atom_regions))
 
@@ -1953,6 +1995,8 @@ def charge_balance_iterative(
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
     prepass_role_ignore_planes: Optional[Collection[int]] = None,
+    ledger: Optional[List[dict]] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     # Calibrate pair cuts from CIF once (robust bipartite ruler everywhere)
     pair_cuts = (
@@ -1995,6 +2039,7 @@ def charge_balance_iterative(
         prepass_min_cn_edge=prepass_min_cn_edge,
         prepass_min_cn_vertex=prepass_min_cn_vertex,
         role_ignore_planes=prepass_role_ignore_planes,
+        lattice_substitution_ledger=lattice_substitution_ledger,
     )
     symbols, pts, _ = _prune_orphan_ligands(
         symbols, pts, charges, ligand, pair_cuts, verbose=verbose, atom_regions=atom_regions
@@ -2155,6 +2200,7 @@ def charge_balance_iterative(
                     atom_regions=atom_regions,
                     region_masks=region_masks if stack_passivation else None,
                     cif_path=cif_path,
+                    ledger=ledger,
                 )
                 if progressed:
                     continue
@@ -2185,6 +2231,7 @@ def charge_balance_iterative(
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
+                ledger=ledger,
             )
             if progressed:
                 continue
@@ -2213,6 +2260,7 @@ def charge_balance_iterative(
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
                 positive_q_strategy_selector=positive_q_strategy_selector,
+                ledger=ledger,
             )
             if progressed:
                 continue
@@ -2249,6 +2297,7 @@ def charge_balance_iterative(
                             atom_regions=atom_regions,
                             region_masks=region_masks,
                             cif_path=cif_path,
+                            ledger=ledger,
                         )
                         if not ok:
                             break
@@ -2272,6 +2321,7 @@ def charge_balance_iterative(
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
+                ledger=ledger,
             )
             if progressed:
                 continue
@@ -2299,6 +2349,7 @@ def charge_balance_iterative(
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
+                ledger=ledger,
             )
             if progressed:
                 continue
@@ -2315,6 +2366,7 @@ def charge_balance_iterative(
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
+                ledger=ledger,
             )
             if progressed:
                 continue
@@ -2342,6 +2394,7 @@ def charge_balance_iterative(
                 atom_regions=atom_regions,
                 region_masks=region_masks if stack_passivation else None,
                 cif_path=cif_path,
+                ledger=ledger,
             )
             if progressed:
                 continue

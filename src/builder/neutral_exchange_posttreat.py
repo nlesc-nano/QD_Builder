@@ -1314,7 +1314,7 @@ def _place_into_vacancies(
     place_one,
     env_radius: float,
     normal_at_anion: bool = False,
-) -> Tuple[List[Tuple[int, List[int]]], List[str], List[np.ndarray], Dict[str, int]]:
+) -> Tuple[List[Tuple[int, List[int]]], List[str], List[np.ndarray], Dict[str, int], List[Tuple[int, List[int]]]]:
     """
     Displace groups one at a time, in candidate order, and fill each vacancy.
 
@@ -1326,6 +1326,15 @@ def _place_into_vacancies(
     (symbols, coords, "") or (None, None, reason).  A group without a clean
     pose keeps its atoms and the next candidate takes its place, until
     ``limit`` groups are filled.
+
+    The 5th return value is placement provenance, one entry per accepted
+    group in the same order as `accepted`/the `lig_syms`/`lig_pts` chunks
+    they contributed: `(atom_count, host_indices)`, where `host_indices` are
+    this group's bonded cations (see `hosts` above) translated back from
+    `env_pos`-local indices into this call's own pre-removal `syms`/`pts`
+    index space, for the caller to carry alongside `atom_indices`/
+    `host_env_indices` in its own ledger (see run_ligand_exchange_posttreatment
+    for the shape).
     """
     from scipy.spatial import cKDTree
 
@@ -1339,6 +1348,7 @@ def _place_into_vacancies(
     lig_pts: List[np.ndarray] = []
     lig_z: List[int] = []
     accepted: List[Tuple[int, List[int]]] = []
+    provenance: List[Tuple[int, List[int]]] = []
     skipped: Dict[str, int] = {}
     used_anions: set = set()
     for ci, neighbors in candidates:
@@ -1379,11 +1389,13 @@ def _place_into_vacancies(
             continue
         accepted.append((int(ci), ais))
         used_anions.update(ais)
+        host_indices = [int(near[h]) for h in hosts]
+        provenance.append((len(mol_syms), host_indices))
         for sym, pos in zip(mol_syms, mol_pts):
             lig_syms.append(sym)
             lig_pts.append(np.asarray(pos, float))
             lig_z.append(_atomic_number(sym))
-    return accepted, lig_syms, lig_pts, skipped
+    return accepted, lig_syms, lig_pts, skipped, provenance
 
 
 def run_neutral_exchange_posttreatment(
@@ -1393,6 +1405,8 @@ def run_neutral_exchange_posttreatment(
     bulk_struct,
     planes: List[Plane],
     cif_path: str,
+    *,
+    provenance_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], List[dict]]:
     spec: NeutralExchangePostTreatSpec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -1542,7 +1556,7 @@ def run_neutral_exchange_posttreatment(
                             return None, None, "no clash-free pose with the tail along the outward normal"
                         return [_z_to_symbol(int(z)) for z in numbers], coords, ""
 
-                groups, lig_syms, lig_pts, skipped = _place_into_vacancies(
+                groups, lig_syms, lig_pts, skipped, group_provenance = _place_into_vacancies(
                     work_syms,
                     work_pts,
                     candidates,
@@ -1563,9 +1577,29 @@ def run_neutral_exchange_posttreatment(
                 continue
             remove_set = {i for ci, ais in groups for i in (ci, *ais)}
             keep = [i for i in range(len(work_syms)) if i not in remove_set]
+            old_to_new = {old: new for new, old in enumerate(keep)}
             new_syms = [work_syms[i] for i in keep] + lig_syms
             new_pts = list(work_pts[keep]) + lig_pts
             placed_charge_correction = _total_formal_q(lig_syms, cfg.charges)
+            if provenance_ledger is not None:
+                # anchor_local_idx: l_type's RDKit-detected anchor atom
+                # (same index for every group of this pass, same ligand);
+                # zwitterion has no single designated anchor atom, so 0
+                # (the placed molecule's first atom) like the rest of this
+                # module's zwitterion provenance.
+                anchor_local_idx = int(lig["anchor_idx"]) if exchange_type == "l_type" else 0
+                atom_cursor = len(keep)
+                for atom_count, host_indices in group_provenance:
+                    atom_start = atom_cursor
+                    atom_cursor += atom_count
+                    provenance_ledger.append({
+                        "type": smiles,
+                        "atom_indices": list(range(atom_start, atom_cursor)),
+                        "anchor_local_idx": anchor_local_idx,
+                        "host_env_indices": [
+                            h for h in (old_to_new.get(g) for g in host_indices) if h is not None
+                        ],
+                    })
             print(f"  → {label} exchange: placed {len(groups)} of {limit} molecules on displaced sites")
             for reason, count in skipped.items():
                 print(f"  → Left {count} group(s) in place: {reason}")
@@ -1645,6 +1679,7 @@ def run_neutral_exchange_posttreatment(
                         )
 
                     for ci, ais in groups:
+                        atom_start = len(new_syms)
                         new_syms.append(cat_sym)
                         new_pts.append(removed_coords[ci])
                         surf_norm = _surface_outward_direction(removed_coords[ci], planes)
@@ -1664,6 +1699,13 @@ def run_neutral_exchange_posttreatment(
                                     _total_formal_q(syms_frag, cfg.charges)
                                     - int(frag["charge"])
                                 )
+                        if provenance_ledger is not None:
+                            provenance_ledger.append({
+                                "type": formula,
+                                "atom_indices": list(range(atom_start, len(new_syms))),
+                                "anchor_local_idx": 0,
+                                "host_env_indices": [],
+                            })
                     print(
                         f"  → MXn exchange successful: placed {len(groups)} {cat_sym} "
                         f"cation(s) with {len(anion_fragments)} replacement anion fragment(s)"

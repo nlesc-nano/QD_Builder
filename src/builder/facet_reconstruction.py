@@ -1120,6 +1120,36 @@ def reconstruct_polar_facets(
         """
         syms = list(base_symbols)
         alive = all_alive.copy()
+        # _execute is re-run per trial n_vac/swap (best one kept, see the
+        # caller's loop) -- collect substitutions locally per-trial, not into
+        # the shared `ledger`, so a rejected trial's entries are never
+        # committed.
+        lattice_substitutions: List[dict] = []
+
+        def _record_substitution(a: int) -> None:
+            # Real provenance for a native anion converted in place to the
+            # ligand (syms[a] = recon_ligand): captured by position, not
+            # index, since this function (and later pipeline stages) still
+            # has several more compaction/reorder steps ahead -- positions
+            # survive those, indices don't without extra remap plumbing.
+            # Host positions are this atom's real bonded cations (from the
+            # bond graph), not a later guess. `symbol`/`host_symbols` let a
+            # later resolution step verify the atom at this position is
+            # still (or still has) the expected species before trusting the
+            # match, in case something further downstream changes it.
+            # `replaced_symbol` is the native anion species this lattice
+            # site originally held (e.g. "P") -- lets a later bulk-CN lookup
+            # compare against the chemically correct reference instead of
+            # the occupying ligand's own (not a true bulk species) symbol.
+            host_idx = [n for n in nb[a] if syms[n] == cation]
+            lattice_substitutions.append({
+                "position": pts[a].tolist(),
+                "symbol": recon_ligand,
+                "host_positions": [pts[n].tolist() for n in host_idx],
+                "host_symbols": [cation] * len(host_idx),
+                "replaced_symbol": anion,
+                "mechanism": "polar_surface_reconstruction",
+            })
         if swap is not None:
             an_sel = {k: [] for k in range(len(an_facets))}
         else:
@@ -1152,6 +1182,7 @@ def reconstruct_polar_facets(
         for c in vacancies:
             for a in nb[c]:
                 if alive[a] and syms[a] == anion and cn(a, alive) == 2:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     converted[facet_of_vac[c]] += 1
                     dq_anion += ligand_charge - q_an
@@ -1163,6 +1194,7 @@ def reconstruct_polar_facets(
                 for k, conv in sel.items():
                     for a in conv:
                         if alive[a] and syms[a] == anion:
+                            _record_substitution(a)
                             syms[a] = recon_ligand
                             dq_anion += ligand_charge - q_an
                             counts[k] += 1
@@ -1171,6 +1203,7 @@ def reconstruct_polar_facets(
         for k, conv in _break_runs(syms, alive).items():
             for a in conv:
                 if syms[a] == anion:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     dq_anion += ligand_charge - q_an
                     n_breaks[k] += 1
@@ -1181,6 +1214,7 @@ def reconstruct_polar_facets(
             if len(f.outer) == 1:
                 a = f.outer[0]
                 if alive[a] and syms[a] == anion:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     dq_anion += ligand_charge - q_an
                     n_breaks[k] += 1
@@ -1340,6 +1374,7 @@ def reconstruct_polar_facets(
             "mu_added": mu_added,
             "added_by_facet": facet_count,
             "q_final": _total_q(new_symbols, charges),
+            "lattice_substitutions": lattice_substitutions,
         }
 
     # Most vacancies per anion facet first; back off one per facet at a time
@@ -1504,4 +1539,6 @@ def reconstruct_polar_facets(
             ledger["swap"] = swap_info
         if rebalance is not None:
             ledger["charge_balance_fallback"] = rebalance
+        if res["lattice_substitutions"]:
+            ledger["lattice_substitutions"] = res["lattice_substitutions"]
     return out_symbols, out_pts

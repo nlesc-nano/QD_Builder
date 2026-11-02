@@ -21,7 +21,7 @@ from .facets import expand_facets, detect_facets_from_nc, halfspaces, scan_facet
 from .facets import unit_normal
 from .geometry import apply_core_lattice_fit, build_nanocrystal, build_spherical_nanocrystal, dedupe_points, recut_with_planes, sphere_halfspaces
 from .io_utils import write_xyz, write_manifest, center_coords
-from .passivation_iterative import charge_balance_iterative
+from .passivation_iterative import charge_balance_iterative, derive_true_bulk_cn_from_cif
 from .analysis import (
     bulk_cn_opposite_by_interior,
     coord_numbers_bipartite,
@@ -32,6 +32,7 @@ from .analysis import (
     PairCuts,
 )
 from .cleanup import prune_low_coord_sites
+from .surface_metadata import build_surface_metadata_document, write_surface_metadata_json
 from .stack import (
     build_layer_planes,
     cumulative_size_unit_cells,
@@ -759,6 +760,7 @@ def _run_passivation_and_write_outputs(
     cif_path: str,
     struct: Structure,
     facet_seeds,
+    facets=None,
     material_label: str | None = None,
     construction_radius_override: float | None = None,
     pair_cuts_override: PairCuts | None = None,
@@ -793,6 +795,8 @@ def _run_passivation_and_write_outputs(
 
     if args.verbose:
         print("\n[8] Balancing charge stepwise (outer anions first; then add/remove ligands if needed)...")
+    charge_balance_ledger: list = []
+    prepass_lattice_substitution_ledger: list = []
     syms, pts = charge_balance_iterative(
         syms, pts,
         cfg.charges, anion_lig,
@@ -815,6 +819,8 @@ def _run_passivation_and_write_outputs(
         prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
         include_sublayer=cfg.passivation.include_sublayer,
         prepass_role_ignore_planes=role_ignore_planes,
+        ledger=charge_balance_ledger,
+        lattice_substitution_ledger=prepass_lattice_substitution_ledger,
     )
 
     surface_reconstruction_spec = getattr(
@@ -872,6 +878,7 @@ def _run_passivation_and_write_outputs(
     ligand_exchange_charge_ledger = []
     z_type_displacement_ledger = []
     alloying_ledger = []
+    neutral_ligand_ledger = []
 
     # ── Inorganic alloying (optional; before Z-type/X-type/L-type), then rebalance
     alloying_spec = getattr(
@@ -902,6 +909,8 @@ def _run_passivation_and_write_outputs(
                 experimental_exhausted_positive_q_fallback=bool(
                     getattr(cfg, "experimental", {}).get("exhausted_positive_q_fallback", False)
                 ),
+                ledger=charge_balance_ledger,
+                lattice_substitution_ledger=prepass_lattice_substitution_ledger,
                 pair_cuts_override=pair_cuts_override,
                 region_masks=region_masks,
                 stack_passivation=stack_passivation,
@@ -922,7 +931,11 @@ def _run_passivation_and_write_outputs(
     if z_type_spec is not None and z_type_spec.enabled:
         from .z_type_displacement_posttreat import run_z_type_displacement_posttreatment
         syms, pts, z_type_displacement_ledger = run_z_type_displacement_posttreatment(
-            syms, pts, cfg, struct, planes, cif_path
+            syms, pts, cfg, struct, planes, cif_path,
+            lattice_substitution_entries=(
+                surface_reconstruction_ledger.get("lattice_substitutions", [])
+                + prepass_lattice_substitution_ledger
+            ),
         )
 
     # ── Neutral ligand exchange (optional; after displacement, before X-type exchange)
@@ -931,10 +944,12 @@ def _run_passivation_and_write_outputs(
         "neutral_exchange",
         None,
     )
+    neutral_exchange_provenance_ledger: list = []
     if neutral_exchange_spec is not None and neutral_exchange_spec.enabled:
         from .neutral_exchange_posttreat import run_neutral_exchange_posttreatment
         syms, pts, neutral_exchange_ledger = run_neutral_exchange_posttreatment(
-            syms, pts, cfg, struct, planes, cif_path
+            syms, pts, cfg, struct, planes, cif_path,
+            provenance_ledger=neutral_exchange_provenance_ledger,
         )
 
     # ── Charged ligand exchange (optional; after reconstruction, before neutral ligands)
@@ -1023,7 +1038,7 @@ def _run_passivation_and_write_outputs(
     if neutral_ligand_spec.enabled:
         from .neutral_ligand_posttreat import run_neutral_ligand_posttreatment
         syms, pts = run_neutral_ligand_posttreatment(
-            syms, pts, cfg, struct, planes
+            syms, pts, cfg, struct, planes, ledger=neutral_ligand_ledger
         )
 
     if args.verbose:
@@ -1039,6 +1054,63 @@ def _run_passivation_and_write_outputs(
         return_order=True,
     )
     write_xyz(args.out, out_syms, out_pts)
+
+    # Remap ligand-placement provenance (host/anchor/atom indices, captured
+    # in pre-reorder space by run_ligand_exchange_posttreatment /
+    # run_neutral_ligand_posttreatment) into the same index space as the
+    # just-written XYZ, so downstream consumers (builder.surface_metadata)
+    # can use these indices directly against args.out.
+    final_index_of = {old: new for new, old in enumerate(out_order)}
+
+    def _remap_placement_ledger(entries: list) -> None:
+        # Enriches each entry in place with final-XYZ-index-space provenance
+        # fields; never removes an entry (ligand_exchange_charge_ledger also
+        # carries charge-accounting fields other code depends on regardless
+        # of whether placement provenance could be resolved).
+        for entry in entries:
+            pre_reorder_atoms = entry.get("atom_indices")
+            pre_reorder_hosts = entry.get("host_env_indices") or []
+            # A ligand can be bonded to more than one host at once (bridging/
+            # multidentate binding) -- keep every host that remaps cleanly
+            # rather than collapsing to a single one; one that doesn't remap
+            # (e.g. removed by a later charge-balance pass) is just dropped
+            # from the list, not treated as fatal for the whole entry.
+            hosts = [final_index_of.get(h) for h in pre_reorder_hosts]
+            hosts = [h for h in hosts if h is not None]
+
+            atoms = [final_index_of.get(i) for i in pre_reorder_atoms] if pre_reorder_atoms else []
+            anchor = None
+            if pre_reorder_atoms and not any(a is None for a in atoms):
+                # atom_indices is always a contiguous ascending range starting
+                # at this ligand's first placed atom (see
+                # run_ligand_exchange_posttreatment / run_neutral_ligand_posttreatment)
+                # -- surviving cross-pass remaps preserve relative order, so
+                # its min is still that start.
+                pre_reorder_anchor = min(pre_reorder_atoms) + int(entry.get("anchor_local_idx", 0))
+                anchor = final_index_of.get(pre_reorder_anchor)
+                if anchor is None:
+                    # The anchor atom itself -- the one actually bonded to
+                    # the surface, not just any atom of the fragment -- was
+                    # removed by a later pass even though its non-anchor
+                    # siblings survived. There's no safe guess for which (if
+                    # any) survivor should take over as anchor, so this
+                    # fragment is unresolved, same as if every atom had been
+                    # removed -- not "atoms present, anchor missing", which
+                    # downstream flags as a malformed entry (a genuine-bug
+                    # signal) rather than a plain unresolved one.
+                    atoms = None
+            else:
+                atoms = None
+            entry["bound_host_atom_indices_0based"] = hosts
+            entry["atom_indices_0based"] = sorted(atoms) if atoms else None
+            entry["anchor_atom_index_0based"] = anchor
+
+    _remap_placement_ledger(ligand_exchange_charge_ledger)
+    _remap_placement_ledger(neutral_ligand_ledger)
+    _remap_placement_ledger(neutral_exchange_provenance_ledger)
+    # charge_balance_ledger is NOT remapped here -- it's resolved by
+    # position instead (see lattice_substitution_provenance assembly
+    # below), since unlike the other three it can run before z-type.
     construction_radius = (
         float(construction_radius_override)
         if construction_radius_override is not None
@@ -1125,6 +1197,8 @@ def _run_passivation_and_write_outputs(
         extra["alloying_ledger"] = alloying_ledger
     if surface_reconstruction_ledger:
         extra["surface_reconstruction_ledger"] = surface_reconstruction_ledger
+    if neutral_ligand_ledger:
+        extra["neutral_ligand_placement_ledger"] = neutral_ligand_ledger
     if facet_geometry_input is not None:
         extra.update(_facet_geometry_entries(
             syms, pts, out_order, core_ref_pts, facet_geometry_input, lattice_pts=lattice_pts,
@@ -1134,6 +1208,86 @@ def _run_passivation_and_write_outputs(
             verbose=args.verbose,
         ))
     write_manifest(prefix, syms, cfg.charges, extra=extra)
+
+    if facets:
+        try:
+            native_species = set(_native_species_in_cif_order(struct, cfg.charges, anion_lig))
+            if output_materials:
+                for m in output_materials:
+                    native_species.update(material_cation_anion(m, cfg.charges))
+            if alloying_ledger:
+                native_species.update(entry["replacement"] for entry in alloying_ledger)
+
+            facet_seed_terminations = {
+                (f.h, f.k, f.l): f.termination
+                for f in facet_seeds
+                if getattr(f, "termination", None)
+            }
+            ligand_provenance = [
+                {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "x_type"}
+                for e in ligand_exchange_charge_ledger
+            ] + [
+                {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "l_type"}
+                for e in neutral_ligand_ledger
+            ] + [
+                {**e, "provenance": "z_type_neutral_exchange"}
+                for e in neutral_exchange_provenance_ledger
+            ]
+            z_type_relocated_records = [
+                rec
+                for entry in z_type_displacement_ledger
+                for rec in entry.get("relocated_ligand_records", [])
+            ]
+            # charge_balance_ledger is resolved by position
+            # (lattice_substitution_provenance), not through the
+            # raw-index/_remap_placement_ledger path above: unlike x_type/
+            # l_type/z_type_neutral_exchange (which only ever run *after*
+            # z-type in this pipeline), charge_balance can run *before*
+            # z-type (the baseline pass, and the post-alloying rebalance
+            # pass) -- z-type's own atom removal then silently invalidates
+            # those raw indices with no remap of its own, which either
+            # drops the entry (index now out of range) or, worse, silently
+            # misattributes it to whatever unrelated atom now occupies that
+            # stale index. Position resolution is immune to this by design.
+            lattice_substitution_provenance = (
+                surface_reconstruction_ledger.get("lattice_substitutions", [])
+                + prepass_lattice_substitution_ledger
+                + z_type_relocated_records
+                + charge_balance_ledger
+            )
+            # Position-captured (see run_alloying_posttreatment's
+            # `atom_positions`), resolved against the final structure at
+            # metadata-assembly time -- robust to any atom-count-changing
+            # step (z-type, further charge balancing, ...) that runs
+            # between alloying and here, unlike a raw-index remap.
+            atom_provenance = [
+                {"position": pos, "symbol": entry["replacement"], "provenance": "alloying"}
+                for entry in alloying_ledger
+                for pos in entry.get("atom_positions", [])
+            ]
+
+            if args.verbose:
+                print(f"[13] Writing surface metadata JSON to {prefix}_metadata.json")
+            # Real, CIF-derived bulk coordination number (same one the build
+            # itself already used for its own passivation decisions, see
+            # charge_balance_iterative's own calls to this function) --
+            # not bulk_cn_opposite_by_interior's statistical estimate.
+            true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges, pair_cuts=pair_cuts_override)
+            metadata_doc = build_surface_metadata_document(
+                out_syms, out_pts, planes, facets, cfg.charges, cfg.passivation.surf_tol,
+                native_species=native_species,
+                material=material_label,
+                xyz_filename=os.path.basename(args.out),
+                facet_seed_terminations=facet_seed_terminations,
+                ligand_provenance=ligand_provenance,
+                lattice_substitution_provenance=lattice_substitution_provenance,
+                atom_provenance=atom_provenance,
+                prepass_mode=cfg.passivation.prepass_mode,
+                true_bulk_cn=true_bulk_cn,
+            )
+            write_surface_metadata_json(f"{prefix}_metadata.json", metadata_doc)
+        except Exception as exc:
+            logging.warning(f"Surface metadata generation failed: {exc}")
 
     return syms, pts, ligand_exchange_charge_ledger
 
@@ -1984,6 +2138,7 @@ def main(argv: List[str] | None = None) -> int:
                     )
                     write_xyz(layer_path, part_syms_out, part_pts_out)
 
+            facets_for_output = _facets if surface_cfg.shape_mode != "sphere" else None
             syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
                 syms,
                 pts,
@@ -1991,6 +2146,7 @@ def main(argv: List[str] | None = None) -> int:
                 cfg=cfg,
                 anion_lig=anion_lig,
                 planes=passivation_planes,
+                facets=facets_for_output,
                 cif_path=surface_cfg.cif,
                 struct=struct,
                 facet_seeds=seeds0,
@@ -2062,7 +2218,21 @@ def main(argv: List[str] | None = None) -> int:
                     )
                 except Exception:
                     pass
-        
+                try:
+                    shutil.copyfile(
+                        f"{layer_prefix}_metadata.json",
+                        f"{os.path.splitext(args.out)[0]}_metadata.json"
+                    )
+                except Exception:
+                    pass
+                try:
+                    shutil.copyfile(
+                        f"{layer_prefix}_cut.xyz",
+                        f"{os.path.splitext(args.out)[0]}_cut.xyz"
+                    )
+                except Exception:
+                    pass
+
             if args.verbose:
                 print("\n### ELEMENT COUNTS ###")
                 _print_stack_summary(
@@ -2303,6 +2473,7 @@ def main(argv: List[str] | None = None) -> int:
                 struct, cfg, wulff_facets, _planes_geo, syms, pts, verbose=args.verbose,
             )
 
+        facets_for_output = _facets if cfg.shape_mode != "sphere" else None
         syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
             syms,
             pts,
@@ -2310,6 +2481,7 @@ def main(argv: List[str] | None = None) -> int:
             cfg=cfg,
             anion_lig=anion_lig,
             planes=planes,
+            facets=facets_for_output,
             cif_path=args.cif,
             struct=struct,
             facet_seeds=wulff_facets,
@@ -2327,6 +2499,20 @@ def main(argv: List[str] | None = None) -> int:
                 shutil.copyfile(
                     f"{os.path.splitext(run_args.out)[0]}.json",
                     f"{os.path.splitext(args.out)[0]}.json"
+                )
+            except Exception:
+                pass
+            try:
+                shutil.copyfile(
+                    f"{os.path.splitext(run_args.out)[0]}_metadata.json",
+                    f"{os.path.splitext(args.out)[0]}_metadata.json"
+                )
+            except Exception:
+                pass
+            try:
+                shutil.copyfile(
+                    f"{os.path.splitext(run_args.out)[0]}_cut.xyz",
+                    f"{os.path.splitext(args.out)[0]}_cut.xyz"
                 )
             except Exception:
                 pass

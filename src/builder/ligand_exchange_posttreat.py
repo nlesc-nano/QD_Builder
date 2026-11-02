@@ -629,6 +629,31 @@ def _effective_charge(symbols: List[str], charges: Dict[str, int], ledger: List[
     return q_element - q_ignored + q_exchange
 
 
+def _remap_ledger_provenance(entries: List[dict], old_to_new: Dict[int, int]) -> None:
+    """
+    Remap a charge_ledger's placement-provenance fields (host_env_indices/
+    atom_indices) through an index-removal map, in place. Never drops the
+    entry itself -- charge_ledger also carries charge-accounting fields
+    (charge/ignored_element_charge/...) that main.py and QDSpaceWebApp rely
+    on regardless of placement provenance. If the entry's own placed atoms
+    were among those just removed, null just the provenance fields; if only
+    some of several hosts were removed (bridging ligand), drop just those
+    hosts from the list rather than the whole entry.
+    """
+    for entry in entries:
+        if "host_env_indices" not in entry:
+            continue
+        atoms = [old_to_new.get(i) for i in entry.get("atom_indices") or []]
+        if not entry.get("atom_indices") or any(a is None for a in atoms):
+            entry["host_env_indices"] = []
+            entry["atom_indices"] = None
+            continue
+        entry["atom_indices"] = atoms
+        entry["host_env_indices"] = [
+            nh for h in entry["host_env_indices"] if (nh := old_to_new.get(h)) is not None
+        ]
+
+
 def _remove_passivation_ligands_for_charge(
     syms: List[str],
     pts: NDArray[np.float64],
@@ -654,6 +679,15 @@ def _remove_passivation_ligands_for_charge(
     keep = np.ones(len(syms), dtype=bool)
     for i in remove_set:
         keep[i] = False
+
+    # Removing atoms shifts every later index; keep `ledger`'s placement
+    # provenance (host_env_indices/atom_indices, see run_ligand_exchange_posttreatment)
+    # consistent with the filtered array. Possible for an entry's own placed
+    # atoms to be among those just removed when `cfg.passivation.ligand`'s
+    # legacy symbol happens to match a previously-placed ligand's atoms.
+    old_to_new = {old: new for new, old in enumerate(i for i in range(len(syms)) if keep[i])}
+    _remap_ledger_provenance(ledger, old_to_new)
+
     return [s for s, k in zip(syms, keep) if k], pts[keep], len(remove_set)
 
 
@@ -1015,6 +1049,15 @@ def run_ligand_exchange_posttreatment(
         base_pts = np.asarray(base_pts_list, float)
         base_z = np.array([_atomic_number(s) for s in base_syms], int)
 
+        # Ligand-placement provenance recorded by earlier passes is expressed
+        # in *this pass's pre-removal* index space; remap it through this
+        # pass's own old_to_base (built above) so it stays valid in the new
+        # (post-removal) index space used by the rest of this pass. Possible
+        # for an earlier entry's atoms to get removed by this pass if this
+        # pass's `replace` target happens to match a previously-placed
+        # ligand atom's symbol.
+        _remap_ledger_provenance(charge_ledger, old_to_base)
+
         site_configs = []
         site_dpos = []
         for local_idx, c in zip(selected_local, selected):
@@ -1117,6 +1160,7 @@ def run_ligand_exchange_posttreatment(
             if len(nums) == 0:
                 continue
             atom_syms = [_z_to_symbol(int(z)) for z in nums]
+            atom_start = len(new_syms)
             for z, xyz in zip(nums, coords):
                 new_syms.append(_z_to_symbol(int(z)))
                 new_pts = np.vstack([new_pts, np.asarray(xyz, float)])
@@ -1131,6 +1175,18 @@ def run_ligand_exchange_posttreatment(
                 "ignored_element_charge": int(
                     sum(int(cfg.charges.get(sym, 0)) for sym in atom_syms)
                 ),
+                # Placement provenance (see README "Surface Metadata (JSON)"):
+                # the actual RDKit-determined anchor atom and every host this
+                # ligand was bound to (bridging/multidentate binding may mean
+                # more than one), in *this pass's post-removal* index space.
+                # Remapped across later passes (see old_to_base handling
+                # above) and finally into the written-XYZ index space by
+                # _run_passivation_and_write_outputs.
+                "host_env_indices": sc.get("hosts") or (
+                    [sc["primary_host_idx_in_env"]] if sc.get("primary_host_idx_in_env") is not None else []
+                ),
+                "anchor_local_idx": int(sc["d1"]),
+                "atom_indices": list(range(atom_start, len(new_syms))),
             })
             exchanged += 1
 

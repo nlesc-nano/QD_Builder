@@ -1134,8 +1134,10 @@ def parse_yaml_config(path: str) -> Config:
             term = f.get("termination")
             if term is not None:
                 term_s = str(term).strip().lower().replace("-", "_")
-                if term_s in {"", "none", "null", "stoichiometric"}:
-                    term_by[(h, k, l)] = None   # non-polar facet: no termination to impose
+                if term_s in {"", "none", "null"}:
+                    term_by[(h, k, l)] = None   # key present but empty -- genuinely unspecified
+                elif term_s == "stoichiometric":
+                    term_by[(h, k, l)] = "stoichiometric"   # explicit real choice: no termination to impose
                 elif term_s in {"cation_rich", "anion_rich"}:
                     term_by[(h, k, l)] = term_s
                 else:
@@ -1144,18 +1146,22 @@ def parse_yaml_config(path: str) -> Config:
                         "'anion_rich' or 'stoichiometric'"
                     )
             else:
-                term_by[(h, k, l)] = None
+                term_by[(h, k, l)] = None   # termination never mentioned at all -- genuinely unknown
 
         if pair_opposites:
             for (h, k, l), g in list(g_by.items()):
                 if scope_by.get((h, k, l)) == "facet":
                     continue
-                if term_by.get((h, k, l)) is not None:
+                if term_by.get((h, k, l)) in {"cation_rich", "anion_rich"}:
                     continue
                 opp = (-h, -k, -l)
                 if opp not in g_by:
                     g_by[opp] = g
-                    term_by[opp] = None
+                    # Inherit whatever the original real value was -- None
+                    # stays None, "stoichiometric" is inherited too (an
+                    # opposite face of a stoichiometric family is
+                    # physically also stoichiometric), never hardcoded.
+                    term_by[opp] = term_by.get((h, k, l))
                     scope_by[opp] = scope_by.get((h, k, l), "family")
 
         return [

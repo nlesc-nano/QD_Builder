@@ -1247,3 +1247,216 @@ def compute_cif_virtual_sites(
 
 
 
+# ===============================
+# Surface-atom metadata (reusable, structured per-atom facet/coordination
+# records; consumed by builder.surface_metadata to assemble the JSON export)
+# ===============================
+
+def _facet_family_label(h: int, k: int, l: int) -> str:
+    """Unsigned Wulff facet family label, e.g. (1,-1,1) -> "{111}", (2,-1,0) -> "{210}".
+
+    Distinct from the exact signed Miller indices, which are preserved separately
+    wherever a facet is referenced (see surface_atom_records / build_surface_metadata_document).
+    """
+    a, b, c = sorted((abs(int(h)), abs(int(k)), abs(int(l))), reverse=True)
+    return f"{{{a}{b}{c}}}"
+
+
+def surface_atom_records(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    facets: List[Facet],
+    surf_tol: float,
+    charges: Dict[str, int],
+    *,
+    true_bulk_cn: Optional[Dict[str, int]] = None,
+    pair_cuts: Optional[PairCuts] = None,
+    index_map: Optional[List[int]] = None,
+    include_indices: Optional[Iterable[int]] = None,
+    atom_provenance: Optional[Dict[int, str]] = None,
+    prepass_mode: str = "standard",
+) -> List[dict]:
+    """
+    Structured per-atom records (`qd_atoms`) for the Wulff-plane/facet
+    membership, coordination, and sublattice analysis this module already
+    performs (see facet_atom_report). Does not print anything; returns a
+    list of plain dicts, one per emitted atom, ready for JSON export.
+
+    Every emitted atom gets a `classification`: `"surface"` (>=1 facet
+    membership, within `surf_tol` of a Wulff plane -- the exact same test as
+    `_facet_memberships`/`alloying_posttreat._surface_mask`) or `"core"`.
+    Facet-exposure-specific keys (`role`, `layer`, `facet_ids`,
+    `facet_hkls`, `facet_families`, `surface_normal`) genuinely don't apply
+    to a `"core"` atom, so they are simply absent from its record rather
+    than present as `None`/`[]` -- a `"surface"` record always has every
+    one of these keys populated. `coordination_number`,
+    `bulk_coordination_number`, `coordination_deficit` and `sublattice` are
+    general-purpose and present (never `None`) on every record either way
+    -- a true core atom's `coordination_deficit` is legitimately `0`.
+
+    Facet membership, coordination number and bulk coordination are always
+    computed against the *full* `symbols`/`pts` array passed in -- this
+    matters when `symbols`/`pts` includes ligand atoms (e.g. Cl, amine N),
+    since a passivated surface atom's true coordination includes its ligand
+    bond(s); silently excluding ligand atoms before this calculation would
+    make passivated atoms look artificially undercoordinated.
+
+    Every atom with >=1 facet membership becomes a record, regardless of
+    element -- this function applies no element/charge-sign filter on
+    inclusion. `include_indices` restricts which local positions may be
+    *emitted* as records (e.g. only native/lattice atoms, when `symbols`/`pts`
+    also contains ligand atoms) without affecting the coordination/membership
+    math above, which always sees every atom passed in. Defaults to every
+    atom in `symbols`. See builder.surface_metadata.build_surface_metadata_document,
+    which uses this to emit only native atoms while still computing true
+    (ligand-inclusive) coordination.
+
+    Facet membership, role classification (facet/edge/vertex), coordination
+    numbers and bulk coordination all reuse the exact same primitives as
+    facet_atom_report: _facet_memberships, coord_numbers_bipartite,
+    bulk_cn_opposite_by_interior.
+
+    Parameters
+    ----------
+    symbols, pts, planes, facets, surf_tol, charges, pair_cuts, true_bulk_cn:
+        Same meaning/shape as in facet_atom_report.
+    index_map:
+        Optional local index (position in `symbols`/`pts`) -> exported atom index
+        mapping (e.g. when the caller has already filtered/reordered atoms before
+        calling this function, such as re-detecting facets from a written XYZ that
+        also contains non-lattice/ligand atoms elsewhere in the array). Defaults to
+        the identity mapping, so this function is directly usable standalone on a
+        plain (symbols, pts) array.
+
+    `atom_provenance`: optional local-index -> mechanism-name map (e.g.
+    `"alloying"` for a substituted atom); defaults to `"native"` for any
+    index not present. Purely descriptive, carried straight into the
+    `provenance` field.
+
+    Returns
+    -------
+    List of dicts sorted by exported atom index ascending. Every record has:
+        qd_atom_id, atom_index_0based, element, position, classification,
+        coordination_number, bulk_coordination_number, coordination_deficit,
+        sublattice, provenance.
+    A `"surface"` record additionally has:
+        role, layer, facet_ids, facet_hkls, facet_families, surface_normal.
+
+    `sublattice` is `"cation"`/`"anion"`/`None`, read directly from the sign of
+    `charges[element]` (the build's own formal-charge configuration) -- never
+    inferred from the periodic table. Purely descriptive, informational only.
+    Ligand attachment information lives in a separate top-level `ligands`
+    list (see build_surface_metadata_document), not embedded per-atom.
+
+    `prepass_mode`: the build's own `cfg.passivation.prepass_mode`. When
+    `"role-aware"`, `role` is computed with the exact same geometric
+    classifier the real build used to decide passivation eligibility
+    (`passivation._role_by_geometry`, against the shallowest-membership
+    facet -- same convention as `passivation.collect_anion_candidates`) --
+    not the plain facet-membership-count heuristic, which that build mode
+    does not actually use and can disagree with. Any other value keeps the
+    membership-count heuristic (also what a `"standard"`-mode build itself
+    uses, so the two already agree there).
+    """
+    n = len(symbols)
+    pts = np.asarray(pts, float)
+    if index_map is None:
+        index_map = list(range(n))
+    emit = range(n) if include_indices is None else include_indices
+
+    memberships = _facet_memberships(pts, planes, surf_tol)
+    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+    bulk = bulk_cn_opposite_by_interior(
+        symbols, pts, planes, surf_tol, charges,
+        true_bulk_cn=true_bulk_cn, pair_cuts=pair_cuts,
+    )
+
+    outer_thr = 0.35 * surf_tol
+    atom_provenance = atom_provenance or {}
+
+    use_geom_role = prepass_mode == "role-aware"
+    if use_geom_role:
+        from .passivation import _build_facet_frames, _intersections_geometry, _role_by_geometry
+        frames = _build_facet_frames(planes)
+        edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+        edge_tol = max(0.25 * surf_tol, 0.35)
+        vertex_tol = max(0.75 * surf_tol, 0.75)
+        _role_label = {"unique": "facet", "edge": "edge", "vertex": "vertex"}
+
+    candidates = []
+    for i in emit:
+        facet_ids = sorted(memberships[i])
+        classification = "surface" if facet_ids else "core"
+
+        facet_only: dict = {}
+
+        if facet_ids:
+            m = len(facet_ids)
+            if use_geom_role:
+                # Same convention as passivation.collect_anion_candidates:
+                # evaluate against the shallowest (closest-to-surface)
+                # facet this atom belongs to, not every one of them.
+                depths_by_fid = {
+                    fid: float(planes[fid][1] - np.dot(pts[i], planes[fid][0]))
+                    for fid in facet_ids
+                }
+                fid_star = min(depths_by_fid, key=depths_by_fid.get)
+                role_name, _role_rank = _role_by_geometry(
+                    i, fid_star, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol,
+                )
+                role = _role_label[role_name]
+            else:
+                role = "facet" if m == 1 else ("edge" if m == 2 else "vertex")
+
+            normals = [np.asarray(planes[fid][0], float) for fid in facet_ids]
+            if m == 1:
+                normal = normals[0]
+            else:
+                normal = np.mean(normals, axis=0)
+                norm = np.linalg.norm(normal)
+                normal = normal / norm if norm > 1e-12 else normals[0]
+            normal = normal / (np.linalg.norm(normal) + 1e-12)
+
+            depth = min(
+                float(planes[fid][1] - np.dot(pts[i], planes[fid][0]))
+                for fid in facet_ids
+            )
+            facet_only = {
+                "role": role,
+                "layer": "outer" if depth < outer_thr else "sublayer",
+                "facet_ids": list(facet_ids),
+                "facet_hkls": [[facets[fid].h, facets[fid].k, facets[fid].l] for fid in facet_ids],
+                "facet_families": [_facet_family_label(facets[fid].h, facets[fid].k, facets[fid].l) for fid in facet_ids],
+                "surface_normal": [float(x) for x in normal],
+            }
+
+        s = symbols[i]
+        q = charges.get(s)
+        sublattice = "cation" if (q is not None and q > 0) else ("anion" if (q is not None and q < 0) else None)
+        deficit = max(0, int(bulk[s]) - int(cn[i]))
+
+        exported_idx = int(index_map[i])
+        candidates.append({
+            "_exported_idx": exported_idx,
+            "atom_index_0based": exported_idx,
+            "element": s,
+            "position": [float(x) for x in pts[i]],
+            "classification": classification,
+            "coordination_number": int(cn[i]),
+            "bulk_coordination_number": int(bulk[s]),
+            "coordination_deficit": deficit,
+            "sublattice": sublattice,
+            "provenance": atom_provenance.get(i, "native"),
+            **facet_only,
+        })
+
+    candidates.sort(key=lambda r: r["_exported_idx"])
+    for qd_atom_id, rec in enumerate(candidates):
+        rec["qd_atom_id"] = qd_atom_id
+        del rec["_exported_idx"]
+
+    return candidates
+
+
+
