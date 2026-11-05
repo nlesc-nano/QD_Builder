@@ -1275,6 +1275,7 @@ def surface_atom_records(
     index_map: Optional[List[int]] = None,
     include_indices: Optional[Iterable[int]] = None,
     atom_provenance: Optional[Dict[int, str]] = None,
+    material: Optional[Dict[int, str]] = None,
     prepass_mode: str = "standard",
 ) -> List[dict]:
     """
@@ -1285,12 +1286,12 @@ def surface_atom_records(
 
     Every emitted atom gets a `classification`: `"surface"` (>=1 facet
     membership, within `surf_tol` of a Wulff plane -- the exact same test as
-    `_facet_memberships`/`alloying_posttreat._surface_mask`) or `"core"`.
+    `_facet_memberships`/`alloying_posttreat._surface_mask`) or `"internal"`.
     Facet-exposure-specific keys (`role`, `layer`, `facet_ids`,
     `facet_hkls`, `facet_families`, `surface_normal`) genuinely don't apply
-    to a `"core"` atom, so they are simply absent from its record rather
-    than present as `None`/`[]` -- a `"surface"` record always has every
-    one of these keys populated. `coordination_number`,
+    to an `"internal"` atom, so they are simply absent from its record
+    rather than present as `None`/`[]` -- a `"surface"` record always has
+    every one of these keys populated. `coordination_number`,
     `bulk_coordination_number`, `coordination_deficit` and `sublattice` are
     general-purpose and present (never `None`) on every record either way
     -- a true core atom's `coordination_deficit` is legitimately `0`.
@@ -1334,6 +1335,10 @@ def surface_atom_records(
     index not present. Purely descriptive, carried straight into the
     `provenance` field.
 
+    `material`: optional local-index -> layer-name map (`"core"`/
+    `"shell1"`/...) for a core-shell build; sets a `material` key only for
+    an index present in the map, absent otherwise.
+
     Returns
     -------
     List of dicts sorted by exported atom index ascending. Every record has:
@@ -1374,6 +1379,7 @@ def surface_atom_records(
 
     outer_thr = 0.35 * surf_tol
     atom_provenance = atom_provenance or {}
+    material = material or {}
 
     use_geom_role = prepass_mode == "role-aware"
     if use_geom_role:
@@ -1387,7 +1393,7 @@ def surface_atom_records(
     candidates = []
     for i in emit:
         facet_ids = sorted(memberships[i])
-        classification = "surface" if facet_ids else "core"
+        classification = "surface" if facet_ids else "internal"
 
         facet_only: dict = {}
 
@@ -1437,7 +1443,7 @@ def surface_atom_records(
         deficit = max(0, int(bulk[s]) - int(cn[i]))
 
         exported_idx = int(index_map[i])
-        candidates.append({
+        rec = {
             "_exported_idx": exported_idx,
             "atom_index_0based": exported_idx,
             "element": s,
@@ -1449,7 +1455,10 @@ def surface_atom_records(
             "sublattice": sublattice,
             "provenance": atom_provenance.get(i, "native"),
             **facet_only,
-        })
+        }
+        if i in material:
+            rec["material"] = material[i]
+        candidates.append(rec)
 
     candidates.sort(key=lambda r: r["_exported_idx"])
     for qd_atom_id, rec in enumerate(candidates):

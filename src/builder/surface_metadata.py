@@ -147,12 +147,31 @@ def _resolve_atom_provenance_by_position(
     }
 
 
+def _resolve_material_by_position(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    entries: Optional[List[Dict[str, Any]]],
+    *,
+    tol: float = 1e-3,
+) -> Dict[int, str]:
+    """
+    Same as _resolve_atom_provenance_by_position, for the per-atom
+    core/shell-material layer tag instead (entries shaped {"position":
+    [...], "symbol": str, "material": str}).
+    """
+    return {
+        idx: entry.get("material")
+        for idx, entry in _resolve_positional_entries(symbols, pts, entries, tol=tol)
+    }
+
+
 def _resolve_lattice_substitutions(
     symbols: List[str],
     pts: NDArray[np.float64],
     entries: Optional[List[Dict[str, Any]]],
     *,
     tol: float = 1e-3,
+    charges: Optional[Dict[str, int]] = None,
 ) -> List[dict]:
     """
     Resolve position-captured lattice-substitution ledger entries (see
@@ -165,13 +184,10 @@ def _resolve_lattice_substitutions(
     positions are exact-matched per atom.
 
     Returns {"anchor_atom_index_0based": int, "host_atom_indices_0based":
-    [int, ...], "replaced_symbol": Optional[str], "mechanism": Optional[str]}
-    per entry. `replaced_symbol` is the native anion species this lattice
-    site originally held (see builder.facet_reconstruction), passed through
-    unresolved -- it's a plain element symbol, not a position, so there's
-    nothing to match against the current structure. `mechanism` identifies
-    which real build-time process produced this entry (see
-    _build_lattice_substitution_records), also passed through unresolved.
+    [int, ...], "replaced_element": Optional[str], "mechanism": Optional[str],
+    "neutrality_redistributed": Optional[bool], "z_type_relocated":
+    Optional[bool]} per entry, each passed through unresolved (see
+    _build_lattice_substitution_records).
     An entry whose anchor position no longer matches an atom of the
     expected symbol (removed, or changed, by something downstream) is
     dropped entirely; a host position that doesn't resolve is dropped from
@@ -181,6 +197,12 @@ def _resolve_lattice_substitutions(
     cation + one alloy-replaced cation) must let each host resolve
     independently, or a surviving host gets wrongly dropped just because a
     sibling host's species differs from it.
+
+    `charges`: the build's own charge map, used to gate a fallback below
+    for a host whose exact-symbol match fails (e.g. alloying or a later
+    mechanism replaced it after capture) -- accepts whatever real atom
+    sits at that exact position only if it's a cation, never an unrelated
+    anion/organic-ligand atom placed there by coincidence.
     """
     if not entries:
         return []
@@ -191,17 +213,28 @@ def _resolve_lattice_substitutions(
     resolved = []
     for idx, entry in _resolve_positional_entries(symbols, pts, entries, tol=tol):
         host_symbols = entry.get("host_symbols") or []
-        host_indices = [
-            hi for hp, hs in zip(entry.get("host_positions") or [], host_symbols)
-            if (hi := _find_atom_at_position(
-                pts, symbols, (np.asarray(hp, float) + offset).tolist(), hs, tol,
-            )) is not None
-        ]
+        host_indices = []
+        for hp, hs in zip(entry.get("host_positions") or [], host_symbols):
+            host_pos = (np.asarray(hp, float) + offset).tolist()
+            hi = _find_atom_at_position(pts, symbols, host_pos, hs, tol)
+            if hi is None and charges:
+                # Fallback: a real cation still sits at this exact position,
+                # just not under the species captured at placement time
+                # (e.g. alloying replaced it afterward). `host_elements`
+                # is read from the current structure, never from this
+                # stale `hs`, so it comes out correct either way.
+                candidate = _find_atom_at_position(pts, symbols, host_pos, None, tol)
+                if candidate is not None and charges.get(symbols[candidate], 0) > 0:
+                    hi = candidate
+            if hi is not None:
+                host_indices.append(hi)
         resolved.append({
             "anchor_atom_index_0based": idx,
             "host_atom_indices_0based": host_indices,
-            "replaced_symbol": entry.get("replaced_symbol"),
+            "replaced_element": entry.get("replaced_element"),
             "mechanism": entry.get("mechanism"),
+            "neutrality_redistributed": entry.get("neutrality_redistributed"),
+            "z_type_relocated": entry.get("z_type_relocated"),
         })
     return resolved
 
@@ -238,12 +271,12 @@ def resolve_prior_ligand_provenance(
 
     Returns a list in the same shape `build_surface_metadata_document`'s own
     `ligand_provenance` parameter expects (so the caller can simply
-    concatenate it in), with each entry's original `provenance` value carried
-    through unchanged -- a prior `"x_type"` ligand that's still genuinely
-    there is still `"x_type"`, not re-labeled. An entry is only emitted when
-    *every* one of its atoms (and every host that was resolved in the prior
-    document) still resolves; a partially-vanished ligand is dropped
-    entirely rather than reported with some atoms missing.
+    concatenate it in), with each entry's original `provenance`/`swap`/
+    `z_type_relocated`/`neutrality_redistributed` carried through unchanged.
+    An entry is only emitted when *every* one of its atoms (and every host
+    that was resolved in the prior document) still resolves; a
+    partially-vanished ligand is dropped entirely rather than reported with
+    some atoms missing.
 
     `alloying_provenance`: optional position-captured entries (see
     build_surface_metadata_document's `atom_provenance` -- same list, reused
@@ -314,13 +347,22 @@ def resolve_prior_ligand_provenance(
             if nh is not None:
                 new_hosts.append(nh)
 
-        resolved.append({
+        out_entry = {
             "type": lig.get("type"),
             "anchor_atom_index_0based": new_anchor,
             "atom_indices_0based": sorted(new_by_old.values()),
             "bound_host_atom_indices_0based": new_hosts,
             "provenance": lig.get("provenance"),
-        })
+        }
+        if lig.get("swap"):
+            out_entry["swap"] = True
+            if lig.get("replaced_element") is not None:
+                out_entry["replaced_element"] = lig["replaced_element"]
+        if lig.get("z_type_relocated"):
+            out_entry["z_type_relocated"] = True
+        if lig.get("neutrality_redistributed"):
+            out_entry["neutrality_redistributed"] = True
+        resolved.append(out_entry)
     return resolved
 
 
@@ -345,22 +387,10 @@ def _build_lattice_substitution_records(
     anchor's own geometric record for its facet label (see
     _facet_label_fields_from_own_position).
 
-    Three real mechanisms feed `resolved`'s entries, told apart by
-    `mechanism`: `reconstruct_polar_facets`'s *optional* polar-{111}
-    reconstruction post-treatment (`"polar_surface_reconstruction"`),
-    `prepass_surface_cleanup`'s *always-on* baseline CN==2 anion-swap step
-    (`"prepass_cleanup"`) that runs as part of ordinary passivation on
-    every build regardless of that post-treatment toggle, and z-type
-    displacement's orphan-ligand relocation (`"z_type_relocated"`, or
-    `"{original_provenance}_z_type_relocated"` when the ligand's provenance
-    before being relocated is itself known -- see
-    z_type_displacement_posttreat._relocate_orphan_ligands). `mechanism` is
-    passed straight through as `provenance`, not coerced into a fixed set,
-    so new mechanism strings need no change here. Only the first two convert
-    a native anion to the ligand species *in place*, so only those get
-    `"swap": True` -- a relocated ligand has moved to a freshly chosen
-    exterior site and no longer occupies a former native lattice position,
-    even if it originally did.
+    `mechanism` is passed straight through as `provenance` (see the
+    surface-metadata walkthrough doc for the current value set); `swap`/
+    `neutrality_redistributed`/`z_type_relocated` are copied through the
+    same way when the entry sets them.
     """
     records = []
     for entry in resolved:
@@ -385,8 +415,13 @@ def _build_lattice_substitution_records(
             "provenance": mechanism,
             "binding_site": _binding_site_from_host_count(len(host_recs)),
         }
-        if mechanism in ("prepass_cleanup", "polar_surface_reconstruction"):
+        if entry.get("replaced_element") is not None:
             record["swap"] = True
+            record["replaced_element"] = entry["replaced_element"]
+        if entry.get("neutrality_redistributed"):
+            record["neutrality_redistributed"] = True
+        if entry.get("z_type_relocated"):
+            record["z_type_relocated"] = True
         record.update(_facet_label_fields_from_own_position(qd_atoms_by_index.get(anchor_idx)))
         records.append(record)
     return records
@@ -411,8 +446,8 @@ def _facet_label_fields_from_own_position(own_record: Optional[dict]) -> Dict[st
     which facet it's geometrically near.
 
     `own_record` is `None` (or has no `facet_ids` key) for a ligand that
-    isn't within `surf_tol` of any plane (geometrically "core") -- reports
-    all-empty, same convention as a core `qd_atoms` record.
+    isn't within `surf_tol` of any plane (geometrically "internal") --
+    reports all-empty, same convention as an internal `qd_atoms` record.
     """
     if not own_record:
         return {"facet_ids": [], "facet_hkls": [], "facet_families": []}
@@ -458,12 +493,10 @@ def _assign_ligands_from_provenance(
     mechanism name). See build_surface_metadata_document's `ligand_provenance`
     param.
 
-    A lattice-substitution ligand (`"polar_surface_reconstruction"` or
-    `"prepass_cleanup"` provenance) chained forward from a prior document
+    A lattice-substitution ligand chained forward from a prior document
     (see resolve_prior_ligand_provenance) arrives here via this generic
     path, not _build_lattice_substitution_records, but gets the exact same
-    uniform field set as every other ligand -- see
-    _facet_label_fields_from_own_position and the `swap` tag below.
+    uniform field set as every other ligand.
 
     `qd_atoms_by_index` covers every atom (native and ligand, see
     surface_atom_records) -- host lookups below only ever resolve to native
@@ -490,13 +523,29 @@ def _assign_ligands_from_provenance(
         atom_indices = sorted(
             int(i) for i in (entry.get("atom_indices_0based") or []) if int(i) in ligand_index_set
         )
-        anchor_idx = entry.get("anchor_atom_index_0based")
+        anchor_idx_raw = entry.get("anchor_atom_index_0based")
         if not atom_indices:
             continue  # nothing attributable -- not even a malformed-entry signal
-        if anchor_idx is None or int(anchor_idx) not in atom_indices:
+        extra_host_indices: List[int] = []
+        if anchor_idx_raw is None:
             malformed.update(atom_indices)
             continue  # malformed entry -> its atoms end up in unresolved_indices below
-        anchor_idx = int(anchor_idx)
+        anchor_idx_raw = int(anchor_idx_raw)
+        if anchor_idx_raw not in atom_indices:
+            # Anchor isn't classified as a ligand atom -- usually an
+            # element collision (e.g. an MXn exchange's placed cation
+            # shares a symbol with an unrelated alloying replacement, so
+            # it's swept into native_species/qd_atoms). If it's a real
+            # native atom, treat it as this fragment's own host instead of
+            # failing the whole entry.
+            if anchor_idx_raw in qd_atoms_by_index:
+                extra_host_indices = [anchor_idx_raw]
+                anchor_idx = min(atom_indices)
+            else:
+                malformed.update(atom_indices)
+                continue  # malformed entry -> its atoms end up in unresolved_indices below
+        else:
+            anchor_idx = anchor_idx_raw
 
         # A ligand can be bonded to more than one surface atom at once
         # (bridging/multidentate binding) -- keep every host that resolves
@@ -508,6 +557,7 @@ def _assign_ligands_from_provenance(
         if raw_host_indices is None:
             legacy = entry.get("bound_host_atom_index_0based")
             raw_host_indices = [legacy] if legacy is not None else []
+        raw_host_indices = list(raw_host_indices) + extra_host_indices
         host_recs = [
             qd_atoms_by_index[int(h)]
             for h in raw_host_indices
@@ -529,8 +579,14 @@ def _assign_ligands_from_provenance(
             "binding_site": _binding_site_from_host_count(len(host_recs)),
         }
         record.update(_facet_label_fields_from_own_position(qd_atoms_by_index.get(anchor_idx)))
-        if entry.get("provenance") in ("polar_surface_reconstruction", "prepass_cleanup"):
+        if entry.get("swap"):
             record["swap"] = True
+            if entry.get("replaced_element") is not None:
+                record["replaced_element"] = entry["replaced_element"]
+        if entry.get("z_type_relocated"):
+            record["z_type_relocated"] = True
+        if entry.get("neutrality_redistributed"):
+            record["neutrality_redistributed"] = True
         records.append(record)
         covered.update(atom_indices)
 
@@ -557,6 +613,7 @@ def build_surface_metadata_document(
     ligand_provenance: Optional[List[Dict[str, Any]]] = None,
     lattice_substitution_provenance: Optional[List[Dict[str, Any]]] = None,
     atom_provenance: Optional[List[Dict[str, Any]]] = None,
+    material_provenance: Optional[List[Dict[str, Any]]] = None,
     prepass_mode: str = "standard",
     prior_metadata_supplied: bool = False,
 ) -> Dict[str, Any]:
@@ -632,6 +689,13 @@ def build_surface_metadata_document(
     `surface_atom_records` expects; defaults to `"native"` for any index not
     present (including one whose entry no longer resolves).
 
+    `material_provenance`: optional list of position-captured entries, one
+    per `qd_atoms` site that belongs to a core-shell build (e.g.
+    `{"position": [...], "symbol": "Cd", "material": "shell1"}`). Resolved
+    the same way as `atom_provenance` (see _resolve_material_by_position)
+    into a `qd_atoms`.`material` field -- absent entirely for a plain,
+    non-core-shell build.
+
     `prepass_mode`: the build's own `cfg.passivation.prepass_mode` --
     `qd_atoms`' `role` is computed with the real build's own geometric
     classifier when this is `"role-aware"` (see surface_atom_records).
@@ -659,8 +723,11 @@ def build_surface_metadata_document(
         native_indices = [i for i in range(n) if symbols[i] in native_set]
         ligand_indices = [i for i in range(n) if symbols[i] not in native_set]
 
-    lattice_subs_resolved = _resolve_lattice_substitutions(symbols, pts, lattice_substitution_provenance)
+    lattice_subs_resolved = _resolve_lattice_substitutions(
+        symbols, pts, lattice_substitution_provenance, charges=charges,
+    )
     atom_provenance_resolved = _resolve_atom_provenance_by_position(symbols, pts, atom_provenance)
+    material_resolved = _resolve_material_by_position(symbols, pts, material_provenance)
 
     # Facet membership / coordination are computed against the *full* atom
     # array (native + ligand together) so a passivated surface atom's true
@@ -676,6 +743,7 @@ def build_surface_metadata_document(
         true_bulk_cn=true_bulk_cn,
         pair_cuts=pair_cuts,
         atom_provenance=atom_provenance_resolved,
+        material=material_resolved,
         prepass_mode=prepass_mode,
     )
     native_index_set = set(native_indices)
@@ -747,17 +815,34 @@ def build_surface_metadata_document(
         "warnings": warnings,
     }
 
-    validate_metadata_matches_xyz(doc, symbols)
+    validate_metadata_matches_xyz(doc, symbols, pts)
     return doc
 
 
-def validate_metadata_matches_xyz(doc: Dict[str, Any], xyz_symbols: List[str]) -> None:
+def validate_metadata_matches_xyz(
+    doc: Dict[str, Any],
+    xyz_symbols: List[str],
+    xyz_pts: Optional[NDArray[np.float64]] = None,
+    *,
+    pos_tol: float = 1e-4,
+) -> None:
     """
     Raise ValueError if `doc` is not self-consistent with `xyz_symbols`
     (the exact symbol list, in order, of the XYZ file this metadata is meant
     to accompany). Checked internally by build_surface_metadata_document
     before it returns; also exported so tests/callers can re-check a document
     loaded back from disk against a downloaded XYZ.
+
+    `xyz_pts`: that same XYZ's positions, same order. When given, also
+    checks every `qd_atoms` record's own `position` against `xyz_pts` at
+    its index, and every ligand's `anchor_host_distances` against the real
+    distance recomputed from `xyz_pts` -- catches a document whose
+    positions have gone stale relative to the XYZ it's meant to describe
+    (e.g. a later step rewrote the XYZ without regenerating the metadata),
+    which the index/element checks alone can't see. `pos_tol` (default
+    1e-4 A) is well above `write_xyz`'s own `.6f` rounding noise (~5e-7 A)
+    but far tighter than any real atomic displacement, so it won't mask a
+    genuine mismatch. Skipped entirely when `xyz_pts` is omitted.
     """
     n = len(xyz_symbols)
     atom_count = doc.get("structure", {}).get("atom_count")
@@ -766,6 +851,7 @@ def validate_metadata_matches_xyz(doc: Dict[str, Any], xyz_symbols: List[str]) -
             f"surface metadata atom_count={atom_count} does not match "
             f"XYZ atom count={n}"
         )
+    xyz_pts = np.asarray(xyz_pts, float) if xyz_pts is not None else None
 
     def _check_index(label: str, idx, element: Optional[str] = None) -> None:
         if not (0 <= idx < n):
@@ -778,6 +864,13 @@ def validate_metadata_matches_xyz(doc: Dict[str, Any], xyz_symbols: List[str]) -
     for rec in doc.get("qd_atoms", []):
         idx0 = rec["atom_index_0based"]
         _check_index(f"qd_atom_id={rec.get('qd_atom_id')}", idx0, rec["element"])
+        if xyz_pts is not None:
+            dist = float(np.linalg.norm(np.asarray(rec["position"], float) - xyz_pts[idx0]))
+            if dist > pos_tol:
+                raise ValueError(
+                    f"qd_atom_id={rec.get('qd_atom_id')}: position is {dist:.6f} Å "
+                    f"from XYZ atom {idx0}'s real position (tol={pos_tol})"
+                )
 
     for lig in doc.get("ligands", []):
         label = f"ligand_id={lig.get('ligand_id')}"
@@ -787,8 +880,9 @@ def validate_metadata_matches_xyz(doc: Dict[str, Any], xyz_symbols: List[str]) -
         # build_surface_metadata_document's `warnings`) -- skip the check
         # rather than treat a deliberately-unclaimed anchor as an
         # inconsistency.
-        if lig.get("anchor_atom_index_0based") is not None:
-            _check_index(f"{label} anchor_atom_index_0based", lig["anchor_atom_index_0based"], lig["anchor_element"])
+        anchor_idx = lig.get("anchor_atom_index_0based")
+        if anchor_idx is not None:
+            _check_index(f"{label} anchor_atom_index_0based", anchor_idx, lig["anchor_element"])
         for i in lig.get("atom_indices_0based", []):
             _check_index(f"{label} atom_indices_0based", i)
 
@@ -797,8 +891,15 @@ def validate_metadata_matches_xyz(doc: Dict[str, Any], xyz_symbols: List[str]) -
         host_dist = lig.get("anchor_host_distances", [])
         if not (len(host_idx) == len(host_el) == len(host_dist)):
             raise ValueError(f"{label}: host_atom_indices_0based/host_elements/anchor_host_distances length mismatch")
-        for idx, el in zip(host_idx, host_el):
+        for idx, el, dist in zip(host_idx, host_el, host_dist):
             _check_index(f"{label} host_atom_indices_0based", idx, el)
+            if xyz_pts is not None and anchor_idx is not None:
+                real_dist = float(np.linalg.norm(xyz_pts[anchor_idx] - xyz_pts[idx]))
+                if abs(real_dist - dist) > pos_tol:
+                    raise ValueError(
+                        f"{label}: anchor_host_distances claims {dist:.6f} Å to host "
+                        f"{idx}, but XYZ positions give {real_dist:.6f} Å (tol={pos_tol})"
+                    )
 
 
 def write_surface_metadata_json(path: str, doc: Dict[str, Any]) -> None:

@@ -869,6 +869,7 @@ def run_ligand_exchange_posttreatment(
     bulk_struct,
     planes: List[Plane],
     cif_path: str,
+    resolved_charge_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], List[dict]]:
     spec: LigandExchangePostTreatSpec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -927,9 +928,9 @@ def run_ligand_exchange_posttreatment(
     charge_ledger: List[dict] = []
 
     for pass_idx, pass_spec in enumerate(spec.passes):
-        replace_charge = pass_spec.replace_charge
-        if replace_charge is None:
-            replace_charge = int(cfg.charges.get(pass_spec.replace, 0))
+        replaced_charge = pass_spec.replaced_charge
+        if replaced_charge is None:
+            replaced_charge = int(cfg.charges.get(pass_spec.replace, 0))
 
         molecular_charge = pass_spec.charge
         if molecular_charge is None:
@@ -937,11 +938,18 @@ def run_ligand_exchange_posttreatment(
                 molecular_charge = _detect_ligand_charge(pass_spec.smiles[0])
             except Exception as exc:
                 print(f"  [warning] Could not determine ligand charge from {pass_spec.smiles[0]!r}: {exc}")
-                molecular_charge = -1 if replace_charge < 0 else 1
+                molecular_charge = -1 if replaced_charge < 0 else 1
+
+        if resolved_charge_ledger is not None:
+            resolved_charge_ledger.append({
+                "replace": pass_spec.replace,
+                "smiles": pass_spec.smiles,
+                "charge": molecular_charge,
+            })
 
         print(
             f"\n[ligand-exchange:pass-{pass_idx + 1}] replace={pass_spec.replace!r} "
-            f"replace_charge={replace_charge:+d} ligand_charge={molecular_charge:+d} ratio={pass_spec.ratio:.2f} "
+            f"replaced_charge={replaced_charge:+d} ligand_charge={molecular_charge:+d} ratio={pass_spec.ratio:.2f} "
             f"dist={pass_spec.distribution} smiles={list(pass_spec.smiles)!r}"
         )
 
@@ -984,7 +992,7 @@ def run_ligand_exchange_posttreatment(
             )
         candidate_indices = [
             i for i, sym in enumerate(work_syms)
-            if sym == pass_spec.replace and int(cfg.charges.get(sym, 0)) == replace_charge
+            if sym == pass_spec.replace and int(cfg.charges.get(sym, 0)) == replaced_charge
         ]
         if native_replace:
             candidate_indices = _filter_passivated_indices(candidate_indices, work_syms, work_pts, native)
@@ -1086,7 +1094,7 @@ def run_ligand_exchange_posttreatment(
                 "cfg_charges": cfg.charges,
                 "base_size": len(base_syms),
                 "replacement_charge": molecular_charge,
-                "removed_charge": replace_charge,
+                "removed_charge": replaced_charge,
                 "replacement_smiles": lig["smiles"],
                 "replacement_name": lig["name"],
             })

@@ -13,6 +13,7 @@ from .analysis import (
     compute_cif_virtual_sites,
     derive_pair_cuts_from_cif,
 )
+from .passivation import _bond_neighbor_indices
 from .nc_types import Config, Plane, NeutralExchangePostTreatSpec, NeutralExchangePass
 from .neutral_ligand_posttreat import (
     _atomic_number,
@@ -1640,6 +1641,7 @@ def run_neutral_exchange_posttreatment(
             keep = [i for i in range(len(work_syms)) if i not in remove_set]
             new_syms = [work_syms[i] for i in keep]
             new_pts = list(work_pts[keep])
+            old_to_new = {old: new for new, old in enumerate(keep)}
 
             branch_success = False
             placed_charge_correction = 0
@@ -1700,11 +1702,19 @@ def run_neutral_exchange_posttreatment(
                                     - int(frag["charge"])
                                 )
                         if provenance_ledger is not None:
+                            # Real hosts: whatever native atoms the old
+                            # (now-removed) cation `ci` was bonded to.
+                            host_old = [
+                                n for n in _bond_neighbor_indices(ci, work_syms, work_pts, cuts)
+                                if n not in remove_set
+                            ]
                             provenance_ledger.append({
                                 "type": formula,
                                 "atom_indices": list(range(atom_start, len(new_syms))),
                                 "anchor_local_idx": 0,
-                                "host_env_indices": [],
+                                "host_env_indices": [
+                                    old_to_new[h] for h in host_old if h in old_to_new
+                                ],
                             })
                     print(
                         f"  → MXn exchange successful: placed {len(groups)} {cat_sym} "

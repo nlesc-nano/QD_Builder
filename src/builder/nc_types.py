@@ -56,7 +56,7 @@ class LigandExchangePass:
     replace: str
     smiles: Tuple[str, ...]
     charge: Optional[int] = None
-    replace_charge: Optional[int] = None
+    replaced_charge: Optional[int] = None
     distribution: str = "random"
     ratio: float = 1.0
     target_count: int = 0

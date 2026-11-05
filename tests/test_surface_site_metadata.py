@@ -25,7 +25,7 @@ _FACETS = [Facet(1, 0, 0, 1.0), Facet(1, -1, 1, 1.0), Facet(1, 1, 1, 1.0)]
 
 def _inp_surface_fixture():
     # In0 facet(plane0), In1 edge(planes 0,1), In2 vertex(planes 0,1,2),
-    # In3 deep bulk (no facet membership -> classification "core"). P0 also
+    # In3 deep bulk (no facet membership -> classification "internal"). P0 also
     # facet(plane0) -- an anion surface atom, proving qd_atoms is not
     # cation-only. Cl sits 2.0 A from In0, *outward* along plane 0's own
     # normal (i.e. past the surface, into the vacuum growth direction) --
@@ -125,13 +125,13 @@ def test_surface_atom_records_shape_and_xyz_order():
         assert "eligible_for_ligand_exchange" not in row
         assert "current_ligand" not in row
 
-    # Every native atom is emitted now (surface AND core) -- In0/In1/In2
+    # Every native atom is emitted now (surface AND internal) -- In0/In1/In2
     # (facet/edge/vertex) and P0 (facet) are "surface"; In3 (deep bulk) is
-    # "core"; Cl (not native) is excluded.
+    # "internal"; Cl (not native) is excluded.
     assert [row["atom_index_0based"] for row in records] == [0, 1, 2, 3, 4]
     assert {row["element"] for row in records} == {"In", "P"}
     by_index = {row["atom_index_0based"]: row for row in records}
-    assert by_index[3]["classification"] == "core"
+    assert by_index[3]["classification"] == "internal"
     assert "role" not in by_index[3]
     assert "facet_ids" not in by_index[3]
     # In3 sits isolated in this fixture (no real neighbors) -- deficit is a
@@ -256,7 +256,7 @@ def test_surface_normals_are_unit_vectors_for_surface_atoms():
         true_bulk_cn={"In": 4, "P": 4, "Cl": 1}, include_indices=native_idx,
     )
     for row in records:
-        if row["classification"] == "core":
+        if row["classification"] == "internal":
             assert "surface_normal" not in row
             continue
         norm = float(np.linalg.norm(row["surface_normal"]))
@@ -353,7 +353,7 @@ def test_document_atom_indices_match_written_xyz_order(tmp_path):
     xyz_symbols, xyz_pts = _read_xyz(xyz_path)
 
     assert xyz_symbols == symbols
-    validate_metadata_matches_xyz(doc, xyz_symbols)
+    validate_metadata_matches_xyz(doc, xyz_symbols, xyz_pts)
     for row in doc["qd_atoms"]:
         idx = row["atom_index_0based"]
         assert xyz_symbols[idx] == row["element"]
@@ -401,6 +401,23 @@ def test_validate_metadata_matches_xyz_raises_on_corrupted_document():
     corrupted2["ligands"][0]["host_atom_indices_0based"] = [9999]
     with pytest.raises(ValueError):
         validate_metadata_matches_xyz(corrupted2, symbols)
+
+    # Position checks (only run when xyz_pts is given): a document whose
+    # positions have gone stale relative to the XYZ it's meant to describe
+    # (the write-ordering class of bug -- a later step rewrote the XYZ
+    # without regenerating the metadata) isn't caught by index/element
+    # checks alone.
+    validate_metadata_matches_xyz(doc, symbols, pts)  # real data: must pass
+    bad_pts = np.asarray(pts, float).copy()
+    bad_pts[doc["qd_atoms"][0]["atom_index_0based"]] += 1.0
+    with pytest.raises(ValueError):
+        validate_metadata_matches_xyz(doc, symbols, bad_pts)
+
+    bad_pts2 = np.asarray(pts, float).copy()
+    some_ligand = next(l for l in doc["ligands"] if l["host_atom_indices_0based"])
+    bad_pts2[some_ligand["host_atom_indices_0based"][0]] += 1.0
+    with pytest.raises(ValueError):
+        validate_metadata_matches_xyz(doc, symbols, bad_pts2)
 
 
 def test_write_surface_metadata_json_roundtrip(tmp_path):
@@ -599,12 +616,14 @@ def test_unresolved_ligand_reason_reflects_prior_metadata_supplied():
 
 def test_chained_lattice_replacement_gets_uniform_fields_and_swap_tag():
     # A lattice-replacement ligand chained forward from a prior document
-    # (see resolve_prior_ligand_provenance) arrives through the generic
-    # ligand_provenance path, not _build_lattice_substitution_records -- it
-    # must still get the exact same uniform field set as a freshly-resolved
-    # one: binding_site from real host count, facet label recomputed from
-    # the ligand's own position (never anything carried on the
-    # ligand_provenance entry itself), and the `swap` tag.
+    # (see resolve_prior_ligand_provenance, which carries `swap` through
+    # directly from the prior document's own record -- the provenance
+    # string alone no longer implies it, since several real mechanisms now
+    # share "charge_balance") arrives through the generic ligand_provenance
+    # path, not _build_lattice_substitution_records -- it must still get
+    # the exact same uniform field set as a freshly-resolved one:
+    # binding_site from real host count, facet label recomputed from the
+    # ligand's own position, and the `swap` tag.
     symbols, pts, planes, facets, charges, native = _inp_surface_fixture()
     provenance = [{
         "type": "Cl",
@@ -612,6 +631,7 @@ def test_chained_lattice_replacement_gets_uniform_fields_and_swap_tag():
         "atom_indices_0based": [5],
         "bound_host_atom_indices_0based": [0, 2],  # In0 (facet 0 only) + In2 (vertex, all three)
         "provenance": "polar_surface_reconstruction",
+        "swap": True,
     }]
     doc = build_surface_metadata_document(
         symbols, pts, planes, facets, charges, 0.2,
@@ -679,8 +699,9 @@ def _lattice_substitution_fixture():
     return symbols, pts, charges, native_species
 
 
-def _entry(pts, anchor_i, host_is, offset=np.zeros(3), replaced_symbol=None,
-           mechanism="polar_surface_reconstruction", host_symbols=None):
+def _entry(pts, anchor_i, host_is, offset=np.zeros(3), replaced_element=None,
+           mechanism="polar_surface_reconstruction", host_symbols=None,
+           z_type_relocated=None, neutrality_redistributed=None):
     entry = {
         "position": (pts[anchor_i] - offset).tolist(),
         "symbol": "Cl",
@@ -688,8 +709,12 @@ def _entry(pts, anchor_i, host_is, offset=np.zeros(3), replaced_symbol=None,
         "host_symbols": host_symbols if host_symbols is not None else ["In"] * len(host_is),
         "mechanism": mechanism,
     }
-    if replaced_symbol is not None:
-        entry["replaced_symbol"] = replaced_symbol
+    if replaced_element is not None:
+        entry["replaced_element"] = replaced_element
+    if z_type_relocated is not None:
+        entry["z_type_relocated"] = z_type_relocated
+    if neutrality_redistributed is not None:
+        entry["neutrality_redistributed"] = neutrality_redistributed
     return entry
 
 
@@ -702,8 +727,9 @@ def test_lattice_substitution_resolves_by_position_with_global_offset():
     # a lone entry to whatever lone same-symbol candidate happens to exist.
     offset = np.array([10.0, -5.0, 3.0])
     entries = [
-        _entry(pts, 3, [0, 1], offset),  # Cl0 bridges In0 (facet 0) + In1 (edge, facets 0,1)
-        _entry(pts, 5, [4], offset),     # Cl1 bonded to In4 (facet 0 only)
+        # Cl0 bridges In0 (facet 0) + In1 (edge, facets 0,1)
+        _entry(pts, 3, [0, 1], offset, replaced_element="Se"),
+        _entry(pts, 5, [4], offset, replaced_element="Se"),  # Cl1 bonded to In4 (facet 0 only)
     ]
     doc = build_surface_metadata_document(
         symbols, pts, _PLANES, _FACETS, charges, 0.2,
@@ -724,6 +750,7 @@ def test_lattice_substitution_resolves_by_position_with_global_offset():
     assert cl0["facet_ids"] == [0]
     assert cl0["facet_hkls"] == [[1, 0, 0]]
     assert cl0["swap"] is True
+    assert cl0["replaced_element"] == "Se"
     assert "role" not in cl0
     assert "coordination_number" not in cl0
     cl1 = lattice_ligs[5]
@@ -757,16 +784,17 @@ def test_ligand_records_never_carry_facet_terminations():
 
 
 def test_lattice_substitution_both_mechanisms_get_uniform_fields():
-    # prepass_surface_cleanup's always-on CN==2 anion-swap step feeds the
-    # same lattice_substitution_provenance list as reconstruct_polar_facets's
+    # The baseline charge-balancing machinery's always-on CN==2 anion-swap
+    # step (prepass_surface_cleanup, tagged "charge_balance") feeds the same
+    # lattice_substitution_provenance list as reconstruct_polar_facets's
     # optional reconstruction -- both are real in-place native-anion-to-
     # ligand conversions, so both get the exact same field set (binding_site
     # from host count, facet label recomputed from the ligand's own
     # position, swap=True); only `provenance` tells them apart.
     symbols, pts, charges, native = _lattice_substitution_fixture()
     entries = [
-        _entry(pts, 3, [0, 1], mechanism="polar_surface_reconstruction"),
-        _entry(pts, 5, [4], mechanism="prepass_cleanup"),
+        _entry(pts, 3, [0, 1], mechanism="polar_surface_reconstruction", replaced_element="Se"),
+        _entry(pts, 5, [4], mechanism="charge_balance", replaced_element="Se"),
     ]
     doc = build_surface_metadata_document(
         symbols, pts, _PLANES, _FACETS, charges, 0.2,
@@ -777,11 +805,29 @@ def test_lattice_substitution_both_mechanisms_get_uniform_fields():
     assert by_anchor[3]["binding_site"] == "μ2-bridging"
     assert by_anchor[3]["facet_ids"] == [0]
     assert by_anchor[3]["swap"] is True
-    assert by_anchor[5]["provenance"] == "prepass_cleanup"
+    assert by_anchor[5]["provenance"] == "charge_balance"
     assert by_anchor[5]["binding_site"] == "μ1-terminal"
     assert by_anchor[5]["facet_ids"] == [0]
     assert by_anchor[5]["swap"] is True
     assert set(by_anchor[3].keys()) == set(by_anchor[5].keys())
+
+
+def test_charge_balance_addition_entry_gets_no_swap():
+    # reconstruct_polar_facets's step 4 (fresh compensating ligands on
+    # cation-facet sites) uses the same select_ligand_sites placement as the
+    # baseline charge-balance add-path, so it's tagged "charge_balance" too
+    # (never "polar_surface_reconstruction", which is reserved for the real
+    # in-place anion->ligand swaps, steps 1-3) -- no replaced_element, no swap.
+    symbols, pts, charges, native = _lattice_substitution_fixture()
+    entries = [_entry(pts, 3, [0, 1], mechanism="charge_balance")]
+    doc = build_surface_metadata_document(
+        symbols, pts, _PLANES, _FACETS, charges, 0.2,
+        native_species=native, lattice_substitution_provenance=entries,
+    )
+    lig = next(l for l in doc["ligands"] if l["anchor_atom_index_0based"] == 3)
+    assert lig["provenance"] == "charge_balance"
+    assert "swap" not in lig
+    assert "replaced_element" not in lig
 
 
 def test_ligand_facet_label_recomputed_from_own_position_not_host():
@@ -899,7 +945,7 @@ def test_lattice_substitution_mixed_host_symbols_surviving_host_not_dropped():
         "symbol": "Cl",
         "host_positions": [pts[0].tolist(), removed_ga_pos],
         "host_symbols": ["In", "Ga"],
-        "mechanism": "prepass_cleanup",
+        "mechanism": "charge_balance",
     }
     doc = build_surface_metadata_document(
         symbols, pts, _PLANES, _FACETS, charges, 0.2,
@@ -910,26 +956,68 @@ def test_lattice_substitution_mixed_host_symbols_surviving_host_not_dropped():
     assert lig["host_elements"] == ["In"]
 
 
-def test_z_type_relocated_mechanism_composes_provenance_and_drops_swap():
+def test_z_type_relocated_keeps_real_provenance_and_drops_swap():
     # z-type's orphan-ligand relocation feeds lattice_substitution_provenance
-    # too (see z_type_displacement_posttreat._relocate_orphan_ligands), with
-    # a mechanism string composed from the ligand's provenance before being
-    # orphaned. Unlike an in-place lattice swap, a relocated ligand no
-    # longer occupies a former native site, so it must not get `swap: True`.
+    # too (see z_type_displacement_posttreat._relocate_orphan_ligands) -- it
+    # no longer uses its own "z_type_relocated" mechanism string; instead it
+    # keeps the ligand's real original `mechanism` (here "charge_balance",
+    # a swap, so `replaced_element` carries through and `swap` still shows)
+    # and layers `z_type_relocated: True` on top, so the full history (what
+    # it really was, plus the fact that it moved) survives. A ligand moved
+    # by a *fresh addition* (no `replaced_element`) must not get `swap: True`
+    # even though it's still a real, known-origin relocation.
     symbols, pts, charges, native = _lattice_substitution_fixture()
     entries = [
-        _entry(pts, 3, [0, 1], mechanism="prepass_cleanup_z_type_relocated"),
-        _entry(pts, 5, [4], mechanism="z_type_relocated"),
+        _entry(pts, 3, [0, 1], mechanism="charge_balance", replaced_element="Se", z_type_relocated=True),
+        _entry(pts, 5, [4], mechanism="polar_surface_reconstruction", z_type_relocated=True),
     ]
     doc = build_surface_metadata_document(
         symbols, pts, _PLANES, _FACETS, charges, 0.2,
         native_species=native, lattice_substitution_provenance=entries,
     )
     by_anchor = {l["anchor_atom_index_0based"]: l for l in doc["ligands"]}
-    assert by_anchor[3]["provenance"] == "prepass_cleanup_z_type_relocated"
-    assert "swap" not in by_anchor[3]
-    assert by_anchor[5]["provenance"] == "z_type_relocated"
+    assert by_anchor[3]["provenance"] == "charge_balance"
+    assert by_anchor[3]["swap"] is True
+    assert by_anchor[3]["z_type_relocated"] is True
+    assert by_anchor[5]["provenance"] == "polar_surface_reconstruction"
     assert "swap" not in by_anchor[5]
+    assert by_anchor[5]["z_type_relocated"] is True
+
+
+def test_z_type_relocated_unrecoverable_origin_stays_null_not_guessed():
+    # When z-type's orphan relocation can't recover the ligand's real prior
+    # mechanism at all (see _lookup_original_provenance returning None),
+    # `provenance` must stay null rather than defaulting to a guess --
+    # `z_type_relocated: True` alone still flags it as "moved, origin
+    # unknown" instead of being indistinguishable from any other
+    # unexplained null.
+    symbols, pts, charges, native = _lattice_substitution_fixture()
+    entries = [_entry(pts, 3, [0, 1], mechanism=None, z_type_relocated=True)]
+    doc = build_surface_metadata_document(
+        symbols, pts, _PLANES, _FACETS, charges, 0.2,
+        native_species=native, lattice_substitution_provenance=entries,
+    )
+    lig = next(l for l in doc["ligands"] if l["anchor_atom_index_0based"] == 3)
+    assert lig["provenance"] is None
+    assert lig["z_type_relocated"] is True
+    assert "swap" not in lig
+
+
+def test_neutrality_redistributed_flag_propagates():
+    # A ligand moved by post-passivation redistribution (Cause B) is not a
+    # swap -- it already was the ligand, it just relocated to resolve
+    # undercoordination -- so it gets `neutrality_redistributed: True`
+    # instead of `swap`.
+    symbols, pts, charges, native = _lattice_substitution_fixture()
+    entries = [_entry(pts, 3, [0, 1], mechanism="charge_balance", neutrality_redistributed=True)]
+    doc = build_surface_metadata_document(
+        symbols, pts, _PLANES, _FACETS, charges, 0.2,
+        native_species=native, lattice_substitution_provenance=entries,
+    )
+    lig = next(l for l in doc["ligands"] if l["anchor_atom_index_0based"] == 3)
+    assert lig["provenance"] == "charge_balance"
+    assert lig["neutrality_redistributed"] is True
+    assert "swap" not in lig
 
 
 def test_charge_balance_ligand_resolves_by_position_surviving_index_shift():

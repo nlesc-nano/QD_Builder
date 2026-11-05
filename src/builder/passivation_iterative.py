@@ -40,6 +40,7 @@ from .passivation import (
     _try_q_neutral_cation_removal_bundle,
     atom_regions_from_masks,
     _tie,
+    _bond_neighbor_indices,
 )
 from .io_utils import write_xyz, center_coords
 
@@ -520,6 +521,7 @@ def _priority1_swap_undercoord_anions_once(
     uv_cache: UVCache,
     *, verbose: bool = True,
     pt_tree: Optional[cKDTree] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     # Native anions only: not the ligand, and not of the ligand's charge (those
     # are already X-type terminators, so a swap would only change the element).
@@ -542,6 +544,19 @@ def _priority1_swap_undercoord_anions_once(
             continue
         before = _total_Q(symbols, charges)
         old = symbols[i]
+        if lattice_substitution_ledger is not None:
+            host_idx = [
+                j for j in _neighbors(i, symbols, pts, pt_tree=pt_tree)
+                if charges.get(symbols[j], 0) > 0
+            ]
+            lattice_substitution_ledger.append({
+                "position": pts[i].tolist(),
+                "symbol": ligand,
+                "host_positions": [pts[j].tolist() for j in host_idx],
+                "host_symbols": [symbols[j] for j in host_idx],
+                "replaced_element": old,
+                "mechanism": "charge_balance",
+            })
         symbols[i] = ligand
         after = _total_Q(symbols, charges)
         if verbose:
@@ -575,6 +590,7 @@ def _priority2_remove_low_cn_cation_once(
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
     role_ignore_planes: Optional[Collection[int]] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     use_stack = stack_passivation
     cands: List[Tuple] = []
@@ -658,6 +674,7 @@ def _priority2_remove_low_cn_cation_once(
                 uv_taken, edit_count_facet, mem, cn_now, alt_i,
                 region_masks=region_masks, region_removals=region_removals,
                 atom_regions=atom_regions, verbose=verbose,
+                lattice_substitution_ledger=lattice_substitution_ledger,
             )
             if ok:
                 cn2 = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
@@ -672,6 +689,19 @@ def _priority2_remove_low_cn_cation_once(
                         continue
                     if int(cn2[j]) < 3:
                         old = symbols[j]
+                        if lattice_substitution_ledger is not None:
+                            host_idx = [
+                                h for h in _bond_neighbor_indices(j, symbols, pts, pair_cuts)
+                                if charges.get(symbols[h], 0) > 0
+                            ]
+                            lattice_substitution_ledger.append({
+                                "position": pts[j].tolist(),
+                                "symbol": ligand,
+                                "host_positions": [pts[h].tolist() for h in host_idx],
+                                "host_symbols": [symbols[h] for h in host_idx],
+                                "replaced_element": old,
+                                "mechanism": "charge_balance",
+                            })
                         symbols[j] = ligand
                         if verbose:
                             print(f"stabilize: swap {old}#{j} → {ligand} (neighbor CN<3)")
@@ -710,6 +740,19 @@ def _priority2_remove_low_cn_cation_once(
         if int(cn2[j]) < 3:
             old = symbols[j]
             bQ = _total_Q(symbols, charges)
+            if lattice_substitution_ledger is not None:
+                host_idx = [
+                    h for h in _bond_neighbor_indices(j, symbols, pts, pair_cuts)
+                    if charges.get(symbols[h], 0) > 0
+                ]
+                lattice_substitution_ledger.append({
+                    "position": pts[j].tolist(),
+                    "symbol": ligand,
+                    "host_positions": [pts[h].tolist() for h in host_idx],
+                    "host_symbols": [symbols[h] for h in host_idx],
+                    "replaced_element": old,
+                    "mechanism": "charge_balance",
+                })
             symbols[j] = ligand
             aQ = _total_Q(symbols, charges)
             if verbose:
@@ -799,6 +842,7 @@ def _priority3_balance_negative_q(
     pair_cuts: Optional[PairCuts],
     *, verbose: bool = True,
     stack_passivation: bool = False,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     cand = _collect_anion_candidates_flat(
         symbols, pts, planes_raw, charges, ligand, surf_tol, pair_cuts,
@@ -828,6 +872,20 @@ def _priority3_balance_negative_q(
         if old == ligand:
             continue
         before = _total_Q(symbols, charges)
+        if lattice_substitution_ledger is not None:
+            # Same convention as prepass_surface_cleanup's CN==2 swap.
+            host_idx = [
+                j for j in _bond_neighbor_indices(i, symbols, pts, pair_cuts)
+                if charges.get(symbols[j], 0) > 0
+            ]
+            lattice_substitution_ledger.append({
+                "position": pts[i].tolist(),
+                "symbol": ligand,
+                "host_positions": [pts[j].tolist() for j in host_idx],
+                "host_symbols": [symbols[j] for j in host_idx],
+                "replaced_element": old,
+                "mechanism": "charge_balance",
+            })
         symbols[i] = ligand
         after = _total_Q(symbols, charges)
         _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
@@ -860,6 +918,7 @@ def _priority3_balance_positive_q_remove(
     *, verbose: bool = True,
     atom_regions: Optional[List[int]] = None,
     cif_path: Optional[str] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     outer_thr = 0.35 * surf_tol
     true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, charges, pair_cuts=pair_cuts) if cif_path else None
@@ -941,6 +1000,20 @@ def _priority3_balance_positive_q_remove(
             if int(cn2[j]) < 3:
                 old = symbols[j]
                 bQ = _total_Q(symbols, charges)
+                if lattice_substitution_ledger is not None:
+                    # Same convention as prepass_surface_cleanup's CN==2 swap.
+                    host_idx = [
+                        h for h in _bond_neighbor_indices(j, symbols, pts, pair_cuts)
+                        if charges.get(symbols[h], 0) > 0
+                    ]
+                    lattice_substitution_ledger.append({
+                        "position": pts[j].tolist(),
+                        "symbol": ligand,
+                        "host_positions": [pts[h].tolist() for h in host_idx],
+                        "host_symbols": [symbols[h] for h in host_idx],
+                        "replaced_element": old,
+                        "mechanism": "charge_balance",
+                    })
                 symbols[j] = ligand
                 aQ = _total_Q(symbols, charges)
                 if verbose:
@@ -1533,6 +1606,7 @@ def _experimental_exhausted_positive_q_fallback_once(
     pair_cuts: Optional[PairCuts],
     *,
     verbose: bool = True,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str], NDArray[np.float64]]:
     """
     Last-resort experimental Q>0 move. It is intentionally separate from the
@@ -1657,6 +1731,19 @@ def _experimental_exhausted_positive_q_fallback_once(
     for j, old, cnj in swapped_logs:
         if verbose:
             print(f"[experimental] stabilize: swap {old}#{j} (CN={cnj}) → {ligand}")
+        if lattice_substitution_ledger is not None:
+            host_idx = [
+                h for h in _bond_neighbor_indices(j, trial_symbols, trial_pts, pair_cuts)
+                if charges.get(trial_symbols[h], 0) > 0
+            ]
+            lattice_substitution_ledger.append({
+                "position": trial_pts[j].tolist(),
+                "symbol": ligand,
+                "host_positions": [trial_pts[h].tolist() for h in host_idx],
+                "host_symbols": [trial_symbols[h] for h in host_idx],
+                "replaced_element": old,
+                "mechanism": "charge_balance",
+            })
 
     if verbose:
         print(
@@ -1681,6 +1768,7 @@ def _optimize_ligand_distribution_at_neutrality(
     verbose: bool = True,
     cif_path: Optional[str] = None,
     atom_regions: Optional[List[int]] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
     Safely migrates existing ligands from fully-coordinated donor cations (CN >= T - 1 after removal)
@@ -1960,6 +2048,15 @@ def _optimize_ligand_distribution_at_neutrality(
                 acceptors_str = ", ".join(f"{symbols[a]}#{a} (CN={int(cn_current[a])})" for a in host_list)
                 print(f"[passivation:migrate] Migrated ligand {ligand}#{l_idx} binding {donors_str} → {acceptors_str} (Delta Fitness: +{delta_fit})")
             pts[l_idx] = new_pos
+            if lattice_substitution_ledger is not None:
+                lattice_substitution_ledger.append({
+                    "position": new_pos.tolist() if hasattr(new_pos, "tolist") else list(new_pos),
+                    "symbol": symbols[l_idx],
+                    "host_positions": [pts[h].tolist() for h in host_list],
+                    "host_symbols": [symbols[h] for h in host_list],
+                    "mechanism": "charge_balance",
+                    "neutrality_redistributed": True,
+                })
             migration_count += 1
         else:
             break
@@ -2122,7 +2219,8 @@ def charge_balance_iterative(
         # Priority 1
         progressed, symbols, pts = _priority1_swap_undercoord_anions_once(
             symbols, pts, frames, mem, cn_bi, charges, ligand, surf_tol, uv_cache, verbose=verbose,
-            pt_tree=pt_tree
+            pt_tree=pt_tree,
+            lattice_substitution_ledger=lattice_substitution_ledger,
         )
         if progressed:
             continue
@@ -2139,6 +2237,7 @@ def charge_balance_iterative(
             prepass_min_cn_edge=prepass_min_cn_edge,
             prepass_min_cn_vertex=prepass_min_cn_vertex,
             role_ignore_planes=prepass_role_ignore_planes,
+            lattice_substitution_ledger=lattice_substitution_ledger,
         )
         if progressed:
             continue
@@ -2160,7 +2259,8 @@ def charge_balance_iterative(
             # Post-passivation ligand migration/redistribution to resolve highly undercoordinated sites
             symbols, pts = _optimize_ligand_distribution_at_neutrality(
                 symbols, pts, frames, planes, cn_bi, charges, ligand, surf_tol, pair_cuts,
-                verbose=verbose, cif_path=cif_path, atom_regions=atom_regions
+                verbose=verbose, cif_path=cif_path, atom_regions=atom_regions,
+                lattice_substitution_ledger=lattice_substitution_ledger,
             )
 
             if stack_passivation:
@@ -2185,6 +2285,7 @@ def charge_balance_iterative(
             progressed, symbols, pts = _priority3_balance_negative_q(
                 symbols, pts, frames, planes, mem, cn_bi, charges, ligand, surf_tol, uv_taken, edit_count_facet, uv_cache,
                 pair_cuts, verbose=verbose, stack_passivation=stack_passivation,
+                lattice_substitution_ledger=lattice_substitution_ledger,
             )
             if progressed:
                 continue
@@ -2218,6 +2319,7 @@ def charge_balance_iterative(
                 positive_q_strategy_selector=positive_q_strategy_selector,
                 verbose=verbose,
                 cif_path=cif_path,
+                lattice_substitution_ledger=lattice_substitution_ledger,
             )
             if progressed:
                 continue
@@ -2247,6 +2349,7 @@ def charge_balance_iterative(
                     surf_tol,
                     pair_cuts,
                     verbose=verbose,
+                    lattice_substitution_ledger=lattice_substitution_ledger,
                 )
                 if progressed:
                     continue
@@ -2278,6 +2381,7 @@ def charge_balance_iterative(
                 symbols, pts, frames, planes, mem, cn_bi, charges, surf_tol,
                 uv_taken, edit_count_facet, uv_cache, ligand, pair_cuts, verbose=verbose,
                 cif_path=cif_path,
+                lattice_substitution_ledger=lattice_substitution_ledger,
             )
             if progressed:
                 _Q_after = _total_Q(symbols, charges)
@@ -2337,6 +2441,7 @@ def charge_balance_iterative(
                     surf_tol,
                     pair_cuts,
                     verbose=verbose,
+                    lattice_substitution_ledger=lattice_substitution_ledger,
                 )
                 if progressed:
                     continue
@@ -2382,6 +2487,7 @@ def charge_balance_iterative(
                     surf_tol,
                     pair_cuts,
                     verbose=verbose,
+                    lattice_substitution_ledger=lattice_substitution_ledger,
                 )
                 if progressed:
                     continue

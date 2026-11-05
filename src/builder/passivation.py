@@ -402,6 +402,7 @@ def _try_q_neutral_cation_removal_bundle(
     region_removals: Optional[Dict[int, int]] = None,
     atom_regions: Optional[List[int]] = None,
     verbose: bool = False,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, NDArray[np.float64]]:
     """
     Remove one surface CN<=2 cation and swap two surface anions to ligand (net Q=0).
@@ -425,6 +426,19 @@ def _try_q_neutral_cation_removal_bundle(
                 f"bundle: swap anion {old}#{ai} (CN={int(cn[ai])}) → {ligand} "
                 f"(companion to cation removal #{cation_idx})"
             )
+        if lattice_substitution_ledger is not None:
+            host_idx = [
+                j for j in _bond_neighbor_indices(ai, symbols, pts, pair_cuts)
+                if charges.get(symbols[j], 0) > 0
+            ]
+            lattice_substitution_ledger.append({
+                "position": pts[ai].tolist(),
+                "symbol": ligand,
+                "host_positions": [pts[j].tolist() for j in host_idx],
+                "host_symbols": [symbols[j] for j in host_idx],
+                "replaced_element": old,
+                "mechanism": "charge_balance",
+            })
         symbols[ai] = ligand
         _record_uv_allfacets(ai, pts, frames, surf_tol, uv_taken, edit_count_facet)
 
@@ -625,6 +639,7 @@ def prepass_surface_cleanup(
                     uv_taken, edit_count_facet, mem, cn, i,
                     region_masks=region_masks, region_removals=region_removals,
                     atom_regions=atom_regions, verbose=verbose,
+                    lattice_substitution_ledger=lattice_substitution_ledger,
                 )
                 if ok:
                     mem = _facet_members()
@@ -638,6 +653,7 @@ def prepass_surface_cleanup(
                         uv_taken, edit_count_facet, mem, cn, alt_i,
                         region_masks=region_masks, region_removals=region_removals,
                         atom_regions=atom_regions, verbose=verbose,
+                        lattice_substitution_ledger=lattice_substitution_ledger,
                     )
                     if ok:
                         mem = _facet_members()
@@ -695,8 +711,8 @@ def prepass_surface_cleanup(
                         # guess that silently drops whichever host didn't
                         # "win" the count even though it's still there.
                         "host_symbols": [symbols[j] for j in host_idx],
-                        "replaced_symbol": s,
-                        "mechanism": "prepass_cleanup",
+                        "replaced_element": s,
+                        "mechanism": "charge_balance",
                     })
                 symbols[i] = anion_ligand
                 _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)

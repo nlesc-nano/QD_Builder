@@ -770,6 +770,8 @@ def _run_passivation_and_write_outputs(
     stack_passivation: bool = False,
     facet_geometry_input: dict | None = None,
     faceless_roles: bool = False,
+    construction_planes=None,
+    post_passivation_fit_fn=None,
 ):
     prefix = os.path.splitext(args.out)[0]
     # The lattice sites: every atom of the Wulff cut, before passivation. Only
@@ -853,6 +855,7 @@ def _run_passivation_and_write_outputs(
             write_all=args.write_all,
             prefix=prefix,
             ledger=surface_reconstruction_ledger,
+            charge_balance_ledger=charge_balance_ledger,
         )
 
     if output_layer_planes is not None:
@@ -869,6 +872,8 @@ def _run_passivation_and_write_outputs(
             cif_path=cif_path,
             pair_cuts_override=pair_cuts_override,
             verbose=args.verbose,
+            ledger=charge_balance_ledger,
+            lattice_substitution_ledger=prepass_lattice_substitution_ledger,
         )
 
     # The inorganic core as passivated: later post-treatments add complexes
@@ -935,6 +940,7 @@ def _run_passivation_and_write_outputs(
             lattice_substitution_entries=(
                 surface_reconstruction_ledger.get("lattice_substitutions", [])
                 + prepass_lattice_substitution_ledger
+                + charge_balance_ledger
             ),
         )
 
@@ -1040,6 +1046,9 @@ def _run_passivation_and_write_outputs(
         syms, pts = run_neutral_ligand_posttreatment(
             syms, pts, cfg, struct, planes, ledger=neutral_ligand_ledger
         )
+
+    if post_passivation_fit_fn is not None:
+        pts = post_passivation_fit_fn(pts, syms)
 
     if args.verbose:
         print(f"\n[11] Writing final XYZ to {args.out}")
@@ -1265,6 +1274,23 @@ def _run_passivation_and_write_outputs(
                 for entry in alloying_ledger
                 for pos in entry.get("atom_positions", [])
             ]
+            # Position-captured core/shell layer tag, recomputed fresh
+            # against the exact final out_syms/out_pts array (same
+            # region_masks_from_layer_planes primitive _stack_size_metrics
+            # already uses for this build) -- None for a plain,
+            # non-core-shell build.
+            material_provenance = None
+            if output_layer_planes is not None and output_materials is not None:
+                region_masks_final = region_masks_from_layer_planes(out_pts, output_layer_planes)
+                material_provenance = [
+                    {
+                        "position": out_pts[i].tolist(),
+                        "symbol": out_syms[i],
+                        "material": "core" if k == 0 else f"shell{k}",
+                    }
+                    for k, mask in enumerate(region_masks_final)
+                    for i, keep in enumerate(mask) if keep
+                ]
 
             if args.verbose:
                 print(f"[13] Writing surface metadata JSON to {prefix}_metadata.json")
@@ -1282,6 +1308,7 @@ def _run_passivation_and_write_outputs(
                 ligand_provenance=ligand_provenance,
                 lattice_substitution_provenance=lattice_substitution_provenance,
                 atom_provenance=atom_provenance,
+                material_provenance=material_provenance,
                 prepass_mode=cfg.passivation.prepass_mode,
                 true_bulk_cn=true_bulk_cn,
             )
@@ -1451,6 +1478,8 @@ def _perform_core_shell_swapping_and_rebalance(
     cif_path,
     pair_cuts_override,
     verbose,
+    ledger=None,
+    lattice_substitution_ledger=None,
 ):
     if not layer_planes or not resolved_materials:
         return syms, pts
@@ -1576,6 +1605,8 @@ def _perform_core_shell_swapping_and_rebalance(
         stack_passivation=False,
         prepass_mode="none",
         include_sublayer=cfg.passivation.include_sublayer,
+        ledger=ledger,
+        lattice_substitution_ledger=lattice_substitution_ledger,
     )
 
     return syms, pts
@@ -2138,6 +2169,40 @@ def main(argv: List[str] | None = None) -> int:
                     )
                     write_xyz(layer_path, part_syms_out, part_pts_out)
 
+            def _fit_core_lattice(pts, syms):
+                # Re-maps core-region atoms from the shell's as-cut lattice
+                # metric onto the core material's own native metric (smooth
+                # blend from the interface inward) -- applied here, before
+                # the final reorder/write/metadata pass, so the written
+                # .xyz and the metadata it feeds stay self-consistent.
+                native_elements = set()
+                for m in resolved_materials:
+                    cat, an = material_cation_anion(m, cfg.charges)
+                    native_elements.update((cat, an))
+                region_masks_final = region_masks_from_layer_planes(pts, layer_planes)
+                core_mask = region_masks_final[0] & np.isin(np.asarray(syms), list(native_elements))
+                if args.verbose:
+                    print("\n[3b] Applying core lattice fit with smooth interface blend...")
+                try:
+                    core_struct = Structure.from_file(core_cfg.cif)
+                    pts = apply_core_lattice_fit(
+                        pts,
+                        core_mask,
+                        layer_planes[0],
+                        struct_ref.lattice.matrix,
+                        core_struct.lattice.matrix,
+                        strain_width=args.core_strain_width,
+                        center_mode=args.core_center,
+                    )
+                    if args.verbose:
+                        print(
+                            f"    - Core lattice fit applied "
+                            f"(width={args.core_strain_width:.3f} Å, center={args.core_center})"
+                        )
+                except np.linalg.LinAlgError:
+                    print("WARNING: reference lattice not invertible; skipping core lattice fit.")
+                return pts
+
             facets_for_output = _facets if surface_cfg.shape_mode != "sphere" else None
             syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
                 syms,
@@ -2157,36 +2222,8 @@ def main(argv: List[str] | None = None) -> int:
                 output_materials=resolved_materials,
                 region_masks=region_masks,
                 stack_passivation=False,
+                post_passivation_fit_fn=None if args.no_core_lattice_fit else _fit_core_lattice,
             )
-
-            use_core_lattice_fit = not args.no_core_lattice_fit
-            if use_core_lattice_fit:
-                region_masks = region_masks_from_layer_planes(pts, layer_planes)
-                if args.verbose:
-                    print("\n[3b] Applying core lattice fit with smooth interface blend...")
-                try:
-                    core_struct = Structure.from_file(core_cfg.cif)
-                    pts = apply_core_lattice_fit(
-                        pts,
-                        region_masks[0],
-                        layer_planes[0],
-                        struct_ref.lattice.matrix,
-                        core_struct.lattice.matrix,
-                        strain_width=args.core_strain_width,
-                        center_mode=args.core_center,
-                    )
-                    if args.verbose:
-                        print(
-                            f"    - Core lattice fit applied "
-                            f"(width={args.core_strain_width:.3f} Å, center={args.core_center})"
-                        )
-                except np.linalg.LinAlgError:
-                    print("WARNING: reference lattice not invertible; skipping core lattice fit.")
-                if args.center:
-                    pts = center_coords(pts)
-                write_xyz(run_args.out, syms, pts)
-                if args.verbose:
-                    print(f"[12] Rewrote passivated structure after core lattice fit → {run_args.out}")
 
             # --- ALWAYS write core.xyz by default using finalized coordinates ---
             final_masks = region_masks_from_layer_planes(pts, layer_planes)

@@ -950,6 +950,7 @@ def reconstruct_polar_facets(
     write_all: bool = False,
     prefix: str = "nanocrystal",
     ledger: Optional[dict] = None,
+    charge_balance_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
     Polar {111} reconstruction of zinc-blende II-VI / III-V nanocrystals.
@@ -957,6 +958,11 @@ def reconstruct_polar_facets(
     See the module docstring for the algorithm.  `charge_balance_fn`,
     `write_all` and `prefix` are accepted for call-site compatibility.  When
     `ledger` is a dict it is filled with a summary of the reconstruction.
+
+    `charge_balance_ledger`: optional list filled the same way as
+    `passivation_iterative.py`'s own `charge_balance_ledger`, covering the
+    *residual* charge-balance pass run internally when the {111}
+    reconstruction alone can't absorb the whole charge.
     """
     if not spec.enabled:
         return symbols, pts
@@ -1137,7 +1143,7 @@ def reconstruct_polar_facets(
             # later resolution step verify the atom at this position is
             # still (or still has) the expected species before trusting the
             # match, in case something further downstream changes it.
-            # `replaced_symbol` is the native anion species this lattice
+            # `replaced_element` is the native anion species this lattice
             # site originally held (e.g. "P") -- lets a later bulk-CN lookup
             # compare against the chemically correct reference instead of
             # the occupying ligand's own (not a true bulk species) symbol.
@@ -1147,7 +1153,7 @@ def reconstruct_polar_facets(
                 "symbol": recon_ligand,
                 "host_positions": [pts[n].tolist() for n in host_idx],
                 "host_symbols": [cation] * len(host_idx),
-                "replaced_symbol": anion,
+                "replaced_element": anion,
                 "mechanism": "polar_surface_reconstruction",
             })
         if swap is not None:
@@ -1352,6 +1358,13 @@ def reconstruct_polar_facets(
             for pk in picks:
                 new_symbols.append(recon_ligand)
                 new_pts = np.vstack([new_pts, pk["pos"]])
+                lattice_substitutions.append({
+                    "position": pk["pos"].tolist() if hasattr(pk["pos"], "tolist") else list(pk["pos"]),
+                    "symbol": recon_ligand,
+                    "host_positions": [new_pts[h].tolist() for h in pk["hosts"]],
+                    "host_symbols": [new_symbols[h] for h in pk["hosts"]],
+                    "mechanism": "charge_balance",
+                })
                 added += 1
                 mu_added[pk["mu"] if pk["mu"] in mu_added else 3] += 1
                 facet_count[pk["facet"]] += 1
@@ -1483,13 +1496,23 @@ def reconstruct_polar_facets(
             out_symbols, out_pts, struct, charges, facet_seeds, recon_ligand, surf_tol
         )
         before = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
+        residual_ledger: List[dict] = []
+        residual_lattice_substitution_ledger: List[dict] = []
         out_symbols, out_pts = charge_balance_iterative(
             list(out_symbols), np.asarray(out_pts, float), charges, recon_ligand,
             verbose, cb_planes, surf_tol, cif_path,
             positive_q_strategy="add",
             pair_cuts_override=pair_cuts,
             prepass_mode="none",
+            ledger=residual_ledger,
+            lattice_substitution_ledger=residual_lattice_substitution_ledger,
         )
+        if charge_balance_ledger is not None:
+            charge_balance_ledger.extend(residual_ledger)
+        if residual_lattice_substitution_ledger:
+            res["lattice_substitutions"] = (
+                res["lattice_substitutions"] + residual_lattice_substitution_ledger
+            )
         after = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
         rebalance = {
             "residual_charge": int(q_final),

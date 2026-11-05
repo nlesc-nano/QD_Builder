@@ -191,15 +191,11 @@ def _lookup_original_provenance(
     lattice_substitution_entries: Optional[List[dict]],
     *,
     tol: float = 1e-3,
-) -> Optional[str]:
+) -> Optional[dict]:
     """
     Was this ligand, immediately before being orphaned, itself a lattice-
-    substitution swap (prepass_cleanup / polar_surface_reconstruction)? A
-    direct position+symbol scan, not the full offset-detection machinery in
-    surface_metadata (_resolve_positional_entries) -- capture (by those
-    mechanisms) and this lookup both happen within the same single pipeline
-    run, before any final recentering translation, so there's no offset to
-    correct for here.
+    substitution entry? Direct position+symbol scan; returns the whole
+    matched entry, or None.
     """
     for entry in lattice_substitution_entries or []:
         if entry.get("symbol") != sym:
@@ -208,7 +204,7 @@ def _lookup_original_provenance(
         if entry_pos is None:
             continue
         if float(np.linalg.norm(np.asarray(entry_pos, float) - pos)) <= tol:
-            return entry.get("mechanism")
+            return entry
     return None
 
 
@@ -226,22 +222,16 @@ def _relocate_orphan_ligands(
     Move unbound passivation ligands to available CIF virtual sites,
     greedily. Returns (syms, pts, stats, relocated_records) -- the last is
     one entry per successfully relocated ligand, shaped like a
-    lattice-substitution ledger entry (position-anchored, position-hosted,
-    see surface_metadata._build_lattice_substitution_records), tagged with
-    `mechanism` = `f"{original}_z_type_relocated"` when the ligand's
-    provenance before being orphaned is itself known (see
-    _lookup_original_provenance), else bare `"z_type_relocated"`. No index
-    remapping needed anywhere downstream -- like every other lattice-
-    substitution entry, these are resolved by position at final metadata
-    assembly, immune to whatever further compaction/reordering happens
-    between here and then.
+    lattice-substitution ledger entry, carrying the ligand's real original
+    `mechanism`/`replaced_element`/`neutrality_redistributed` forward (see
+    _lookup_original_provenance) plus `z_type_relocated: True`.
     """
     pts = np.asarray(pts, float)
     ligand_symbols = {s for s in ligand_symbols if int(cfg.charges.get(s, 0)) != 0}
     if not ligand_symbols:
         return syms, pts, {"detected": 0, "relocated": 0, "removed": 0}, []
 
-    orphan_records: List[Tuple[str, np.ndarray, Optional[str]]] = []
+    orphan_records: List[Tuple[str, np.ndarray, Optional[dict]]] = []
     orphan_indices = set()
     for i, sym in enumerate(syms):
         if sym not in ligand_symbols:
@@ -250,8 +240,8 @@ def _relocate_orphan_ligands(
             continue
         orphan_indices.add(i)
         old_pos = pts[i].copy()
-        original_provenance = _lookup_original_provenance(old_pos, sym, lattice_substitution_entries)
-        orphan_records.append((sym, old_pos, original_provenance))
+        original_entry = _lookup_original_provenance(old_pos, sym, lattice_substitution_entries)
+        orphan_records.append((sym, old_pos, original_entry))
 
     if not orphan_records:
         return syms, pts, {"detected": 0, "relocated": 0, "removed": 0}, []
@@ -284,11 +274,11 @@ def _relocate_orphan_ligands(
         virtual_sites = []
 
     used_sites: set[int] = set()
-    placed: List[Tuple[str, np.ndarray, Optional[str], List[int]]] = []
+    placed: List[Tuple[str, np.ndarray, Optional[dict], List[int]]] = []
     existing_ligand_pts = [base_pts[i] for i, sym in enumerate(base_syms) if sym in ligand_symbols]
     min_ligand_spacing = 1.5
 
-    for lig_sym, old_pos, original_provenance in orphan_records:
+    for lig_sym, old_pos, original_entry in orphan_records:
         q_lig = int(cfg.charges.get(lig_sym, 0))
         candidates = []
         for site_idx, site in enumerate(virtual_sites):
@@ -314,24 +304,27 @@ def _relocate_orphan_ligands(
             continue
         _dist, _rank, site_idx, pos, hosts = min(candidates, key=lambda c: c[:3])
         used_sites.add(site_idx)
-        placed.append((lig_sym, pos.copy(), original_provenance, hosts))
+        placed.append((lig_sym, pos.copy(), original_entry, hosts))
         existing_ligand_pts.append(pos.copy())
 
     relocated_records: List[dict] = []
     if placed:
-        base_syms = list(base_syms) + [sym for sym, _pos, _prov, _hosts in placed]
-        base_pts = np.vstack([base_pts, np.asarray([pos for _sym, pos, _prov, _hosts in placed], float)])
-        for sym, pos, original_provenance, hosts in placed:
-            mechanism = (
-                f"{original_provenance}_z_type_relocated" if original_provenance else "z_type_relocated"
-            )
-            relocated_records.append({
+        base_syms = list(base_syms) + [sym for sym, _pos, _entry, _hosts in placed]
+        base_pts = np.vstack([base_pts, np.asarray([pos for _sym, pos, _entry, _hosts in placed], float)])
+        for sym, pos, original_entry, hosts in placed:
+            record = {
                 "position": pos.tolist(),
                 "symbol": sym,
                 "host_positions": [base_pts[h].tolist() for h in hosts],
                 "host_symbols": [base_syms[h] for h in hosts],
-                "mechanism": mechanism,
-            })
+                "mechanism": original_entry.get("mechanism") if original_entry else None,
+                "z_type_relocated": True,
+            }
+            if original_entry and original_entry.get("replaced_element") is not None:
+                record["replaced_element"] = original_entry["replaced_element"]
+            if original_entry and original_entry.get("neutrality_redistributed"):
+                record["neutrality_redistributed"] = True
+            relocated_records.append(record)
 
     relocated = len(placed)
     return base_syms, np.asarray(base_pts, float), {

@@ -513,13 +513,13 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
         else:
             charge = None
 
-        replace_charge_raw = entry.get("replace_charge", entry.get("replacement_charge"))
-        if replace_charge_raw is not None:
-            replace_charge = int(replace_charge_raw)
-            if replace_charge == 0:
-                raise ValueError(f"ligand_exchange.passes[{i}].replace_charge must be non-zero")
+        replaced_charge_raw = entry.get("replaced_charge", entry.get("replacement_charge"))
+        if replaced_charge_raw is not None:
+            replaced_charge = int(replaced_charge_raw)
+            if replaced_charge == 0:
+                raise ValueError(f"ligand_exchange.passes[{i}].replaced_charge must be non-zero")
         else:
-            replace_charge = None
+            replaced_charge = None
 
         smiles_raw = entry.get("smiles")
         if isinstance(smiles_raw, str):
@@ -547,7 +547,7 @@ def _parse_ligand_exchange(raw) -> LigandExchangePostTreatSpec:
         passes.append(LigandExchangePass(
             replace=replace,
             charge=charge,
-            replace_charge=replace_charge,
+            replaced_charge=replaced_charge,
             smiles=smiles,
             distribution=distribution,
             ratio=ratio,

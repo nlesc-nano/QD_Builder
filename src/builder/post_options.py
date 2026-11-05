@@ -129,7 +129,7 @@ def surface_options(xyz_path: str, cfg: Config, cif_path: str) -> Dict[str, list
                 "replace": sym,
                 "dummy": sym,
                 "charge": q,
-                "replace_charge": q,
+                "replaced_charge": q,
                 "ligand_charge": -1 if q < 0 else 1,
                 "site_type": "anion" if q < 0 else "cation",
                 "available_count": available,
