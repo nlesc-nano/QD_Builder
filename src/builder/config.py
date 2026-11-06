@@ -48,7 +48,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--from-xyz", metavar="DOT.xyz", default=None,
         help="Post-treatment only: run the recipe's post_treatment block on this already "
-             "passivated dot (no Wulff cut, no first charge balance). Single-material mode."
+             "passivated dot (no Wulff cut, no first charge balance). Single-material mode. "
+             "Writes <out stem>_metadata.json alongside the output XYZ."
+    )
+    p.add_argument(
+        "--extra-native-cif", metavar="CIF", action="append", default=None,
+        help="With --from-xyz: additional material CIF(s) whose species should be treated "
+             "as native (not ligands) in the written metadata -- e.g. a shell material's "
+             "CIF when repassivating a core-shell dot built from a different outermost "
+             "CIF. Repeatable."
+    )
+    p.add_argument(
+        "--prior-xyz", metavar="PRIOR.xyz", default=None,
+        help="With --from-xyz: a previously-passivated XYZ (paired with --prior-metadata) "
+             "to chain forward ligand/material provenance from, for atoms this run's own "
+             "ledgers don't otherwise resolve."
+    )
+    p.add_argument(
+        "--prior-metadata", metavar="PRIOR_METADATA.json", default=None,
+        help="With --from-xyz: the surface-metadata JSON matching --prior-xyz."
+    )
+    p.add_argument(
+        "--builder-params-json", metavar="PARAMS.json", default=None,
+        help="With --from-xyz: a small JSON object (e.g. {\"radius_A\": ..., "
+             "\"size_unit_cells\": [...], \"aspect\": [...], \"shape\": ..., "
+             "\"center_ion\": ..., \"shells\": [...]}) describing the *original* "
+             "build this dot came from -- --from-xyz has no way to know this on "
+             "its own. Merged into the written metadata's \"builder\" field "
+             "alongside this run's own post_treatment recipe."
     )
     p.add_argument(
         "--options", metavar="DOT.xyz", default=None,

@@ -16,10 +16,10 @@ except ImportError:
     sys.exit("pip install pymatgen[matproj]")
 
 from .config import build_parser, parse_yaml_config
-from .nc_types import Config, Facet
+from .nc_types import Config, Facet, PostTreatmentSpec
 from .facets import expand_facets, detect_facets_from_nc, halfspaces, scan_facets_from_cif
 from .facets import unit_normal
-from .geometry import apply_core_lattice_fit, build_nanocrystal, build_spherical_nanocrystal, dedupe_points, recut_with_planes, sphere_halfspaces
+from .geometry import apply_core_lattice_fit, build_nanocrystal, build_spherical_nanocrystal, dedupe_points, recut_with_planes, sphere_halfspaces, sphere_facet_placeholders
 from .io_utils import write_xyz, write_manifest, center_coords
 from .passivation_iterative import charge_balance_iterative, derive_true_bulk_cn_from_cif
 from .analysis import (
@@ -396,6 +396,47 @@ def _material_label_from_cif_or_structure(
         if sym not in seen:
             seen.append(sym)
     return "".join(seen) or "Material"
+
+
+def _post_treatment_summary(pt: PostTreatmentSpec) -> dict:
+    """Real post_treatment recipe that actually ran, for the metadata's
+    `builder` field -- only mechanisms explicitly enabled, not every
+    possible (mostly-disabled-default) sub-spec PostTreatmentSpec carries."""
+    out: dict = {}
+    for field_name in (
+        "surface_reconstruction", "alloying", "z_type_displacement",
+        "neutral_exchange", "ligand_exchange", "z_type_ligands", "neutral_ligands",
+    ):
+        spec = getattr(pt, field_name, None)
+        if spec is not None and getattr(spec, "enabled", False):
+            out[field_name] = dataclasses.asdict(spec)
+    return out
+
+
+def _builder_params_for_metadata(
+    cfg: Config, *, radius_A: float | None = None, shells: List[str] | None = None,
+) -> dict:
+    """Real build-config info for the metadata's `builder` field -- shape,
+    size, aspect, center species, shell materials (stack builds), and
+    whichever post_treatment mechanisms actually ran. Reused by both
+    main.py's fresh-build path and from_xyz.py's --from-xyz (merged there
+    with any --builder-params-json the caller supplied, since --from-xyz
+    itself never knows the *original* build's own radius/size/shape/shells)."""
+    params: dict = {
+        "shape": "sphere" if cfg.shape_mode == "sphere" else "wulff",
+        "aspect": list(cfg.aspect),
+        "center_ion": (cfg.construction_origin or {}).get("center_on_species"),
+    }
+    if radius_A is not None:
+        params["radius_A"] = radius_A
+    if cfg.size_unit_cells is not None:
+        params["size_unit_cells"] = list(cfg.size_unit_cells)
+    if shells:
+        params["shells"] = shells
+    post_treatment = _post_treatment_summary(cfg.post_treatment)
+    if post_treatment:
+        params["post_treatment"] = post_treatment
+    return params
 
 
 def _native_species_in_cif_order(struct: Structure, charges, ligand_symbol: str | None) -> List[str]:
@@ -1219,102 +1260,105 @@ def _run_passivation_and_write_outputs(
     write_manifest(prefix, syms, cfg.charges, extra=extra)
 
     if facets:
-        try:
-            native_species = set(_native_species_in_cif_order(struct, cfg.charges, anion_lig))
-            if output_materials:
-                for m in output_materials:
-                    native_species.update(material_cation_anion(m, cfg.charges))
-            if alloying_ledger:
-                native_species.update(entry["replacement"] for entry in alloying_ledger)
+        native_species = set(_native_species_in_cif_order(struct, cfg.charges, anion_lig))
+        if output_materials:
+            for m in output_materials:
+                native_species.update(material_cation_anion(m, cfg.charges))
+        if alloying_ledger:
+            native_species.update(entry["replacement"] for entry in alloying_ledger)
 
-            facet_seed_terminations = {
-                (f.h, f.k, f.l): f.termination
-                for f in facet_seeds
-                if getattr(f, "termination", None)
-            }
-            ligand_provenance = [
-                {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "x_type"}
-                for e in ligand_exchange_charge_ledger
-            ] + [
-                {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "l_type"}
-                for e in neutral_ligand_ledger
-            ] + [
-                {**e, "provenance": "z_type_neutral_exchange"}
-                for e in neutral_exchange_provenance_ledger
+        facet_seed_terminations = {
+            (f.h, f.k, f.l): f.termination
+            for f in facet_seeds
+            if getattr(f, "termination", None)
+        }
+        ligand_provenance = [
+            {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "x_type"}
+            for e in ligand_exchange_charge_ledger
+        ] + [
+            {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "l_type"}
+            for e in neutral_ligand_ledger
+        ] + [
+            {**e, "provenance": "z_type_neutral_exchange"}
+            for e in neutral_exchange_provenance_ledger
+        ]
+        z_type_relocated_records = [
+            rec
+            for entry in z_type_displacement_ledger
+            for rec in entry.get("relocated_ligand_records", [])
+        ]
+        # charge_balance_ledger is resolved by position
+        # (lattice_substitution_provenance), not through the
+        # raw-index/_remap_placement_ledger path above: unlike x_type/
+        # l_type/z_type_neutral_exchange (which only ever run *after*
+        # z-type in this pipeline), charge_balance can run *before*
+        # z-type (the baseline pass, and the post-alloying rebalance
+        # pass) -- z-type's own atom removal then silently invalidates
+        # those raw indices with no remap of its own, which either
+        # drops the entry (index now out of range) or, worse, silently
+        # misattributes it to whatever unrelated atom now occupies that
+        # stale index. Position resolution is immune to this by design.
+        lattice_substitution_provenance = (
+            surface_reconstruction_ledger.get("lattice_substitutions", [])
+            + prepass_lattice_substitution_ledger
+            + z_type_relocated_records
+            + charge_balance_ledger
+        )
+        # Position-captured (see run_alloying_posttreatment's
+        # `atom_positions`), resolved against the final structure at
+        # metadata-assembly time -- robust to any atom-count-changing
+        # step (z-type, further charge balancing, ...) that runs
+        # between alloying and here, unlike a raw-index remap.
+        atom_provenance = [
+            {"position": pos, "symbol": entry["replacement"], "provenance": "alloying"}
+            for entry in alloying_ledger
+            for pos in entry.get("atom_positions", [])
+        ]
+        # Position-captured core/shell layer tag, recomputed fresh
+        # against the exact final out_syms/out_pts array (same
+        # region_masks_from_layer_planes primitive _stack_size_metrics
+        # already uses for this build) -- None for a plain,
+        # non-core-shell build.
+        material_provenance = None
+        if output_layer_planes is not None and output_materials is not None:
+            region_masks_final = region_masks_from_layer_planes(out_pts, output_layer_planes)
+            material_provenance = [
+                {
+                    "position": out_pts[i].tolist(),
+                    "symbol": out_syms[i],
+                    "material": "core" if k == 0 else f"shell{k}",
+                }
+                for k, mask in enumerate(region_masks_final)
+                for i, keep in enumerate(mask) if keep
             ]
-            z_type_relocated_records = [
-                rec
-                for entry in z_type_displacement_ledger
-                for rec in entry.get("relocated_ligand_records", [])
-            ]
-            # charge_balance_ledger is resolved by position
-            # (lattice_substitution_provenance), not through the
-            # raw-index/_remap_placement_ledger path above: unlike x_type/
-            # l_type/z_type_neutral_exchange (which only ever run *after*
-            # z-type in this pipeline), charge_balance can run *before*
-            # z-type (the baseline pass, and the post-alloying rebalance
-            # pass) -- z-type's own atom removal then silently invalidates
-            # those raw indices with no remap of its own, which either
-            # drops the entry (index now out of range) or, worse, silently
-            # misattributes it to whatever unrelated atom now occupies that
-            # stale index. Position resolution is immune to this by design.
-            lattice_substitution_provenance = (
-                surface_reconstruction_ledger.get("lattice_substitutions", [])
-                + prepass_lattice_substitution_ledger
-                + z_type_relocated_records
-                + charge_balance_ledger
-            )
-            # Position-captured (see run_alloying_posttreatment's
-            # `atom_positions`), resolved against the final structure at
-            # metadata-assembly time -- robust to any atom-count-changing
-            # step (z-type, further charge balancing, ...) that runs
-            # between alloying and here, unlike a raw-index remap.
-            atom_provenance = [
-                {"position": pos, "symbol": entry["replacement"], "provenance": "alloying"}
-                for entry in alloying_ledger
-                for pos in entry.get("atom_positions", [])
-            ]
-            # Position-captured core/shell layer tag, recomputed fresh
-            # against the exact final out_syms/out_pts array (same
-            # region_masks_from_layer_planes primitive _stack_size_metrics
-            # already uses for this build) -- None for a plain,
-            # non-core-shell build.
-            material_provenance = None
-            if output_layer_planes is not None and output_materials is not None:
-                region_masks_final = region_masks_from_layer_planes(out_pts, output_layer_planes)
-                material_provenance = [
-                    {
-                        "position": out_pts[i].tolist(),
-                        "symbol": out_syms[i],
-                        "material": "core" if k == 0 else f"shell{k}",
-                    }
-                    for k, mask in enumerate(region_masks_final)
-                    for i, keep in enumerate(mask) if keep
-                ]
 
-            if args.verbose:
-                print(f"[13] Writing surface metadata JSON to {prefix}_metadata.json")
-            # Real, CIF-derived bulk coordination number (same one the build
-            # itself already used for its own passivation decisions, see
-            # charge_balance_iterative's own calls to this function) --
-            # not bulk_cn_opposite_by_interior's statistical estimate.
-            true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges, pair_cuts=pair_cuts_override)
-            metadata_doc = build_surface_metadata_document(
-                out_syms, out_pts, planes, facets, cfg.charges, cfg.passivation.surf_tol,
-                native_species=native_species,
-                material=material_label,
-                xyz_filename=os.path.basename(args.out),
-                facet_seed_terminations=facet_seed_terminations,
-                ligand_provenance=ligand_provenance,
-                lattice_substitution_provenance=lattice_substitution_provenance,
-                atom_provenance=atom_provenance,
-                material_provenance=material_provenance,
-                prepass_mode=cfg.passivation.prepass_mode,
-                true_bulk_cn=true_bulk_cn,
-            )
-            write_surface_metadata_json(f"{prefix}_metadata.json", metadata_doc)
-        except Exception as exc:
-            logging.warning(f"Surface metadata generation failed: {exc}")
+        if args.verbose:
+            print(f"[13] Writing surface metadata JSON to {prefix}_metadata.json")
+        # Real, CIF-derived bulk coordination number (same one the build
+        # itself already used for its own passivation decisions, see
+        # charge_balance_iterative's own calls to this function) --
+        # not bulk_cn_opposite_by_interior's statistical estimate.
+        true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges, pair_cuts=pair_cuts_override)
+        builder_params = _builder_params_for_metadata(
+            cfg,
+            radius_A=getattr(args, "radius", None),
+            shells=[m.cif for m in output_materials[1:]] if output_materials and len(output_materials) > 1 else None,
+        )
+        metadata_doc = build_surface_metadata_document(
+            out_syms, out_pts, planes, facets, cfg.charges, cfg.passivation.surf_tol,
+            native_species=native_species,
+            material=material_label,
+            xyz_filename=os.path.basename(args.out),
+            builder_params=builder_params,
+            facet_seed_terminations=facet_seed_terminations,
+            ligand_provenance=ligand_provenance,
+            lattice_substitution_provenance=lattice_substitution_provenance,
+            atom_provenance=atom_provenance,
+            material_provenance=material_provenance,
+            prepass_mode=cfg.passivation.prepass_mode,
+            true_bulk_cn=true_bulk_cn,
+        )
+        write_surface_metadata_json(f"{prefix}_metadata.json", metadata_doc)
 
     return syms, pts, ligand_exchange_charge_ledger
 
@@ -1872,6 +1916,8 @@ def main(argv: List[str] | None = None) -> int:
 
     if args.from_xyz is not None and args.options is not None:
         p.error("--from-xyz and --options are separate runs")
+    if bool(args.prior_xyz) != bool(args.prior_metadata):
+        p.error("--prior-xyz and --prior-metadata must be given together")
     if args.from_xyz is not None:
         if cfg.mode == "stack" or args.cif is None:
             p.error("--from-xyz needs single-material mode: nc-builder STRUCT.cif RECIPE.yaml --from-xyz DOT.xyz")
@@ -2203,7 +2249,7 @@ def main(argv: List[str] | None = None) -> int:
                     print("WARNING: reference lattice not invertible; skipping core lattice fit.")
                 return pts
 
-            facets_for_output = _facets if surface_cfg.shape_mode != "sphere" else None
+            facets_for_output = _facets if surface_cfg.shape_mode != "sphere" else sphere_facet_placeholders(passivation_planes)
             syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
                 syms,
                 pts,
@@ -2510,7 +2556,7 @@ def main(argv: List[str] | None = None) -> int:
                 struct, cfg, wulff_facets, _planes_geo, syms, pts, verbose=args.verbose,
             )
 
-        facets_for_output = _facets if cfg.shape_mode != "sphere" else None
+        facets_for_output = _facets if cfg.shape_mode != "sphere" else sphere_facet_placeholders(planes)
         syms, pts, ligand_exchange_charge_ledger = _run_passivation_and_write_outputs(
             syms,
             pts,

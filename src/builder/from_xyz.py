@@ -20,8 +20,9 @@ step's entries in the order they ran.
 from __future__ import annotations
 
 import io
+import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,7 +32,37 @@ from .config import Config
 from .facet_reconstruction import _native_facets_and_planes, reconstruct_polar_facets
 from .facets import detect_facets_from_nc, expand_facets
 from .io_utils import center_coords, write_manifest
-from .passivation_iterative import charge_balance_iterative
+from .passivation_iterative import charge_balance_iterative, derive_true_bulk_cn_from_cif
+from .surface_metadata import (
+    build_surface_metadata_document,
+    resolve_prior_ligand_provenance,
+    write_surface_metadata_json,
+)
+
+
+def _finalize_placement_ledger(entries: List[dict]) -> None:
+    """Normalize raw atom_indices/host_env_indices/anchor_local_idx (appended by
+    run_ligand_exchange_posttreatment / run_neutral_ligand_posttreatment) into the
+    _0based field names build_surface_metadata_document expects.
+
+    Unlike main.py's fresh-build path (which reorders atoms via
+    _ordered_xyz_view before writing, and so needs a real permutation remap,
+    see _remap_placement_ledger), run_from_xyz never reorders atoms before
+    the final XYZ write, and no post-treatment step after ligand placement
+    (z-type ligands, neutral ligands) removes atoms -- only ever appends --
+    so these raw indices are already final-XYZ indices. Pure field-name
+    normalization, not an index remap.
+    """
+    for entry in entries:
+        atoms = entry.get("atom_indices")
+        if not atoms:
+            entry["atom_indices_0based"] = None
+            entry["bound_host_atom_indices_0based"] = []
+            entry["anchor_atom_index_0based"] = None
+            continue
+        entry["atom_indices_0based"] = sorted(atoms)
+        entry["anchor_atom_index_0based"] = min(atoms) + int(entry.get("anchor_local_idx", 0))
+        entry["bound_host_atom_indices_0based"] = list(entry.get("host_env_indices") or [])
 
 
 def post_treat(
@@ -44,6 +75,7 @@ def post_treat(
     prefix: str,
     verbose: bool = False,
     write_all: bool = False,
+    extra_native_species: Iterable[str] | None = None,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[str, object]]:
     """Run ``cfg.post_treatment`` on a passivated dot; return the dot and the step ledgers."""
     syms = list(syms)
@@ -53,6 +85,20 @@ def post_treat(
     pt = getattr(cfg, "post_treatment", None)
     flat: List[dict] = []
     ledgers: Dict[str, object] = {"post_treatment": flat}
+
+    # Everything build_surface_metadata_document needs beyond the per-step
+    # ledgers already threaded below (same shape main.py's fresh-build path
+    # assembles, see its metadata block in _run_passivation_and_write_outputs).
+    native_species = {str(s.specie.symbol) for s in struct.sites}
+    if extra_native_species:
+        native_species.update(extra_native_species)
+    charge_balance_ledger: List[dict] = []
+    prepass_lattice_substitution_ledger: List[dict] = []
+    neutral_exchange_provenance_ledger: List[dict] = []
+    neutral_ligand_ledger: List[dict] = []
+    resolved_charge_ledger: List[dict] = []
+    atom_provenance: List[dict] = []
+    lattice_substitution_records: List[dict] = []
 
     def balance(syms, pts, planes, strategy):
         return charge_balance_iterative(
@@ -73,6 +119,8 @@ def post_treat(
             prepass_min_cn_edge=cfg.passivation.prepass_min_cn_edge,
             prepass_min_cn_vertex=cfg.passivation.prepass_min_cn_vertex,
             include_sublayer=cfg.passivation.include_sublayer,
+            ledger=charge_balance_ledger,
+            lattice_substitution_ledger=prepass_lattice_substitution_ledger,
         )
 
     z_target = getattr(pt, "z_type_target", None)
@@ -101,6 +149,7 @@ def post_treat(
         if recon_ledger:
             ledgers["surface_reconstruction"] = recon_ledger
             flat.append({"surface_reconstruction": True, **recon_ledger})
+            lattice_substitution_records = recon_ledger.get("lattice_substitutions", [])
 
     _facets, planes = _native_facets_and_planes(
         syms, pts, struct, cfg.charges, facet_seeds, anion_lig, cfg.passivation.surf_tol
@@ -123,6 +172,12 @@ def post_treat(
                 cfg.charges.setdefault(entry["replacement"], int(entry["replacement_charge"]))
             ledgers["alloying"] = alloy_ledger
             flat.extend({"alloying": True, **entry} for entry in alloy_ledger)
+            native_species.update(entry["replacement"] for entry in alloy_ledger)
+            atom_provenance.extend(
+                {"position": pos, "symbol": entry["replacement"], "provenance": "alloying"}
+                for entry in alloy_ledger
+                for pos in entry.get("atom_positions", [])
+            )
             alloyed_syms, alloyed_pts = list(syms), np.asarray(pts, float).copy()
             for strategy in ("add", "remove"):
                 if strategy == "remove":
@@ -135,7 +190,10 @@ def post_treat(
     z_spec = getattr(pt, "z_type_displacement", None)
     if z_spec is not None and z_spec.enabled:
         from .z_type_displacement_posttreat import run_z_type_displacement_posttreatment
-        syms, pts, z_ledger = run_z_type_displacement_posttreatment(syms, pts, cfg, struct, planes, cif_path)
+        syms, pts, z_ledger = run_z_type_displacement_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path,
+            lattice_substitution_entries=lattice_substitution_records + prepass_lattice_substitution_ledger,
+        )
         ledgers["z_type_displacement"] = z_ledger
         flat.extend({"z_type": True, **entry} for entry in z_ledger)
 
@@ -143,7 +201,10 @@ def post_treat(
     ne_spec = getattr(pt, "neutral_exchange", None)
     if ne_spec is not None and ne_spec.enabled:
         from .neutral_exchange_posttreat import run_neutral_exchange_posttreatment
-        syms, pts, ne_ledger = run_neutral_exchange_posttreatment(syms, pts, cfg, struct, planes, cif_path)
+        syms, pts, ne_ledger = run_neutral_exchange_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path,
+            provenance_ledger=neutral_exchange_provenance_ledger,
+        )
         ledgers["neutral_exchange"] = ne_ledger
         flat.extend({"neutral_exchange": True, **entry} for entry in ne_ledger)
 
@@ -155,7 +216,10 @@ def post_treat(
             rebalance_ligand_exchange_charge,
             run_ligand_exchange_posttreatment,
         )
-        syms, pts, x_ledger = run_ligand_exchange_posttreatment(syms, pts, cfg, struct, planes, cif_path)
+        syms, pts, x_ledger = run_ligand_exchange_posttreatment(
+            syms, pts, cfg, struct, planes, cif_path,
+            resolved_charge_ledger=resolved_charge_ledger,
+        )
         flat.extend(x_ledger)
         if x_ledger:
             from .main import _charge_with_ligand_exchange
@@ -168,6 +232,7 @@ def post_treat(
                 syms, pts = rebalance_ligand_exchange_charge(
                     syms, pts, cfg, struct, planes, cif_path, x_ledger, verbose=verbose
                 )
+        _finalize_placement_ledger(x_ledger)
     ledgers["ligand_exchange"] = x_ledger
 
     # 6. Z-type ligands (MXn complexes on free surface anions; before L-type)
@@ -182,8 +247,21 @@ def post_treat(
     neutral_spec = getattr(pt, "neutral_ligands", cfg.passivation.neutral_ligands)
     if neutral_spec is not None and neutral_spec.enabled:
         from .neutral_ligand_posttreat import run_neutral_ligand_posttreatment
-        syms, pts = run_neutral_ligand_posttreatment(syms, pts, cfg, struct, planes)
+        syms, pts = run_neutral_ligand_posttreatment(
+            syms, pts, cfg, struct, planes, ledger=neutral_ligand_ledger,
+        )
+        _finalize_placement_ledger(neutral_ligand_ledger)
 
+    ledgers["facets"] = _facets
+    ledgers["planes"] = planes
+    ledgers["facet_seeds"] = facet_seeds
+    ledgers["native_species"] = native_species
+    ledgers["atom_provenance"] = atom_provenance
+    ledgers["charge_balance_ledger"] = charge_balance_ledger
+    ledgers["prepass_lattice_substitution_ledger"] = prepass_lattice_substitution_ledger
+    ledgers["neutral_exchange_provenance"] = neutral_exchange_provenance_ledger
+    ledgers["neutral_ligand"] = neutral_ligand_ledger
+    ledgers["resolved_charge_ledger"] = resolved_charge_ledger
     return syms, pts, ledgers
 
 
@@ -198,12 +276,14 @@ def xyz_text(syms: List[str], pts: NDArray[np.float64]) -> str:
 
 
 def run_from_xyz(args, cfg: Config) -> int:
-    """``--from-xyz``: post-treat ``args.from_xyz``, write ``args.out`` and its manifest."""
+    """``--from-xyz``: post-treat ``args.from_xyz``, write ``args.out``, its manifest,
+    and its surface-metadata JSON."""
     from ase.io import read as ase_read
 
     from .main import (
         _charge_with_ligand_exchange,
         _material_label_from_cif_or_structure,
+        _post_treatment_summary,
         get_cluster_size_metrics,
     )
 
@@ -214,9 +294,15 @@ def run_from_xyz(args, cfg: Config) -> int:
     if args.verbose:
         print(f"[from-xyz] {len(atoms)} atoms from {args.from_xyz}; post-treatment only (no Wulff cut)")
 
+    extra_native_species: set = set()
+    for extra_cif in (getattr(args, "extra_native_cif", None) or []):
+        extra_struct = Structure.from_file(extra_cif)
+        extra_native_species.update(str(s.specie.symbol) for s in extra_struct.sites)
+
     syms, pts, ledgers = post_treat(
         atoms.get_chemical_symbols(), atoms.get_positions(), cfg, struct, cif_path,
         prefix=prefix, verbose=args.verbose, write_all=args.write_all,
+        extra_native_species=extra_native_species,
     )
 
     final_pts = center_coords(pts) if args.center else pts
@@ -257,4 +343,95 @@ def run_from_xyz(args, cfg: Config) -> int:
     if args.verbose:
         print(f"[from-xyz] Writing {args.out} ({len(syms)} atoms) and {prefix}.json")
     write_manifest(prefix, syms, cfg.charges, extra=extra)
+
+    _facets, planes = ledgers.get("facets"), ledgers.get("planes")
+    if _facets and planes:
+        ligand_provenance = [
+            {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "x_type"}
+            for e in ledgers.get("ligand_exchange", [])
+        ] + [
+            {**e, "type": e.get("type") or e.get("kind") or e.get("smiles"), "provenance": "l_type"}
+            for e in ledgers.get("neutral_ligand", [])
+        ] + [
+            {**e, "provenance": "z_type_neutral_exchange"}
+            for e in ledgers.get("neutral_exchange_provenance", [])
+        ]
+        z_type_relocated_records = [
+            rec
+            for entry in ledgers.get("z_type_displacement", [])
+            for rec in entry.get("relocated_ligand_records", [])
+        ]
+        lattice_substitution_provenance = (
+            ledgers.get("surface_reconstruction", {}).get("lattice_substitutions", [])
+            + ledgers.get("prepass_lattice_substitution_ledger", [])
+            + z_type_relocated_records
+            + ledgers.get("charge_balance_ledger", [])
+        )
+        facet_seed_terminations = {
+            (f.h, f.k, f.l): f.termination
+            for f in ledgers.get("facet_seeds", [])
+            if getattr(f, "termination", None)
+        }
+        material_provenance = None
+        prior_metadata_supplied = False
+        prior_xyz_path = getattr(args, "prior_xyz", None)
+        prior_metadata_path = getattr(args, "prior_metadata", None)
+        if prior_xyz_path and prior_metadata_path:
+            with open(prior_metadata_path) as fh:
+                prior_doc = json.load(fh)
+            prior_atoms = ase_read(prior_xyz_path, format="xyz")
+            prior_syms = prior_atoms.get_chemical_symbols()
+            prior_pts = prior_atoms.get_positions()
+            chained = resolve_prior_ligand_provenance(
+                syms, final_pts, prior_syms, prior_pts,
+                prior_doc.get("ligands"),
+                alloying_provenance=ledgers.get("atom_provenance"),
+            )
+            already_covered = {
+                i for entry in ligand_provenance for i in (entry.get("atom_indices_0based") or [])
+            }
+            ligand_provenance = ligand_provenance + [
+                e for e in chained
+                if not already_covered.intersection(e.get("atom_indices_0based") or [])
+            ]
+            material_provenance = [
+                {"position": r["position"], "symbol": r["element"], "material": r["material"]}
+                for r in prior_doc.get("qd_atoms", [])
+                if r.get("material") is not None
+            ] or None
+            prior_metadata_supplied = True
+        if args.verbose:
+            print(f"[from-xyz] Writing surface metadata JSON to {prefix}_metadata.json")
+        true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges)
+        # --from-xyz never knows the *original* build's own radius/size/
+        # aspect/shape/shells (its own minimal recipe only carries charges/
+        # passivation/facets for site discovery, not real build geometry) --
+        # a caller that has that info (e.g. QDSpaceWebApp, from its own
+        # request options) can pass it through via --builder-params-json.
+        # This run's own post_treatment recipe is always real and known,
+        # so it's added unconditionally.
+        builder_params: dict = {}
+        builder_params_json_path = getattr(args, "builder_params_json", None)
+        if builder_params_json_path:
+            with open(builder_params_json_path) as fh:
+                builder_params.update(json.load(fh))
+        post_treatment_summary = _post_treatment_summary(cfg.post_treatment)
+        if post_treatment_summary:
+            builder_params["post_treatment"] = post_treatment_summary
+        metadata_doc = build_surface_metadata_document(
+            syms, final_pts, planes, _facets, cfg.charges, cfg.passivation.surf_tol,
+            native_species=ledgers.get("native_species"),
+            material=material_label,
+            xyz_filename=os.path.basename(args.out),
+            builder_params=builder_params or None,
+            facet_seed_terminations=facet_seed_terminations,
+            ligand_provenance=ligand_provenance,
+            lattice_substitution_provenance=lattice_substitution_provenance,
+            atom_provenance=ledgers.get("atom_provenance"),
+            material_provenance=material_provenance,
+            prepass_mode=cfg.passivation.prepass_mode,
+            true_bulk_cn=true_bulk_cn,
+            prior_metadata_supplied=prior_metadata_supplied,
+        )
+        write_surface_metadata_json(f"{prefix}_metadata.json", metadata_doc)
     return 0

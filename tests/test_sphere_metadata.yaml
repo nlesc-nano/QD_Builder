@@ -1,0 +1,20 @@
+shape:
+  mode: sphere
+  sphere_planes: 24
+
+size_unit_cells: [2, 2, 2]
+
+passivation:
+  ligand: Cl
+  surf_tol: 2.0
+
+charges:
+  In: +3
+  P: -3
+  Cl: -1
+
+symmetry:
+  proper_rotations_only: true
+
+construction_origin:
+  center_on_species: all

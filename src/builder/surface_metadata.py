@@ -904,5 +904,5 @@ def validate_metadata_matches_xyz(
 
 def write_surface_metadata_json(path: str, doc: Dict[str, Any]) -> None:
     """Write `doc` (as returned by build_surface_metadata_document) to `path`."""
-    with open(path, "w") as fh:
-        json.dump(doc, fh, indent=2)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False)
