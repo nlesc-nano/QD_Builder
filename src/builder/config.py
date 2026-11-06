@@ -47,22 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     p.add_argument(
         "--from-xyz", metavar="DOT.xyz", default=None,
-        help="Post-treatment only: run the recipe's post_treatment block on this already "
-             "passivated dot (no Wulff cut, no first charge balance). Single-material mode. "
-             "Writes <out stem>_metadata.json alongside the output XYZ."
+        help="Post-treatment only on this already-passivated dot (no Wulff cut). Single-material mode."
     )
     p.add_argument(
         "--extra-native-cif", metavar="CIF", action="append", default=None,
-        help="With --from-xyz: additional material CIF(s) whose species should be treated "
-             "as native (not ligands) in the written metadata -- e.g. a shell material's "
-             "CIF when repassivating a core-shell dot built from a different outermost "
-             "CIF. Repeatable."
+        help="With --from-xyz: additional material CIF(s) treated as native, not ligands. Repeatable."
     )
     p.add_argument(
         "--prior-xyz", metavar="PRIOR.xyz", default=None,
-        help="With --from-xyz: a previously-passivated XYZ (paired with --prior-metadata) "
-             "to chain forward ligand/material provenance from, for atoms this run's own "
-             "ledgers don't otherwise resolve."
+        help="With --from-xyz: a prior XYZ (with --prior-metadata) to chain ligand provenance from."
     )
     p.add_argument(
         "--prior-metadata", metavar="PRIOR_METADATA.json", default=None,
@@ -70,12 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--builder-params-json", metavar="PARAMS.json", default=None,
-        help="With --from-xyz: a small JSON object (e.g. {\"radius_A\": ..., "
-             "\"size_unit_cells\": [...], \"aspect\": [...], \"shape\": ..., "
-             "\"center_ion\": ..., \"shells\": [...]}) describing the *original* "
-             "build this dot came from -- --from-xyz has no way to know this on "
-             "its own. Merged into the written metadata's \"builder\" field "
-             "alongside this run's own post_treatment recipe."
+        help="With --from-xyz: JSON describing the original build (radius_A, size_unit_cells, "
+             "aspect, shape, center_ion, shells), merged into the metadata's \"builder\" field."
     )
     p.add_argument(
         "--options", metavar="DOT.xyz", default=None,
@@ -1184,11 +1173,7 @@ def parse_yaml_config(path: str) -> Config:
                 opp = (-h, -k, -l)
                 if opp not in g_by:
                     g_by[opp] = g
-                    # Inherit whatever the original real value was -- None
-                    # stays None, "stoichiometric" is inherited too (an
-                    # opposite face of a stoichiometric family is
-                    # physically also stoichiometric), never hardcoded.
-                    term_by[opp] = term_by.get((h, k, l))
+                    term_by[opp] = term_by.get((h, k, l))  # inherit, never hardcode
                     scope_by[opp] = scope_by.get((h, k, l), "family")
 
         return [

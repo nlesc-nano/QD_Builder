@@ -1248,8 +1248,7 @@ def compute_cif_virtual_sites(
 
 
 # ===============================
-# Surface-atom metadata (reusable, structured per-atom facet/coordination
-# records; consumed by builder.surface_metadata to assemble the JSON export)
+# Surface-atom metadata
 # ===============================
 
 def _facet_family_label(h: int, k: int, l: int) -> str:
@@ -1279,90 +1278,21 @@ def surface_atom_records(
     prepass_mode: str = "standard",
 ) -> List[dict]:
     """
-    Structured per-atom records (`qd_atoms`) for the Wulff-plane/facet
-    membership, coordination, and sublattice analysis this module already
-    performs (see facet_atom_report). Does not print anything; returns a
-    list of plain dicts, one per emitted atom, ready for JSON export.
+    Structured per-atom records (`qd_atoms`), reusing facet_atom_report's
+    own primitives (_facet_memberships, coord_numbers_bipartite,
+    bulk_cn_opposite_by_interior). One dict per atom in `include_indices`
+    (default: all), sorted by exported index:
+      classification: "surface" (>=1 facet membership) | "internal"
+      role/layer/facet_ids/facet_hkls/facet_families/surface_normal: only on surface records
+      coordination_number/bulk_coordination_number/coordination_deficit/sublattice: always present
+      provenance: from atom_provenance, default "native"
+      material: from `material`, only set when present
 
-    Every emitted atom gets a `classification`: `"surface"` (>=1 facet
-    membership, within `surf_tol` of a Wulff plane -- the exact same test as
-    `_facet_memberships`/`alloying_posttreat._surface_mask`) or `"internal"`.
-    Facet-exposure-specific keys (`role`, `layer`, `facet_ids`,
-    `facet_hkls`, `facet_families`, `surface_normal`) genuinely don't apply
-    to an `"internal"` atom, so they are simply absent from its record
-    rather than present as `None`/`[]` -- a `"surface"` record always has
-    every one of these keys populated. `coordination_number`,
-    `bulk_coordination_number`, `coordination_deficit` and `sublattice` are
-    general-purpose and present (never `None`) on every record either way
-    -- a true core atom's `coordination_deficit` is legitimately `0`.
-
-    Facet membership, coordination number and bulk coordination are always
-    computed against the *full* `symbols`/`pts` array passed in -- this
-    matters when `symbols`/`pts` includes ligand atoms (e.g. Cl, amine N),
-    since a passivated surface atom's true coordination includes its ligand
-    bond(s); silently excluding ligand atoms before this calculation would
-    make passivated atoms look artificially undercoordinated.
-
-    Every atom with >=1 facet membership becomes a record, regardless of
-    element -- this function applies no element/charge-sign filter on
-    inclusion. `include_indices` restricts which local positions may be
-    *emitted* as records (e.g. only native/lattice atoms, when `symbols`/`pts`
-    also contains ligand atoms) without affecting the coordination/membership
-    math above, which always sees every atom passed in. Defaults to every
-    atom in `symbols`. See builder.surface_metadata.build_surface_metadata_document,
-    which uses this to emit only native atoms while still computing true
-    (ligand-inclusive) coordination.
-
-    Facet membership, role classification (facet/edge/vertex), coordination
-    numbers and bulk coordination all reuse the exact same primitives as
-    facet_atom_report: _facet_memberships, coord_numbers_bipartite,
-    bulk_cn_opposite_by_interior.
-
-    Parameters
-    ----------
-    symbols, pts, planes, facets, surf_tol, charges, pair_cuts, true_bulk_cn:
-        Same meaning/shape as in facet_atom_report.
-    index_map:
-        Optional local index (position in `symbols`/`pts`) -> exported atom index
-        mapping (e.g. when the caller has already filtered/reordered atoms before
-        calling this function, such as re-detecting facets from a written XYZ that
-        also contains non-lattice/ligand atoms elsewhere in the array). Defaults to
-        the identity mapping, so this function is directly usable standalone on a
-        plain (symbols, pts) array.
-
-    `atom_provenance`: optional local-index -> mechanism-name map (e.g.
-    `"alloying"` for a substituted atom); defaults to `"native"` for any
-    index not present. Purely descriptive, carried straight into the
-    `provenance` field.
-
-    `material`: optional local-index -> layer-name map (`"core"`/
-    `"shell1"`/...) for a core-shell build; sets a `material` key only for
-    an index present in the map, absent otherwise.
-
-    Returns
-    -------
-    List of dicts sorted by exported atom index ascending. Every record has:
-        qd_atom_id, atom_index_0based, element, position, classification,
-        coordination_number, bulk_coordination_number, coordination_deficit,
-        sublattice, provenance.
-    A `"surface"` record additionally has:
-        role, layer, facet_ids, facet_hkls, facet_families, surface_normal.
-
-    `sublattice` is `"cation"`/`"anion"`/`None`, read directly from the sign of
-    `charges[element]` (the build's own formal-charge configuration) -- never
-    inferred from the periodic table. Purely descriptive, informational only.
-    Ligand attachment information lives in a separate top-level `ligands`
-    list (see build_surface_metadata_document), not embedded per-atom.
-
-    `prepass_mode`: the build's own `cfg.passivation.prepass_mode`. When
-    `"role-aware"`, `role` is computed with the exact same geometric
-    classifier the real build used to decide passivation eligibility
-    (`passivation._role_by_geometry`, against the shallowest-membership
-    facet -- same convention as `passivation.collect_anion_candidates`) --
-    not the plain facet-membership-count heuristic, which that build mode
-    does not actually use and can disagree with. Any other value keeps the
-    membership-count heuristic (also what a `"standard"`-mode build itself
-    uses, so the two already agree there).
+    `index_map` remaps local position -> exported atom index (identity by
+    default). `prepass_mode == "role-aware"` computes role with
+    passivation._role_by_geometry against the shallowest membership facet,
+    matching a role-aware build's own eligibility classifier; otherwise the
+    plain membership-count heuristic.
     """
     n = len(symbols)
     pts = np.asarray(pts, float)

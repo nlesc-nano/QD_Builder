@@ -250,15 +250,8 @@ def sphere_halfspaces(R: float, n_planes: int = 192) -> list[Plane]:
 
 
 def sphere_facet_placeholders(planes: List[Plane]) -> List[Facet]:
-    """One placeholder Facet per sphere_halfspaces() plane, same length/order.
-
-    A tangent-plane patch on a near-spherical cut has no real Miller index.
-    h=k=l=0 is used as an explicit "not a real Miller facet" sentinel --
-    distinct from any genuine low-index facet, which is physically
-    impossible at (0,0,0). build_surface_metadata_document/surface_atom_records
-    need *a* Facet per plane (same length/order) to resolve facet_ids -> hkl;
-    they don't require the hkl to be geometrically meaningful.
-    """
+    """One placeholder Facet per sphere_halfspaces() plane (same length/
+    order); h=k=l=0 as a "not a real Miller facet" sentinel."""
     return [Facet(h=0, k=0, l=0, gamma=0.0, termination=None, scope="sphere_patch") for _ in planes]
 
 

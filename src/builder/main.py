@@ -416,12 +416,8 @@ def _post_treatment_summary(pt: PostTreatmentSpec) -> dict:
 def _builder_params_for_metadata(
     cfg: Config, *, radius_A: float | None = None, shells: List[str] | None = None,
 ) -> dict:
-    """Real build-config info for the metadata's `builder` field -- shape,
-    size, aspect, center species, shell materials (stack builds), and
-    whichever post_treatment mechanisms actually ran. Reused by both
-    main.py's fresh-build path and from_xyz.py's --from-xyz (merged there
-    with any --builder-params-json the caller supplied, since --from-xyz
-    itself never knows the *original* build's own radius/size/shape/shells)."""
+    """Real build-config info for the metadata's `builder` field: shape,
+    size, aspect, center species, shells, post_treatment mechanisms run."""
     params: dict = {
         "shape": "sphere" if cfg.shape_mode == "sphere" else "wulff",
         "aspect": list(cfg.aspect),
@@ -1105,49 +1101,24 @@ def _run_passivation_and_write_outputs(
     )
     write_xyz(args.out, out_syms, out_pts)
 
-    # Remap ligand-placement provenance (host/anchor/atom indices, captured
-    # in pre-reorder space by run_ligand_exchange_posttreatment /
-    # run_neutral_ligand_posttreatment) into the same index space as the
-    # just-written XYZ, so downstream consumers (builder.surface_metadata)
-    # can use these indices directly against args.out.
+    # Remap ligand-placement provenance from pre-reorder indices into the
+    # just-written XYZ's index space, for builder.surface_metadata.
     final_index_of = {old: new for new, old in enumerate(out_order)}
 
     def _remap_placement_ledger(entries: list) -> None:
-        # Enriches each entry in place with final-XYZ-index-space provenance
-        # fields; never removes an entry (ligand_exchange_charge_ledger also
-        # carries charge-accounting fields other code depends on regardless
-        # of whether placement provenance could be resolved).
         for entry in entries:
             pre_reorder_atoms = entry.get("atom_indices")
             pre_reorder_hosts = entry.get("host_env_indices") or []
-            # A ligand can be bonded to more than one host at once (bridging/
-            # multidentate binding) -- keep every host that remaps cleanly
-            # rather than collapsing to a single one; one that doesn't remap
-            # (e.g. removed by a later charge-balance pass) is just dropped
-            # from the list, not treated as fatal for the whole entry.
             hosts = [final_index_of.get(h) for h in pre_reorder_hosts]
             hosts = [h for h in hosts if h is not None]
 
             atoms = [final_index_of.get(i) for i in pre_reorder_atoms] if pre_reorder_atoms else []
             anchor = None
             if pre_reorder_atoms and not any(a is None for a in atoms):
-                # atom_indices is always a contiguous ascending range starting
-                # at this ligand's first placed atom (see
-                # run_ligand_exchange_posttreatment / run_neutral_ligand_posttreatment)
-                # -- surviving cross-pass remaps preserve relative order, so
-                # its min is still that start.
                 pre_reorder_anchor = min(pre_reorder_atoms) + int(entry.get("anchor_local_idx", 0))
                 anchor = final_index_of.get(pre_reorder_anchor)
                 if anchor is None:
-                    # The anchor atom itself -- the one actually bonded to
-                    # the surface, not just any atom of the fragment -- was
-                    # removed by a later pass even though its non-anchor
-                    # siblings survived. There's no safe guess for which (if
-                    # any) survivor should take over as anchor, so this
-                    # fragment is unresolved, same as if every atom had been
-                    # removed -- not "atoms present, anchor missing", which
-                    # downstream flags as a malformed entry (a genuine-bug
-                    # signal) rather than a plain unresolved one.
+                    # Anchor atom removed by a later pass -> whole fragment unresolved.
                     atoms = None
             else:
                 atoms = None
@@ -1158,9 +1129,7 @@ def _run_passivation_and_write_outputs(
     _remap_placement_ledger(ligand_exchange_charge_ledger)
     _remap_placement_ledger(neutral_ligand_ledger)
     _remap_placement_ledger(neutral_exchange_provenance_ledger)
-    # charge_balance_ledger is NOT remapped here -- it's resolved by
-    # position instead (see lattice_substitution_provenance assembly
-    # below), since unlike the other three it can run before z-type.
+    # charge_balance_ledger is resolved by position instead (can run before z-type).
     construction_radius = (
         float(construction_radius_override)
         if construction_radius_override is not None
@@ -1287,38 +1256,18 @@ def _run_passivation_and_write_outputs(
             for entry in z_type_displacement_ledger
             for rec in entry.get("relocated_ligand_records", [])
         ]
-        # charge_balance_ledger is resolved by position
-        # (lattice_substitution_provenance), not through the
-        # raw-index/_remap_placement_ledger path above: unlike x_type/
-        # l_type/z_type_neutral_exchange (which only ever run *after*
-        # z-type in this pipeline), charge_balance can run *before*
-        # z-type (the baseline pass, and the post-alloying rebalance
-        # pass) -- z-type's own atom removal then silently invalidates
-        # those raw indices with no remap of its own, which either
-        # drops the entry (index now out of range) or, worse, silently
-        # misattributes it to whatever unrelated atom now occupies that
-        # stale index. Position resolution is immune to this by design.
+        # charge_balance_ledger (can run before z-type) is resolved by position instead.
         lattice_substitution_provenance = (
             surface_reconstruction_ledger.get("lattice_substitutions", [])
             + prepass_lattice_substitution_ledger
             + z_type_relocated_records
             + charge_balance_ledger
         )
-        # Position-captured (see run_alloying_posttreatment's
-        # `atom_positions`), resolved against the final structure at
-        # metadata-assembly time -- robust to any atom-count-changing
-        # step (z-type, further charge balancing, ...) that runs
-        # between alloying and here, unlike a raw-index remap.
         atom_provenance = [
             {"position": pos, "symbol": entry["replacement"], "provenance": "alloying"}
             for entry in alloying_ledger
             for pos in entry.get("atom_positions", [])
         ]
-        # Position-captured core/shell layer tag, recomputed fresh
-        # against the exact final out_syms/out_pts array (same
-        # region_masks_from_layer_planes primitive _stack_size_metrics
-        # already uses for this build) -- None for a plain,
-        # non-core-shell build.
         material_provenance = None
         if output_layer_planes is not None and output_materials is not None:
             region_masks_final = region_masks_from_layer_planes(out_pts, output_layer_planes)
@@ -1334,10 +1283,6 @@ def _run_passivation_and_write_outputs(
 
         if args.verbose:
             print(f"[13] Writing surface metadata JSON to {prefix}_metadata.json")
-        # Real, CIF-derived bulk coordination number (same one the build
-        # itself already used for its own passivation decisions, see
-        # charge_balance_iterative's own calls to this function) --
-        # not bulk_cn_opposite_by_interior's statistical estimate.
         true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges, pair_cuts=pair_cuts_override)
         builder_params = _builder_params_for_metadata(
             cfg,
@@ -2216,11 +2161,8 @@ def main(argv: List[str] | None = None) -> int:
                     write_xyz(layer_path, part_syms_out, part_pts_out)
 
             def _fit_core_lattice(pts, syms):
-                # Re-maps core-region atoms from the shell's as-cut lattice
-                # metric onto the core material's own native metric (smooth
-                # blend from the interface inward) -- applied here, before
-                # the final reorder/write/metadata pass, so the written
-                # .xyz and the metadata it feeds stay self-consistent.
+                # Re-fits core-region atoms onto the core material's own
+                # native metric, before the final reorder/write/metadata pass.
                 native_elements = set()
                 for m in resolved_materials:
                     cat, an = material_cation_anion(m, cfg.charges)

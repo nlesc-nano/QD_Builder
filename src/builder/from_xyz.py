@@ -41,18 +41,10 @@ from .surface_metadata import (
 
 
 def _finalize_placement_ledger(entries: List[dict]) -> None:
-    """Normalize raw atom_indices/host_env_indices/anchor_local_idx (appended by
-    run_ligand_exchange_posttreatment / run_neutral_ligand_posttreatment) into the
-    _0based field names build_surface_metadata_document expects.
-
-    Unlike main.py's fresh-build path (which reorders atoms via
-    _ordered_xyz_view before writing, and so needs a real permutation remap,
-    see _remap_placement_ledger), run_from_xyz never reorders atoms before
-    the final XYZ write, and no post-treatment step after ligand placement
-    (z-type ligands, neutral ligands) removes atoms -- only ever appends --
-    so these raw indices are already final-XYZ indices. Pure field-name
-    normalization, not an index remap.
-    """
+    """Normalize raw atom_indices/host_env_indices/anchor_local_idx into the
+    _0based field names build_surface_metadata_document expects. No index
+    remap needed here (unlike main.py's _remap_placement_ledger), since
+    run_from_xyz never reorders atoms before the final XYZ write."""
     for entry in entries:
         atoms = entry.get("atom_indices")
         if not atoms:
@@ -86,9 +78,7 @@ def post_treat(
     flat: List[dict] = []
     ledgers: Dict[str, object] = {"post_treatment": flat}
 
-    # Everything build_surface_metadata_document needs beyond the per-step
-    # ledgers already threaded below (same shape main.py's fresh-build path
-    # assembles, see its metadata block in _run_passivation_and_write_outputs).
+    # For build_surface_metadata_document, same shape as main.py's fresh-build path.
     native_species = {str(s.specie.symbol) for s in struct.sites}
     if extra_native_species:
         native_species.update(extra_native_species)
@@ -403,13 +393,8 @@ def run_from_xyz(args, cfg: Config) -> int:
         if args.verbose:
             print(f"[from-xyz] Writing surface metadata JSON to {prefix}_metadata.json")
         true_bulk_cn = derive_true_bulk_cn_from_cif(cif_path, cfg.charges)
-        # --from-xyz never knows the *original* build's own radius/size/
-        # aspect/shape/shells (its own minimal recipe only carries charges/
-        # passivation/facets for site discovery, not real build geometry) --
-        # a caller that has that info (e.g. QDSpaceWebApp, from its own
-        # request options) can pass it through via --builder-params-json.
-        # This run's own post_treatment recipe is always real and known,
-        # so it's added unconditionally.
+        # --from-xyz doesn't know the original build's own params; a caller
+        # that does can pass them through via --builder-params-json.
         builder_params: dict = {}
         builder_params_json_path = getattr(args, "builder_params_json", None)
         if builder_params_json_path:
