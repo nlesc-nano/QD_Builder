@@ -217,14 +217,6 @@ def run_alloying_posttreatment(
             "region": pass_spec.region,
             "count": len(selected),
             "charge_delta": len(selected) * (q_new - q_old),
-            # Pure in-place substitution (no insertion/removal), so these
-            # indices stay valid in this call's own `work_syms`/`work_pts`
-            # space. `atom_positions` is captured at the same moment so the
-            # caller can resolve this atom's provenance by position instead
-            # (see surface_metadata._resolve_atom_provenance_by_position) --
-            # robust to any atom-count-changing step (z-type, further
-            # charge balancing, ...) that runs between here and final
-            # metadata assembly, unlike a raw index.
             "atom_indices_0based": list(selected),
             "atom_positions": [work_pts[idx].tolist() for idx in selected],
         })

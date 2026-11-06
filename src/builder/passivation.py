@@ -704,12 +704,6 @@ def prepass_surface_cleanup(
                         "position": pts[i].tolist(),
                         "symbol": anion_ligand,
                         "host_positions": [pts[j].tolist() for j in host_idx],
-                        # Per-host, not one shared symbol -- a mixed host
-                        # set (e.g. one native cation + one alloy-replaced
-                        # cation) must let each host resolve against its
-                        # own real species, not a single Counter-derived
-                        # guess that silently drops whichever host didn't
-                        # "win" the count even though it's still there.
                         "host_symbols": [symbols[j] for j in host_idx],
                         "replaced_element": s,
                         "mechanism": "charge_balance",

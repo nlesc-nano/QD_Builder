@@ -1134,19 +1134,7 @@ def reconstruct_polar_facets(
 
         def _record_substitution(a: int) -> None:
             # Real provenance for a native anion converted in place to the
-            # ligand (syms[a] = recon_ligand): captured by position, not
-            # index, since this function (and later pipeline stages) still
-            # has several more compaction/reorder steps ahead -- positions
-            # survive those, indices don't without extra remap plumbing.
-            # Host positions are this atom's real bonded cations (from the
-            # bond graph), not a later guess. `symbol`/`host_symbols` let a
-            # later resolution step verify the atom at this position is
-            # still (or still has) the expected species before trusting the
-            # match, in case something further downstream changes it.
-            # `replaced_element` is the native anion species this lattice
-            # site originally held (e.g. "P") -- lets a later bulk-CN lookup
-            # compare against the chemically correct reference instead of
-            # the occupying ligand's own (not a true bulk species) symbol.
+            # ligand (syms[a] = recon_ligand): captured by position, not index
             host_idx = [n for n in nb[a] if syms[n] == cation]
             lattice_substitutions.append({
                 "position": pts[a].tolist(),

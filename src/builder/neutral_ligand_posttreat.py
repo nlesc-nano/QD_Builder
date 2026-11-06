@@ -1230,14 +1230,6 @@ def run_neutral_ligand_posttreatment(
 
     Called from main.py after charge_balance_iterative() returns Q=0.
 
-    `ledger`: optional list this function appends placement-provenance
-    records to (one per placed ligand: every bonded host, RDKit-detected
-    anchor, and the atom indices it occupies -- see run_ligand_exchange_posttreatment for the
-    X-type analog). This function only ever appends atoms, never removes or
-    reorders, so indices captured here stay valid through the rest of this
-    function; the caller (_run_passivation_and_write_outputs) remaps them
-    into final-XYZ-index space. When `ledger` is None (the default), this is
-    a no-op -- existing callers see no behavior change.
     """
     spec: NeutralLigandPostTreatSpec = getattr(
         getattr(cfg, "post_treatment", None),

@@ -1216,17 +1216,6 @@ def _priority3_balance_positive_q_add(
                 symbols.append(ligand)
                 pts = np.vstack([pts, c["pos"]])
                 if ledger is not None:
-                    # Pre-reorder index space (same convention
-                    # run_ligand_exchange_posttreatment/run_neutral_ligand_posttreatment
-                    # use) -- remapped to final-XYZ indices by main.py's
-                    # _remap_placement_ledger, same as those two ledgers.
-                    # Also captured by position (`position`/`host_positions`/
-                    # `host_symbols`/`mechanism`): unlike x_type/l_type, this
-                    # mechanism can run *before* a later atom-count-changing
-                    # step (z-type), which silently invalidates the raw
-                    # indices above with no remap of its own -- the position
-                    # fields let the caller resolve this entry the same
-                    # robust way as lattice_substitution_provenance instead.
                     ledger.append({
                         "atom_indices": [new_idx],
                         "anchor_local_idx": 0,
@@ -1555,10 +1544,6 @@ def _priority3_balance_positive_q_add(
             symbols.append(ligand)
             pts = np.vstack([pts, new_pos])
             if ledger is not None:
-                # See the sibling ledger.append above (the select_ligand_sites
-                # batch path) for why the position fields are needed alongside the raw
-                # indices: this mechanism can run before z-type, which
-                # invalidates raw indices with no remap of its own.
                 ledger.append({
                     "atom_indices": [new_idx],
                     "anchor_local_idx": 0,

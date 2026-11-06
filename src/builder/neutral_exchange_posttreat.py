@@ -1327,15 +1327,7 @@ def _place_into_vacancies(
     (symbols, coords, "") or (None, None, reason).  A group without a clean
     pose keeps its atoms and the next candidate takes its place, until
     ``limit`` groups are filled.
-
-    The 5th return value is placement provenance, one entry per accepted
-    group in the same order as `accepted`/the `lig_syms`/`lig_pts` chunks
-    they contributed: `(atom_count, host_indices)`, where `host_indices` are
-    this group's bonded cations (see `hosts` above) translated back from
-    `env_pos`-local indices into this call's own pre-removal `syms`/`pts`
-    index space, for the caller to carry alongside `atom_indices`/
-    `host_env_indices` in its own ledger (see run_ligand_exchange_posttreatment
-    for the shape).
+    The 5th return value is placement provenance for metadata.
     """
     from scipy.spatial import cKDTree
 

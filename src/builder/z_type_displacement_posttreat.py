@@ -218,14 +218,7 @@ def _relocate_orphan_ligands(
     ligand_symbols: set[str],
     lattice_substitution_entries: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[str, int], List[dict]]:
-    """
-    Move unbound passivation ligands to available CIF virtual sites,
-    greedily. Returns (syms, pts, stats, relocated_records) -- the last is
-    one entry per successfully relocated ligand, shaped like a
-    lattice-substitution ledger entry, carrying the ligand's real original
-    `mechanism`/`replaced_element`/`neutrality_redistributed` forward (see
-    _lookup_original_provenance) plus `z_type_relocated: True`.
-    """
+    """ Move unbound passivation ligands to available CIF virtual sites, greedily. """
     pts = np.asarray(pts, float)
     ligand_symbols = {s for s in ligand_symbols if int(cfg.charges.get(s, 0)) != 0}
     if not ligand_symbols:
