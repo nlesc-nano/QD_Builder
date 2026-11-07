@@ -163,7 +163,9 @@ def test_pure_100_cube_is_neutral(centre, size, mode, tmp_path):
 
 
 def test_cut_consumed_by_prepass_is_a_clean_rejection(tmp_path):
-    facets = [{"hkl": "-1-1-1", "scope": "family", "termination": "anion_rich", "gamma": 1.0},
+    # {111}B + {110} at 0.5 cells is the 5-atom Cd4Se unit, which now builds (Cd4SeCl6):
+    # planes with no face on the cut no longer decide the roles of its {111} corners.
+    facets = [{"hkl": "100", "scope": "family", "gamma": 1.0},
               {"hkl": "110", "scope": "family", "gamma": 1.0}]
     res = _build(facets, 0.5, "Se", tmp_path=tmp_path)
     assert res["error"].startswith("ValueError: surface prepass removed every native atom")
