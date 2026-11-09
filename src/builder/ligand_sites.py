@@ -40,6 +40,7 @@ from scipy.spatial import cKDTree
 
 from .analysis import PairCuts, _pair_cut_calibrated, compute_cif_virtual_sites
 from .nc_types import Plane
+from .passivation import _tie
 
 ABOVE_TOL = 0.4   # Å above a facet's outer native layer: an added (not lattice) ligand
 
@@ -61,8 +62,10 @@ def _native_planes(
 
 
 def _facet_of(pos: NDArray[np.float64], nplanes) -> int:
-    """Facet plane the position sits outside of (largest height above it)."""
-    return int(np.argmax([float(pos @ n) - d for n, d in nplanes]))
+    """Facet plane the position sits outside of (largest height above it; on
+    an edge or corner the heights tie, and the first plane wins)."""
+    h = [_tie(float(pos @ n) - d) for n, d in nplanes]
+    return h.index(max(h))
 
 
 def select_ligand_sites(
