@@ -39,6 +39,7 @@ from .passivation import (
     _atom_region_index,
     _try_q_neutral_cation_removal_bundle,
     atom_regions_from_masks,
+    _tie,
 )
 from .io_utils import write_xyz, center_coords
 
@@ -135,7 +136,7 @@ def _surface_low_cn_cations_remain(
         role = 0
         if prepass_mode == "role-aware":
             if edges_by_facet is not None and verts_by_facet is not None:
-                fid_min = min(inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
+                fid_min = min(inc, key=lambda fid: _tie(frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))))
                 _role_name, role = _role_by_geometry(
                     i, fid_min, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
                 )
@@ -599,7 +600,7 @@ def _priority2_remove_low_cn_cation_once(
             # Planes of families with no Wulff face touch the dot only at edges and
             # corners; their degenerate faces give no role ({111} facets only).
             role_inc = role_planes(inc, role_ignore_planes, frames)
-            fid_for_role = min(role_inc, key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])))
+            fid_for_role = min(role_inc, key=lambda fid: _tie(frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))))
             if edges_by_facet is not None and verts_by_facet is not None:
                 _role_name, role = _role_by_geometry(
                     i, fid_for_role, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol
@@ -620,7 +621,7 @@ def _priority2_remove_low_cn_cation_once(
             continue
 
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
-        fid, depth = min(depths, key=lambda t: t[1])
+        fid, depth = min(depths, key=lambda t: _tie(t[1]))
         inc_count = len(inc)
         role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)
         uv = _get_uv(frames, fid, i, pts, uv_cache)
@@ -641,10 +642,10 @@ def _priority2_remove_low_cn_cation_once(
         return False, symbols, pts
 
     if use_stack:
-        cands.sort(key=lambda t: (t[0], -t[1], t[2], t[3], t[5]))
+        cands.sort(key=lambda t: (t[0], -t[1], _tie(t[2]), _tie(t[3]), t[5]))
         _reg, role_rank, _negdmin, depth, fid, i = cands[0]
     else:
-        cands.sort(key=lambda t: (-t[0], t[1], t[2], t[4]))
+        cands.sort(key=lambda t: (-t[0], _tie(t[1]), _tie(t[2]), t[4]))
         role_rank, _negdmin, depth, fid, i = cands[0]
 
     q_cat = int(charges.get(symbols[i], 0))
@@ -812,13 +813,13 @@ def _priority3_balance_negative_q(
         if not subset:
             continue
         # role V->E->U (higher is better: vertex>edge>unique), then spacing,
-        # then shallower; the first of equals wins. Only the leading role
+        # then shallower; the first of equals (to 1e-6 Å, _tie) wins. Only the leading role
         # group can win, so the spacing is refreshed against the global
         # uv_taken for that group alone.
         top_role = max(int(r.get("role_rank", 0)) for r in subset)
         lead = [r for r in subset if int(r.get("role_rank", 0)) == top_role]
         _refresh_uv_spacing(lead, frames, pts, uv_taken, uv_cache)
-        picked = max(lead, key=lambda r: (float(r.get("dmin_uv", 0.0)), -float(r.get("depth", 0.0))))
+        picked = max(lead, key=lambda r: (_tie(float(r.get("dmin_uv", 0.0))), -_tie(float(r.get("depth", 0.0)))))
         i = int(picked.get("idx", -1))
         fid = int(picked.get("fid", -1))
         if i < 0 or fid < 0:
@@ -877,7 +878,7 @@ def _priority3_balance_positive_q_remove(
             continue
         inc = inc_all[i]
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
-        fid, depth = min(depths, key=lambda t: t[1])
+        fid, depth = min(depths, key=lambda t: _tie(t[1]))
         shell = "outer" if depth < outer_thr else "sublayer"
         if shell != "outer":
             continue
@@ -907,7 +908,7 @@ def _priority3_balance_positive_q_remove(
         # spacing term is only needed for the leading deficit/role group.
         lead = max((t[5], t[0]) for t in lst)
         lst = [(t[0], neg_dmin_of(t)) + t[2:] for t in lst if (t[5], t[0]) == lead]
-        lst.sort(key=lambda t: (-t[5], -t[0], t[1], t[2], t[4]))
+        lst.sort(key=lambda t: (-t[5], -t[0], _tie(t[1]), _tie(t[2]), t[4]))
         role_rank, neg_dmin, depth, fid, i, deficit = lst[0]
 
         before = _total_Q(symbols, charges)
@@ -1406,7 +1407,7 @@ def _priority3_balance_positive_q_add(
                         # No candidate is safe from steric exclusion
                         break
                 else:
-                    best_idx = max(range(len(candidates)), key=lambda idx: candidates[idx]["dmin_3d"])
+                    best_idx = max(range(len(candidates)), key=lambda idx: _tie(candidates[idx]["dmin_3d"]))
                 
                 best_cand = candidates[best_idx]
 
@@ -1549,7 +1550,7 @@ def _experimental_exhausted_positive_q_fallback_once(
         if ci not in (3, 4):
             continue
         depths = [(fid, frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))) for fid in inc]
-        fid_min, depth = min(depths, key=lambda t: t[1])
+        fid_min, depth = min(depths, key=lambda t: _tie(t[1]))
         inc_count = len(inc)
         role_rank = 2 if inc_count >= 3 else (1 if inc_count == 2 else 0)
         if edges_by_facet is not None and verts_by_facet is not None:

@@ -1,5 +1,6 @@
 # nanocrystal_builder/passivation.py
 from __future__ import annotations
+import math
 from collections import OrderedDict
 from typing import Collection, Dict, List, Tuple, Optional, Sequence, Set
 import numpy as np
@@ -28,6 +29,17 @@ def _memo(name: str, key: tuple, compute):
 
 def _planes_key(planes) -> bytes:
     return b"".join(np.asarray(p[0], float).tobytes() + np.float64(p[1]).tobytes() for p in planes)
+
+
+def _tie(x: float) -> float:
+    """
+    x (Å) rounded to 1e-6 for ranking sites.  Symmetry-equivalent sites get
+    depths and spacings that differ only in the last bits, and those bits
+    depend on the numpy/BLAS build (L0198 of the CdSe Wulff scan: 2 ulp in an
+    in-plane spacing picked a different Se on numpy 2.5 than on 2.2).  Ranked
+    on this key they tie, and the caller's own order decides.
+    """
+    return round(x, 6) if math.isfinite(x) else x
 
 
 def _pts_key(pts) -> tuple:
@@ -532,7 +544,7 @@ def prepass_surface_cleanup(
                     role_fids = role_planes(mem[i], role_ignore_planes, planes)
                     fid_for_role = min(
                         role_fids,
-                        key=lambda fid: frames[fid][1] - float(np.dot(pts[i], frames[fid][0])),
+                        key=lambda fid: _tie(frames[fid][1] - float(np.dot(pts[i], frames[fid][0]))),
                     )
                     if edges_by_facet is not None and verts_by_facet is not None:
                         _role_name, role = _role_by_geometry(
@@ -564,7 +576,7 @@ def prepass_surface_cleanup(
                     n, d, *_rest = frames[fid]
                     depth = d - float(np.dot(pts[i], n))
                     if depth < surf_tol:
-                        if best is None or depth < best[0]:
+                        if best is None or _tie(depth) < _tie(best[0]):
                             best = (depth, fid)
                 if best is None: continue
                 depth, fid = best
@@ -572,7 +584,7 @@ def prepass_surface_cleanup(
                 from math import hypot
                 taken = uv_taken.get(fid, [])
                 dmin = float("inf") if not taken else min(hypot(uv[0]-x, uv[1]-y) for (x,y) in taken)
-                cands.append((dmin, -depth, -i, i, s, fid, role))
+                cands.append((_tie(dmin), -_tie(depth), -i, i, s, fid, role))
             if not cands: break
             if stack_passivation:
                 cands.sort(key=lambda t: (
@@ -884,7 +896,7 @@ def _collect_cation_sites(
         # shallowest facet
         dlist = depths[i]
         depth_min = min(dlist)
-        fid_star  = mem[i][int(np.argmin(dlist))]
+        fid_star  = mem[i][min(range(len(dlist)), key=lambda k: _tie(float(dlist[k])))]
 
         # outer/sublayer gating
         if outer_only:
