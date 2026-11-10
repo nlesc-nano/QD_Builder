@@ -251,6 +251,31 @@ def _detect_neutral_anchor(mol, coords: Optional[np.ndarray] = None) -> Tuple[in
     return anchor_idx, coords[anchor_idx], _anchor_vec_to_body(mol, coords, anchor_idx), "electronegative_atom"
 
 
+def _acid_carbonyl_frame(mol, coords: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray, np.ndarray, str]:
+    """Anchor frame of a carboxylic acid bound to a cation as an L-type donor: the carbonyl O on the metal, the
+    donor axis O -> C (the C=O pointing away from the metal); any other molecule as ``_detect_neutral_anchor``."""
+    from rdkit import Chem
+    if coords is None:
+        coords = _rdconf_to_numpy(mol)
+    coords = np.asarray(coords, float)
+    m = mol.GetSubstructMatches(Chem.MolFromSmarts("[CX3](=O)[OX2H1]"))
+    if not m:
+        return _detect_neutral_anchor(mol, coords)
+    c_idx, o_idx = int(m[0][0]), int(m[0][1])
+    return o_idx, coords[o_idx], _unit(coords[c_idx] - coords[o_idx]), "carboxylic_acid_o"
+
+
+def _acid_hbond_h(mol) -> Optional[int]:
+    """The O-H hydrogen of a carboxylic acid: the hydrogen-bond donor of an acid bound by its carbonyl O."""
+    from rdkit import Chem
+    m = mol.GetSubstructMatches(Chem.MolFromSmarts("[CX3](=O)[OX2H1]"))
+    return _find_attached_h(mol, int(m[0][2])) if m else None
+
+
+HBOND_RANGE = (1.5, 2.4)    # Å, H...O of a hydrogen bond (the H's own clash floor is the lower end)
+HBOND_BONUS = 0.5           # score of a pose whose donor H hydrogen-bonds an O of the environment
+
+
 def _detect_anchor_atom(mol, direction_hint: Optional[np.ndarray] = None) -> int:
     """
     Find the best anchor atom in a neutral ligand.
@@ -534,6 +559,9 @@ def _refine_one_ligand(
         tail_vec      – anchor → heavy-body direction, aligned with n_surf
         hosts         – env indices the anchor bonds to (not clashes)
         anchor_group  – ligand atoms whose host contacts are bonds (default: the anchor)
+        hbond_h       – a hydrogen-bond donor H of the ligand (an acid's O-H on a cation): its contacts with
+                        environment O count from HBOND_RANGE[0] instead of the vdW sum, and a pose where it
+                        sits within HBOND_RANGE of an O scores HBOND_BONUS more
         other_site_positions – sites of the other ligands of the pass
     env_pos : (M, 3) float — positions of the atoms already present
     env_z   : (M,)   int  — atomic numbers of environment atoms
@@ -636,6 +664,16 @@ def _refine_one_ligand(
     reach = float(lig_vdw.max() + sub_vdw.max())
     tree = cKDTree(sub_pos)
     k_val = min(24, len(near))
+    hb_h = site_config.get("hbond_h")
+    hb_h = None if hb_h is None else int(hb_h)
+    sub_o = env_z[near] == 8
+    o_tree = cKDTree(sub_pos[sub_o]) if hb_h is not None and sub_o.any() else None
+
+    def hbond_bonus(poses):
+        if o_tree is None:
+            return np.zeros(len(poses))
+        d = o_tree.query(poses[:, hb_h])[0]
+        return np.where((d >= HBOND_RANGE[0]) & (d <= HBOND_RANGE[1]), HBOND_BONUS, 0.0)
 
     def sterics(poses, atoms):
         """Score and gaps (vdW sum to distance, inf if out of reach) of ``atoms``."""
@@ -649,6 +687,10 @@ def _refine_one_ligand(
         for dent in np.flatnonzero(np.isin(atoms, anchor_group)):
             counted[:, dent, :] &= ~is_host[safe[:, dent, :]]
         gap = np.where(counted, dists - (lig_vdw[atoms][None, :, None] + sub_vdw[safe]), np.inf)
+        if hb_h is not None and hb_h in atoms:                    # the donor H against O: an H-bond, not a clash
+            col = int(np.flatnonzero(atoms == hb_h)[0])
+            hb_pair = counted[:, col, :] & sub_o[safe[:, col, :]]
+            gap[:, col, :] = np.where(hb_pair, dists[:, col, :] - HBOND_RANGE[0], gap[:, col, :])
         overlap = np.clip(-margin - gap, 0.0, None)
         clearance = np.minimum(gap.min(axis=2), 1.0)
         return clearance.min(axis=1) - 1000.0 * np.sum(overlap ** 2, axis=(1, 2)), gap, safe
@@ -664,12 +706,15 @@ def _refine_one_ligand(
         poses = rotated + (dpos + extra * n0)
         cand = np.arange(n_pose)
         if len(heavy_atoms) < n_atom and n_pose > n_refine:
-            coarse = sterics(poses, heavy_atoms)[0] + soft
+            coarse = sterics(poses, heavy_atoms)[0] + soft + hbond_bonus(poses)
             cand = np.argsort(-coarse, kind="stable")[:n_refine]
         scores, gap, safe = sterics(poses[cand], all_atoms)
-        scores += soft[cand]
+        scores += soft[cand] + hbond_bonus(poses[cand])
         b = int(np.argmax(scores))
         with_h = (numbers[:, None] == 1) | sub_h[safe[b]]
+        if hb_h is not None:                                      # the H-bond floor is its own clash limit
+            with_h = with_h.copy()
+            with_h[hb_h] &= ~sub_o[safe[b][hb_h]]
         contacts = int(np.sum(gap[b] < -np.where(with_h, h_margin, margin)))
         if contacts == 0:
             return numbers, poses[cand[b]], 0
@@ -1248,9 +1293,11 @@ def run_neutral_ligand_posttreatment(
         cur_syms = work_syms
         cur_pts  = np.asarray(work_pts, float)
 
-        # Prepare ligand molecule once.  It remains neutral: no ionic transform.
+        # Prepare ligand molecule once.  It remains neutral: no ionic transform.  A carboxylic acid on cations
+        # binds by its carbonyl O, its O-H turned toward a nearby O (on anions: the acidic-H anchor).
         try:
-            lig = _prepare_neutral_ligand(pass_spec.smiles, seed=spec.seed, ff=spec.ff)
+            frame = _acid_carbonyl_frame if pass_spec.target == "cation" else None
+            lig = _prepare_neutral_ligand(pass_spec.smiles, seed=spec.seed, ff=spec.ff, anchor_frame=frame)
         except Exception as exc:
             print(f"  [warning] Could not prepare SMILES {pass_spec.smiles!r}: {exc}. Skipping pass.")
             continue
@@ -1258,6 +1305,10 @@ def run_neutral_ligand_posttreatment(
         lig_coords = lig["coords"]
         lig_numbers = lig["numbers"]
         anchor_atom_idx = lig["anchor_idx"]
+        hbond_h = None
+        if lig["anchor_name"] == "carboxylic_acid_o":
+            from rdkit import Chem
+            hbond_h = _acid_hbond_h(Chem.AddHs(Chem.MolFromSmiles(pass_spec.smiles)))
         print(f"  → Neutral anchor: {lig['anchor_name']} atom_index={anchor_atom_idx}")
 
         unique_host_sites = neutral_ligand_host_sites(
@@ -1327,6 +1378,7 @@ def run_neutral_ligand_posttreatment(
                 "host_env_idx": primary_host,
                 "hosts":      hosts,
                 "other_site_positions": intended,
+                "hbond_h":    hbond_h,
             }
             placed_numbers, placed_coords, contacts = _refine_one_ligand(
                 site_config, env_pos, env_z, args_ns

@@ -36,8 +36,12 @@ The binding atom of the molecule is found from its functional groups. For
 amines, phosphines and thioethers it is the donor N, P or S atom, and the
 molecule is oriented along the vector from that atom to the centroid of
 its heavy atoms. If no donor group is recognised, the most electronegative
-heavy atom is used. For acids the anchor is the acidic hydrogen, since the
-molecule is attached in its neutral, protonated form.
+heavy atom is used. For acids on anions the anchor is the acidic hydrogen,
+since the molecule is attached in its neutral, protonated form. A carboxylic
+acid on a cation is a donor: its carbonyl O sits on the vacant site with the
+C=O pointing away from the cation, and its O-H hydrogen is turned toward a
+nearby O. That hydrogen may approach an O to 1.5 Å, and a pose with it 1.5 to
+2.4 Å from an O of the dot or its ligands (a hydrogen bond) scores 0.5 higher.
 
 The anchor is placed on the vacant lattice site, and the molecule is
 oriented along the direction from the host to that site. The builder then
