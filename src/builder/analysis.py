@@ -996,7 +996,11 @@ def nc_bulk_frac_shift(syms: List[str], pts: NDArray, bulk_struct) -> Optional[n
     to a translation (the construction origin).  The shift is found by trying
     the bulk sites of the first native atom's species and keeping the first
     one that brings the first 50 native atoms onto bulk sites of their own
-    species.  Returns None when no candidate fits.
+    species.  A relaxed nanocrystal (surface atoms moved by more than ~0.3 A)
+    fails that test; the shift is then the one that brings the most native
+    atoms within 0.06 (fractional) of a site of their own species, candidates
+    from the atoms nearest the centre (moved the least), accepted when it
+    holds at least half of them.  Returns None when no candidate fits.
     """
     if bulk_struct is None or not hasattr(bulk_struct, "sites"):
         return None
@@ -1025,7 +1029,32 @@ def nc_bulk_frac_shift(syms: List[str], pts: NDArray, bulk_struct) -> Optional[n
                 break
         if all_match:
             return candidate_shift
-    return None
+    return _frac_shift_by_vote(syms, pts, f_coords, native_idx, sites_by_sym)
+
+
+def _frac_shift_by_vote(syms, pts, f_coords, native_idx, sites_by_sym, tol=0.06, n_ref=8):
+    """The constant fractional shift most native atoms agree on (relaxed nanocrystals): candidates map one of the
+    n_ref atoms nearest the centre onto each bulk site of its species; the one with the most atoms within `tol` of a
+    site of their own species wins if that is at least half of them."""
+    nat = np.asarray(native_idx)
+    centre = pts[nat].mean(axis=0)
+    refs = nat[np.argsort(np.linalg.norm(pts[nat] - centre, axis=1))[:n_ref]]
+    site_f = {e: np.asarray([s.frac_coords for s in v], float) for e, v in sites_by_sym.items()}
+    groups = {e: nat[[syms[i] == e for i in nat]] for e in {syms[i] for i in nat}}
+    best, best_n = None, -1
+    for r in refs:
+        for sf in site_f[syms[r]]:
+            cand = (sf - f_coords[r]) % 1
+            n_ok = 0
+            for e, idx in groups.items():
+                if e not in site_f:
+                    continue
+                g = (f_coords[idx] + cand + 0.5) % 1 - 0.5
+                d = (site_f[e][None, :, :] - g[:, None, :] + 0.5) % 1 - 0.5
+                n_ok += int((np.linalg.norm(d, axis=2).min(axis=1) <= tol).sum())
+            if n_ok > best_n:
+                best, best_n = cand, n_ok
+    return best if best_n >= 0.5 * len(nat) else None
 
 
 def compute_cif_virtual_sites(
@@ -1078,8 +1107,9 @@ def compute_cif_virtual_sites(
 
         # 2. Map to reference bulk site in unit cell (with shift un-biasing)
         f_coord_unshifted = (f_coords[int(idx)] + best_f_shift + 0.5) % 1 - 0.5
-        site_idx = int(np.argmin([
+        site_idx = int(np.argmin([                     # the nearest bulk site of its own species
             float(np.linalg.norm((site.frac_coords - f_coord_unshifted + 0.5) % 1 - 0.5))
+            if site.specie.symbol == sym_i else np.inf
             for site in bulk_struct.sites
         ]))
         bulk_site = bulk_struct.sites[site_idx]
