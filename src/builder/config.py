@@ -47,8 +47,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     p.add_argument(
         "--from-xyz", metavar="DOT.xyz", default=None,
-        help="Post-treatment only: run the recipe's post_treatment block on this already "
-             "passivated dot (no Wulff cut, no first charge balance). Single-material mode."
+        help="Post-treatment only on this already-passivated dot (no Wulff cut). Single-material mode."
+    )
+    p.add_argument(
+        "--extra-native-cif", metavar="CIF", action="append", default=None,
+        help="With --from-xyz: additional material CIF(s) treated as native, not ligands. Repeatable."
+    )
+    p.add_argument(
+        "--prior-xyz", metavar="PRIOR.xyz", default=None,
+        help="With --from-xyz: a prior XYZ (with --prior-metadata) to chain ligand provenance from."
+    )
+    p.add_argument(
+        "--prior-metadata", metavar="PRIOR_METADATA.json", default=None,
+        help="With --from-xyz: the surface-metadata JSON matching --prior-xyz."
+    )
+    p.add_argument(
+        "--builder-params-json", metavar="PARAMS.json", default=None,
+        help="With --from-xyz: JSON describing the original build (radius_A, size_unit_cells, "
+             "aspect, shape, center_ion, shells), merged into the metadata's \"builder\" field."
     )
     p.add_argument(
         "--options", metavar="DOT.xyz", default=None,
@@ -1134,8 +1150,10 @@ def parse_yaml_config(path: str) -> Config:
             term = f.get("termination")
             if term is not None:
                 term_s = str(term).strip().lower().replace("-", "_")
-                if term_s in {"", "none", "null", "stoichiometric"}:
-                    term_by[(h, k, l)] = None   # non-polar facet: no termination to impose
+                if term_s in {"", "none", "null"}:
+                    term_by[(h, k, l)] = None   # key present but empty -- genuinely unspecified
+                elif term_s == "stoichiometric":
+                    term_by[(h, k, l)] = "stoichiometric"   # explicit real choice: no termination to impose
                 elif term_s in {"cation_rich", "anion_rich"}:
                     term_by[(h, k, l)] = term_s
                 else:
@@ -1144,18 +1162,18 @@ def parse_yaml_config(path: str) -> Config:
                         "'anion_rich' or 'stoichiometric'"
                     )
             else:
-                term_by[(h, k, l)] = None
+                term_by[(h, k, l)] = None   # termination never mentioned at all -- genuinely unknown
 
         if pair_opposites:
             for (h, k, l), g in list(g_by.items()):
                 if scope_by.get((h, k, l)) == "facet":
                     continue
-                if term_by.get((h, k, l)) is not None:
+                if term_by.get((h, k, l)) in {"cation_rich", "anion_rich"}:
                     continue
                 opp = (-h, -k, -l)
                 if opp not in g_by:
                     g_by[opp] = g
-                    term_by[opp] = None
+                    term_by[opp] = term_by.get((h, k, l))  # inherit, never hardcode
                     scope_by[opp] = scope_by.get((h, k, l), "family")
 
         return [

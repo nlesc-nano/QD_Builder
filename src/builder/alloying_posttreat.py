@@ -217,6 +217,8 @@ def run_alloying_posttreatment(
             "region": pass_spec.region,
             "count": len(selected),
             "charge_delta": len(selected) * (q_new - q_old),
+            "atom_indices_0based": list(selected),
+            "atom_positions": [work_pts[idx].tolist() for idx in selected],
         })
 
     total = sum(int(entry.get("count", 0)) for entry in ledger)

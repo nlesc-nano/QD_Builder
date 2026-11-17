@@ -1247,3 +1247,155 @@ def compute_cif_virtual_sites(
 
 
 
+# ===============================
+# Surface-atom metadata
+# ===============================
+
+def _facet_family_label(h: int, k: int, l: int) -> str:
+    """Unsigned Wulff facet family label, e.g. (1,-1,1) -> "{111}", (2,-1,0) -> "{210}".
+
+    Distinct from the exact signed Miller indices, which are preserved separately
+    wherever a facet is referenced (see surface_atom_records / build_surface_metadata_document).
+    """
+    a, b, c = sorted((abs(int(h)), abs(int(k)), abs(int(l))), reverse=True)
+    return f"{{{a}{b}{c}}}"
+
+
+def surface_atom_records(
+    symbols: List[str],
+    pts: NDArray[np.float64],
+    planes: List[Plane],
+    facets: List[Facet],
+    surf_tol: float,
+    charges: Dict[str, int],
+    *,
+    true_bulk_cn: Optional[Dict[str, int]] = None,
+    pair_cuts: Optional[PairCuts] = None,
+    index_map: Optional[List[int]] = None,
+    include_indices: Optional[Iterable[int]] = None,
+    atom_provenance: Optional[Dict[int, str]] = None,
+    material: Optional[Dict[int, str]] = None,
+    prepass_mode: str = "standard",
+) -> List[dict]:
+    """
+    Structured per-atom records (`qd_atoms`), reusing facet_atom_report's
+    own primitives (_facet_memberships, coord_numbers_bipartite,
+    bulk_cn_opposite_by_interior). One dict per atom in `include_indices`
+    (default: all), sorted by exported index:
+      classification: "surface" (>=1 facet membership) | "internal"
+      role/layer/facet_ids/facet_hkls/facet_families/surface_normal: only on surface records
+      coordination_number/bulk_coordination_number/coordination_deficit/sublattice: always present
+      provenance: from atom_provenance, default "native"
+      material: from `material`, only set when present
+
+    `index_map` remaps local position -> exported atom index (identity by
+    default). `prepass_mode == "role-aware"` computes role with
+    passivation._role_by_geometry against the shallowest membership facet,
+    matching a role-aware build's own eligibility classifier; otherwise the
+    plain membership-count heuristic.
+    """
+    n = len(symbols)
+    pts = np.asarray(pts, float)
+    if index_map is None:
+        index_map = list(range(n))
+    emit = range(n) if include_indices is None else include_indices
+
+    memberships = _facet_memberships(pts, planes, surf_tol)
+    cn = coord_numbers_bipartite(symbols, pts, charges, pair_cuts=pair_cuts)
+    bulk = bulk_cn_opposite_by_interior(
+        symbols, pts, planes, surf_tol, charges,
+        true_bulk_cn=true_bulk_cn, pair_cuts=pair_cuts,
+    )
+
+    outer_thr = 0.35 * surf_tol
+    atom_provenance = atom_provenance or {}
+    material = material or {}
+
+    use_geom_role = prepass_mode == "role-aware"
+    if use_geom_role:
+        from .passivation import _build_facet_frames, _intersections_geometry, _role_by_geometry
+        frames = _build_facet_frames(planes)
+        edges_by_facet, verts_by_facet = _intersections_geometry(frames)
+        edge_tol = max(0.25 * surf_tol, 0.35)
+        vertex_tol = max(0.75 * surf_tol, 0.75)
+        _role_label = {"unique": "facet", "edge": "edge", "vertex": "vertex"}
+
+    candidates = []
+    for i in emit:
+        facet_ids = sorted(memberships[i])
+        classification = "surface" if facet_ids else "internal"
+
+        facet_only: dict = {}
+
+        if facet_ids:
+            m = len(facet_ids)
+            if use_geom_role:
+                # Same convention as passivation.collect_anion_candidates:
+                # evaluate against the shallowest (closest-to-surface)
+                # facet this atom belongs to, not every one of them.
+                depths_by_fid = {
+                    fid: float(planes[fid][1] - np.dot(pts[i], planes[fid][0]))
+                    for fid in facet_ids
+                }
+                fid_star = min(depths_by_fid, key=depths_by_fid.get)
+                role_name, _role_rank = _role_by_geometry(
+                    i, fid_star, pts, frames, edges_by_facet, verts_by_facet, edge_tol, vertex_tol,
+                )
+                role = _role_label[role_name]
+            else:
+                role = "facet" if m == 1 else ("edge" if m == 2 else "vertex")
+
+            normals = [np.asarray(planes[fid][0], float) for fid in facet_ids]
+            if m == 1:
+                normal = normals[0]
+            else:
+                normal = np.mean(normals, axis=0)
+                norm = np.linalg.norm(normal)
+                normal = normal / norm if norm > 1e-12 else normals[0]
+            normal = normal / (np.linalg.norm(normal) + 1e-12)
+
+            depth = min(
+                float(planes[fid][1] - np.dot(pts[i], planes[fid][0]))
+                for fid in facet_ids
+            )
+            facet_only = {
+                "role": role,
+                "layer": "outer" if depth < outer_thr else "sublayer",
+                "facet_ids": list(facet_ids),
+                "facet_hkls": [[facets[fid].h, facets[fid].k, facets[fid].l] for fid in facet_ids],
+                "facet_families": [_facet_family_label(facets[fid].h, facets[fid].k, facets[fid].l) for fid in facet_ids],
+                "surface_normal": [float(x) for x in normal],
+            }
+
+        s = symbols[i]
+        q = charges.get(s)
+        sublattice = "cation" if (q is not None and q > 0) else ("anion" if (q is not None and q < 0) else None)
+        deficit = max(0, int(bulk[s]) - int(cn[i]))
+
+        exported_idx = int(index_map[i])
+        rec = {
+            "_exported_idx": exported_idx,
+            "atom_index_0based": exported_idx,
+            "element": s,
+            "position": [float(x) for x in pts[i]],
+            "classification": classification,
+            "coordination_number": int(cn[i]),
+            "bulk_coordination_number": int(bulk[s]),
+            "coordination_deficit": deficit,
+            "sublattice": sublattice,
+            "provenance": atom_provenance.get(i, "native"),
+            **facet_only,
+        }
+        if i in material:
+            rec["material"] = material[i]
+        candidates.append(rec)
+
+    candidates.sort(key=lambda r: r["_exported_idx"])
+    for qd_atom_id, rec in enumerate(candidates):
+        rec["qd_atom_id"] = qd_atom_id
+        del rec["_exported_idx"]
+
+    return candidates
+
+
+

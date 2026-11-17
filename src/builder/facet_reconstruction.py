@@ -950,6 +950,7 @@ def reconstruct_polar_facets(
     write_all: bool = False,
     prefix: str = "nanocrystal",
     ledger: Optional[dict] = None,
+    charge_balance_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
     Polar {111} reconstruction of zinc-blende II-VI / III-V nanocrystals.
@@ -957,6 +958,11 @@ def reconstruct_polar_facets(
     See the module docstring for the algorithm.  `charge_balance_fn`,
     `write_all` and `prefix` are accepted for call-site compatibility.  When
     `ledger` is a dict it is filled with a summary of the reconstruction.
+
+    `charge_balance_ledger`: optional list filled the same way as
+    `passivation_iterative.py`'s own `charge_balance_ledger`, covering the
+    *residual* charge-balance pass run internally when the {111}
+    reconstruction alone can't absorb the whole charge.
     """
     if not spec.enabled:
         return symbols, pts
@@ -1120,6 +1126,24 @@ def reconstruct_polar_facets(
         """
         syms = list(base_symbols)
         alive = all_alive.copy()
+        # _execute is re-run per trial n_vac/swap (best one kept, see the
+        # caller's loop) -- collect substitutions locally per-trial, not into
+        # the shared `ledger`, so a rejected trial's entries are never
+        # committed.
+        lattice_substitutions: List[dict] = []
+
+        def _record_substitution(a: int) -> None:
+            # Real provenance for a native anion converted in place to the
+            # ligand (syms[a] = recon_ligand): captured by position, not index
+            host_idx = [n for n in nb[a] if syms[n] == cation]
+            lattice_substitutions.append({
+                "position": pts[a].tolist(),
+                "symbol": recon_ligand,
+                "host_positions": [pts[n].tolist() for n in host_idx],
+                "host_symbols": [cation] * len(host_idx),
+                "replaced_element": anion,
+                "mechanism": "polar_surface_reconstruction",
+            })
         if swap is not None:
             an_sel = {k: [] for k in range(len(an_facets))}
         else:
@@ -1152,6 +1176,7 @@ def reconstruct_polar_facets(
         for c in vacancies:
             for a in nb[c]:
                 if alive[a] and syms[a] == anion and cn(a, alive) == 2:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     converted[facet_of_vac[c]] += 1
                     dq_anion += ligand_charge - q_an
@@ -1163,6 +1188,7 @@ def reconstruct_polar_facets(
                 for k, conv in sel.items():
                     for a in conv:
                         if alive[a] and syms[a] == anion:
+                            _record_substitution(a)
                             syms[a] = recon_ligand
                             dq_anion += ligand_charge - q_an
                             counts[k] += 1
@@ -1171,6 +1197,7 @@ def reconstruct_polar_facets(
         for k, conv in _break_runs(syms, alive).items():
             for a in conv:
                 if syms[a] == anion:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     dq_anion += ligand_charge - q_an
                     n_breaks[k] += 1
@@ -1181,6 +1208,7 @@ def reconstruct_polar_facets(
             if len(f.outer) == 1:
                 a = f.outer[0]
                 if alive[a] and syms[a] == anion:
+                    _record_substitution(a)
                     syms[a] = recon_ligand
                     dq_anion += ligand_charge - q_an
                     n_breaks[k] += 1
@@ -1318,6 +1346,13 @@ def reconstruct_polar_facets(
             for pk in picks:
                 new_symbols.append(recon_ligand)
                 new_pts = np.vstack([new_pts, pk["pos"]])
+                lattice_substitutions.append({
+                    "position": pk["pos"].tolist() if hasattr(pk["pos"], "tolist") else list(pk["pos"]),
+                    "symbol": recon_ligand,
+                    "host_positions": [new_pts[h].tolist() for h in pk["hosts"]],
+                    "host_symbols": [new_symbols[h] for h in pk["hosts"]],
+                    "mechanism": "charge_balance",
+                })
                 added += 1
                 mu_added[pk["mu"] if pk["mu"] in mu_added else 3] += 1
                 facet_count[pk["facet"]] += 1
@@ -1340,6 +1375,7 @@ def reconstruct_polar_facets(
             "mu_added": mu_added,
             "added_by_facet": facet_count,
             "q_final": _total_q(new_symbols, charges),
+            "lattice_substitutions": lattice_substitutions,
         }
 
     # Most vacancies per anion facet first; back off one per facet at a time
@@ -1448,13 +1484,23 @@ def reconstruct_polar_facets(
             out_symbols, out_pts, struct, charges, facet_seeds, recon_ligand, surf_tol
         )
         before = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
+        residual_ledger: List[dict] = []
+        residual_lattice_substitution_ledger: List[dict] = []
         out_symbols, out_pts = charge_balance_iterative(
             list(out_symbols), np.asarray(out_pts, float), charges, recon_ligand,
             verbose, cb_planes, surf_tol, cif_path,
             positive_q_strategy="add",
             pair_cuts_override=pair_cuts,
             prepass_mode="none",
+            ledger=residual_ledger,
+            lattice_substitution_ledger=residual_lattice_substitution_ledger,
         )
+        if charge_balance_ledger is not None:
+            charge_balance_ledger.extend(residual_ledger)
+        if residual_lattice_substitution_ledger:
+            res["lattice_substitutions"] = (
+                res["lattice_substitutions"] + residual_lattice_substitution_ledger
+            )
         after = {s: out_symbols.count(s) for s in (cation, anion, recon_ligand)}
         rebalance = {
             "residual_charge": int(q_final),
@@ -1504,4 +1550,6 @@ def reconstruct_polar_facets(
             ledger["swap"] = swap_info
         if rebalance is not None:
             ledger["charge_balance_fallback"] = rebalance
+        if res["lattice_substitutions"]:
+            ledger["lattice_substitutions"] = res["lattice_substitutions"]
     return out_symbols, out_pts

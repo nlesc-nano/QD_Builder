@@ -402,6 +402,7 @@ def _try_q_neutral_cation_removal_bundle(
     region_removals: Optional[Dict[int, int]] = None,
     atom_regions: Optional[List[int]] = None,
     verbose: bool = False,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[bool, NDArray[np.float64]]:
     """
     Remove one surface CN<=2 cation and swap two surface anions to ligand (net Q=0).
@@ -425,6 +426,19 @@ def _try_q_neutral_cation_removal_bundle(
                 f"bundle: swap anion {old}#{ai} (CN={int(cn[ai])}) → {ligand} "
                 f"(companion to cation removal #{cation_idx})"
             )
+        if lattice_substitution_ledger is not None:
+            host_idx = [
+                j for j in _bond_neighbor_indices(ai, symbols, pts, pair_cuts)
+                if charges.get(symbols[j], 0) > 0
+            ]
+            lattice_substitution_ledger.append({
+                "position": pts[ai].tolist(),
+                "symbol": ligand,
+                "host_positions": [pts[j].tolist() for j in host_idx],
+                "host_symbols": [symbols[j] for j in host_idx],
+                "replaced_element": old,
+                "mechanism": "charge_balance",
+            })
         symbols[ai] = ligand
         _record_uv_allfacets(ai, pts, frames, surf_tol, uv_taken, edit_count_facet)
 
@@ -484,6 +498,7 @@ def prepass_surface_cleanup(
     prepass_min_cn_edge: int = 2,
     prepass_min_cn_vertex: int = 2,
     role_ignore_planes: Optional[Collection[int]] = None,
+    lattice_substitution_ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray[np.float64], Dict[int, List[Tuple[float, float]]], Dict[int, int]]:
     """
     Always run before charge balancing:
@@ -495,6 +510,14 @@ def prepass_surface_cleanup(
     zero-area {100} plane, would count as a heterogeneous {111}|{100}
     intersection and be held to the terrace CN.
     Returns (symbols, pts, uv_taken, edit_count_facet) to seed spacing state.
+
+    `lattice_substitution_ledger`, if given, is filled with one position-
+    captured entry (see builder.facet_reconstruction._record_substitution --
+    same shape, same position-based resolution via
+    builder.surface_metadata._resolve_lattice_substitutions) per anion swapped
+    to `anion_ligand` below -- this is the same "native atom converted in
+    place to the ligand species" case, just reached by the baseline prepass
+    instead of polar facet reconstruction.
     """
     from .analysis import coord_numbers_bipartite
 
@@ -616,6 +639,7 @@ def prepass_surface_cleanup(
                     uv_taken, edit_count_facet, mem, cn, i,
                     region_masks=region_masks, region_removals=region_removals,
                     atom_regions=atom_regions, verbose=verbose,
+                    lattice_substitution_ledger=lattice_substitution_ledger,
                 )
                 if ok:
                     mem = _facet_members()
@@ -629,6 +653,7 @@ def prepass_surface_cleanup(
                         uv_taken, edit_count_facet, mem, cn, alt_i,
                         region_masks=region_masks, region_removals=region_removals,
                         atom_regions=atom_regions, verbose=verbose,
+                        lattice_substitution_ledger=lattice_substitution_ledger,
                     )
                     if ok:
                         mem = _facet_members()
@@ -670,6 +695,19 @@ def prepass_surface_cleanup(
             elif anion_cn == 2:
                 if verbose:
                     print(f"prepass: swap anion {s}#{i} (CN={anion_cn}) → {anion_ligand}")
+                if lattice_substitution_ledger is not None:
+                    host_idx = [
+                        j for j in _bond_neighbor_indices(i, symbols, pts, pair_cuts)
+                        if charges.get(symbols[j], 0) > 0
+                    ]
+                    lattice_substitution_ledger.append({
+                        "position": pts[i].tolist(),
+                        "symbol": anion_ligand,
+                        "host_positions": [pts[j].tolist() for j in host_idx],
+                        "host_symbols": [symbols[j] for j in host_idx],
+                        "replaced_element": s,
+                        "mechanism": "charge_balance",
+                    })
                 symbols[i] = anion_ligand
                 _record_uv_allfacets(i, pts, frames, surf_tol, uv_taken, edit_count_facet)
                 changed_swap = True

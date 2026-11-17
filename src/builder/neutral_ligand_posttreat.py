@@ -1222,11 +1222,14 @@ def run_neutral_ligand_posttreatment(
     cfg: Config,
     bulk_struct,        # pymatgen Structure (CIF-loaded)
     planes: List[Plane],
+    *,
+    ledger: Optional[List[dict]] = None,
 ) -> Tuple[List[str], NDArray]:
     """
     Run the neutral-ligand post-treatment and return the updated (syms, pts).
 
     Called from main.py after charge_balance_iterative() returns Q=0.
+
     """
     spec: NeutralLigandPostTreatSpec = getattr(
         getattr(cfg, "post_treatment", None),
@@ -1386,9 +1389,20 @@ def run_neutral_ligand_posttreatment(
             if contacts:
                 skipped += 1
                 continue
+            atom_start = len(work_syms)
             for at_z, at_pos in zip(placed_numbers, placed_coords):
                 work_syms.append(_z_to_symbol(int(at_z)))
                 work_pts.append(at_pos)
+            if ledger is not None:
+                ledger.append({
+                    "smiles": pass_spec.smiles,
+                    "kind": lig["anchor_name"],
+                    # Every host this ligand is bonded to (bridging/multidentate
+                    # binding may mean more than one), not just the primary one.
+                    "host_env_indices": hosts,
+                    "anchor_local_idx": int(anchor_atom_idx),
+                    "atom_indices": list(range(atom_start, len(work_syms))),
+                })
             env_pos = np.vstack([env_pos, placed_coords])
             env_z = np.concatenate([env_z, placed_numbers])
             placed_count += 1
