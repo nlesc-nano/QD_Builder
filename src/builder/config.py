@@ -452,7 +452,7 @@ def _parse_neutral_ligands(raw) -> NeutralLigandPostTreatSpec:
         smiles = str(entry.get("smiles", "")).strip()
         if not smiles:
             raise ValueError(f"neutral_ligands.passes[{i}].smiles is required")
-        target_symbol = str(entry.get("target_symbol", "")).strip() or None
+        target_symbol = str(entry.get("target_symbol") or "").strip() or None
         distribution = str(entry.get("distribution", "random")).strip().lower()
         if distribution not in valid_distributions:
             raise ValueError(
@@ -918,7 +918,7 @@ def _parse_z_type_ligands(raw) -> ZTypeLigandPostTreatSpec:
         complex_ = str(entry.get("complex", entry.get("formula", entry.get("smiles", "")))).strip()
         if not complex_:
             raise ValueError(f"z_type_ligands.passes[{i}].complex is required, e.g. CdCl2")
-        target_symbol = str(entry.get("target_symbol", "")).strip() or None
+        target_symbol = str(entry.get("target_symbol") or "").strip() or None
         target_count = int(entry.get("target_count", entry.get("count", 0)) or 0)
         if target_count < 0:
             raise ValueError(f"z_type_ligands.passes[{i}].target_count must be >= 0")
