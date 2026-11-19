@@ -170,7 +170,10 @@ def resolve_prior_ligand_provenance(
     current atom array (`prior_symbols`/`prior_pts` index into the prior
     document, not `symbols`/`pts`). Returns a list shaped like
     build_surface_metadata_document's `ligand_provenance`; drops a ligand
-    whose atoms/hosts no longer resolve."""
+    whose atoms/hosts no longer resolve, or whose entry is malformed."""
+    if not prior_ligands or not isinstance(prior_ligands, list):
+        return []
+    prior_ligands = [lig for lig in prior_ligands if isinstance(lig, dict)]
     if not prior_ligands:
         return []
     prior_pts = np.asarray(prior_pts, float)
@@ -416,6 +419,7 @@ def build_surface_metadata_document(
     material_provenance: Optional[List[Dict[str, Any]]] = None,
     prepass_mode: str = "standard",
     prior_metadata_supplied: bool = False,
+    prior_metadata_malformed: bool = False,
 ) -> Dict[str, Any]:
     """
     Assemble the full surface metadata document. `symbols`/`pts` must match
@@ -428,6 +432,8 @@ def build_surface_metadata_document(
     - atom_provenance / material_provenance: position-resolved qd_atoms `provenance`/`material` tags.
     - prepass_mode: "role-aware" computes qd_atoms `role` with the build's own geometric classifier.
     - prior_metadata_supplied: whether a prior document was available to chain from, for `warnings` reason text.
+    - prior_metadata_malformed: whether that prior document was supplied but unusable (wrong shape),
+      as opposed to usable-but-position-matching-failed; also feeds `warnings` reason text.
 
     Returns a plain dict, JSON-serializable as-is.
     """
@@ -490,6 +496,8 @@ def build_surface_metadata_document(
         })
         if i in malformed_ligand_indices:
             reason = "malformed_ledger_entry"
+        elif prior_metadata_malformed:
+            reason = "prior_metadata_malformed"
         elif prior_metadata_supplied:
             reason = "prior_position_match_failed"
         else:

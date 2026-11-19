@@ -364,6 +364,7 @@ def run_from_xyz(args, cfg: Config) -> int:
         }
         material_provenance = None
         prior_metadata_supplied = False
+        prior_metadata_malformed = False
         prior_xyz_path = getattr(args, "prior_xyz", None)
         prior_metadata_path = getattr(args, "prior_metadata", None)
         if prior_xyz_path and prior_metadata_path:
@@ -372,9 +373,29 @@ def run_from_xyz(args, cfg: Config) -> int:
             prior_atoms = ase_read(prior_xyz_path, format="xyz")
             prior_syms = prior_atoms.get_chemical_symbols()
             prior_pts = prior_atoms.get_positions()
+
+            # A caller-supplied prior document is untrusted input: validate the
+            # shape of its 'ligands'/'qd_atoms' fields rather than assume them,
+            # so a malformed field degrades to a `warnings` entry (below) instead
+            # of crashing the whole build. resolve_prior_ligand_provenance() is
+            # independently defensive about this too, but detecting it here lets
+            # us record *why* chaining didn't happen.
+            prior_ligands_raw = prior_doc.get("ligands")
+            if prior_ligands_raw and not (
+                isinstance(prior_ligands_raw, list) and all(isinstance(e, dict) for e in prior_ligands_raw)
+            ):
+                prior_metadata_malformed = True
+
+            prior_qd_atoms_raw = prior_doc.get("qd_atoms")
+            if prior_qd_atoms_raw and not (
+                isinstance(prior_qd_atoms_raw, list) and all(isinstance(e, dict) for e in prior_qd_atoms_raw)
+            ):
+                prior_metadata_malformed = True
+                prior_qd_atoms_raw = []
+
             chained = resolve_prior_ligand_provenance(
                 syms, final_pts, prior_syms, prior_pts,
-                prior_doc.get("ligands"),
+                prior_ligands_raw,
                 alloying_provenance=ledgers.get("atom_provenance"),
             )
             already_covered = {
@@ -386,8 +407,8 @@ def run_from_xyz(args, cfg: Config) -> int:
             ]
             material_provenance = [
                 {"position": r["position"], "symbol": r["element"], "material": r["material"]}
-                for r in prior_doc.get("qd_atoms", [])
-                if r.get("material") is not None
+                for r in (prior_qd_atoms_raw or [])
+                if isinstance(r, dict) and r.get("material") is not None
             ] or None
             prior_metadata_supplied = True
         if args.verbose:
@@ -417,6 +438,7 @@ def run_from_xyz(args, cfg: Config) -> int:
             prepass_mode=cfg.passivation.prepass_mode,
             true_bulk_cn=true_bulk_cn,
             prior_metadata_supplied=prior_metadata_supplied,
+            prior_metadata_malformed=prior_metadata_malformed,
         )
         write_surface_metadata_json(f"{prefix}_metadata.json", metadata_doc)
     return 0
