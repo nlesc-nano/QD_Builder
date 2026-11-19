@@ -74,6 +74,56 @@ def test_from_xyz_prior_metadata_chains_ligand_provenance(tmp_path):
     assert not chained_doc.get("warnings")
 
 
+def test_from_xyz_malformed_prior_metadata_does_not_crash(tmp_path):
+    """A caller-supplied --prior-metadata is untrusted input (e.g. a webapp
+    request body); a malformed 'ligands'/'qd_atoms' shape must degrade to a
+    `warnings` entry, never crash the build or silently drop the metadata JSON.
+
+    Before the fix, this raised AttributeError deep in
+    resolve_prior_ligand_provenance() and _run (check=True) surfaced it as a
+    CalledProcessError -- i.e. this test failed outright on the regression.
+    """
+    base_out = tmp_path / "base.xyz"
+    _run([str(CIF), "tests/test_from_xyz_baseline.yaml", "-o", str(base_out)])
+
+    malformed_metadata = tmp_path / "malformed_metadata.json"
+    malformed_metadata.write_text(json.dumps({
+        "ligands": "not-a-list",
+        "qd_atoms": [{"bogus": True}],
+    }))
+
+    final_out = tmp_path / "final.xyz"
+    _run([
+        str(CIF), "tests/test_from_xyz_posttreat.yaml",
+        "--from-xyz", str(base_out),
+        "--prior-xyz", str(base_out),
+        "--prior-metadata", str(malformed_metadata),
+        "-o", str(final_out),
+    ])
+
+    metadata_path = tmp_path / "final_metadata.json"
+    assert metadata_path.exists(), "a malformed --prior-metadata must not prevent the metadata JSON from being written"
+    doc = json.loads(metadata_path.read_text())
+    reasons = {w.get("reason") for w in (doc.get("warnings") or [])}
+    assert "prior_metadata_malformed" in reasons
+
+
+def test_resolve_prior_ligand_provenance_rejects_malformed_shapes():
+    """Fast, isolated regression check: malformed `prior_ligands` must drop
+    to an empty list, never raise, independent of the CLI-level test above."""
+    import numpy as np
+    from builder.surface_metadata import resolve_prior_ligand_provenance
+
+    syms = ["Cl", "Cl"]
+    pts = np.zeros((2, 3))
+
+    assert resolve_prior_ligand_provenance(syms, pts, syms, pts, "not-a-list") == []
+    assert resolve_prior_ligand_provenance(syms, pts, syms, pts, [1, 2, 3]) == []
+    assert resolve_prior_ligand_provenance(syms, pts, syms, pts, [{"not": "a valid ligand entry"}]) == []
+    assert resolve_prior_ligand_provenance(syms, pts, syms, pts, None) == []
+    assert resolve_prior_ligand_provenance(syms, pts, syms, pts, []) == []
+
+
 def test_from_xyz_builder_params_merge_with_post_treatment_recipe(tmp_path):
     base_out = tmp_path / "base.xyz"
     _run([str(CIF), "tests/test_from_xyz_baseline.yaml", "-o", str(base_out)])
